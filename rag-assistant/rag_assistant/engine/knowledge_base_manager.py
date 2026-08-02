@@ -1,0 +1,1160 @@
+"""
+local-rag-builder 知识库管理模块
+v0.1.0
+支持多知识库创建、导入、删除、自动分类
+"""
+
+import os
+import sys
+import json
+import glob
+
+# ── SM3 国密哈希（Python 内置 hashlib，OpenSSL 1.1.1+） ────────
+import hashlib
+
+def sm3(data: bytes) -> str:
+    """SM3 哈希，返回 64 位十六进制字符串（零依赖）"""
+    return hashlib.new('sm3', data).hexdigest()
+import shutil
+import time
+import zipfile
+from datetime import datetime
+
+from utils import KB_DIR, DATA_ROOT, safe_json_load, safe_json_dump
+
+KB_INDEX_FILE = os.path.join(KB_DIR, "kb_index.json")
+AUTO_CLASSIFY_RULES_FILE = os.path.join(KB_DIR, "auto_classify_rules.json")
+
+
+def _load_index():
+    data = safe_json_load(KB_INDEX_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+
+    # 扫描磁盘，自动补录索引缺失的知识库目录
+    existing = sorted([
+        d for d in os.listdir(KB_DIR)
+        if os.path.isdir(os.path.join(KB_DIR, d))
+    ])
+    changed = False
+    for _name in existing:
+        if _name not in data:
+            data[_name] = {
+                "path": os.path.join(KB_DIR, _name),
+                "description": "",
+                "doc_count": 0,
+            }
+            changed = True
+
+    # 磁盘和索引都空 → 创建 default
+    if not existing and "default" not in data:
+        data["default"] = {
+            "path": os.path.join(KB_DIR, "default"),
+            "description": "默认知识库",
+        }
+        os.makedirs(os.path.join(KB_DIR, "default"), exist_ok=True)
+        changed = True
+
+    if changed:
+        safe_json_dump(data, KB_INDEX_FILE)
+
+    return data
+
+
+def _save_index(index):
+    safe_json_dump(index, KB_INDEX_FILE)
+
+
+def _load_rules():
+    return safe_json_load(AUTO_CLASSIFY_RULES_FILE, {})
+
+
+def _save_rules(rules):
+    """保存规则 + 自动补齐 _originals"""
+    for kb_name, entry in rules.items():
+        if isinstance(entry, dict) and "_originals" not in entry and entry.get("keywords"):
+            entry["_originals"] = list(entry["keywords"])
+    safe_json_dump(rules, AUTO_CLASSIFY_RULES_FILE)
+
+
+def list_knowledge_bases():
+    """列出所有知识库"""
+    return _load_index()
+
+
+def create_knowledge_base(name, description="", model_id=""):
+    """创建新知识库"""
+    index = _load_index()
+    if name in index:
+        return False, f"知识库 '{name}' 已存在"
+
+    kb_path = os.path.join(KB_DIR, name)
+    os.makedirs(kb_path, exist_ok=True)
+
+    entry = {
+        "path": kb_path,
+        "description": description,
+        "created": str(__import__("datetime").datetime.now()),
+        "doc_count": 0,
+    }
+    if model_id:
+        entry["embedding_model"] = model_id
+    index[name] = entry
+    _save_index(index)
+    return True, f"知识库 '{name}' 已创建"
+
+
+def set_kb_model(kb_name, model_id=""):
+    """设置/清除知识库的嵌入模型。空字符串 = 回退到全局默认。"""
+    index = _load_index()
+    if kb_name not in index:
+        return False, f"知识库 '{kb_name}' 不存在"
+    if model_id:
+        index[kb_name]["embedding_model"] = model_id
+    else:
+        index[kb_name].pop("embedding_model", None)
+    _save_index(index)
+    return True, f"知识库 '{kb_name}' 嵌入模型已{'更新' if model_id else '清除（回退全局默认）'}"
+
+
+def get_kb_model(kb_name):
+    """获取知识库指定的嵌入模型 ID，空串表示未指定（回退全局默认）"""
+    index = _load_index()
+    entry = index.get(kb_name, {})
+    return entry.get("embedding_model", "")
+
+
+# ── HNSW 配置管理 ─────────────────────────────
+
+DEFAULT_HNSW_M = 16
+MAX_HNSW_M = 256
+
+def get_kb_hnsw_config(kb_name: str) -> dict:
+    """获取 KB 的 HNSW 配置：{hnsw_m, auto_rebuild_hnsw}"""
+    index = _load_index()
+    entry = index.get(kb_name, {})
+    return {
+        "hnsw_m": entry.get("hnsw_m", DEFAULT_HNSW_M),
+        "auto_rebuild_hnsw": entry.get("auto_rebuild_hnsw", False),
+    }
+
+
+def set_kb_hnsw_config(kb_name: str, hnsw_m: int = None,
+                       auto_rebuild_hnsw: bool = None) -> tuple:
+    """设置 KB 的 HNSW 配置。M 值变化自动触重建，返回 (ok, msg, rebuilt)"""
+    index = _load_index()
+    if kb_name not in index:
+        return False, f"知识库 '{kb_name}' 不存在", False
+
+    entry = index[kb_name]
+    rebuilt = False
+
+    if hnsw_m is not None:
+        hnsw_m = max(4, min(int(hnsw_m), MAX_HNSW_M))
+        old_m = entry.get("hnsw_m", DEFAULT_HNSW_M)
+        entry["hnsw_m"] = hnsw_m
+        _save_index(index)  # 先存盘，让 rebuild_kb_hnsw 能从磁盘读到新 M 值
+        if hnsw_m != old_m:
+            rebuild_kb_hnsw(kb_name)
+            rebuilt = True
+
+    if auto_rebuild_hnsw is not None:
+        entry["auto_rebuild_hnsw"] = bool(auto_rebuild_hnsw)
+
+    _save_index(index)
+    return True, f"知识库 '{kb_name}' HNSW 配置已更新" + ("（M 值变化 → HNSW 已重建）" if rebuilt else ""), rebuilt
+
+
+def rebuild_kb_hnsw(kb_name: str) -> tuple:
+    """全量重建 HNSW 索引：从 SQLite 读取文档 → 删 hnswlib → 重新 embed → 写回 hnswlib
+    不碰 ChromaDB collection 的 segment，HNSW 搜索全走 hnswlib。
+    """
+    from rag_core import get_embeddings
+    from chroma_adapter import Chroma, INDEX_FILE
+    import os, numpy as np, sqlite3
+
+    index = _load_index()
+    if kb_name not in index:
+        return False, f"知识库 '{kb_name}' 不存在"
+
+    persist_dir = index[kb_name]["path"]
+    hnsw_m = index[kb_name].get("hnsw_m", DEFAULT_HNSW_M)
+
+    if not os.path.isdir(persist_dir):
+        return False, f"知识库目录不存在: {persist_dir}"
+
+    db_path = os.path.join(persist_dir, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return False, f"知识库无数据库文件: {db_path}"
+
+    # 1. 从 SQLite 直接读取文档和 metadata（绕过 ChromaDB Rust 后端）
+    conn = sqlite3.connect(db_path)
+
+    # 1a. 读取文档文本（同时取 ChromaDB 的真实 embedding_id）
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT em.id, e.embedding_id, em.string_value
+        FROM embedding_metadata em
+        JOIN embeddings e ON em.id = e.id
+        WHERE em.key='chroma:document'
+        ORDER BY em.id
+    """)
+    rows = cur.fetchall()
+    if not rows:
+        conn.close()
+        return False, "知识库无文档数据"
+
+    all_chroma_ids = [r[1] for r in rows]  # ChromaDB 真实 ID（SHA256 串）
+    all_texts = [r[2] for r in rows]
+    sqlite_ids = [r[0] for r in rows]      # 仅用于 metadata 关联
+
+    # 1b. 读取所有 metadata（拼接为 {id: {key: val}}）
+    cur.execute("""
+        SELECT e.embedding_id, em.key, em.string_value
+        FROM embeddings e
+        JOIN embedding_metadata em ON e.embedding_id = em.id
+        ORDER BY e.embedding_id, em.id
+    """)
+    meta_rows = cur.fetchall()
+    conn.close()
+
+    all_metas = {}
+    for eid, key, val in meta_rows:
+        if eid not in all_metas:
+            all_metas[eid] = {}
+        all_metas[eid][key] = val or ""
+
+    # 按 all_ids 顺序整理 metadata
+    meta_list = [all_metas.get(int(eid), {}) for eid in sqlite_ids]
+
+    print(f"  [HNSW 重建] {kb_name}: {len(all_chroma_ids)} 个 chunk (M={hnsw_m})")
+
+    # 2. 获取 embedding 模型
+    emb = get_embeddings(kb_name=kb_name)
+    st_model = emb._model
+    if st_model is None:
+        return False, "嵌入模型不可用"
+
+    # 3. 删除旧的 hnswlib 索引文件（新旧位置都清理）
+    from chroma_adapter import INDEX_FILE, _hnsw_storage_dir
+    for location in [persist_dir, _hnsw_storage_dir(persist_dir)]:
+        for fn in [INDEX_FILE, "hnsw_meta.json"]:
+            p = os.path.join(location, fn)
+            if os.path.exists(p):
+                os.remove(p)
+
+    # 4. 创建 Chroma adapter → 自动初始化新 hnswlib 索引
+    vs = Chroma(persist_directory=persist_dir, embedding_function=emb)
+
+    # 5. 批量重新 embedding 并写入 hnswlib
+    batch_size = 100
+    for i in range(0, len(all_chroma_ids), batch_size):
+        batch_ids = all_chroma_ids[i:i+batch_size]
+        batch_texts = all_texts[i:i+batch_size]
+
+        embs = st_model.encode(batch_texts, normalize_embeddings=True, show_progress_bar=True).tolist()
+        vs._hnsw.add_items(embs, batch_ids)
+
+    # 6. 更新计数
+    cnt = vs._hnsw.count()
+    index = _load_index()
+    index[kb_name]["doc_count"] = cnt
+    _save_index(index)
+
+    return True, f"HNSW 已重建: {kb_name} ({cnt} chunk, M={hnsw_m})"
+
+
+def delete_knowledge_base(name):
+    """删除知识库"""
+    index = _load_index()
+    if name not in index:
+        return False, f"知识库 '{name}' 不存在"
+    if name == "default":
+        return False, "不能删除默认知识库"
+
+    import shutil
+    kb_path = index[name]["path"]
+    if os.path.exists(kb_path):
+        shutil.rmtree(kb_path)
+
+    del index[name]
+    _save_index(index)
+
+    # 清理签名文件中的残留
+    try:
+        sig_file = os.path.join(KB_DIR, "kb_signatures.json")
+        if os.path.exists(sig_file):
+            with open(sig_file, "r", encoding="utf-8") as f:
+                sigs = json.load(f)
+            if name in sigs:
+                del sigs[name]
+                with open(sig_file, "w", encoding="utf-8") as f:
+                    json.dump(sigs, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # 签名清理失败不阻塞删除
+    return True, f"知识库 '{name}' 已删除"
+
+
+def get_kb_vectorstore(kb_name, embeddings):
+    """获取知识库的向量存储对象"""
+    from chroma_adapter import Chroma
+
+    index = _load_index()
+    if kb_name not in index:
+        kb_name = "default"
+
+    persist_dir = index[kb_name]["path"]
+
+    # 检查是否已有数据
+    if os.path.exists(persist_dir) and os.listdir(persist_dir):
+        return Chroma(
+            persist_directory=persist_dir,
+            embedding_function=embeddings,
+        )
+    return None
+
+
+# ==================== 容灾备份 ====================
+
+_BACKUP_LOCK = set()
+_AUTO_BACKUP_DONE = set()  # 每批次已备份的 KB，避免单批次多次重复备份
+
+def _backup_kb(persist_dir: str) -> str | None:
+    """备份完整 KB 目录（SQLite + HNSW 索引），返回备份路径"""
+    db_path = os.path.join(persist_dir, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    bak_path = db_path + ".bak"
+    try:
+        if os.path.exists(bak_path):
+            os.remove(bak_path)
+        shutil.copy2(db_path, bak_path)
+        # 同时备份 HNSW UUID 目录
+        for entry in os.listdir(persist_dir):
+            if len(entry) == 36 and os.path.isdir(os.path.join(persist_dir, entry)):
+                bak_hnsw = bak_path + ".hnsw"
+                if os.path.exists(bak_hnsw):
+                    shutil.rmtree(bak_hnsw, ignore_errors=True)
+                shutil.copytree(os.path.join(persist_dir, entry), bak_hnsw)
+                break
+        return bak_path
+    except Exception:
+        return None
+
+def _restore_kb(persist_dir: str) -> bool:
+    """从备份恢复 ChromaDB"""
+    db_path = os.path.join(persist_dir, "chroma.sqlite3")
+    bak_path = db_path + ".bak"
+    if not os.path.isfile(bak_path):
+        return False
+    try:
+        shutil.copy2(bak_path, db_path)
+        return True
+    except Exception:
+        return False
+
+def _try_repair_kb(persist_dir: str) -> bool:
+    """修复 ChromaDB（由 retrieve_documents 在 HNSW 异常后调用）"""
+    db_path = os.path.join(persist_dir, "chroma.sqlite3")
+    bak_path = db_path + ".bak"
+    if not os.path.isfile(db_path):
+        return False
+    import sqlite3, shutil
+    # SQLite 完整性
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA integrity_check").fetchall()
+        conn.close()
+    except Exception:
+        bak_dir = persist_dir + ".bak"
+        if os.path.isdir(bak_dir):
+            shutil.rmtree(persist_dir, ignore_errors=True)
+            shutil.copytree(bak_dir, persist_dir)
+            print(f"  [recovery] 从完整备份恢复: {persist_dir}")
+            return True
+        return False
+    # SQLite 正常 → 恢复或重建 HNSW
+    bak_hnsw = bak_path + ".hnsw"
+    if os.path.isdir(bak_hnsw):
+        for entry in os.listdir(persist_dir):
+            if os.path.isdir(os.path.join(persist_dir, entry)) and len(entry) == 36:
+                shutil.rmtree(os.path.join(persist_dir, entry), ignore_errors=True)
+        shutil.copytree(bak_hnsw, os.path.join(persist_dir, os.path.basename(os.path.normpath(bak_hnsw))))
+        print(f"  [recovery] HNSW 已从备份恢复")
+        return True
+    # 清理 UUID 目录，Chromadb 下次查询重建
+    for entry in os.listdir(persist_dir):
+        if os.path.isdir(os.path.join(persist_dir, entry)) and len(entry) == 36:
+            shutil.rmtree(os.path.join(persist_dir, entry), ignore_errors=True)
+            print(f"  [recovery] HNSW 已清理，ChromaDB 自动重建")
+    return True
+
+
+# ==================== 多版本备份系统（手动/自动/恢复） ====================
+
+KB_BACKUP_DIR = os.path.join(DATA_ROOT, "kb_backups")
+
+# ── 自动备份配置读写 ─────────────────────────
+def _load_backup_cfg():
+    """从数据目录加载备份配置"""
+    cfg_file = os.path.join(DATA_ROOT, "kb_backup_config.json")
+    return safe_json_load(cfg_file, {"auto_enabled": False})
+
+def _save_backup_cfg(cfg):
+    cfg_file = os.path.join(DATA_ROOT, "kb_backup_config.json")
+    safe_json_dump(cfg, cfg_file)
+
+def get_auto_backup_enabled() -> bool:
+    cfg = _load_backup_cfg()
+    return cfg.get("auto_enabled", False)
+
+def set_auto_backup_enabled(enabled: bool):
+    cfg = _load_backup_cfg()
+    cfg["auto_enabled"] = enabled
+    _save_backup_cfg(cfg)
+
+def reset_auto_backup_tracker():
+    """每批次开始时调用，清空已备份记录"""
+    _AUTO_BACKUP_DONE.clear()
+
+# ── 单 KB 备份目录 ─────────────────────────
+def _kb_backup_dir(kb_name: str) -> str:
+    """获取某个知识库的备份子目录"""
+    d = os.path.join(KB_BACKUP_DIR, kb_name)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+# ── 压缩整个 KB 目录为 zip ──────────────────
+def _zip_kb(persist_dir: str, zip_path: str) -> bool:
+    """将 KB 目录（SQLite + HNSW）以及 hnswlib 索引压缩为 zip"""
+    try:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(persist_dir):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    arcname = os.path.relpath(fp, os.path.dirname(persist_dir))
+                    zf.write(fp, arcname)
+            # 额外打包 hnswlib 索引（存在 data/_hnsw/ 下）
+            try:
+                from chroma_adapter import _hnsw_storage_dir
+                hnsw_dir = _hnsw_storage_dir(persist_dir)
+                if os.path.isdir(hnsw_dir):
+                    hnsw_rel = os.path.basename(hnsw_dir)
+                    for root, _, files in os.walk(hnsw_dir):
+                        for fn in files:
+                            fp = os.path.join(root, fn)
+                            arcname = os.path.join("_hnsw_store", hnsw_rel, fn)
+                            zf.write(fp, arcname)
+            except Exception:
+                pass  # hnswlib 索引不存在时跳过
+        return True
+    except Exception as e:
+        print(f"  [backup error] 压缩失败: {e}")
+        return False
+
+def _unzip_kb(zip_path: str, target_dir: str) -> bool:
+    """将 zip 备份解压恢复到目标目录（含 hnswlib 索引）"""
+    try:
+        # 先删除目标目录（重建）
+        if os.path.exists(target_dir):
+            shutil.rmtree(target_dir, ignore_errors=True)
+        os.makedirs(target_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            for name in zf.namelist():
+                if name.startswith("_hnsw_store/"):
+                    # hnswlib 索引 → data/_hnsw/{hash}/
+                    data_root = os.path.normpath(os.path.join(target_dir, "..", ".."))
+                    rel = name[len("_hnsw_store/"):]  # {hash}/hnsw_index.bin
+                    dest = os.path.join(data_root, "_hnsw", rel)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    with open(dest, "wb") as f:
+                        f.write(zf.read(name))
+                else:
+                    zf.extract(name, os.path.dirname(target_dir))
+        return True
+    except Exception as e:
+        print(f"  [restore error] 解压恢复失败: {e}")
+        return False
+
+# ── 手动备份 ────────────────────────────────
+def manual_backup_kb(kb_name: str) -> tuple:
+    """手动备份指定知识库，返回 (ok, msg)"""
+    index = _load_index()
+    if kb_name not in index:
+        return False, f"知识库 '{kb_name}' 不存在"
+    persist_dir = index[kb_name]["path"]
+    if not os.path.isdir(persist_dir):
+        return False, f"知识库 '{kb_name}' 目录不存在"
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bak_dir = _kb_backup_dir(kb_name)
+    zip_name = f"manual_{kb_name}_{ts}.zip"
+    zip_path = os.path.join(bak_dir, zip_name)
+
+    if _zip_kb(persist_dir, zip_path):
+        size = os.path.getsize(zip_path)
+        size_str = f"{size/1024/1024:.1f}MB" if size > 1024*1024 else f"{size/1024:.1f}KB"
+        return True, f"手动备份成功: {zip_name} ({size_str})"
+    return False, "手动备份失败，压缩出错"
+
+# ── 自动备份 ────────────────────────────────
+def auto_backup_kb(kb_name: str) -> tuple:
+    """自动备份指定知识库，保留最多 3 个自动版本，返回 (ok, msg)"""
+    index = _load_index()
+    if kb_name not in index:
+        return False, f"知识库 '{kb_name}' 不存在"
+    persist_dir = index[kb_name]["path"]
+    if not os.path.isdir(persist_dir):
+        return False, f"知识库 '{kb_name}' 目录不存在"
+
+    # 先清理旧的自动备份（最多保留 2 个，给新备份留位置）
+    bak_dir = _kb_backup_dir(kb_name)
+    auto_prefix = f"auto_{kb_name}_"
+    auto_files = sorted([
+        f for f in os.listdir(bak_dir)
+        if f.startswith(auto_prefix) and f.endswith(".zip")
+    ])
+    while len(auto_files) >= 3:
+        oldest = auto_files.pop(0)
+        try:
+            os.remove(os.path.join(bak_dir, oldest))
+        except OSError:
+            pass
+
+    # 创建新备份
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"auto_{kb_name}_{ts}.zip"
+    zip_path = os.path.join(bak_dir, zip_name)
+
+    if _zip_kb(persist_dir, zip_path):
+        size = os.path.getsize(zip_path)
+        size_str = f"{size/1024/1024:.1f}MB" if size > 1024*1024 else f"{size/1024:.1f}KB"
+        return True, f"自动备份成功: {zip_name} ({size_str})"
+    return False, "自动备份失败，压缩出错"
+
+# ── 列出备份 ────────────────────────────────
+def list_kb_backups(kb_name: str) -> list:
+    """列出知识库的所有备份，返回 [{name, type, time, size, size_str}, ...]"""
+    bak_dir = _kb_backup_dir(kb_name)
+    prefix_manual = f"manual_{kb_name}_"
+    prefix_auto = f"auto_{kb_name}_"
+    backups = []
+    if not os.path.isdir(bak_dir):
+        return backups
+    for fn in sorted(os.listdir(bak_dir), reverse=True):
+        if not fn.endswith(".zip"):
+            continue
+        if not (fn.startswith(prefix_manual) or fn.startswith(prefix_auto)):
+            continue
+        # 提取时间戳
+        ts_str = fn.replace(".zip", "").split("_")[-2] + "_" + fn.replace(".zip", "").split("_")[-1]
+        try:
+            ts_dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+            ts_display = ts_dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            ts_display = ts_str
+        btype = "manual" if fn.startswith("manual_") else "auto"
+        fp = os.path.join(bak_dir, fn)
+        size = os.path.getsize(fp) if os.path.exists(fp) else 0
+        size_str = f"{size/1024/1024:.1f}MB" if size > 1024*1024 else f"{size/1024:.1f}KB"
+        backups.append({
+            "name": fn,
+            "type": btype,
+            "time": ts_display,
+            "size": size,
+            "size_str": size_str,
+        })
+    return backups
+
+# ── 恢复备份 ────────────────────────────────
+def restore_kb_backup(kb_name: str, backup_name: str) -> tuple:
+    """从指定备份恢复知识库，返回 (ok, msg)"""
+    index = _load_index()
+    if kb_name not in index:
+        return False, f"知识库 '{kb_name}' 不存在"
+    persist_dir = index[kb_name]["path"]
+    bak_dir = _kb_backup_dir(kb_name)
+    zip_path = os.path.join(bak_dir, backup_name)
+    if not os.path.isfile(zip_path):
+        return False, f"备份文件不存在: {backup_name}"
+
+    if _unzip_kb(zip_path, persist_dir):
+        return True, f"已从 '{backup_name}' 恢复知识库 '{kb_name}'"
+    return False, "恢复失败，解压出错"
+
+# ── 删除备份 ────────────────────────────────
+def delete_kb_backup(kb_name: str, backup_name: str) -> tuple:
+    """删除指定备份文件，返回 (ok, msg)"""
+    bak_dir = _kb_backup_dir(kb_name)
+    zip_path = os.path.join(bak_dir, backup_name)
+    if not os.path.isfile(zip_path):
+        return False, f"备份文件不存在: {backup_name}"
+    try:
+        os.remove(zip_path)
+        return True, f"已删除备份: {backup_name}"
+    except OSError as e:
+        return False, f"删除失败: {e}"
+
+
+# ==================== KB 文档浏览与移动 ====================
+
+def list_kb_sources(kb_name: str) -> dict:
+    """列出知识库中所有文档的 source 来源及块数，返回 {source: count}"""
+    index = _load_index()
+    if kb_name not in index:
+        return {}
+    persist_dir = index[kb_name]["path"]
+    if not os.path.isdir(persist_dir):
+        return {}
+    try:
+        from chroma_adapter import Chroma
+        from rag_core import get_embeddings
+        emb = get_embeddings()
+        vs = Chroma(persist_directory=persist_dir, embedding_function=emb)
+        data = vs._collection.get(include=['metadatas'])
+        from collections import Counter
+        sources = Counter()
+        for m in data['metadatas']:
+            src = (m or {}).get('source', 'unknown')
+            sources[src] += 1
+        return dict(sources.most_common())
+    except Exception as e:
+        print(f"  [list_kb_sources error] {e}")
+        return {}
+
+
+def check_kb_model_compatible(kb1: str, kb2: str) -> bool:
+    """检查两个知识库的向量模型是否一致"""
+    m1 = get_kb_model(kb1)
+    m2 = get_kb_model(kb2)
+    if not m1 and not m2:
+        return True  # 都使用默认模型
+    if m1 == m2:
+        return True
+    return False
+
+
+def get_kb_source_preview(kb_name: str, source: str, max_chars: int = 300) -> str:
+    """获取某个来源文件的文档内容预览"""
+    index = _load_index()
+    if kb_name not in index:
+        return ""
+    persist_dir = index[kb_name]["path"]
+    if not os.path.isdir(persist_dir):
+        return ""
+    try:
+        from chroma_adapter import Chroma
+        from rag_core import get_embeddings
+        emb = get_embeddings()
+        vs = Chroma(persist_directory=persist_dir, embedding_function=emb)
+        data = vs._collection.get(include=['documents'], where={"source": source})
+        if data and data.get('documents'):
+            # 把所有块的内容拼接，取前 max_chars 个字符
+            full = "\n".join(data['documents'])[:max_chars]
+            return full
+        return ""
+    except Exception as e:
+        print(f"  [source_preview error] {e}")
+        return ""
+
+
+def move_kb_documents(src_kb: str, target_kb: str, sources: list) -> tuple:
+    """将 src_kb 中指定 source 的文档块移动到 target_kb
+    返回 (ok, msg)"""
+    index = _load_index()
+    if src_kb not in index:
+        return False, f"源知识库 '{src_kb}' 不存在"
+    if target_kb not in index:
+        return False, f"目标知识库 '{target_kb}' 不存在"
+    if src_kb == target_kb:
+        return False, "源和目标不能相同"
+
+    if not check_kb_model_compatible(src_kb, target_kb):
+        return False, "两个知识库的向量模型不一致，无法移动"
+
+    persist_src = index[src_kb]["path"]
+    persist_tgt = index[target_kb]["path"]
+
+    try:
+        from chroma_adapter import Chroma
+        from utils import Document
+        from rag_core import get_embeddings
+
+        emb = get_embeddings()
+        vs_src = Chroma(persist_directory=persist_src, embedding_function=emb)
+
+        # 读取源库所有文档
+        data = vs_src._collection.get(include=['documents', 'metadatas'])
+        all_ids = data['ids']
+        all_docs = data['documents']
+        all_metas = data['metadatas']
+
+        # 按 source 过滤
+        move_ids = []
+        move_docs = []
+        for doc_id, content, meta in zip(all_ids, all_docs, all_metas):
+            src = (meta or {}).get('source', '')
+            if any(s in src for s in sources):
+                move_ids.append(doc_id)
+                move_docs.append(Document(page_content=content, metadata=meta or {}))
+
+        if not move_docs:
+            return False, f"在 '{src_kb}' 中未找到匹配的文档"
+
+        # 导入到目标库
+        ok, msg = add_documents_to_kb(target_kb, move_docs, emb)
+        if not ok:
+            return False, f"导入到 '{target_kb}' 失败: {msg}"
+
+        # 从源库删除
+        try:
+            vs_src._collection.delete(ids=move_ids)
+        except Exception as e:
+            # 删除失败不阻塞，但发出警告
+            print(f"  [move] 从 '{src_kb}' 删除失败: {e}")
+
+        # 更新源库计数——直接从 ChromaDB 读真实行数
+        try:
+            index = _load_index()
+            src_count = vs_src._collection.count()
+            index[src_kb]["doc_count"] = src_count
+            _save_index(index)
+        except Exception as e:
+            print(f"  [move] 更新 '{src_kb}' 计数失败: {e}")
+
+        # 重建签名+反哺
+        try:
+            from router import build_kb_signature
+
+            # 目标库 — 取最新的文档重建
+            vs_tgt = Chroma(persist_directory=persist_tgt, embedding_function=emb)
+            tgt_data = vs_tgt._collection.get(include=['documents'])
+            if tgt_data and tgt_data.get('documents'):
+                tgt_objs = [Document(page_content=c[:2000]) for c in tgt_data['documents'][:100]]
+                build_kb_signature(target_kb, tgt_objs)
+
+            # 源库
+            src_remaining = vs_src._collection.get(include=['documents'])
+            if src_remaining and src_remaining.get('documents'):
+                src_objs = [Document(page_content=c[:2000]) for c in src_remaining['documents'][:100]]
+                build_kb_signature(src_kb, src_objs)
+        except Exception as e:
+            print(f"  [move] 签名重建异常: {e}")
+
+        return True, f"已从 '{src_kb}' 移动 {len(move_docs)} 个文档块到 '{target_kb}'"
+
+    except Exception as e:
+        return False, f"移动失败: {e}"
+
+
+def add_documents_to_kb(kb_name, documents, embeddings=None):
+    """向知识库添加文档"""
+    from config import load_config
+    from chroma_adapter import Chroma
+
+    # 检查 KB 是否暂停写入
+    if kb_name in load_config().get("kb_paused", []):
+        return False, f"知识库「{kb_name}」已暂停写入，仅可查询"
+
+    index = _load_index()
+    if kb_name not in index:
+        return False, f"知识库 '{kb_name}' 不存在"
+
+    persist_dir = index[kb_name]["path"]
+    os.makedirs(persist_dir, exist_ok=True)
+
+    if embeddings is None:
+        return False, "需要提供嵌入模型"
+
+    # 自动备份（开启时）：在入库前创建备份（每批次每个KB只备份一次）
+    if get_auto_backup_enabled() and kb_name not in _AUTO_BACKUP_DONE:
+        auto_backup_kb(kb_name)
+        _AUTO_BACKUP_DONE.add(kb_name)
+    # 入库前自动备份（已有数据时）
+    _backup_kb(persist_dir)
+
+    try:
+        # 对文档内容做 SM3 哈希作为 ID（去重 + 国密合规）
+        doc_ids = [sm3(d.page_content.encode("utf-8")) for d in documents]
+        # 批次内去重：相同 SM3 哈希 = 相同内容
+        seen = set()
+        unique_docs, unique_ids = [], []
+        for doc, did in zip(documents, doc_ids):
+            if did not in seen:
+                seen.add(did)
+                unique_docs.append(doc)
+                unique_ids.append(did)
+        if len(unique_docs) < len(documents):
+            print(f"  [dedup] 批次内去重: {len(documents)} → {len(unique_docs)} 块")
+        documents, doc_ids = unique_docs, unique_ids
+        # 检查是否已有向量库
+        if os.path.exists(persist_dir) and any(f.endswith(".sqlite3") for f in os.listdir(persist_dir)):
+            vectorstore = Chroma(
+                persist_directory=persist_dir,
+                embedding_function=embeddings,
+            )
+            vectorstore.add_documents(documents, ids=doc_ids)
+        else:
+            vectorstore = Chroma.from_documents(
+                documents=documents,
+                embedding=embeddings,
+                persist_directory=persist_dir,
+                ids=doc_ids,
+            )
+    except Exception as e:
+        # 写入失败 -> 自动回滚备份
+        print(f"  [recovery] ChromaDB 写入失败: {e}")
+        if _restore_kb(persist_dir):
+            print(f"  [recovery] 已从备份恢复")
+        return False, f"入库失败，已回滚: {str(e)[:80]}"
+
+    # 更新文档计数：直接取 ChromaDB 真实计数，唯一可靠来源
+    try:
+        count = vectorstore._collection.count()
+    except Exception:
+        # ChromaDB 不可用时回退到累积计数
+        count = index[kb_name].get("doc_count", 0) + len(unique_docs)
+
+    index[kb_name]["doc_count"] = count
+    _save_index(index)
+
+    # 更新 KB 签名（入库时自动归纳）
+    # 全量重建 or 增量更新 由 signature_auto_rebuild 控制
+    try:
+        from config import load_config
+        _cfg = load_config()
+        _rebuild = _cfg.get("router", {}).get("fallback", {}).get("signature_auto_rebuild", False)
+        from router import build_kb_signature
+        if _rebuild:
+            build_kb_signature(kb_name)           # 全量：从 ChromaDB 读取所有 chunk
+        else:
+            build_kb_signature(kb_name, documents) # 增量：基于刚入库的文档
+    except Exception:
+        pass
+
+    # 自动重建 HNSW（由 auto_rebuild_hnsw 开关控制）
+    try:
+        if index[kb_name].get("auto_rebuild_hnsw", False):
+            _rebuild_result = rebuild_kb_hnsw(kb_name)
+            print(f"  [HNSW auto-rebuild] {_rebuild_result[1]}")
+    except Exception:
+        pass
+
+    return True, f"已向 '{kb_name}' 添加 {len(documents)} 个文档块 (总计: {count})"
+
+
+def auto_classify(content, rules=None, filename=None, use_semantic=False):
+    """根据规则自动分类内容到对应知识库
+
+    支持：
+    - 扩展名匹配（始终精确，不走语义）
+    - 关键词匹配：use_semantic=False → 硬匹配(in)；True → 纯语义；
+      "hybrid" → 关键词筛选 top-3 → 语义 rerank → 加权投票
+    """
+    if rules is None:
+        rules = _load_rules()
+
+    if not rules:
+        return "default"
+
+    # 过滤掉暂停写入的 KB→自动路由到次高分 KB
+    from config import load_config
+    _paused = load_config().get("kb_paused", [])
+    if _paused:
+        rules = {k: v for k, v in rules.items() if k not in _paused}
+    if not rules:
+        return "default"
+
+    content_lower = content.lower()
+    ext = os.path.splitext(filename or "")[1].lower() if filename else ""
+    best_match = "default"
+    best_score = 0
+    is_hybrid = use_semantic == "hybrid"
+
+    # 语义模式：复用 FallbackRouter，避免每次循环重载模型
+    fallback = None
+    if use_semantic or is_hybrid:
+        try:
+            from reranker import FallbackRouter
+            fallback = FallbackRouter()
+        except Exception:
+            fallback = None
+
+    # Hybrid 模式：先关键词跑出候选池（top-3），再语义打分
+    if is_hybrid and fallback is not None:
+        # 第一轮：关键词硬匹配 → 候选池（按绝对数排序，相同则匹配率高者优先）
+        candidates = []
+        for kb_name, rule in rules.items():
+            for ex in rule.get("extensions", []):
+                if ex.lower() == ext:
+                    return kb_name
+            kw_list = rule.get("keywords", [])
+            kw_score = sum(1 for kw in kw_list if kw.lower() in content_lower)
+            if kw_score > 0 and kw_list:
+                ratio = kw_score / len(kw_list)
+                candidates.append((kb_name, kw_score, ratio))
+        # 先按绝对数降序，相同则按匹配率降序
+        candidates.sort(key=lambda x: (-x[1], -x[2]))
+        candidates = candidates[:3]
+
+        # 第二轮：语义 rerank（仅对候选池打分）
+        if not candidates:
+            return "default"
+        sem_raw = {}
+        for kb_name, kw_score, _ in candidates:
+            rule = rules.get(kb_name, {})
+            keywords = rule.get("keywords", [])
+            if keywords:
+                try:
+                    kw_text = " ".join(keywords)
+                    scores = fallback.score(content, {kb_name: kw_text})
+                    sem_raw[kb_name] = scores.get(kb_name, 0.0)
+                except (ValueError, RuntimeError):
+                    sem_raw[kb_name] = 0.0
+            else:
+                sem_raw[kb_name] = 0.0
+
+        # 候选池内 min-max 归一化（reranker 输出原始 logits 可能为负）
+        sem_vals = list(sem_raw.values())
+        min_s, max_s = min(sem_vals), max(sem_vals)
+        best_score = -float('inf')
+
+        for kb_name, kw_score, _ in candidates:
+            kw_norm = min(kw_score / 3, 1.0)
+            if max_s > min_s:
+                sem_norm = (sem_raw[kb_name] - min_s) / (max_s - min_s)
+            else:
+                sem_norm = 0.5
+            score = kw_norm * 0.4 + sem_norm * 0.6
+            if score > best_score:
+                best_score = score
+                best_match = kb_name
+
+        if best_match == "default":
+            return "default"
+        return best_match
+
+    for kb_name, rule in rules.items():
+        # 扩展名匹配（始终精确，任何模式都优先）
+        for ex in rule.get("extensions", []):
+            if ex.lower() == ext:
+                return kb_name
+
+        if use_semantic and fallback is not None:
+            # 路由开启（纯语义）：reranker 语义匹配关键词锚点
+            keywords = rule.get("keywords", [])
+            if keywords:
+                try:
+                    kw_text = " ".join(keywords)
+                    scores = fallback.score(content, {kb_name: kw_text})
+                    score = scores.get(kb_name, 0.0)
+                except (ValueError, RuntimeError):
+                    score = 0
+            else:
+                score = 0
+        else:
+            # 路由关闭：硬匹配（关键词 in content）
+            score = 0
+            for kw in rule.get("keywords", []):
+                if kw.lower() in content_lower:
+                    score += 1
+
+        if score > best_score:
+            best_score = score
+            best_match = kb_name
+
+    return best_match
+
+
+def set_classify_rule(kb_name, keywords=None, extensions=None, description=""):
+    """设置自动分类规则"""
+    rules = _load_rules()
+    entry = {"description": description}
+    if keywords:
+        entry["keywords"] = keywords if isinstance(keywords, list) else [keywords]
+    if extensions:
+        entry["extensions"] = extensions if isinstance(extensions, list) else [extensions]
+    rules[kb_name] = entry
+    _save_rules(rules)
+    parts = []
+    if keywords:
+        parts.append(f"关键词: {keywords}")
+    if extensions:
+        parts.append(f"扩展名: {extensions}")
+    return True, f"分类规则已设置: '{kb_name}' ← {'; '.join(parts)}"
+
+
+def remove_classify_rule(kb_name):
+    """删除分类规则并同步删除知识库"""
+    rules = _load_rules()
+    if kb_name not in rules:
+        return False, f"规则 '{kb_name}' 不存在"
+
+    del rules[kb_name]
+    _save_rules(rules)
+
+    # 同步删除知识库（含向量数据、索引、签名）
+    ok, msg = delete_knowledge_base(kb_name)
+    if ok:
+        return True, f"已删除 '{kb_name}' 的分类规则及知识库"
+    return True, f"规则已删除，但知识库删除失败: {msg}"
+
+
+def reset_classify_rules():
+    """重置分类规则为默认"""
+    default_rules = {
+        "tech": {
+            "keywords": ["代码", "API", "编程", "函数", "class", "def", "import"],
+            "extensions": [".py", ".js", ".ts", ".java", ".cpp", ".go", ".rs"],
+            "description": "技术代码类",
+        },
+        "doc": {
+            "keywords": ["说明", "文档", "指南", "教程", "手册", "README"],
+            "extensions": [".md", ".txt", ".rst"],
+            "description": "文档类",
+        },
+        "data": {
+            "keywords": ["数据", "csv", "json", "数据库", "table", "分析"],
+            "extensions": [".csv", ".json", ".xml", ".yaml", ".yml"],
+            "description": "数据类",
+        },
+    }
+    _save_rules(default_rules)
+    return True, "分类规则已重置为默认"
+
+
+def get_kb_stats():
+    """获取所有知识库统计"""
+    index = _load_index()
+    stats = {}
+    for name, info in index.items():
+        path = info["path"]
+        size_mb = 0
+        if os.path.exists(path):
+            for dirpath, _, filenames in os.walk(path):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    try:
+                        size_mb += os.path.getsize(fp)
+                    except OSError:
+                        pass
+            size_mb = round(size_mb / (1024 * 1024), 2)
+        stats[name] = {
+            **info,
+            "size_mb": size_mb,
+        }
+    return stats
+
+
+def load_documents_from_file(filepath):
+    """从文件加载文档"""
+    from utils import Document
+
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext in (".txt", ".md", ".py", ".json", ".yaml", ".yml"):
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        return [Document(page_content=content, metadata={"source": filepath})]
+    else:
+        # 回退到基础文本读取
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        return [Document(page_content=content, metadata={"source": filepath})]
+
+
+def load_documents_from_directory(dirpath):
+    """从目录加载文档"""
+    from utils import Document
+
+    docs = []
+    for ext in ("*.txt", "*.md"):
+        for filepath in glob.glob(os.path.join(dirpath, "**", ext), recursive=True):
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                docs.append(Document(page_content=content, metadata={"source": filepath}))
+                docs.extend(loader.load())
+            except Exception:
+                pass
+
+    return docs
+
+
+if __name__ == "__main__":
+    import argparse
+    from datetime import datetime
+
+    parser = argparse.ArgumentParser(description="知识库管理工具")
+    parser.add_argument("--create", type=str, help="创建知识库")
+    parser.add_argument("--desc", type=str, default="", help="知识库描述")
+    parser.add_argument("--model", type=str, default="", help="知识库专用嵌入模型 ID 或路径")
+    parser.add_argument("--set-model", nargs=2, metavar=("KB_NAME", "MODEL_ID"), help="设置知识库的嵌入模型")
+    parser.add_argument("--delete", type=str, help="删除知识库")
+    parser.add_argument("--list", action="store_true", help="列出所有知识库")
+    parser.add_argument("--stats", action="store_true", help="显示知识库统计")
+    parser.add_argument("--import-file", type=str, dest="import_file", help="导入文件到知识库")
+    parser.add_argument("--import-dir", type=str, dest="import_dir", help="导入目录到知识库")
+    parser.add_argument("--kb", type=str, default="default", help="目标知识库名")
+    parser.add_argument("--set-rule", nargs=2, metavar=("KB_NAME", "KEYWORDS"), help="设置分类规则 (逗号分隔关键词)")
+    parser.add_argument("--classify", type=str, help="对文本分类到知识库")
+    parser.add_argument("--json", action="store_true", help="JSON 格式输出")
+
+    args = parser.parse_args()
+
+    if args.list:
+        kbs = list_knowledge_bases()
+        if args.json:
+            print(json.dumps(kbs, ensure_ascii=False, indent=2))
+        else:
+            print(f"知识库 ({len(kbs)}):")
+            for name, info in kbs.items():
+                print(f"  {name}: {info.get('description', '')} [{info.get('doc_count', 0)} 文档]")
+
+    elif args.stats:
+        stats = get_kb_stats()
+        if args.json:
+            print(json.dumps(stats, ensure_ascii=False, indent=2))
+        else:
+            print("知识库统计:")
+            for name, s in stats.items():
+                print(f"  {name}: {s.get('doc_count', 0)} 文档, {s.get('size_mb', 0)} MB")
+
+    elif args.create:
+        ok, msg = create_knowledge_base(args.create, args.desc, args.model)
+        print(f"[{'OK' if ok else '!'}] {msg}")
+
+    elif args.set_model:
+        kb_name, model_id = args.set_model
+        ok, msg = set_kb_model(kb_name, model_id)
+        print(f"[{'OK' if ok else '!'}] {msg}")
+
+    elif args.delete:
+        ok, msg = delete_knowledge_base(args.delete)
+        print(f"[{'OK' if ok else '!'}] {msg}")
+
+    elif args.set_rule:
+        kb_name, keywords = args.set_rule
+        ok, msg = set_classify_rule(kb_name, [k.strip() for k in keywords.split(",")], args.desc)
+        print(f"[{'OK' if ok else '!'}] {msg}")
+
+    elif args.classify:
+        result = auto_classify(args.classify)
+        print(f"分类结果: {result}")
+
+    elif args.import_file:
+        if not os.path.exists(args.import_file):
+            print(f"[!] 文件不存在: {args.import_file}")
+            sys.exit(1)
+        docs = load_documents_from_file(args.import_file)
+        print(f"加载了 {len(docs)} 个文档")
+        # 注：实际向量化需要嵌入模型，此步骤在 rag_core.py 中完成
+        output = {"kb": args.kb, "docs_count": len(docs), "docs": [{"content": d.page_content[:100], "metadata": d.metadata} for d in docs]}
+        if args.json:
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+        else:
+            print(f"准备导入知识库 '{args.kb}' ({len(docs)} 块)")
+            print(f"运行 rag_core.py --import-kb {args.kb} --input {args.import_file} 完成入库")
+
+    else:
+        parser.print_help()
