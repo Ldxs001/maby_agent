@@ -1,0 +1,106 @@
+# =============================================================================
+# PyPI Trusted Publisher — 全自动发布工作流
+# 触发方式: git push --tags (匹配 v* 自动识别项目)
+#   例: git tag v0.8.5 && git push --tags            → agent rag-assistant
+#   例: git tag git-sync-v2.28.0 && git push --tags  → skill git-sync
+# =============================================================================
+name: Publish to PyPI (Trusted Publisher)
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '*-v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect project from tag
+        id: info
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION=""
+          TYPE=""
+          NAME=""
+
+          # maby_agent 仓库：仓库根下直接是 agent 项目（Orchestrator/rag-assistant/structured-writer）
+          # tag 格式: v0.8.5 / v1.3.0b1 / v1.3.0-beta → agent
+          if echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([.-]?[a-zA-Z][a-zA-Z0-9]*)?$'; then
+            VERSION="${TAG#v}"; VERSION_CLEAN="${VERSION%%-*}"
+            TYPE="agent"
+            # 扫描仓库根下所有项目目录，自动检测含 __version__ 的 __init__.py（不硬编码包目录名）
+            for dir in */; do
+              [ -d "$dir" ] || continue
+              case "$dir" in
+                .github/|.*/) continue ;;
+              esac
+              found=""
+              while IFS= read -r init_file; do
+                ver=$(grep '__version__' "$init_file" | sed 's/.*"\(.*\)".*/\1/' | head -1)
+                if [ -n "$ver" ] && [ "${ver%%-*}" = "$VERSION_CLEAN" ]; then
+                  found=1
+                  echo "Found agent: $(basename "$dir") v$VERSION ($init_file)"
+                  break
+                fi
+              done < <(find "$dir" -name "__init__.py" -not -path "*/vendor/*" -not -path "*/tools/*" -not -path "*/static/*" 2>/dev/null)
+              if [ -n "$found" ]; then
+                NAME=$(basename "$dir")
+                break
+              fi
+            done
+          else
+            echo "::error::maby_agent 仓库仅支持 v* 格式 tag（agent 发布）"
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION TYPE=$TYPE NAME=$NAME"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "type=$TYPE" >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          echo "pypi_name=${NAME}-ldxs" >> $GITHUB_OUTPUT
+
+          if [ -z "$NAME" ] || [ -z "$VERSION" ]; then
+            echo "::error::无法从 tag $TAG 识别项目"
+            exit 1
+          fi
+          if [ ! -d "$NAME" ]; then
+            echo "::error::目录 $NAME 不存在"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Skip non-agent projects
+        if: steps.info.outputs.type != 'agent'
+        run: echo "::warning::非 agent 项目 (${{ steps.info.outputs.type }}/${{ steps.info.outputs.name }}) 跳过 PyPI 发布"
+
+      - name: Install build tools
+        run: pip install --upgrade pip build
+
+      - name: Build wheel
+        if: steps.info.outputs.type == 'agent'
+        run: |
+          python .github/scripts/pypi-build.py \
+            "${{ steps.info.outputs.type }}" \
+            "${{ steps.info.outputs.name }}" \
+            "${{ steps.info.outputs.version }}" \
+            "${{ steps.info.outputs.pypi_name }}"
+
+      - name: Upload to PyPI (Trusted Publisher)
+        if: steps.info.outputs.type == 'agent'
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          packages-dir: dist/
+          print-hash: true
+          skip-existing: true
