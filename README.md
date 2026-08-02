@@ -1,46 +1,39 @@
-<!--
-SPDX-License-Identifier: Apache-2.0
-Copyright (c) 2026 wUwproject
--->
+# Maby Agent
 
-# Maby Agent — 智能体仓库
+> **用户智能体仓库** — 由 git-sync 自动同步维护。
+> 最后更新：2026-08-02
 
-> wUwproject 开发的领域智能体集合。Apache License 2.0。
+本仓库托管 wUwproject 智能体项目，由 git-sync 自动同步维护。码云（Gitee）和 GitHub 双平台同步。
 
-## 仓库定位
+> 历史提交保留于永久存档仓库 workbuddy-skills（agent/ 目录）：Gitee https://gitee.com/wUwproject/workbuddy-skills | GitHub https://github.com/Ldxs001/workbuddy-skills
 
-本仓库独立托管 wUwproject 的智能体（Agent）项目。2026-08-02 自 `workbuddy-skills` 仓库的 `agent/` 目录独立拆分而来。
-
-**历史提交说明：** 本仓库为全新初始化，不带历史提交。所有历史记录保留于永久存档仓库：
-
-- Gitee: https://gitee.com/wUwproject/workbuddy-skills （`agent/` 目录）
-- GitHub: https://github.com/Ldxs001/workbuddy-skills （`agent/` 目录）
+---
 
 ## 智能体列表
 
-| 智能体 | 说明 |
-|--------|------|
-| **Orchestrator** | 链驱动 Pipeline 编排引擎（skill-sub 优化 + seq/par/loop 真执行） |
-| **rag-assistant** | 本地知识库智能体（组合式检索 + SM3 去重 + 多库路由 + 自修正循环） |
-| **structured-writer** | 结构化写作智能体（模板驱动大纲规划 + 串行写作 + 两级 RAG + 引用自动格式化） |
+以下为仓库中实际存在的智能体项目：
+
+| 智能体名 | 描述 |
+|----------|------|
+| `Orchestrator` | Orchestrator v2 — 链驱动智能体系统 |
+| `rag-assistant` | rag-assistant: 独立智能体，封装 local-rag-builder 技能 |
+| `structured-writer` | Structured Writer — 结构化写作智能体 |
+
+---
 
 ## 目录结构
 
 ```
 maby_agent/
-├── LICENSE                  # Apache License 2.0
-├── README.md
-├── Orchestrator/            # 链驱动编排引擎
-├── rag-assistant/           # 本地知识库智能体
-└── structured-writer/       # 结构化写作智能体
+├── Orchestrator/
+├── rag-assistant/
+└── structured-writer/
 ```
 
-## 使用方式
+---
 
-各智能体目录内自带 README / PROTOCOL / SCHEMA 说明文档，按其自身说明运行。
+## 维护说明
 
-## 维护约定
-
-- 本仓库由 wUwproject 维护，Gitee / GitHub 双平台同步
-- 智能体版本号从各自 `__init__.py` 的 `__version__` 读取
-- 更新流程：修改 → 测试 → 双端推送
+- 本仓库由 **git-sync** 技能自动维护
+- README.md 由 `update_readme.py` **从仓库实际文件全量生成**，不手动编辑
+- 许可证：Apache License 2.0
