@@ -1,6 +1,6 @@
 # Orchestrator — 平台编排型智能体
 
-> 基于本地 LLM 的 Python 智能体系统 / Skill Pipeline Orchestrator。运行时动态加载 WorkBuddy 技能，自动编排流水线，支持 ReAct 循环、多 LLM 后端与工具系统。
+> 基于本地 LLM 的 Python 智能体系统 / Skill Pipeline Orchestrator。运行时动态加载本地技能，自动编排流水线，支持 ReAct 循环、多 LLM 后端与工具系统。
 >
 > 版本：2.0.0 | 作者：wUwproject | 许可证：Apache 2.0
 
@@ -32,7 +32,7 @@ Orchestrator 是一个**平台编排型智能体**。它不内嵌任何技能代
 |------|------|---------|
 | **Python** | 3.11+（标准库，无外部框架依赖） | python.org |
 | **LLM 推理服务** | LM Studio / Ollama / OpenAI 兼容 API / 直接 GGUF 加载 | LM Studio / Ollama 官网 |
-| **WorkBuddy 技能** | 可选，动态加载 `~/.workbuddy/skills/` 下的技能 | 随 WorkBuddy 安装 |
+| **本地技能** | 可选，动态加载 `~/.workbuddy/skills/` 下的技能 | 随 WorkBuddy 环境安装 |
 
 ---
 
