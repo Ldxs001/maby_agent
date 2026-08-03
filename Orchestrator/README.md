@@ -32,7 +32,7 @@ Orchestrator 是一个**平台编排型智能体**。它不内嵌任何技能代
 |------|------|---------|
 | **Python** | 3.11+（标准库，无外部框架依赖） | python.org |
 | **LLM 推理服务** | LM Studio / Ollama / OpenAI 兼容 API / 直接 GGUF 加载 | LM Studio / Ollama 官网 |
-| **本地技能** | 可选，动态加载 `~/.workbuddy/skills/` 下的技能 | 随 WorkBuddy 环境安装 |
+| **本地技能** | 可选，动态加载 `~/.workbuddy/skills/` 下的技能 | 本地环境安装 |
 
 ---
 

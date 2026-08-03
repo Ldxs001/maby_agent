@@ -1,7 +1,7 @@
 # Orchestrator v1.1.0
 
 > 基于本地 LLM 的 Python 智能体系统 / Skill Pipeline Orchestrator。
-> 运行时动态加载 WorkBuddy 技能（读 SKILL.md），自动编排流水线。
+> 运行时动态加载本地技能（读 SKILL.md），自动编排流水线。
 
 ---
 
