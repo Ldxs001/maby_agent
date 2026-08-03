@@ -1,14 +1,22 @@
 """串行写作器 — 逐节写作 + context_loader + .md 输出"""
 import json
 import logging
+import os
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from .llm_client import LLMClient, LLMClientError
-from .state_manager import StateManager, OUTPUTS_DIR
+from .state_manager import StateManager, OUTPUTS_DIR, SESSIONS_DIR
 from .citation_validator import post_process as citation_post_process
 from .planner import _strip_word_desc
+from . import aux_parser
+
+
+def _resolve_aux_path(rel_path: str) -> Path:
+    """辅助资料相对路径（aux/xxx.csv）→ 绝对路径（会话临时目录）"""
+    return SESSIONS_DIR / rel_path
 
 # 写入异常日志到 writer_error.log
 _logger = logging.getLogger("writer")
@@ -179,6 +187,8 @@ def generate_article(
     context_buffer = ""
     parts_by_sid = {}
     sub_fact_notes = []
+    sub_images = {}  # ssid → [{name, path}] 图片登记，生成后插图
+    _aux_nums = set()  # 数据源数字集合（防造数据校验）
     all_rag_headers = {}  # 累积所有 RAG 查询的文档元数据
 
     for i, section in enumerate(sections):
@@ -349,15 +359,33 @@ def generate_article(
             sub_aux = None
             if aux_knowledge:
                 ak = aux_knowledge.get(ssid, {}) or {}
-                aux_parts = []
-                if ak.get("text"):
-                    aux_parts.append(ak["text"])
-                if ak.get("files"):
-                    for f in ak["files"]:
-                        if f.get("content"):
-                            aux_parts.append(f"[{f.get('name', 'file')}]\n{f['content']}")
-                if aux_parts:
-                    sub_aux = "\n\n---\n\n".join(aux_parts)
+                cmd = ak.get("text", "")  # 命令框内容（字段名保留 text，语义=使用指令）
+                parts = []
+                for f in ak.get("files") or []:
+                    ftype = f.get("type", "text")
+                    fname = f.get("name", "file")
+                    if ftype == "text" and f.get("content"):
+                        # 文字资料：原样注入（截断防撑爆）
+                        parts.append(f"[{fname}]\n{aux_parser.truncate_text(f['content'])}")
+                    elif ftype == "table" and f.get("path"):
+                        # 表格资料：表头定位（启发式/LLM）→ 小表全量 / 大表 LLM 选列行 → JSON
+                        try:
+                            fpath = _resolve_aux_path(f["path"])
+                            raw = aux_parser.parse_table(str(fpath), os.path.splitext(fname)[1].lower())
+                            h, rows, _loc_note = aux_parser.locate_header(raw, llm_client)
+                            h2, rows2, note = aux_parser.select_table(h, rows, cmd, llm_client)
+                            parts.append(f"[{fname}]{note}\n{aux_parser.to_json(h2, rows2)}")
+                            # 收集数据源数字（防造数据校验用）
+                            _aux_nums.update(aux_parser.extract_numbers(rows2))
+                        except Exception as _e:
+                            parts.append(f"[{fname}]\n（表格解析失败: {_e}）")
+                    elif ftype == "image" and f.get("path"):
+                        # 图片资料：不进 prompt，登记待插图
+                        sub_images.setdefault(ssid, []).append({"name": fname, "path": f["path"]})
+                if cmd:
+                    parts.insert(0, cmd)
+                if parts:
+                    sub_aux = "\n\n---\n\n".join(parts)
 
             sub_headers_text = _build_headers_text(all_rag_headers)
 
@@ -439,6 +467,10 @@ def generate_article(
 
             wrote_any = True
             sub_md = f"### {sub['title']}\n\n{content}\n"
+            # 图片：py 确定性插图（子结构末尾追加相对路径引用，LLM 零参与）
+            if ssid in sub_images:
+                for img in sub_images[ssid]:
+                    sub_md += f"\n\n![]({img['name']})\n"
 
             section_md += sub_md
             context_buffer += sub_md
@@ -500,16 +532,49 @@ def generate_article(
                 review_lines.append(f"{i+1}. {note}")
         else:
             review_lines.append("未发现需标记的问题。")
+        # 辅助数据数值校验：正文带单位数值未在数据源找到 → 追加警告
+        if _aux_nums:
+            suspicious = aux_parser.verify_article_numbers(article_md, _aux_nums)
+            if suspicious:
+                review_lines.append("")
+                review_lines.append("**辅助数据一致性**：以下数值未在辅助数据中找到，请核实是否编造：")
+                for i, s in enumerate(suspicious[:20]):
+                    review_lines.append(f"  {i+1}. {s}")
         article_md += "\n\n---\n\n" + "\n".join(review_lines)
 
-    # 写入文件
+    # 写入文件（目录化：每篇一个文件夹，图片集同目录）
     safe_title = "".join(c for c in title if c.isalnum() or c in " _-")
     safe_title = safe_title.strip() or "untitled"
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{safe_title}_{now}.md"
-    output_path = OUTPUTS_DIR / filename
+    out_dir = OUTPUTS_DIR / f"{safe_title}_{now}"
+    out_dir.mkdir(parents=True, exist_ok=True)
     state_mgr.set_status_text("正在保存文章…")
 
+    # 复制图片集到输出目录（md 相对路径引用；重名加序号并同步改引用）
+    img_map = {}
+    for ssid, imgs in sub_images.items():
+        for img in imgs:
+            src = _resolve_aux_path(img["path"])
+            if not src.exists():
+                continue
+            target_name = img["name"]
+            target = out_dir / target_name
+            if target.exists():
+                stem, ext = os.path.splitext(target_name)
+                target_name = f"{stem}_1{ext}"
+                target = out_dir / target_name
+            try:
+                shutil.copy2(src, target)
+            except OSError:
+                continue
+            img_map[img["name"]] = target_name
+    if img_map:
+        for old, new in img_map.items():
+            if old != new:
+                article_md = article_md.replace(f"![]({old})", f"![]({new})")
+
+    filename = f"{safe_title}.md"
+    output_path = out_dir / filename
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(article_md)
 

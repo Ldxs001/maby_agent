@@ -41,6 +41,16 @@ _batch_lock = threading.Lock()
 _stop_flags = {}
 _stop_lock = threading.Lock()
 
+# MiKTeX bin 路径探测与 PATH 注入（winget 装完 MiKTeX 不会自动更新当前进程 PATH）
+_MIKTEX_BIN_CANDIDATES = [
+    r"C:\Program Files\MiKTeX\miktex\bin\x64",
+    r"C:\Program Files (x86)\MiKTeX\miktex\bin",
+    os.path.expanduser(r"~\AppData\Local\Programs\MiKTeX\miktex\bin\x64"),
+]
+for _mb in _MIKTEX_BIN_CANDIDATES:
+    if os.path.exists(os.path.join(_mb, "lualatex.exe")) and _mb not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _mb + os.pathsep + os.environ["PATH"]
+
 
 class StructuredWriterHandler(BaseHTTPRequestHandler):
     """HTTP 请求处理器"""
@@ -73,6 +83,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/batch_progress": cls._handle_batch_progress,
             "/api/outputs": cls._handle_outputs_list,
             "/api/outputs/read": cls._handle_outputs_read,
+            "/api/outputs/texpdf": cls._handle_outputs_texpdf,
         }
         cls.ROUTES["POST"] = {
             "/api/config": cls._handle_update_config,
@@ -89,6 +100,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/session/delete": cls._handle_session_delete,
             "/api/stop": cls._handle_stop,
             "/api/gen-template": cls._handle_gen_template,
+            "/api/aux_upload": cls._handle_aux_upload,
         }
 
     def do_GET(self):
@@ -530,50 +542,266 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
     # ---- 已完成文章列表 ----
 
     def _handle_outputs_list(self):
-        """列出 data/outputs/ 下所有 .md 文件"""
+        """列出 data/outputs/ 下的文章：兼容平铺 .md（旧）与文章目录（新，目录内 md + 图片集）"""
         from .state_manager import OUTPUTS_DIR
         files = []
         if OUTPUTS_DIR.exists():
             for f in sorted(OUTPUTS_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-                if f.suffix == ".md" and f.stat().st_size > 0:
+                if f.is_file() and f.suffix == ".md" and f.stat().st_size > 0:
                     files.append({
-                        "name": f.name,
-                        "size": f.stat().st_size,
-                        "mtime": f.stat().st_mtime,
+                        "name": f.name, "is_dir": False,
+                        "size": f.stat().st_size, "mtime": f.stat().st_mtime,
                     })
+                elif f.is_dir():
+                    mds = sorted(f.glob("*.md"))
+                    if mds and mds[0].stat().st_size > 0:
+                        img_count = sum(1 for p in f.iterdir()
+                                        if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif"))
+                        files.append({
+                            "name": f.name + "/", "is_dir": True,
+                            "md_name": mds[0].name, "image_count": img_count,
+                            "size": mds[0].stat().st_size, "mtime": f.stat().st_mtime,
+                        })
         self._json_response({"success": True, "files": files})
 
+    @classmethod
+    def _safe_output_path(cls, name: str):
+        """解析输出路径并做越界防护（防 ../ 与绝对路径穿越）"""
+        from .state_manager import OUTPUTS_DIR
+        if not name or ".." in name or name.startswith("/") or "\\" in name or ":" in name:
+            return None
+        fpath = (OUTPUTS_DIR / name).resolve()
+        base = OUTPUTS_DIR.resolve()
+        if not str(fpath).startswith(str(base)):
+            return None
+        return fpath
+
     def _handle_outputs_read(self):
-        """读取单个 .md 文件内容"""
+        """读取文章内容：name 可为 .md 文件（旧）或目录（新，读目录内第一个 .md）"""
         from .state_manager import OUTPUTS_DIR
         params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         name = params.get("file", [""])[0]
         if not name:
             self._json_response({"success": False, "error": "缺少 file 参数"}, 400)
             return
-        fpath = OUTPUTS_DIR / name
-        if not fpath.exists() or fpath.suffix != ".md":
+        fpath = self._safe_output_path(name)
+        if fpath is None:
+            self._json_response({"success": False, "error": "非法路径"}, 400)
+            return
+        if fpath.is_dir():
+            mds = sorted(fpath.glob("*.md"))
+            fpath = mds[0] if mds else None
+        if not fpath or not fpath.is_file() or fpath.suffix != ".md":
             self._json_response({"success": False, "error": "文件不存在"}, 404)
             return
         content = fpath.read_text(encoding="utf-8")
         # 安全过滤不可见字符
         safe = "".join(c if c.isprintable() or c in "\n\r\t" else " " for c in content)
-        self._json_response({"success": True, "content": safe, "name": name})
+        # 附带所在目录的图片清单（供预览展示）
+        images = []
+        for p in fpath.parent.iterdir():
+            if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif"):
+                images.append(p.name)
+        self._json_response({"success": True, "content": safe, "name": name, "images": images})
 
     def _handle_outputs_delete(self):
-        """删除单个 .md 文件"""
+        """删除文章：name 为 .md 文件 → 单删（旧）；为目录 → 删整个文件夹（新，含图片集）"""
         from .state_manager import OUTPUTS_DIR
         data = self._read_body()
         name = data.get("file", "")
         if not name:
             self._json_response({"success": False, "error": "缺少 file 参数"}, 400)
             return
-        fpath = OUTPUTS_DIR / name
-        if not fpath.exists() or fpath.suffix != ".md":
+        fpath = self._safe_output_path(name)
+        if fpath is None:
+            self._json_response({"success": False, "error": "非法路径"}, 400)
+            return
+        if fpath.is_dir():
+            import shutil
+            shutil.rmtree(fpath)
+            self._json_response({"success": True, "deleted": "dir"})
+            return
+        if fpath.is_file() and fpath.suffix == ".md":
+            fpath.unlink()
+            self._json_response({"success": True, "deleted": "file"})
+            return
+        self._json_response({"success": False, "error": "文件不存在"}, 404)
+
+    # ---- tex/pdf 生成 API ----
+
+    _LATEX_SKILL_DIR = Path(os.path.expanduser("~")) / ".workbuddy" / "skills" / "latex-modular"
+
+    @staticmethod
+    def _find_lualatex() -> str:
+        """保留向后兼容：返回找到的 LaTeX 引擎路径（优先 xelatex，ctex 兼容性最好）"""
+        return StructuredWriterHandler._find_engine("xelatex")
+
+    @staticmethod
+    def _find_engine(engine: str = "xelatex") -> str:
+        """查找 LaTeX 引擎（xelatex/lualatex）：PATH 优先，其次常见安装路径"""
+        exe = engine + ".exe"
+        # PATH 查找
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            cand = os.path.join(d, exe)
+            if os.path.exists(cand):
+                return cand
+        # MiKTeX 常见路径
+        for p in [
+            r"C:\Program Files\MiKTeX\miktex\bin\x64",
+            r"C:\Program Files (x86)\MiKTeX\miktex\bin",
+            os.path.expanduser(r"~\AppData\Local\Programs\MiKTeX\miktex\bin\x64"),
+        ]:
+            cand = os.path.join(p, exe)
+            if os.path.exists(cand):
+                return cand
+        return ""
+
+    @staticmethod
+    def _engine_available(engine: str) -> bool:
+        """引擎是否可调用（PATH 或常见路径）"""
+        return bool(StructuredWriterHandler._find_engine(engine))
+
+    def _handle_outputs_texpdf(self):
+        """生成 .tex + .pdf：读 md → 环境自检（无 LaTeX 自动安装）→ md2tex → 编译"""
+        from .state_manager import OUTPUTS_DIR
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        name = params.get("file", [""])[0]
+        if not name:
+            self._json_response({"success": False, "error": "缺少 file 参数"}, 400)
+            return
+        fpath = self._safe_output_path(name)
+        if fpath is None:
+            self._json_response({"success": False, "error": "非法路径"}, 400)
+            return
+        if fpath.is_dir():
+            mds = sorted(fpath.glob("*.md"))
+            fpath = mds[0] if mds else None
+        if not fpath or not fpath.is_file() or fpath.suffix != ".md":
             self._json_response({"success": False, "error": "文件不存在"}, 404)
             return
-        fpath.unlink()
-        self._json_response({"success": True})
+
+        out_dir = fpath.parent
+        title = fpath.stem
+
+        # ① 环境自检：选定可用引擎（xelatex 优先，ctex 兼容性最好；lualatex 回退）
+        engine = "xelatex" if self._engine_available("xelatex") else (
+            "lualatex" if self._engine_available("lualatex") else "")
+        engine_path = self._find_engine(engine) if engine else ""
+        install_msg = ""
+        if not engine:
+            # 自动安装 MiKTeX（默认装完整引擎集）
+            try:
+                r = subprocess.run(["winget", "install", "MiKTeX.MiKTeX", "--accept-package-agreements",
+                                    "--accept-source-agreements", "--silent"],
+                                   capture_output=True, text=True, timeout=900,
+                                   encoding="utf-8", errors="replace")
+                install_msg = "已自动安装 MiKTeX（winget）。" if r.returncode == 0 else f"MiKTeX 安装失败: {r.stderr.strip()[:200]}"
+            except Exception as e:
+                install_msg = f"MiKTeX 安装异常: {e}"
+            engine = "xelatex" if self._engine_available("xelatex") else "lualatex"
+            engine_path = self._find_engine(engine)
+
+        if not engine_path:
+            self._json_response({"success": False, "error": f"未检测到 LaTeX 引擎。{install_msg} 请手动安装 MiKTeX 后重试。"})
+            return
+
+        # ①.5 MiKTeX 宏包自动安装（AutoInstall=1，避免编译时弹窗逐个询问）
+        try:
+            miktex_bin = os.path.dirname(engine_path)
+            initexmf = os.path.join(miktex_bin, "initexmf.exe")
+            if os.path.exists(initexmf):
+                subprocess.run([initexmf, "--set-config-value=[MPM]AutoInstall=1"],
+                               capture_output=True, text=True, timeout=120,
+                               encoding="utf-8", errors="replace")
+        except Exception:
+            pass  # 设置失败不阻塞编译
+
+        # ② md → tex
+        from .md2tex import md_to_tex
+        md_text = fpath.read_text(encoding="utf-8")
+        tex_text = md_to_tex(md_text, title=title)
+        tex_path = out_dir / f"{title}.tex"
+        tex_path.write_text(tex_text, encoding="utf-8")
+
+        # ③ 编译：调用 latex-modular 技能的 validate.py
+        #   PYTHONIOENCODING=utf-8：子进程 print/open 默认 UTF-8，避免 GBK 编码 Unicode 字符（×/✓）崩
+        #   引擎优先 xelatex（ctex 兼容性最好），无则 lualatex
+        sub_env = os.environ.copy()
+        sub_env["PYTHONIOENCODING"] = "utf-8"
+        sub_env["PYTHONUTF8"] = "1"
+        validate_py = self._LATEX_SKILL_DIR / "scripts" / "validate.py"
+        if validate_py.exists():
+            cmd = [sys.executable, str(validate_py), str(tex_path),
+                   "--engine", engine, "--fix"]
+        else:
+            # 技能缺失时回退直接引擎编译
+            cmd = [engine_path, "-interaction=nonstopmode", "-halt-on-error", str(tex_path)]
+        try:
+            r = subprocess.run(cmd, cwd=str(out_dir), capture_output=True, text=True, timeout=600,
+                               encoding="utf-8", errors="replace", env=sub_env)
+        except Exception as e:
+            self._json_response({"success": False, "error": f"编译异常: {e}", "tex": str(tex_path)})
+            return
+
+        pdf_path = out_dir / f"{title}.pdf"
+        ok = pdf_path.exists()
+        msg = "编译成功。" if ok else f"编译未生成 PDF。{r.stdout[-300:] if r.stdout else ''}{r.stderr[-200:] if r.stderr else ''}"
+        self._json_response({
+            "success": ok,
+            "tex": str(tex_path),
+            "pdf": str(pdf_path) if ok else "",
+            "install_msg": install_msg,
+            "message": msg,
+        })
+
+    # ---- 辅助资料上传 API ----
+    _AUX_ALLOWED_EXT = (".csv", ".db", ".txt", ".md", ".png", ".jpg", ".jpeg", ".gif")
+    _AUX_MAX_SIZE = 20 * 1024 * 1024  # 20MB
+
+    @classmethod
+    def _aux_type(cls, name: str) -> str:
+        ext = os.path.splitext(name)[1].lower()
+        if ext in (".csv", ".db"):
+            return "table"
+        if ext in (".txt", ".md"):
+            return "text"
+        if ext in (".png", ".jpg", ".jpeg", ".gif"):
+            return "image"
+        return "unknown"
+
+    def _handle_aux_upload(self):
+        """辅助资料上传：base64 JSON → 存会话临时目录，返回 {name, type, path}"""
+        from .state_manager import SESSIONS_DIR
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        name = str(data.get("name", "")).strip()
+        b64 = str(data.get("b64", ""))
+        if not name or not b64:
+            self._json_response({"success": False, "error": "缺少 name/b64"}, 400)
+            return
+        ftype = self._aux_type(name)
+        if ftype == "unknown":
+            self._json_response({"success": False, "error": f"不支持的文件类型: {name}"}, 400)
+            return
+        import base64
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            self._json_response({"success": False, "error": "base64 解码失败"}, 400)
+            return
+        if len(raw) > self._AUX_MAX_SIZE:
+            self._json_response({"success": False, "error": f"文件超过 {self._AUX_MAX_SIZE // 1024 // 1024}MB 限制"}, 413)
+            return
+        # 存会话临时目录（不入 session JSON，防撑爆）
+        aux_dir = SESSIONS_DIR / "aux"
+        aux_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = f"{int(time.time())}_{os.path.basename(name)}"
+        target = aux_dir / safe_name
+        target.write_bytes(raw)
+        self._json_response({"success": True, "name": name, "type": ftype, "path": f"aux/{safe_name}"})
 
     # ---- 进度 API ----
 
@@ -1511,6 +1739,14 @@ body {
   white-space: nowrap;
   flex-shrink: 0;
 }
+.output-item .img-badge {
+  font-size: 10px;
+  color: #f39c12;
+  background: rgba(243,156,18,0.15);
+  padding: 0 4px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
 .output-item .del-btn {
   font-size: 12px;
   color: var(--accent);
@@ -1974,7 +2210,7 @@ body {
         <h3>🔗 RAG 知识库</h3>
         <div class="form-row">
           <label>RAG 路径</label>
-          <input type="text" id="rag-path" value="" placeholder="C:\Users\sm001\WorkBuddy\rag-assistant" style="flex:2">
+          <input type="text" id="rag-path" value="" placeholder="C:\Users\YourName\WorkBuddy\rag-assistant" style="flex:2">
           <button class="btn btn-secondary btn-sm" onclick="saveRagPath()">保存路径</button>
         </div>
         <div class="form-row">
@@ -3294,8 +3530,10 @@ function openAuxModal(subId) {
         if (ss.id === subId && ss.aux_knowledge) {
           textarea.value = ss.aux_knowledge.text || '';
           if (ss.aux_knowledge.files) {
+            const label = {table: '表格', text: '文字', image: '图片'};
             ss.aux_knowledge.files.forEach((f, i) => {
-              fileList.innerHTML += `<div class="file-item"><span>${f.name}</span><span class="file-del" onclick="removeAuxFile(${i})">&times;</span></div>`;
+              const tag = label[f.type] || '';
+              fileList.innerHTML += `<div class="file-item"><span>${tag ? '[' + tag + '] ' : ''}${f.name}</span><span class="file-del" onclick="removeAuxFile(${i})">&times;</span></div>`;
             });
           }
           break;
@@ -3314,28 +3552,53 @@ function closeAuxModal() {
 function onAuxFilesSelected(event) {
   const fileList = document.getElementById('aux-file-list');
   Array.from(event.target.files).forEach(file => {
-    if (!file.name.endsWith('.txt') && !file.name.endsWith('.md')) return;
-    const reader = new FileReader();
-    reader.onload = function(e) {
-      if (currentOutline && _auxModalSubId) {
-        for (const sec of currentOutline.sections) {
-          for (const ss of sec.sub_sections || []) {
-            if (ss.id === _auxModalSubId) {
-              if (!ss.aux_knowledge) ss.aux_knowledge = {text: '', files: []};
-              if (!ss.aux_knowledge.files) ss.aux_knowledge.files = [];
-              const idx = ss.aux_knowledge.files.findIndex(f => f.name === file.name);
-              if (idx >= 0) ss.aux_knowledge.files[idx].content = e.target.result;
-              else ss.aux_knowledge.files.push({name: file.name, content: e.target.result});
-              break;
-            }
-          }
-        }
-      }
-      fileList.innerHTML += `<div class="file-item"><span>${file.name}</span><span class="file-del" onclick="removeAuxFile(${document.querySelectorAll('#aux-file-list .file-item').length})">&times;</span></div>`;
-    };
-    reader.readAsText(file);
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    const isText = ext === 'txt' || ext === 'md';
+    const isTable = ext === 'csv' || ext === 'db';
+    const isImage = ['png','jpg','jpeg','gif'].includes(ext);
+    if (!isText && !isTable && !isImage) { alert('不支持的文件类型: ' + file.name); return; }
+    if (isText) {
+      // 文字：本地读内容
+      const reader = new FileReader();
+      reader.onload = function(e) { addAuxFile({name: file.name, type: 'text', content: e.target.result}); };
+      reader.readAsText(file);
+    } else if (isTable || isImage) {
+      // 表格/图片：base64 上传后端存临时目录
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const b64 = String(e.target.result).split(',')[1] || '';
+        fetch('/api/aux_upload', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: file.name, b64: b64})
+        }).then(r => r.json()).then(d => {
+          if (d.success) addAuxFile({name: d.name, type: d.type, path: d.path});
+          else alert('上传失败: ' + (d.error || ''));
+        }).catch(() => alert('上传失败（网络错误）'));
+      };
+      reader.readAsDataURL(file);
+    }
   });
   event.target.value = '';
+}
+
+function addAuxFile(file) {
+  if (!currentOutline || !_auxModalSubId) return;
+  for (const sec of currentOutline.sections) {
+    for (const ss of sec.sub_sections || []) {
+      if (ss.id === _auxModalSubId) {
+        if (!ss.aux_knowledge) ss.aux_knowledge = {text: '', files: []};
+        if (!ss.aux_knowledge.files) ss.aux_knowledge.files = [];
+        const idx = ss.aux_knowledge.files.findIndex(f => f.name === file.name);
+        if (idx >= 0) ss.aux_knowledge.files[idx] = file;
+        else ss.aux_knowledge.files.push(file);
+        break;
+      }
+    }
+  }
+  const fileList = document.getElementById('aux-file-list');
+  const label = {table: '表格', text: '文字', image: '图片'}[file.type] || file.type;
+  fileList.innerHTML += `<div class="file-item"><span>[${label}] ${file.name}</span><span class="file-del" onclick="removeAuxFile(${document.querySelectorAll('#aux-file-list .file-item').length})">&times;</span></div>`;
 }
 
 function removeAuxFile(idx) {
@@ -3787,10 +4050,14 @@ function loadOutputs() {
       const date = new Date(f.mtime * 1000);
       const dateStr = `${date.getMonth()+1}/${date.getDate()} ${String(date.getHours()).padStart(2,'0')}:${String(date.getMinutes()).padStart(2,'0')}`;
       const name = escapeHtml(f.name);
+      const badge = f.is_dir && f.image_count > 0
+        ? '<span class="img-badge" title="含图片">🖼 ' + f.image_count + '</span>' : '';
+      const isDir = f.is_dir ? '1' : '0';
       return '<div class="output-item" onclick="openOutput(\'' + name + '\')">' +
         '<span class="name" title="' + name + '">' + name + '</span>' +
+        badge +
         '<span class="date">' + dateStr + '</span>' +
-        '<span class="del-btn" onclick="event.stopPropagation();deleteOutput(this,\'' + name + '\')" title="删除">✕</span>' +
+        '<span class="del-btn" onclick="event.stopPropagation();deleteOutput(this,\'' + name + '\',' + isDir + ',' + (f.image_count||0) + ')" title="删除">✕</span>' +
         '</div>';
     }).join('');
     // 自动刷新
@@ -3804,8 +4071,11 @@ function openOutput(name) {
       if (!d.success) return;
       // 用模态框展示
       const modal = document.getElementById('output-modal') || createOutputModal();
+      _texPdfName = name;
       modal.querySelector('.modal-header h3').textContent = d.name;
-      const body = modal.querySelector('.modal-body');
+      const info = modal.querySelector('#texpdf-info');
+      if (info) { info.style.display = 'none'; info.innerHTML = ''; info.style.color = ''; }
+      const body = modal.querySelector('#output-content');
       body.innerHTML = '';  // 清空
       body.style.whiteSpace = 'pre-wrap';
       body.style.fontSize = '13px';
@@ -3813,6 +4083,13 @@ function openOutput(name) {
       body.style.maxHeight = '70vh';
       body.style.overflowY = 'auto';
       body.textContent = d.content;
+      // 附图片清单（目录文章）
+      if (d.images && d.images.length) {
+        const imgBox = document.createElement('div');
+        imgBox.style.cssText = 'margin-top:10px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;color:var(--text-dim)';
+        imgBox.textContent = '本文章图片（' + d.images.length + '）：' + d.images.join('、');
+        body.appendChild(imgBox);
+      }
       modal.classList.add('show');
     });
 }
@@ -3822,19 +4099,65 @@ function createOutputModal() {
   div.className = 'modal-overlay';
   div.id = 'output-modal';
   div.innerHTML = '<div class="modal-box" style="width:80%;max-width:900px">' +
-    '<div class="modal-header"><h3></h3><button class="modal-close" onclick="this.closest(\'.modal-overlay\').classList.remove(\'show\')">&times;</button></div>' +
-    '<div class="modal-body"></div></div>';
+    '<div class="modal-header"><h3></h3>' +
+    '<button class="modal-btn" id="btn-texpdf" onclick="genTexPdf()" style="margin-right:8px;padding:3px 10px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--bg-card);color:var(--text);cursor:pointer">生成 tex+pdf</button>' +
+    '<button class="modal-close" onclick="this.closest(\'.modal-overlay\').classList.remove(\'show\')">&times;</button></div>' +
+    '<div class="modal-body">' +
+    '<div id="texpdf-info" style="display:none;margin-bottom:10px;padding:8px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:4px;font-size:12px;line-height:1.7;word-break:break-all"></div>' +
+    '<div id="output-content"></div></div></div>';
   document.body.appendChild(div);
   return div;
 }
 
-function deleteOutput(btn, name) {
-  // 二次确认：第一次点击变为确认态
+let _texPdfName = null;
+function genTexPdf() {
+  if (!_texPdfName) return;
+  const btn = document.getElementById('btn-texpdf');
+  btn.disabled = true;
+  btn.textContent = '生成中…（首次可能需装 LaTeX）';
+  fetch('/api/outputs/texpdf?file=' + encodeURIComponent(_texPdfName))
+    .then(r => r.json()).then(d => {
+      btn.disabled = false;
+      const info = document.getElementById('texpdf-info');
+        if (d.success) {
+        btn.textContent = '已生成 tex+pdf';
+        if (info) {
+          info.style.display = 'block';
+          info.innerHTML = '<b>tex：</b>' + escapeHtml(d.tex) + '<br><b>pdf：</b>' + escapeHtml(d.pdf) +
+            (d.install_msg ? '<br>' + escapeHtml(d.install_msg) : '');
+        }
+      } else {
+        btn.textContent = '生成 tex+pdf';
+        if (info) {
+          info.style.display = 'block';
+          info.style.color = '#e74c3c';
+          info.innerHTML = '生成失败：' + escapeHtml((d.error || d.message || '未知错误').slice(0, 300));
+        }
+      }
+    }).catch(e => {
+      btn.disabled = false;
+      btn.textContent = '生成 tex+pdf';
+      const info = document.getElementById('texpdf-info');
+      if (info) {
+        info.style.display = 'block';
+        info.style.color = '#e74c3c';
+        info.innerHTML = '生成失败：网络错误（' + escapeHtml(String(e)) + '）';
+      }
+    });
+}
+
+function deleteOutput(btn, name, isDir, imageCount) {
+  // 二次确认：第一次点击变为确认态（目录文章提示删整个文件夹）
   if (btn.dataset.confirming !== 'true') {
     btn.dataset.confirming = 'true';
+    btn.dataset.isDir = isDir || '0';
+    btn.dataset.imgCount = imageCount || 0;
     btn.textContent = '确认?';
     btn.style.background = '#e74c3c';
     btn.style.color = '#fff';
+    if (isDir === 1 || isDir === '1') {
+      btn.title = '将删除整篇文章文件夹（含 ' + (imageCount || 0) + ' 张图片），不可恢复';
+    }
     // 添加取消按钮
     const cancel = document.createElement('span');
     cancel.className = 'del-cancel';
@@ -3845,12 +4168,22 @@ function deleteOutput(btn, name) {
       btn.textContent = '✕';
       btn.style.background = '';
       btn.style.color = '';
+      btn.title = '删除';
       cancel.remove();
     };
     btn.parentNode.insertBefore(cancel, btn.nextSibling);
     return;
   }
-  // 第二次点击：执行删除
+  // 第二次点击：执行删除（目录 → 删整个文件夹）
+  if ((btn.dataset.isDir === '1') && !confirm('将删除整篇文章文件夹（含 ' + btn.dataset.imgCount + ' 张图片），不可恢复。确定删除？')) {
+    btn.dataset.confirming = 'false';
+    btn.textContent = '✕';
+    btn.style.background = '';
+    btn.style.color = '';
+    btn.title = '删除';
+    btn.parentNode.querySelector('.del-cancel')?.remove();
+    return;
+  }
   fetch('/api/outputs/delete', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({file: name})
@@ -3868,12 +4201,12 @@ function deleteOutput(btn, name) {
       <button class="modal-close" onclick="closeAuxModal()">&times;</button>
     </div>
     <div class="modal-body">
-      <label style="font-size:12px;color:var(--text-dim);display:block;margin-bottom:4px">文本内容：</label>
-      <textarea id="aux-text-input" placeholder="输入参考文本，或上传 .txt/.md 文件..."></textarea>
+      <label style="font-size:12px;color:var(--text-dim);display:block;margin-bottom:4px">使用指令（如何用这些资料）：</label>
+      <textarea id="aux-text-input" placeholder="如：必须真实采用以下资料进行营收分析 / 将图1、图2插在本节末尾（图片默认插末尾，可留空）"></textarea>
       <div class="file-upload-area" onclick="document.getElementById('aux-file-input').click()">
-        + 上传文件（.txt / .md）
+        + 上传资料（表格 .csv/.db ｜ 文字 .txt/.md ｜ 图片 .png/.jpg）
       </div>
-      <input type="file" id="aux-file-input" accept=".txt,.md" style="display:none" multiple onchange="onAuxFilesSelected(event)">
+      <input type="file" id="aux-file-input" accept=".csv,.db,.txt,.md,.png,.jpg,.jpeg,.gif" style="display:none" multiple onchange="onAuxFilesSelected(event)">
       <div class="file-list" id="aux-file-list"></div>
     </div>
     <div class="modal-footer">

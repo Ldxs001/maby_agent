@@ -5,6 +5,49 @@
 
 ---
 
+## [1.4.0b1] - 2026-08-03
+### 新增（tex/pdf 生成）
+- **预览模态框「生成 tex+pdf」按钮**：一键将文章 md 转换为 .tex 并编译出 .pdf，产物与 md/图片同目录；生成成功在预览框内显示 tex/pdf 完整路径（无弹窗，状态由按钮文字 + 信息区承载）
+- **LaTeX 环境自包含**：点击后自动检测可用引擎（xelatex 优先、lualatex 回退，PATH + MiKTeX 常见路径），未安装则 `winget install MiKTeX` 自动安装；装完设置 `[MPM]AutoInstall=1`（宏包自动静默安装，无弹窗）；MiKTeX bin 自动注入当前进程 PATH
+- **复用 latex-modular 技能脚本**：编译走 `~/.workbuddy/skills/latex-modular/scripts/validate.py --engine <引擎> --fix`（错误自动修复）；宏包顺序/文档头组装参考其 compose.py
+- 新模块 `md2tex.py`：Markdown → LaTeX 确定性映射（#→section、表格→tabular、图片→includegraphics、粗体/斜体/列表/引用/代码块、特殊字符转义），中文经 ctex + Windows 自带字体
+- 技能脚本缺失时回退直接 `<引擎> -interaction=nonstopmode -halt-on-error` 编译
+### 修复
+- **Windows 编码崩溃（2 类）**：① `subprocess.run(text=True)` 默认 GBK 解码 UTF-8 输出 → `UnicodeDecodeError`，全部补 `encoding="utf-8", errors="replace"`（web_ui 2 处 + validate.py 3 处）；② validate.py 子进程内部 print/open 默认 GBK 编码 Unicode 字符（×/✓）→ `UnicodeEncodeError`，调用时强制 `PYTHONIOENCODING=utf-8` + `PYTHONUTF8=1`
+- **lualatex + ctex 不兼容**：报 `this package currently works only with XeTeX` → 改用 **xelatex**（ctex 官方推荐引擎，兼容性最好；lualatex 保留为回退）
+- **geometry Option clash**：md2tex.py 的 PACKAGES 列表与文档头各加载一次 geometry → 从 PACKAGES 移除，保留文档头带边距选项那一次
+- **找不到 lualatex**：MiKTeX 装在用户目录（AppData）不在系统 PATH，且 winget 装完不更新当前进程 → 模块加载时检测 3 个 MiKTeX bin 候选路径 prepend 到 `os.environ["PATH"]`
+### 变更
+- UI 静默化：生成结果不再 `alert()` 弹窗，改为按钮文字状态 + 预览模态框 `#texpdf-info` 信息区（成功显示 tex/pdf 路径，失败显示错误摘要）
+
+---
+
+## [1.3.0] - 2026-08-03
+### 新增（tex/pdf 生成）
+- **预览模态框「生成 tex+pdf」按钮**：一键将文章 md 转换为 .tex 并编译出 .pdf，产物与 md/图片同目录
+- **LaTeX 环境自包含**：点击后自动检测 lualatex（PATH + MiKTeX 常见路径），未安装则 `winget install MiKTeX` 自动安装，全程无人工介入
+- **复用 latex-modular 技能脚本**：编译走 `~/.workbuddy/skills/latex-modular/scripts/validate.py --engine lualatex --fix`（错误自动修复）；宏包顺序/文档头组装参考其 compose.py
+- 新模块 `md2tex.py`：Markdown → LaTeX 确定性映射（#→section、表格→tabular、图片→includegraphics、粗体/斜体/列表/引用/代码块、特殊字符转义），中文经 ctex + Windows 自带字体
+- 技能脚本缺失时回退直接 `lualatex -interaction=nonstopmode` 编译
+
+---
+
+## [1.2.0] - 2026-08-03
+### 新增（辅助资料系统 + 目录化输出）
+- **辅助资料按类型特化三条管线**（子结构"+"按钮）：
+  - **图片**（.png/.jpg/.jpeg/.gif）：py 确定性插图——生成时复制到输出目录、子结构正文末尾自动追加 `![](图名)` 相对路径引用，LLM 零参与，无写错风险
+  - **文字**（.txt/.md）：原样注入【辅助知识】，注入前截断 8000 字符防撑爆上下文
+  - **表格**（.csv/.db）：标准库解析（csv/sqlite3，零第三方依赖）——**表头定位鲁棒**（启发式：多单元格+文本列名+列数与数据行一致，自动丢弃大标题/说明行；失败则 LLM 看原始行定位，兼容英文表头/合并单元格/双行表头）——小表（≤100 行）全量 JSON 注入；大表由 LLM 直接看着列标题/行标题选列选行（理解归 LLM、执行归 py，无正则穷举，中英列名均可），失败回退前 50 行
+- **命令框语义升级**：模态框输入框从"填资料内容"改为"填使用指令"（如"必须真实采用以下资料进行分析"），placeholder 按已选类型提示
+- **防造数据数值校验**：注入表格时收集数据源数字集合，生成后扫描正文带单位数值，未在数据源找到的（非年份/编号）追加到"建议人工复审"清单
+- **输出目录化**：每篇文章一个文件夹 `data/outputs/<标题>_<时间戳>/`（含 md + 图片集，无图也建目录），md 用相对路径引用图片
+- **上传接口 `/api/aux_upload`**：base64 JSON 通道，扩展名白名单 + 20MB 限制，存会话临时目录（不入 session JSON）
+### 变更
+- `aux_parser.py`（新）：csv/sqlite 解析、select_table（小表全量/大表 LLM 选列行）、JSON 转换、文字截断、数字提取与正文校验
+- `web_ui.py`：模态框文件类型放开 + 命令框；输出三接口（list/read/delete）适配目录文章——扫文件夹内 md、读目录内 md、删整个文件夹（含图片集）；**新增 resolve 路径穿越防护**（修复旧代码 `OUTPUTS_DIR / name` 可越界的隐患）；前端列表图片徽标 + 目录删除确认提示
+- `writer.py`：辅助资料按类型分流注入、图片 py 插图、目录化落盘、数值校验接入事实自检清单
+- 旧平铺 .md 输出与历史文件：三接口照常兼容管理
+
 ## [1.1.0] - 2026-07-31（正式版，自 1.1.0b15 累积）
 ### 行为变化（用户可见）
 1. **参考文献列表只包含正文真实引用的来源**：以前按 RAG 全集 1-5 全列（未引用的也列），现在只列正文实际用到的，悬空条目消失
