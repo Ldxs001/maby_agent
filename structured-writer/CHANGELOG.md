@@ -5,7 +5,7 @@
 
 ---
 
-## [1.4.0b1] - 2026-08-03
+## [1.4.0b2] - 2026-08-03（b1 已废弃：classifier 误标 Production/Stable，b2 修正为 Beta 并修复 git-sync prerelease 判别）
 ### 新增（tex/pdf 生成）
 - **预览模态框「生成 tex+pdf」按钮**：一键将文章 md 转换为 .tex 并编译出 .pdf，产物与 md/图片同目录；生成成功在预览框内显示 tex/pdf 完整路径（无弹窗，状态由按钮文字 + 信息区承载）
 - **LaTeX 环境自包含**：点击后自动检测可用引擎（xelatex 优先、lualatex 回退，PATH + MiKTeX 常见路径），未安装则 `winget install MiKTeX` 自动安装；装完设置 `[MPM]AutoInstall=1`（宏包自动静默安装，无弹窗）；MiKTeX bin 自动注入当前进程 PATH
