@@ -15,7 +15,7 @@
 
 | 智能体名 | 描述 |
 |----------|------|
-| `Orchestrator` | Orchestrator 是一个基于本地 LLM 的 Python 智能体系统，支持: |
+| `Orchestrator` | 基于本地 LLM 的 Python 智能体系统 / Skill Pipeline Orchestrator。运行时动态加载 WorkBuddy 技能，自动编排流水线，支持 ReAct 循环、多 LLM 后端与工具系统。 |
 | `rag-assistant` | 基于 LLM 的组合式语义检索与多库路由智能体。连接本地 LLM，对你的文档库做知识问答——自动识别查询意图、拆分组合检索、跨库路由、精排与语义验证，最终给出带来源的答案。 |
 | `structured-writer` | 模板驱动的大纲规划 + 串行写作引擎。基于 LLM 的结构化长文写作系统，支持两级 RAG 增强、事实自检、引用自动格式化、交互式大纲控制。 |
 
