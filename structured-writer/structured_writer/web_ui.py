@@ -716,10 +716,10 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         except Exception:
             pass  # 设置失败不阻塞编译
 
-        # ② md → tex
+        # ② md → tex（image_base_dir：图片与 md/tex 同目录，供图片分类排版读像素尺寸）
         from .md2tex import md_to_tex
         md_text = fpath.read_text(encoding="utf-8")
-        tex_text = md_to_tex(md_text, title=title)
+        tex_text = md_to_tex(md_text, title=title, image_base_dir=str(out_dir))
         tex_path = out_dir / f"{title}.tex"
         tex_path.write_text(tex_text, encoding="utf-8")
 
@@ -3533,7 +3533,8 @@ function openAuxModal(subId) {
             const label = {table: '表格', text: '文字', image: '图片'};
             ss.aux_knowledge.files.forEach((f, i) => {
               const tag = label[f.type] || '';
-              fileList.innerHTML += `<div class="file-item"><span>${tag ? '[' + tag + '] ' : ''}${f.name}</span><span class="file-del" onclick="removeAuxFile(${i})">&times;</span></div>`;
+              const hint = f.type === 'image' ? '（自动插图至末尾）' : '';
+              fileList.innerHTML += `<div class="file-item"><span>${tag ? '[' + tag + '] ' : ''}${f.name}${hint}</span><span class="file-del" onclick="removeAuxFile(${i})">&times;</span></div>`;
             });
           }
           break;
@@ -3598,7 +3599,8 @@ function addAuxFile(file) {
   }
   const fileList = document.getElementById('aux-file-list');
   const label = {table: '表格', text: '文字', image: '图片'}[file.type] || file.type;
-  fileList.innerHTML += `<div class="file-item"><span>[${label}] ${file.name}</span><span class="file-del" onclick="removeAuxFile(${document.querySelectorAll('#aux-file-list .file-item').length})">&times;</span></div>`;
+  const hint = file.type === 'image' ? '（自动插图至末尾）' : '';
+  fileList.innerHTML += `<div class="file-item"><span>[${label}] ${file.name}${hint}</span><span class="file-del" onclick="removeAuxFile(${document.querySelectorAll('#aux-file-list .file-item').length})">&times;</span></div>`;
 }
 
 function removeAuxFile(idx) {
@@ -4201,8 +4203,8 @@ function deleteOutput(btn, name, isDir, imageCount) {
       <button class="modal-close" onclick="closeAuxModal()">&times;</button>
     </div>
     <div class="modal-body">
-      <label style="font-size:12px;color:var(--text-dim);display:block;margin-bottom:4px">使用指令（如何用这些资料）：</label>
-      <textarea id="aux-text-input" placeholder="如：必须真实采用以下资料进行营收分析 / 将图1、图2插在本节末尾（图片默认插末尾，可留空）"></textarea>
+      <label style="font-size:12px;color:var(--text-dim);display:block;margin-bottom:4px">使用指令（作用于文字/表格资料；图片自动插图至本子结构末尾，不受指令控制）：</label>
+      <textarea id="aux-text-input" placeholder="如：必须真实采用以下资料进行营收分析（图片无需指令，默认插在末尾）"></textarea>
       <div class="file-upload-area" onclick="document.getElementById('aux-file-input').click()">
         + 上传资料（表格 .csv/.db ｜ 文字 .txt/.md ｜ 图片 .png/.jpg）
       </div>

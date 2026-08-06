@@ -1,7 +1,7 @@
 # Maby Agent
 
 > **用户智能体仓库** — 由 git-sync 自动同步维护。
-> 最后更新：2026-08-03
+> 最后更新：2026-08-06
 
 本仓库托管 wUwproject 智能体项目，由 git-sync 自动同步维护。码云（Gitee）和 GitHub 双平台同步。
 

@@ -219,7 +219,7 @@ python main.py
 
 **输出目录化（v1.2.0）**：每篇文章一个文件夹 `data/outputs/<标题>_<时间戳>/`，md 与图片集同目录、相对路径引用——一篇文章的所有内容在一起，方便移动/打包。
 
-**tex/pdf 生成（v1.4.0b3）**：预览模态框「生成 tex+pdf」按钮一键转换并编译——md → .tex（新模块 `md2tex.py`，确定性映射：标题/表格/图片/列表/引用/代码块 + 特殊字符转义，中文经 ctex）→ xelatex 编译（复用 latex-modular 技能的 `validate.py --fix` 自动修复错误；xelatex 优先，ctex 兼容性最好）。**LaTeX 环境自包含**：未检测到引擎时自动 `winget install MiKTeX`，宏包自动安装（AutoInstall=1 无弹窗），MiKTeX bin 自动注入 PATH。产物 `.tex` + `.pdf` 与 md、图片同目录。
+**tex/pdf 生成（v1.5.0）**：预览模态框「生成 tex+pdf」按钮一键转换并编译——md → .tex（新模块 `md2tex.py`，确定性映射：标题/表格/列表/引用/代码块 + 特殊字符转义，中文经 ctex）→ xelatex 编译（复用 latex-modular 技能的 `validate.py --fix` 自动修复错误；xelatex 优先，ctex 兼容性最好）。**图片自动四类排版**（读像素尺寸分类，标准库零依赖）：小图两列并排各 0.48 页宽、中图 0.8 页宽居中、竖大图 0.92 页宽 × 0.85 页高双约束、超宽全景（>2600px 且宽高比 ≥2.5）旋转 90° 竖放——所有阈值比例化，与纸张尺寸无关。**图片块为非浮动独立块**：紧跟文本流末尾下一行，空间不足自动整块换页，不与文字混排、不强制本页。**LaTeX 环境自包含**：未检测到引擎时自动 `winget install MiKTeX`，宏包自动安装（AutoInstall=1 无弹窗），MiKTeX bin 自动注入 PATH。产物 `.tex` + `.pdf` 与 md、图片同目录。
 
 ---
 
