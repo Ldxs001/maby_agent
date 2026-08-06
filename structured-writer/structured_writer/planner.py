@@ -390,3 +390,215 @@ def plan_outline(topic: str, template: dict = None,
     outline = _normalize_outline(outline, content_fields)
 
     return outline
+
+
+# ═══════════════════════════════════════════════════════════
+# 模板生成（按 SCHEMA 规矩，从 web_ui gen-template 迁移，行为一致）
+# ═══════════════════════════════════════════════════════════
+
+GEN_TEMPLATE_SYSTEM_PROMPT = """你是一个文档模板规划助手。根据用户描述生成模板定义。
+
+输出 JSON：
+{
+  "name": "模板名称",
+  "meta": [
+    {"name": "字段名", "show_label": true/false, "desc": "字段要求", "source": "user/llm/auto"}
+  ],
+  "content": [
+    {"name": "字段名", "show_label": true/false, "desc": "写作要点", "type": "leaf/section", "logical_order": 0}
+  ],
+  "style": "写作风格提示词",
+  "logic": "写作顺序提示词（控制LLM的认知流程顺序，不控制文章顺序）"
+}
+
+规则：
+
+一、元数据 vs 内容树 —— 严格的二分法：
+- 元数据：标识/管理信息（标题、作者、单位、文号、密级、日期等）。
+  特征：短（≤100字）、不参与大纲规划、不支持子结构、以键值对渲染。
+  位置：放入 meta 数组。
+- 内容树：文章正文构成（摘要、引言、正文、结论、参考文献等）。
+  特征：长（≥200字）、参与大纲规划、可拆子结构、构成文章主体。
+  位置：放入 content 数组。
+  互斥：同一个字段不能同时出现在 meta 和 content 中。
+
+二、元数据规则：
+- source=user：用户必须填写，LLM不碰（如作者、单位、文号）
+- source=auto：用户可填，留空LLM生成（如标题）
+- source=llm：由LLM生成（如关键词）——但关键词推荐放入 content 尾部
+- show_label=true 输出时带"字段名："前缀，false 不带
+- 元数据固定为 leaf（无子结构），不要输出 type 字段
+
+三、内容树规则：
+- source 固定为 llm（不输出 source 字段）
+- type=leaf：单段内容，不拆子结构（摘要、参考文献、关键词）
+- type=section：需要拆 2-4 个子结构（引言、正文各节、结论）
+- show_label=true 输出时带"字段名："前缀，false 不带
+- desc 写清楚写作要点
+- logical_order：可选。不设或留空=按 content[] 顺序写，不需特殊排序。
+  需要特殊排序时才设置：0=先写，1=其次，2=最后写（如摘要/关键词需在全文写完后提取）。
+  逻辑顺序只控制 LLM 写作时的认知流程，不影响文章最终排列
+- **citation_check（引用校验）**：如果字段是引用列表/参考文献，必须设置 `"citation_check": true` 并在 `"citation_format"` 中指定行内引用标记格式和参考文献列表前缀格式，如 `"citation_format": "[x]=1."` 表示正文中用 `[文件名]` 标记引用，参考文献用 `1.` 前缀
+
+四、逻辑提示词（logic）规则：
+- 控制 LLM 的认知流程顺序，而非文章最终顺序
+- 示例："引言和正文优先写，结论在正文完成后写，关键词和摘要在全文写完后从成品中提取"
+- 如果用户未指定，根据字段类型推断合理顺序
+
+五、其他规则：
+- 字段数量：元数据 0-8 个 + 内容树 3-12 个
+- name 用中文
+- style 描述文风和语气"""
+
+
+def _normalize_template(t: dict) -> dict:
+    """校验 + 补默认值，确保模板结构正确（从 web_ui 迁移，行为一致）"""
+    if not t.get("name"):
+        t["name"] = "自定义模板"
+
+    meta = t.get("meta", [])
+    if not isinstance(meta, list):
+        meta = []
+    cleaned_meta = []
+    for f in meta:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name", "")).strip()
+        if not name:
+            continue
+        cleaned_meta.append({
+            "name": name,
+            "show_label": bool(f.get("show_label", True)),
+            "desc": str(f.get("desc", "")),
+            "source": f.get("source", "auto") if f.get("source") in ("user", "auto", "llm") else "auto"
+        })
+    t["meta"] = cleaned_meta
+
+    content = t.get("content", [])
+    if not isinstance(content, list):
+        content = []
+    cleaned_content = []
+    for f in content:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name", "")).strip()
+        if not name:
+            continue
+        entry = {
+            "name": name,
+            "show_label": bool(f.get("show_label", True)),
+            "desc": str(f.get("desc", "")),
+            "type": f.get("type", "leaf") if f.get("type") in ("leaf", "section") else "leaf"
+        }
+        lo = f.get("logical_order")
+        if lo is not None and lo in (0, 1, 2):
+            entry["logical_order"] = lo
+        # 引用校验：字段名含"参考文献"或已有 citation_check=true 时自动开启
+        if f.get("citation_check") or "参考文献" in name or "引用" in name:
+            entry["citation_check"] = True
+            entry["citation_format"] = str(f.get("citation_format", "[x]=1."))
+        cleaned_content.append(entry)
+    t["content"] = cleaned_content
+
+    # style / logic 字符串
+    t.setdefault("style", "")
+    t.setdefault("logic", "")
+
+    # 清理多余字段
+    allowed = {"name", "meta", "content", "style", "logic", "citation_check", "citation_format"}
+    for k in list(t.keys()):
+        if k not in allowed:
+            del t[k]
+
+    return t
+
+
+def generate_template(description: str, llm_client: LLMClient, name: str = "") -> dict:
+    """按 SCHEMA 规矩生成模板（3 次重试 + 容错解析，从 web_ui 迁移，行为一致）。
+
+    参数:
+        description: 模板描述（必填，非空）
+        llm_client: LLM 客户端
+        name: 模板名称（可选，注入到 user prompt）
+
+    返回:
+        规范化后的模板 dict {name, meta, content, style, logic}
+
+    异常:
+        LLMClientError: LLM 3 次均未返回正确格式
+    """
+    user_content = f"模板名称：{name}\n" if name else ""
+    user_content += description
+    messages = [
+        {"role": "system", "content": GEN_TEMPLATE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content}
+    ]
+
+    result = None
+    last_raw = ""
+    for attempt in range(3):
+        try:
+            raw = llm_client.chat(messages, max_tokens=None, temperature=0.3)
+            last_raw = raw
+        except Exception as e:
+            if attempt < 2:
+                continue
+            raise LLMClientError(f"LLM 调用失败: {e}") from e
+
+        # 尝试直接解析
+        try:
+            result = json.loads(raw.strip())
+            if result.get("meta") or result.get("content"):
+                break
+        except json.JSONDecodeError:
+            pass
+
+        # 尝试提取 ```json ... ``` 代码块
+        if "```" in raw:
+            start = raw.index("```")
+            end = raw.index("```", start + 3) if "```" in raw[start + 3:] else len(raw)
+            content = raw[start + 3:end].strip()
+            if content.startswith("json\n"):
+                content = content[5:]
+            try:
+                result = json.loads(content)
+                if result.get("meta") or result.get("content"):
+                    break
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # 尝试找到第一个 { 提取 JSON
+        brace = raw.find("{")
+        if brace >= 0:
+            try:
+                result = json.loads(raw[brace:])
+                if result.get("meta") or result.get("content"):
+                    break
+            except json.JSONDecodeError:
+                lines = raw[brace:].split("\n")
+                for cut in range(len(lines), 0, -1):
+                    try:
+                        r = json.loads("\n".join(lines[:cut]))
+                        if r.get("meta") or r.get("content"):
+                            result = r
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                if result:
+                    break
+
+        if attempt < 2:
+            error_feedback = (
+                f"【格式错误】输出必须包含非空的 meta 和 content 字段（至少一个有内容）。\n"
+                f"只输出 JSON，不要任何其他文字。\n重新生成："
+            )
+            messages.append({"role": "assistant", "content": raw[:500]})
+            messages.append({"role": "user", "content": error_feedback})
+
+    if result:
+        result = _normalize_template(result)
+        if result.get("meta") or result.get("content"):
+            return result
+    raise LLMClientError(
+        f"模板生成失败，LLM 3 次均未返回正确格式。最后输出：{last_raw[:300]}"
+    )

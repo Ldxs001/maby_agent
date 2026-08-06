@@ -2,7 +2,7 @@
 
 > 模板驱动的大纲规划 + 串行写作引擎。基于 LLM 的结构化长文写作系统，支持两级 RAG 增强、事实自检、引用自动格式化、交互式大纲控制。
 >
-> 版本：1.5.0 | 作者：wUwproject | 许可证：Apache 2.0
+> 版本：1.6.0b0 | 作者：wUwproject | 许可证：Apache 2.0
 
 ---
 
@@ -82,6 +82,24 @@ python main.py
 
 # 4. 浏览器访问 http://localhost:8770
 ```
+
+### 对外写作 API（v1.6.0b0，仿 rag-assistant 8767 模式）
+
+独立端口启动，与 Web UI 隔离：
+
+```bash
+python main.py --api-port 8777     # 同时启动 Web UI(8770) + 对外 API(8777)
+python main.py --api-port 8777 --no-web   # 仅对外 API（--no-web 需自行控制 Web 不启）
+```
+
+| 端点 | 说明 |
+|---|---|
+| `POST /api/write` | 同步写作：传 `prompt`（必填）+ `template`（模板名 / 内联 JSON / `template_desc` 描述生成）+ `images`（base64，`target` 可选，缺省第一个 section 节末尾）+ `rag`（`enabled/kb/cold_start`，探测→冷启动→降级三态）+ `format`（`md`/`latex`/`pdf`）→ 返回全文 |
+| `GET /api/health` | 服务状态 + 版本 |
+| `GET /api/capabilities` | 模板列表 / formats / RAG 可达性 |
+| `GET /api/rag/status` | 8767 RAG 探测（只查不启动） |
+
+两级 RAG 自动走 rag-assistant 8767 `/api/kb/query`；rag-assistant 离线且 `cold_start=true` 时自动拉起其子进程，失败降级纯 LLM 写作（不报错，返回 `rag.status=degraded`）。
 
 ### 搭建后的首次配置
 
@@ -219,7 +237,7 @@ python main.py
 
 **输出目录化（v1.2.0）**：每篇文章一个文件夹 `data/outputs/<标题>_<时间戳>/`，md 与图片集同目录、相对路径引用——一篇文章的所有内容在一起，方便移动/打包。
 
-**tex/pdf 生成（v1.5.0）**：预览模态框「生成 tex+pdf」按钮一键转换并编译——md → .tex（新模块 `md2tex.py`，确定性映射：标题/表格/列表/引用/代码块 + 特殊字符转义，中文经 ctex）→ xelatex 编译（复用 latex-modular 技能的 `validate.py --fix` 自动修复错误；xelatex 优先，ctex 兼容性最好）。**图片自动四类排版**（读像素尺寸分类，标准库零依赖）：小图两列并排各 0.48 页宽、中图 0.8 页宽居中、竖大图 0.92 页宽 × 0.85 页高双约束、超宽全景（>2600px 且宽高比 ≥2.5）旋转 90° 竖放——所有阈值比例化，与纸张尺寸无关。**图片块为非浮动独立块**：紧跟文本流末尾下一行，空间不足自动整块换页，不与文字混排、不强制本页。**LaTeX 环境自包含**：未检测到引擎时自动 `winget install MiKTeX`，宏包自动安装（AutoInstall=1 无弹窗），MiKTeX bin 自动注入 PATH。产物 `.tex` + `.pdf` 与 md、图片同目录。
+**tex/pdf 生成（v1.6.0b0）**：预览模态框「生成 tex+pdf」按钮一键转换并编译——md → .tex（新模块 `md2tex.py`，确定性映射：标题/表格/列表/引用/代码块 + 特殊字符转义，中文经 ctex）→ xelatex 编译（复用 latex-modular 技能的 `validate.py --fix` 自动修复错误；xelatex 优先，ctex 兼容性最好）。**图片自动四类排版**（读像素尺寸分类，标准库零依赖）：小图两列并排各 0.48 页宽、中图 0.8 页宽居中、竖大图 0.92 页宽 × 0.85 页高双约束、超宽全景（>2600px 且宽高比 ≥2.5）旋转 90° 竖放——所有阈值比例化，与纸张尺寸无关。**图片块为非浮动独立块**：紧跟文本流末尾下一行，空间不足自动整块换页，不与文字混排、不强制本页。**LaTeX 环境自包含**：未检测到引擎时自动 `winget install MiKTeX`，宏包自动安装（AutoInstall=1 无弹窗），MiKTeX bin 自动注入 PATH。产物 `.tex` + `.pdf` 与 md、图片同目录。
 
 ---
 

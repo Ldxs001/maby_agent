@@ -5,6 +5,23 @@
 
 ---
 
+## [1.6.0b0] - 2026-08-06（beta 验证版：对外写作 API；验证通过后转正 1.6.0）
+### 新增（对外写作 API，仿 rag-assistant 8767 模式）
+- **新模块 `external_api.py`**：`--api-port`（默认 8777）独立端口启动，与 Web UI(8770) 完全隔离；`http.server` + 统一 `{"success": bool}` 响应风格
+- **`POST /api/write`（同步写作，核心）**：
+  - `prompt`（必填）+ `template` 三形态：模板名 / 内联模板 JSON（结构校验）/ `template_desc` 描述生成（走 SCHEMA 规矩）
+  - `instructions` / `title` / `meta`（填 source=user 字段）/ `word_count` / `context_review_length` / `fact_check`
+  - `images`：base64 数组（≤20 张、单张 ≤20MB、type 与扩展名一致校验），`target` 可选（子结构标题模糊匹配），**缺省落点 = 第一个 section 节末尾**
+  - `rag`：`{enabled, kb（空=自动路由，sub 级查询沿用同一 kb）, cold_start}`——探测 8767 → 冷启动拉起 rag-assistant 子进程（≤90s）→ 失败降级纯 LLM 写作（**不报错**），返回 `rag.status = off|online|cold_started|degraded`
+  - `format`：`md` / `latex`（含四类图片排版）/ `pdf`（xelatex 编译，base64 返回）
+- **`GET /api/health` / `GET /api/capabilities` / `GET /api/rag/status`**（仿 8767 风格）
+- **模板生成逻辑抽取**：`GEN_TEMPLATE_SYSTEM_PROMPT` + 3 次重试容错解析 + `_normalize_template` 从 `web_ui._handle_gen_template` 迁移至 `planner.generate_template()`（行为逐字节一致），web_ui 调用处替换——模板规矩单一来源
+### 变更
+- `main.py` 新增 `--api-port` 参数（默认不启动，不影响现有启动路径）
+- 写作管道（planner/writer/md2tex/rag_client/config_manager）零改动，全部复用
+
+---
+
 ## [1.5.0] - 2026-08-06（由 1.5.0b1 迭代转正：四类图片排版 + 非浮动独立块 + 文件名特殊字符保护 + 辅助知识面板文案；b1 未发布废弃）
 ### 新增（图片分类排版）
 - **图片按像素尺寸自动四类排版**（`md2tex.py`，读 PNG/JPEG/GIF 头，标准库 struct 零依赖）：
