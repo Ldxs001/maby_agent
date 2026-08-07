@@ -6,4 +6,3 @@
 # 标准库依赖（无需安装）
 # - urllib (LLM 客户端)
 # - json / os / sys / argparse
-# - tkinter (GUI 模式)

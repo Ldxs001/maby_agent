@@ -47,7 +47,7 @@ python main.py [OPTIONS]
 
 | 参数 | 说明 |
 |------|------|
-| `--web` | 启动 Web UI（默认端口 8765） |
+| `--web` | 启动 Web UI（默认端口 8788） |
 | `--port PORT` | Web UI 端口（数字或 `auto`） |
 | `--query TEXT` | 单次问答 |
 | `--batch INPUT OUTPUT` | 批处理模式 |
@@ -125,7 +125,7 @@ python main.py --query "今天天气怎么样"
 python main.py --web
 ```
 
-启动 Web UI 服务器，监听 0.0.0.0:8765。提供三个 Tab:
+启动 Web UI 服务器，监听 0.0.0.0:8788。提供三个 Tab:
 
 - **对话**: ReAct 智能体交互
 - **配置**: LLM 后端 / 搜索 / 提示词设置
@@ -177,7 +177,7 @@ cat input.jsonl | python main.py --jsonl | jq '.output' > results.txt
 ### 4.1 基础
 
 - **Base URL**: `http://<host>:<port>/`
-- **默认端口**: 8765
+- **默认端口**: 8788
 - **Content-Type**: `application/json; charset=utf-8`
 - **编码**: UTF-8
 

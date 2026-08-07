@@ -146,35 +146,78 @@ def _get_skill_scripts(skill_dir: str) -> list[str]:
     return []
 
 
+def _normalize_name(name: str) -> str:
+    """技能名/脚本名归一化：连字符、空格统一为下划线（workday-calendar ↔ workday_calendar）"""
+    return str(name or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+_CONFIG_SCRIPT_NAMES = {
+    "settings.py", "config.py", "__init__.py", "_paths.py",
+    "prompt_manager.py", "prompt_manager.py.bak",
+}
+
+
+def _is_real_entry_script(script: str) -> bool:
+    """判断是否为真实可执行入口（排除纯配置/辅助脚本）"""
+    base = os.path.basename(script).lower()
+    if base in _CONFIG_SCRIPT_NAMES:
+        return False
+    if base.startswith("_") and base.endswith(".py"):
+        return False
+    return base.endswith((".py", ".sh", ".bat"))
+
+
 def _get_main_script(skill_name: str, scripts: list[str]) -> Optional[str]:
     if not scripts:
         return None
     scripts_dir = os.path.dirname(scripts[0])
+    norm = _normalize_name(skill_name)
+    # 1) 精确归一化匹配: workday-calendar → workday_calendar.py
     for ext in (".py", ".sh", ".bat"):
-        candidate = os.path.join(scripts_dir, skill_name + ext)
+        candidate = os.path.join(scripts_dir, norm + ext)
         if candidate in scripts:
             return candidate
-    for name in ("main.py", "run.py", "index.py"):
+    # 2) 标准入口名
+    for name in ("main.py", "run.py", "index.py", "cli.py"):
         candidate = os.path.join(scripts_dir, name)
         if candidate in scripts:
             return candidate
+    # 3) 兜底：与技能名前缀匹配的脚本（含 .sh）
+    for s in scripts:
+        base = os.path.basename(s)
+        base_noext = os.path.splitext(base)[0]
+        if (base.startswith(norm) or norm.startswith(base_noext)) and _is_real_entry_script(s):
+            return s
+    # 4) 宽兜底：排除纯配置脚本后，任意可执行脚本都算入口
+    for s in scripts:
+        if _is_real_entry_script(s):
+            return s
     return None
 
 
-def _run_script(script: str, timeout: int = 1800, progress_callback=None) -> str:
+def _run_script(script: str, timeout: int = 1800, progress_callback=None,
+                cli_args: list = None, input_text: str = "") -> str:
+    """运行脚本；cli_args 作为位置参数追加，input_text 作为 stdin 传入"""
     if script.endswith(".py"):
         runner = [sys.executable, script]
     elif script.endswith(".bat"):
         runner = [script]
     else:
-            runner = ["bash", script]
+        runner = ["bash", script]
+    if cli_args:
+        runner.extend(str(a) for a in cli_args)
     try:
         r = subprocess.run(
             runner, capture_output=True, timeout=timeout,
             cwd=os.path.dirname(os.path.dirname(script)),
             text=True, encoding='utf-8', errors='replace',
+            input=input_text or None,
         )
-        return (r.stdout or r.stderr or "(无输出)").strip()
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        if r.returncode != 0:
+            return f"[退出码 {r.returncode}] {out}\n{err}".strip() or f"[退出码 {r.returncode}] 无输出"
+        return out or err or "(无输出)"
     except subprocess.TimeoutExpired:
         return f"[超时] {script}（超过{timeout}秒）"
     except Exception as e:
@@ -733,10 +776,29 @@ def execute_node(node: PipelineNode, llm: LLMClient,
     scripts = _get_skill_scripts(sdir)
     main_script = _get_main_script(node.skill_name, scripts)
 
+    # 节点 params → CLI 参数（command + args，位置参数兜底）
+    cli_args = []
+    params = node.params or {}
+    if isinstance(params, dict):
+        cmd = params.get("command") or params.get("cmd") or params.get("subcommand")
+        if cmd:
+            cli_args.append(str(cmd))
+        args_list = params.get("args") or params.get("arguments") or []
+        if isinstance(args_list, str):
+            args_list = [args_list]
+        if isinstance(args_list, (list, tuple)):
+            cli_args.extend(str(a) for a in args_list)
+        # 剩余标量参数按 key=value 追加（skill 脚本可能接受 --key value）
+        for k, v in params.items():
+            if k in ("command", "cmd", "subcommand", "args", "arguments"):
+                continue
+            cli_args.extend([f"--{k}", str(v)])
+
     if main_script:
         if progress_callback:
-            progress_callback(f"{prefix} 运行脚本 {os.path.basename(main_script)}...")
-        return _run_script(main_script, script_timeout, progress_callback)
+            progress_callback(f"{prefix} 运行脚本 {os.path.basename(main_script)} 参数={cli_args}")
+        return _run_script(main_script, script_timeout, progress_callback,
+                           cli_args=cli_args, input_text=prev_output or None)
 
     # LLM 执行 — 用 system 指令压制 LLM 的"解释倾向"
     if progress_callback:

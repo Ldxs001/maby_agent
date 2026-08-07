@@ -1,0 +1,6 @@
+[{"name":"","display":"并行组1","mode":"par","children":[
+  {"name":"skill_a","display":"技能A","mode":"seq","children":[],"params":{}},
+  {"name":"skill_b","display":"技能B","mode":"seq","children":[],"params":{}}
+],"loop_times":3},{"name":"","display":"循环组1","mode":"loop","children":[
+  {"name":"skill_c","display":"技能C","mode":"seq","children":[],"params":{}}
+],"loop_times":3}]

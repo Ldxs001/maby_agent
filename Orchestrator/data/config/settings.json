@@ -1,0 +1,46 @@
+{
+  "llm": {
+    "backend": "lmstudio",
+    "base_url": "http://localhost:1234/v1",
+    "api_key": "not-needed",
+    "model_name": "qwen/qwen3.5-35b-a3b",
+    "temperature": 0.3,
+    "max_tokens": 40960,
+    "top_p": 0.9,
+    "timeout": 1800,
+    "ollama_url": "http://localhost:11434",
+    "lmstudio_url": "http://localhost:1234"
+  },
+  "agent": {
+    "max_steps": 20,
+    "max_retries": 3,
+    "verbose": true,
+    "stop_on_tool_error": false
+  },
+  "memory": {
+    "max_history": 20,
+    "max_context_chars": 8000,
+    "working_memory_file": "working_memory.json"
+  },
+  "rag": {
+    "skill_path": "C:\\Users\\sm001/.workbuddy/skills/local-rag-builder",
+    "default_kb": "default",
+    "k": 5,
+    "score_threshold": 0.0
+  },
+  "search": {
+    "backend": "duckduckgo",
+    "url": "",
+    "api_key": "",
+    "google_key": "",
+    "google_cx": "",
+    "bing_key": "",
+    "presets": []
+  },
+  "prompt": {
+    "user": ""
+  },
+  "skills": {
+    "dirs": []
+  }
+}

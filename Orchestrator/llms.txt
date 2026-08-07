@@ -1,19 +1,20 @@
-# Orchestrator v1.1.0
+# Orchestrator v2.8.1
 
-> 基于本地 LLM 的 Python 智能体系统 / Skill Pipeline Orchestrator。
-> 运行时动态加载本地技能（读 SKILL.md），自动编排流水线。
+> 基于本地 LLM 的链驱动编排器（Skill Pipeline Orchestrator）。
+> 人工编排技能链 → LLM 只做前处理与输出整理 → 中间 subprocess 确定性执行。
 
 ---
 
 ## 是什么
 
-Orchestrator 是一个 **平台编排型智能体**。它不内嵌任何技能代码，而是运行时扫描 `~/.workbuddy/skills/` 下的 SKILL.md，动态理解和加载技能。
+Orchestrator 是一个 **链驱动编排器**，不是聊天工具。
 
 **核心特质**：
-- 多 LLM 后端：LM Studio / Ollama / Custom API / 直接加载 GGUF
-- 动态技能加载：运行时读 SKILL.md，无需写适配代码
-- Skill Pipeline：链式/并行编排多个技能
-- 工具集合：文件读写、网页抓取、搜索、Python 执行
+- 人工编排 Pipeline（技能链，支持 seq/par/loop 嵌套）
+- LLM 只做两头：**前处理**（需求分析 + 用工具处理上传数据）+ **输出整理**（按用户提示词整理交付）
+- 中间死链：Pipeline 执行是 subprocess 确定性运行 skill 脚本，不经过 LLM
+- 16 个通用工具（文件全操作 + 网络 + 数据访问），32 个可编排技能
+- 文件上传通道：对话框纯文本指令，csv/xlsx/db/图片/视频等数据走上传
 
 ---
 
@@ -21,16 +22,30 @@ Orchestrator 是一个 **平台编排型智能体**。它不内嵌任何技能�
 
 ### 一键安装启动
 ```bash
-setup.bat                                # 检测环境 → 装依赖 → 选择模式
+setup.bat                                # 检测环境 → 装依赖 → 启动 Web UI（端口 8788）
 ```
 
 ### 手动启动
 ```bash
-python main.py                            # 默认 LM Studio 后端
-python main.py --web                      # Web UI（对话+配置+Pipeline）
-python main.py --query "你的问题"          # 单次问答
-python main.py --backend ollama           # Ollama 后端
-python main.py --check                    # 仅检测后端连接
+python main.py --web                     # 启动 Web UI（编排 Pipeline）
+python main.py --web --port 8788         # 指定端口
+python main.py --batch in.json out.json  # 批处理执行 Pipeline
+python main.py --jsonl < in.jsonl        # JSONL 管道执行
+python main.py --backend ollama          # Ollama 后端
+python main.py --check                   # 仅检测后端连接
+python main.py --list-models             # 罗列本地模型
+```
+
+---
+
+## 使用流程总览
+
+```
+1. Pipeline Tab   人工编排技能链（选技能/排顺序/配参数/定模式）并保存
+2. 对话 Tab       选择 Pipeline + 输入任务描述（纯文本）+ 可选上传文件
+3. 前处理         LLM 分析任务 + 用工具处理上传数据 → 产出最小输入
+4. 执行           subprocess 跑链上每个技能脚本（真实输出）
+5. 输出整理       LLM 按用户提示词整理最终交付
 ```
 
 ---
@@ -38,29 +53,27 @@ python main.py --check                    # 仅检测后端连接
 ## 架构总览
 
 ```
-main.py ─── 入口（CLI 交互 / 单次问答 / 检测）
+main.py ─── 入口（--web / --batch / --jsonl）
   │
-  └── orchestrator/           ← 智能体核心层
-      ├── agent_loop.py       ← ReAct 决策循环（Think → Act → Observe）
-      ├── agent_config.py     ← 代码配置（dataclass + property）
+  └── orchestrator/           ← 核心层
+      ├── web_ui.py           ← Web UI（Pipeline 编排 + 链驱动执行）
+      ├── agent_loop.py       ← 编排器系统提示词（LLM 角色定义）
+      ├── agent_config.py     ← 统一配置（data/config/settings.json）
       ├── llm_client.py       ← LLM 客户端（urllib，零依赖）
-      ├── memory.py           ← 两层记忆（会话 + 持久化工作记忆）
-      ├── model_manager.py    ← 统一模型管理器（发现/加载/卸载/GPU仲裁）
-      ├── direct_llm_client.py ← 直接加载 GGUF（GPU/CPU 分摊）
-      ├── gui_agent.py        ← tkinter 流水线编排 GUI
-      ├── chain_engine.py     ← 流水线执行引擎
+      ├── chain_engine.py     ← 流水线执行引擎（subprocess 真执行）
       ├── chain_model.py      ← 流水线数据模型
-      ├── skill_scanner.py    ← 技能目录扫描器
+      ├── skill_scanner.py    ← 技能扫描（只显示有入口脚本的技能）
       ├── tool_base.py        ← 工具抽象基类
       │
-      ├── tools/              ← 工具集合
-      │   ├── skill_loader.py ← 动态技能加载器
-      │   ├── file_tool.py    ← 文件操作工具
-      │   ├── web_tool.py     ← 网络工具
-      │   └── rag_tool.py     ← RAG 检索工具
+      ├── tools/              ← 工具集合（16 个）
+      │   ├── file_tool.py    ← 读/写/列目录
+      │   ├── file_ops_tool.py← 复制/移动/删除/追加/建目录/查找
+      │   ├── web_tool.py     ← 网页抓取/搜索/Python 执行
+      │   ├── data_tool.py    ← db_query/read_table/image_info
+      │   └── skill_loader.py ← 技能加载
       │
-      ├── chains/             ← 预编排流水线定义
-      └── working_memory.json ← 工作记忆持久化
+      ├── chains/             ← 已保存的 Pipeline 定义
+      └── input/              ← 上传文件落盘目录
 ```
 
 ---
@@ -73,21 +86,20 @@ main.py ─── 入口（CLI 交互 / 单次问答 / 检测）
 - **Custom**: --backend custom --base-url URL --model NAME
 - **Direct GGUF**: --direct，自动发现 ~/.lmstudio/models/
 
-### 动态技能加载
-- 扫描 `~/.workbuddy/skills/` 下的 SKILL.md
-- 运行时通过 `load_skill` 工具加载任意技能
-- 自动解析 frontmatter、参数 Schema、触发词
+### 技能编排
+- 32 个可编排技能（有可执行脚本入口）
+- seq / par（真并发）/ loop（真循环，输出回传）
+- 纯提示词技能自动过滤，不参与编排
 
-### 工具集合
-- 文件操作：读/写/列出目录
-- 网络：网页抓取 / 搜索
-- RAG：调用 local-rag-builder 技能
-- Python 执行：沙箱执行代码
+### 工具集合（16 个）
+- 文件：read_file / write_file / list_directory / copy_file / move_file / delete_file / append_file / make_dir / find_files
+- 网络：web_fetch / web_search / python_execute
+- 数据：db_query（SQLite 查询）/ read_table（csv/xlsx 摘要）/ image_info（图片元数据）
+- 技能：load_skill
 
-### Skill Pipeline 编排
-- 链式/并行节点
-- 循环和条件分支
-- GUI 可视化编排界面
+### 文件上传通道
+- 对话框纯文本指令；数据文件经 /api/upload 落盘 input/ 目录
+- 50MB 限制、文件名净化、重名自动加序号
 
 ---
 
@@ -95,6 +107,6 @@ main.py ─── 入口（CLI 交互 / 单次问答 / 检测）
 
 | 文件 | 作用 |
 |------|------|
-| `data/config/settings.json` | 运行时配置（技能路径、超时等） |
-| `data/memory/working_memory.json` | 工作记忆持久化 |
+| `data/config/settings.json` | 运行时配置（LLM 后端/模型/超时/搜索/提示词） |
+| `input/` | 上传文件落盘目录 |
 | `main.py` 配置区 | 代码级默认配置（后端、模型、参数） |

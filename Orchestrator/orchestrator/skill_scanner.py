@@ -11,10 +11,19 @@ if _DIR not in sys.path:
 
 from chain_model import SkillInfo
 
-# 默认技能路径：仅项目内 skills/，不存在则空（不回退到全局目录）
+# 默认技能路径：项目内 skills/ → 用户全局 ~/.workbuddy/skills，两级回退
 _PROJECT_ROOT = os.path.dirname(_DIR)  # Orchestrator/
 _LOCAL_SKILLS = os.path.join(_PROJECT_ROOT, "skills")
-SKILLS_BASE = _LOCAL_SKILLS if os.path.isdir(_LOCAL_SKILLS) else None
+_USER_SKILLS = os.path.join(os.path.expanduser("~"), ".workbuddy", "skills")
+
+def _resolve_skills_base() -> str:
+    """返回第一个存在的技能根目录，都不存在则返回 None"""
+    for p in (_LOCAL_SKILLS, _USER_SKILLS):
+        if os.path.isdir(p):
+            return p
+    return None
+
+SKILLS_BASE = _resolve_skills_base()
 
 
 def _parse_frontmatter(text: str) -> dict:

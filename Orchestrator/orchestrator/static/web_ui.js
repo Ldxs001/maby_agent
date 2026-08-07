@@ -50,6 +50,51 @@ if(document.readyState === 'loading'){
 
 // ===== Chat =====
 var isStreaming = false;
+var pendingAttachments = [];  // [{path, name, size}]
+
+// 上传文件（base64 → /api/upload）
+function uploadFiles(fileList){
+  if(!fileList || fileList.length === 0) return;
+  Array.prototype.forEach.call(fileList, function(file){
+    if(file.size > 50*1024*1024){ toast('文件超过 50MB: '+file.name); return; }
+    var reader = new FileReader();
+    reader.onload = function(ev){
+      var data = ev.target.result.split(',')[1];  // 去掉 data:...;base64, 前缀
+      fetch('/api/upload', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({filename:file.name, data:data})
+      }).then(function(r){return r.json()}).then(function(d){
+        if(d.success){
+          pendingAttachments.push({path:d.path, name:d.name, size:d.size});
+          renderAttachments();
+        } else {
+          toast('上传失败: '+(d.error||'未知错误'));
+        }
+      }).catch(function(e){ toast('上传错误: '+e.message); });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function renderAttachments(){
+  var box = document.getElementById('chat-attachments');
+  if(!box) return;
+  if(pendingAttachments.length === 0){
+    box.style.display = 'none';
+    box.innerHTML = '';
+    return;
+  }
+  box.style.display = 'flex';
+  box.innerHTML = pendingAttachments.map(function(a, i){
+    return '<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:#eef0ff;color:#667eea;border-radius:12px;font-size:12px">'+
+      a.name+' ('+a.size+' 字节) <span style="cursor:pointer;opacity:.5" onclick="removeAttachment('+i+')">x</span></span>';
+  }).join('');
+}
+
+function removeAttachment(idx){
+  pendingAttachments.splice(idx, 1);
+  renderAttachments();
+}
 
 function sendMessage(){
   if(isStreaming) return;
@@ -72,10 +117,17 @@ function sendMessage(){
       if(radios[ri].checked && radios[ri].value==='save'){ saveChain = true; break; }
     }
   }
+  var body = {message:msg, pipeline_id:pipelineId, skill_sub:skillSub, save_chain:saveChain};
+  if(pendingAttachments.length > 0){
+    body.attachments = pendingAttachments.slice();
+  }
   fetch('/api/chat', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({message:msg, pipeline_id:pipelineId, skill_sub:skillSub, save_chain:saveChain})
+    body:JSON.stringify(body)
   }).then(function(r){return r.json()}).then(function(d){
+    // 发送后清空附件
+    pendingAttachments = [];
+    renderAttachments();
     var thinking = document.getElementById('thinking');
     if(thinking) thinking.remove();
     if(d.success){
@@ -92,14 +144,14 @@ function sendMessage(){
             if(round.cohesion_checks && round.cohesion_checks.length){
               html += '<div style="color:#888;margin:4px 0">黏连点检查:</div>';
               round.cohesion_checks.forEach(function(c){
-                var ic = c.compatible ? '✅' : '🔧';
+                var ic = c.compatible ? '[OK]' : '[FIX]';
                 html += '<div style="padding:2px 0;color:#555">' + ic + ' ' + (c.from||'') + ' → ' + (c.to||'') + ': ' + (c.note||'') + '</div>';
               });
             }
             if(round.milestones && round.milestones.length){
               html += '<div style="color:#888;margin:4px 0">里程碑:</div>';
               round.milestones.forEach(function(m){
-                html += '<div style="padding:2px 0;color:#555">🏁 ' + (m.name||'') + '</div>';
+                html += '<div style="padding:2px 0;color:#555">[MS] ' + (m.name||'') + '</div>';
               });
             }
             html += '<div style="color:#888;margin:4px 0">步骤:</div>';
@@ -296,7 +348,7 @@ function renderNodes(nodes, depth, parentPath){
     if(isContainer){
       var childCount = (n.children||[]).length;
       if(childCount < 2 && childCount > 0){
-        groupWarn = '<div style="margin-left:24px;font-size:11px;color:#e67e22;padding:2px 0">⚠️ 仅 '+childCount+' 个成员，不足 2 个将降级为串行</div>';
+        groupWarn = '<div style="margin-left:24px;font-size:11px;color:#e67e22;padding:2px 0">[WARN] 仅 '+childCount+' 个成员，不足 2 个将降级为串行</div>';
       } else if(childCount === 0){
         groupWarn = '<div style="margin-left:24px;font-size:11px;color:#aaa;padding:2px 0">双击左侧技能加入组</div>';
       }
@@ -456,7 +508,7 @@ function flattenTree(nodes, warnings){
       var kids = flattenTree(n.children||[], warnings);
       var label = n.mode === 'par' ? '并行组' : '循环组';
       if(kids.length < 2){
-        warnings.push('⚠️ ['+label+'] 仅 '+kids.length+' 个成员，降级为串行');
+        warnings.push('[WARN] ['+label+'] 仅 '+kids.length+' 个成员，降级为串行');
         result = result.concat(kids);  // 降级
       } else {
         if(n.mode === 'loop'){
@@ -651,7 +703,7 @@ function renderChatSearchPresets(presets){
     container.innerHTML = '';
     return;
   }
-  container.innerHTML = '<span style="font-size:11px;color:#888">🔍</span> ' +
+  container.innerHTML = '<span style="font-size:11px;color:#888">[S]</span> ' +
     presets.map(function(c){
       return '<span style="cursor:pointer;padding:2px 8px;background:#eef0ff;color:#667eea;border-radius:10px;font-size:11px" onclick="quickSearch(\''+c.replace(/'/g,"\\'")+'\')">'+c+'</span>';
     }).join('');

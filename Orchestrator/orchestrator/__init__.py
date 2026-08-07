@@ -16,12 +16,15 @@ LLM 后端可选:
 """
 
 from .agent_config import AgentConfig
-from .agent_loop import Agent, ToolRegistry
 from .llm_client import LLMClient
-from .memory import ConversationMemory, WorkingMemory
 from .tool_base import BaseTool, ToolResult
 from .tools import LoadSkillTool, ReadFileTool, WriteFileTool, ListDirTool
 from .tools import WebFetchTool, WebSearchTool, PythonExecuteTool
+from .tools.file_ops_tool import (
+    CopyFileTool, MoveFileTool, DeleteFileTool,
+    AppendFileTool, MakeDirTool, FindFilesTool,
+)
+from .tools.data_tool import DBQueryTool, ReadTableTool, ImageInfoTool
 
 try:
     from .direct_llm_client import DirectLLMClient
@@ -35,15 +38,17 @@ from .chain_model import SkillInfo, Pipeline, PipelineNode
 from .skill_scanner import scan_skills, search_skills
 from .chain_engine import execute_pipeline, execute_node
 
-__version__ = "2.0.0"
+__version__ = "2.8.1"
 __all__ = [
-    "AgentConfig", "Agent", "ToolRegistry",
+    "AgentConfig",
     "LLMClient", "DirectLLMClient",
-    "ConversationMemory", "WorkingMemory",
     "BaseTool", "ToolResult",
     "ModelManager", "ModelInfo", "ModelType", "get_model_manager",
     "LoadSkillTool", "ReadFileTool", "WriteFileTool", "ListDirTool",
     "WebFetchTool", "WebSearchTool", "PythonExecuteTool",
+    "CopyFileTool", "MoveFileTool", "DeleteFileTool",
+    "AppendFileTool", "MakeDirTool", "FindFilesTool",
+    "DBQueryTool", "ReadTableTool", "ImageInfoTool",
     # Pipeline Orchestrator
     "SkillInfo", "Pipeline", "PipelineNode",
     "scan_skills", "search_skills",

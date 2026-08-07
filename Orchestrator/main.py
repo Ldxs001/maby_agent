@@ -14,7 +14,6 @@ main.py — CLI 入口
   python main.py --backend custom --base-url http://x:8000/v1 --model xxx
   python main.py --direct                              # 直接加载 GGUF
   python main.py --direct --model 2                    # 选择列表中的第2个模型
-  python main.py --query "你的问题"                     # 单次问答
   python main.py --no-rag                              # 不带 RAG 工具
 """
 
@@ -34,20 +33,19 @@ CFG_BASE_URL = ""
 CFG_API_KEY = "not-needed"
 CFG_CUSTOM_MODEL = ""
 
-# 单次问答：留空则进入交互模式
-CFG_QUERY = ""
 
 # 开关
 CFG_VERBOSE = False
 CFG_GPU_LAYERS = -1          # direct模式: -1=自动, 0=纯CPU
 CFG_AUTO_INSTALL_GPU = True  # 自动装 GPU 版
 
-# 技能路径（自包含，只扫这里）
-# 把你想要智能体用的技能复制到这个目录下
+# 技能路径（自包含优先，回退到用户全局技能目录）
+# 把你想要智能体用的技能复制到这两个目录下
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_SCRIPT_DIR)
 CFG_SKILL_DIRS = [
     os.path.join(_PARENT_DIR, "skills"),
+    os.path.join(os.path.expanduser("~"), ".workbuddy", "skills"),
 ]
 # ======================================================================
 
@@ -59,10 +57,14 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 from orchestrator.agent_config import AgentConfig
-from orchestrator.agent_loop import Agent
 from orchestrator.llm_client import LLMClient
 from orchestrator.tools.file_tool import ReadFileTool, WriteFileTool, ListDirTool
+from orchestrator.tools.file_ops_tool import (
+    CopyFileTool, MoveFileTool, DeleteFileTool,
+    AppendFileTool, MakeDirTool, FindFilesTool,
+)
 from orchestrator.tools.web_tool import WebFetchTool, WebSearchTool, PythonExecuteTool
+from orchestrator.tools.data_tool import DBQueryTool, ReadTableTool, ImageInfoTool
 from orchestrator.tools.skill_loader import LoadSkillTool
 
 CAPABILITY_TEXT = """
@@ -92,13 +94,12 @@ def build_parser():
     )
 
     # 运行模式
-    p.add_argument("--query", "-q", default="", help="单次问答（不进入交互模式）")
     p.add_argument("--check", action="store_true", help="仅检测后端连接，不进入对话")
     p.add_argument("--list-models", action="store_true", help="罗列所有可用模型")
     p.add_argument("--verbose", default="", choices=["True", "False", ""],
                    help="是否打印思考过程")
     p.add_argument("--web", action="store_true", help="启动 Web UI")
-    p.add_argument("--port", type=str, default="8765", help="Web UI 端口（默认 8765，设为 auto 自动分配空闲端口）")
+    p.add_argument("--port", type=str, default="8788", help="Web UI 端口（默认 8788，设为 auto 自动分配空闲端口）")
     p.add_argument("--pidfile", default="", help="PID 文件路径（setup.bat 用）")
     # 批处理 / 管道模式
     p.add_argument("--batch", nargs=2, metavar=("INPUT", "OUTPUT"), default=None,
@@ -190,12 +191,16 @@ def make_llm(config, args):
     base_url = args.base_url
     model_name = args.model
 
+    # 优先用已持久化配置（settings.json），CLI 参数可覆盖
+    saved_base = config.data["llm"].get("base_url", "")
+    saved_model = config.data["llm"].get("model_name", "")
+
     if args.backend == "lm-studio":
-        base_url = base_url or "http://localhost:1234/v1"
-        model_name = model_name or "qwen/qwen3.6-35b-a3b"
+        base_url = base_url or saved_base or "http://localhost:1234/v1"
+        model_name = model_name or saved_model or "qwen/qwen3.6-35b-a3b"
     elif args.backend == "ollama":
         base_url = base_url or "http://localhost:11434/v1"
-        model_name = model_name or ""
+        model_name = model_name or saved_model or ""
     elif args.backend == "custom":
         if not base_url:
             print("❌ custom 模式需要 --base-url")
@@ -334,68 +339,6 @@ def _make_direct_llm(config, args):
 
 
 # ======================================================================
-# 创建 Agent
-# ======================================================================
-def create_agent(config, llm):
-    """创建智能体"""
-    agent = Agent(config)
-    agent.llm = llm
-
-    tools = [
-        LoadSkillTool(extra_dirs=CFG_SKILL_DIRS),
-        ReadFileTool(), WriteFileTool(), ListDirTool(),
-        WebFetchTool(), WebSearchTool(), PythonExecuteTool(),
-    ]
-
-    agent.register_tools(tools)
-    return agent
-
-
-# ======================================================================
-# 交互模式
-# ======================================================================
-def interactive(agent, config, backend_name):
-    print()
-    print("=" * 56)
-    print("  Local Agent — 多工具智能体")
-    print(f"  后端: {backend_name}")
-    print(f"  工具: {len(agent.tools.list())} 个")
-    print(f"  命令: /exit  /reset  /tools  /help")
-    print("=" * 56)
-
-    while True:
-        try:
-            text = input("\n你: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n再见")
-            break
-        if not text:
-            continue
-
-        cmd = text.lower()
-        if cmd in ("/exit", "/quit", "exit", "quit"):
-            break
-        if cmd == "/reset":
-            agent.reset()
-            print("已重置")
-            continue
-        if cmd == "/tools":
-            for t in agent.tools.list():
-                print(f"  - {t.name}: {t.description}")
-            continue
-        if cmd == "/help":
-            print("/exit 退出  /reset 重置")
-            print("/tools 查看工具  /help 帮助")
-            continue
-
-        try:
-            answer = agent.run(text)
-            print(f"AI: {answer}")
-        except Exception as e:
-            print(f"错误: {e}")
-
-
-# ======================================================================
 # Pipeline 扁平化与执行（批处理/管道模式用）
 # ======================================================================
 def _flatten_pipeline(nodes, depth=0):
@@ -425,8 +368,37 @@ def _flatten_pipeline(nodes, depth=0):
             result.append({"mode":"seq","display":display,"name":name})
     return result
 
-def _execute_pipeline_batch(nodes, agent=None):
-    """执行 Pipeline 并返回结果文本（批处理/管道模式）"""
+def _run_skill_node(name, display, params, llm):
+    """真执行单个技能节点：找脚本 → subprocess 跑（与 web_ui 相同逻辑）"""
+    from orchestrator.chain_engine import (
+        _find_skill_dir, _get_skill_scripts, _get_main_script, _run_script,
+    )
+    sdir = _find_skill_dir(name)
+    if not sdir:
+        return f"[错误] 找不到技能目录: {name}"
+    scripts = _get_skill_scripts(sdir)
+    main_script = _get_main_script(name, scripts)
+    if not main_script:
+        return f"[不可编排] 技能「{name}」没有可执行脚本（纯提示词技能无法参与链执行）"
+    cli_args = []
+    if isinstance(params, dict):
+        cmd = params.get("command") or params.get("cmd") or params.get("subcommand")
+        if cmd:
+            cli_args.append(str(cmd))
+        args_list = params.get("args") or params.get("arguments") or []
+        if isinstance(args_list, str):
+            args_list = [args_list]
+        if isinstance(args_list, (list, tuple)):
+            cli_args.extend(str(a) for a in args_list)
+        for k, v in params.items():
+            if k in ("command", "cmd", "subcommand", "args", "arguments"):
+                continue
+            cli_args.extend([f"--{k}", str(v)])
+    return _run_script(main_script, 180, cli_args=cli_args)
+
+
+def _execute_pipeline_batch(nodes, llm=None):
+    """执行 Pipeline 并返回结果文本（批处理/管道模式，真执行）"""
     flat = _flatten_pipeline(nodes)
     if not flat:
         return "（空 Pipeline）"
@@ -442,17 +414,21 @@ def _execute_pipeline_batch(nodes, agent=None):
             lines.append(f"  [{i+1}] ↻ 循环组: {display} ({step['times']}次)")
         else:
             name = step.get("name","")
+            params = step.get("params", {})
             lines.append(f"  [{i+1}] → {display}{loop_info}")
-            if agent and name:
+            if name:
+                if llm is None:
+                    lines.append(f"      结果: （LLM 不可用，仅规划）")
+                    continue
                 try:
-                    result = agent.run(f"执行技能: {name}")
+                    result = _run_skill_node(name, display, params, llm)
                     lines.append(f"      结果: {result[:200]}")
                 except Exception as e:
                     lines.append(f"      错误: {e}")
     return "\n".join(lines)
 
 
-def run_batch(input_path, output_path, agent=None):
+def run_batch(input_path, output_path, llm=None):
     """JSON 批处理模式"""
     import time
     start = time.time()
@@ -468,7 +444,7 @@ def run_batch(input_path, output_path, agent=None):
     if not nodes or not isinstance(nodes, list):
         nodes = data if isinstance(data, list) else []
     try:
-        output = _execute_pipeline_batch(nodes, agent)
+        output = _execute_pipeline_batch(nodes, llm)
         elapsed = int((time.time() - start) * 1000)
         result = {"success": True, "output": output, "steps": len(_flatten_pipeline(nodes)), "latency_ms": elapsed}
     except Exception as e:
@@ -483,8 +459,8 @@ def _write_json_output(data, path):
     print(f"  [batch] 结果已写入: {path}")
 
 
-def run_jsonl(agent=None):
-    """JSONL 管道模式"""
+def run_jsonl(llm=None):
+    """JSONL 管道模式（仅 Pipeline 节点执行，无普通对话）"""
     import sys, time
     for line in sys.stdin:
         line = line.strip()
@@ -493,14 +469,11 @@ def run_jsonl(agent=None):
         start = time.time()
         try:
             data = json.loads(line)
-            query = data.get("query", data.get("message", ""))
             nodes = data.get("nodes", data.get("tree", []))
             if nodes:
-                output = _execute_pipeline_batch(nodes, agent)
-            elif query:
-                output = agent.run(query) if agent else f"[jsonl] {query[:100]}"
+                output = _execute_pipeline_batch(nodes, llm)
             else:
-                output = "（空输入）"
+                output = "（空输入，JSONL 仅支持 Pipeline 节点执行）"
             elapsed = int((time.time() - start) * 1000)
             sys.stdout.write(json.dumps({"success": True, "output": output, "latency_ms": elapsed}, ensure_ascii=False) + "\n")
             sys.stdout.flush()
@@ -532,8 +505,6 @@ def main():
         args.api_key = CFG_API_KEY
     if CFG_CUSTOM_MODEL and not args.model:
         args.model = CFG_CUSTOM_MODEL
-    if CFG_QUERY:
-        args.query = CFG_QUERY
     if CFG_VERBOSE:
         args.verbose = "True"
     if CFG_GPU_LAYERS != -1:
@@ -542,13 +513,12 @@ def main():
     if args.direct:
         args.backend = "direct"
 
-    # 加载配置
+    # 加载配置（统一使用 data/config/settings.json）
     if args.config:
         cfg_path = args.config
     else:
-        cwd_cfg = os.path.join(os.getcwd(), "agent_config.json")
-        script_cfg = os.path.join(_SCRIPT_DIR, "agent_config.json")
-        cfg_path = cwd_cfg if os.path.exists(cwd_cfg) else script_cfg
+        script_cfg = os.path.join(_SCRIPT_DIR, "data", "config", "settings.json")
+        cfg_path = script_cfg
 
     config = AgentConfig.load(cfg_path)
 
@@ -557,15 +527,25 @@ def main():
     elif args.verbose == "False":
         config.data["agent"]["verbose"] = False
 
-    # 批处理模式 (无需 LLM)
+    # 批处理模式：真实执行（需 LLM）
     if args.batch:
         input_path, output_path = args.batch
-        run_batch(input_path, output_path, agent=None)
+        try:
+            batch_llm = make_llm(config, args)
+        except SystemExit:
+            print("  [batch] LLM 不可用，降级为步骤规划输出（不执行技能）")
+            batch_llm = None
+        run_batch(input_path, output_path, llm=batch_llm)
         return
 
-    # JSONL 管道模式 (无需 LLM)
+    # JSONL 管道模式：真实执行
     if args.jsonl:
-        run_jsonl(agent=None)
+        try:
+            pipe_llm = make_llm(config, args)
+        except SystemExit:
+            print("  [jsonl] LLM 不可用，降级为步骤规划输出（不执行技能）")
+            pipe_llm = None
+        run_jsonl(llm=pipe_llm)
         return
 
     # 创建 LLM
@@ -573,14 +553,10 @@ def main():
     if args.check:
         return
 
-    # 显示工具列表
+    # 显示能力说明
     print(CAPABILITY_TEXT)
 
-    # 创建智能体
-    from orchestrator.tools.skill_loader import LoadSkillTool
-    agent = create_agent(config, llm)
-
-    # Web UI 模式
+    # Web UI 模式（编排器唯一入口；无 --web 时提示使用方式）
     if args.web:
         import socket
         port = args.port
@@ -598,17 +574,15 @@ def main():
                 with open(portfile, "w") as pf:
                     pf.write(str(port))
         from orchestrator.web_ui import start_web_ui
-        start_web_ui(agent=agent, config=config, port=port)
+        start_web_ui(config=config, llm=llm, port=port)
         return
 
-    if args.query:
-        print(f"Q: {args.query}")
-        try:
-            print(f"A: {agent.run(args.query)}")
-        except Exception as e:
-            print(f"错误: {e}")
-    else:
-        interactive(agent, config, args.backend)
+    # 无交互对话：编排器不是聊天工具，仅提示使用方式
+    print("Orchestrator 是链驱动编排器，不是聊天工具。")
+    print("使用方式:")
+    print("  python main.py --web              # 启动 Web UI（编排 Pipeline）")
+    print("  python main.py --batch in.json out.json   # 批处理执行 Pipeline")
+    print("  python main.py --jsonl < in.jsonl        # JSONL 管道执行")
 
 
 if __name__ == "__main__":

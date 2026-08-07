@@ -3,7 +3,7 @@ web_ui.py — Orchestrator Web 界面
 含对话 + 配置 + Pipeline 编排，三 Tab 切换
 自包含 HTTP 服务器，纯 HTML/CSS/JS 内联
 """
-import os, sys, json, logging, http.server, urllib.parse, socketserver, threading
+import os, sys, json, logging, http.server, urllib.parse, socketserver, threading, re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
 from orchestrator.agent_config import AgentConfig
-from orchestrator.agent_loop import Agent
 from orchestrator.llm_client import LLMClient
 from orchestrator.tool_base import BaseTool, ToolResult
 from orchestrator.tools.file_tool import ReadFileTool, WriteFileTool, ListDirTool
@@ -62,6 +61,8 @@ class OrchestratorHandler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/api/chat":
             self._handle_chat_post()
+        elif path == "/api/upload":
+            self._handle_upload()
         elif path == "/api/config":
             self._handle_config_post()
         elif path == "/api/pipelines":
@@ -113,12 +114,21 @@ class OrchestratorHandler(http.server.BaseHTTPRequestHandler):
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
             ext = os.path.splitext(file_path)[1]
-            mime = {"": "text/plain"}
-            if ext == ".js": mime[""] = "application/javascript"
-            elif ext == ".css": mime[""] = "text/css"
-            elif ext == ".html": mime[""] = "text/html"
+            mime = {
+                ".js": "application/javascript",
+                ".css": "text/css",
+                ".html": "text/html",
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".gif": "image/gif",
+                ".svg": "image/svg+xml",
+                ".woff": "font/woff",
+                ".woff2": "font/woff2",
+                ".ttf": "font/ttf",
+            }.get(ext, "text/plain")
             self.send_response(200)
-            self.send_header("Content-Type", mime[""] + "; charset=utf-8")
+            self.send_header("Content-Type", mime + "; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(content.encode("utf-8"))
@@ -132,7 +142,7 @@ class OrchestratorHandler(http.server.BaseHTTPRequestHandler):
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Orchestrator Web UI</title>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="/static/marked.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f6fa;color:#333;height:100vh;display:flex;flex-direction:column}
@@ -266,9 +276,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <div id="chat-messages">
     <div class="msg assistant">你好！我是 Orchestrator 智能体。<br>输入问题，我会调用工具来回答。</div>
   </div>
-  <div class="chat-input-panel">
+    <div class="chat-input-panel">
     <div class="chat-input-tools">
       <select id="chat-pipeline-select"><option value="">-- 选择 Pipeline --</option></select>
+      <button class="btn btn-secondary" onclick="document.getElementById('file-input').click()" style="font-size:12px;padding:4px 10px">上传文件</button>
+      <input type="file" id="file-input" multiple style="display:none" onchange="uploadFiles(this.files)">
       <label><input type="checkbox" id="chat-skillsub" onchange="onSkillSubToggle()"> skill-sub 优化</label>
       <label id="chat-skillsub-save-group" style="display:none;font-size:12px;color:#888">
         <label style="cursor:pointer"><input type="radio" name="skillsub-mode" value="single" checked> 单次执行</label>
@@ -277,6 +289,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       <span style="flex:1"></span>
       <div id="chat-search-presets" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"></div>
     </div>
+    <div id="chat-attachments" style="display:none;padding:4px 16px;background:#fafbfc;border-bottom:1px solid #f0f0f0;flex-wrap:wrap;gap:6px"></div>
     <div class="chat-input-row">
       <textarea id="chat-input" rows="2" placeholder="输入消息...（支持自然语言+文件选择）" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"></textarea>
       <button id="send-btn" onclick="sendMessage()">发送</button>
@@ -396,12 +409,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <div class="config-section">
       <h3>提示词</h3>
       <div class="config-row" style="flex-direction:column;align-items:stretch">
-        <label style="margin-bottom:4px">系统提示词（只读）</label>
+        <label style="margin-bottom:4px">系统提示词（只读，编排器本体定义）</label>
         <textarea id="cfg-system-prompt" rows="6" readonly style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:12px;font-family:monospace;background:#f8f8f8;color:#555;resize:vertical;outline:none;line-height:1.6"></textarea>
       </div>
       <div class="config-row" style="flex-direction:column;align-items:stretch;margin-top:12px">
-        <label style="margin-bottom:4px">用户提示词（可编辑，追加到系统提示词末尾）</label>
-        <textarea id="cfg-user-prompt" rows="3" placeholder="输入自定义指令，如：用中文回答、输出简洁、优先提供代码示例等。" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:13px;resize:vertical;outline:none;font-family:inherit;line-height:1.6"></textarea>
+        <label style="margin-bottom:4px">用户提示词（可编辑）</label>
+        <textarea id="cfg-user-prompt" rows="3" placeholder="仅作用于前处理与输出格式：如「用中文分析任务」「最终输出为 Markdown 报告」「表格优先」。不干预 Pipeline 执行。" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:13px;resize:vertical;outline:none;font-family:inherit;line-height:1.6"></textarea>
+        <div style="font-size:11px;color:#888;margin-top:4px">作用域：需求分析（前处理）+ 输出整理。Pipeline 执行是确定性脚本运行，不受提示词影响。</div>
       </div>
     </div>
     <!-- 技能路径 -->
@@ -517,23 +531,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         if body.get("reset"):
-            if self.agent:
-                self.agent.reset()
             self._send_json({"success": True})
             return
         msg = body.get("message", "")
         pipeline_id = body.get("pipeline_id", "")
         skill_sub = body.get("skill_sub", False)
         save_chain = body.get("save_chain", False)
+        attachments = body.get("attachments", [])  # [{path, name, size}]
 
-        # 没有链 → 回退到原始 ReAct（零闲聊）
+        # 编排器不是聊天工具：必须选择 Pipeline 才能执行
         if not pipeline_id:
-            try:
-                answer = self.agent.run(msg) if self.agent else "Agent 未初始化"
-                self._send_json({"success": True, "text": answer, "kb": ""})
-            except Exception as e:
-                logger.exception("chat error")
-                self._send_json({"success": False, "error": str(e)})
+            self._send_json({"success": False,
+                             "error": "请先在 Pipeline Tab 编排技能链并保存，然后在对话中选择 Pipeline 执行。"})
             return
 
         # ================================================================
@@ -558,8 +567,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 
         rounds = []
 
+        # 附件信息注入：把上传的文件路径附加到任务描述，供需求分析/执行引用
+        attach_note = ""
+        if attachments:
+            lines = ["\n\n[已附加文件]"]
+            for a in attachments:
+                p = a.get("path", "") if isinstance(a, dict) else str(a)
+                n = a.get("name", os.path.basename(p)) if isinstance(a, dict) else os.path.basename(p)
+                s = a.get("size", 0) if isinstance(a, dict) else 0
+                lines.append(f"  - {n} ({s} 字节): {p}")
+            attach_note = "\n".join(lines)
+        task_desc = msg + attach_note
+
         # ─── Round 1: 需求分析 ───
-        analysis = self._round_analysis(tree, msg, pipeline_id)
+        analysis = self._round_analysis(tree, task_desc, pipeline_id)
         rounds.append({"type": "analysis", "title": "需求分析", "content": analysis})
 
         # ─── Round 2 (if skill-sub): 优化 ───
@@ -567,7 +588,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         cohesion_checks = []
         milestones = []
         if skill_sub:
-            opt_result = self._skill_sub_optimize(tree, msg, pipeline_id)
+            opt_result = self._skill_sub_optimize(tree, task_desc, pipeline_id)
             optimized_steps = opt_result.get("steps", [])
             cohesion_checks = opt_result.get("cohesion_checks", [])
             milestones = opt_result.get("milestones", [])
@@ -578,25 +599,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         # ─── Round 3+: 执行 ───
         if optimized_steps:
             # 按优化步骤逐步执行
-            step_results, exec_content = self._execute_optimized_steps(optimized_steps, cohesion_checks, milestones, msg)
+            step_results, exec_content = self._execute_optimized_steps(optimized_steps, cohesion_checks, milestones, task_desc)
         else:
             # 直接用 _execute_tree（支持 seq/par/loop）
             output_lines = []
             step_count = [0]
-            self._execute_tree(tree, output_lines, 0, step_count, prev_output=msg)
+            self._execute_tree(tree, output_lines, 0, step_count, prev_output=task_desc)
             exec_content = "\n".join(output_lines)
             step_results = []
 
         rounds.append({"type": "execution", "title": "执行结果", "content": exec_content, "steps": step_results})
 
-        # ─── 组装响应 ───
-        self._send_json({
-            "success": True,
-            "rounds": rounds,
-            "chain": {"pipeline": pipeline_id},
-        })
+        # ─── Round 4: 输出整理（用户提示词管"最终输出"，不保证完全按提示词） ───
+        final_output = self._finalize_output(rounds, msg)
+        if final_output:
+            rounds.append({"type": "final", "title": "最终输出", "content": final_output})
 
-        # ---------- step 4: 保存优化链 ----------
+        # ─── 先保存优化链（若有），再发送响应 ───
         if save_chain:
             try:
                 # 将优化结果保存到 extra 字段
@@ -608,14 +627,69 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
             except Exception as e:
                 logger.warning(f"保存优化链失败: {e}")
 
+        # ─── 组装响应（单次响应，修复双 send_json + 未定义变量崩溃） ───
         self._send_json({
             "success": True,
-            "text": full_output,
-            "chain": chain_info,
-            "kb": "",
+            "rounds": rounds,
+            "chain": {"pipeline": pipeline_id},
+            "text": final_output or exec_content[:2000],
+        })
+
+    def _handle_upload(self):
+        """上传文件到 input/ 目录（base64 JSON）。返回可被 skill 引用的绝对路径。"""
+        import base64
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            self._send_json({"success": False, "error": "空请求"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception as e:
+            self._send_json({"success": False, "error": f"解析失败: {e}"})
+            return
+
+        filename = str(body.get("filename", "")).strip()
+        data_b64 = body.get("data", "")
+        if not filename or not data_b64:
+            self._send_json({"success": False, "error": "缺少 filename 或 data"})
+            return
+
+        # 安全化文件名：去路径分隔符、控制字符
+        safe_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", os.path.basename(filename))
+        if not safe_name:
+            self._send_json({"success": False, "error": "文件名非法"})
+            return
+
+        # 大小限制（base64 解码后 50MB）
+        raw = base64.b64decode(data_b64)
+        if len(raw) > 50 * 1024 * 1024:
+            self._send_json({"success": False, "error": "文件超过 50MB 限制"})
+            return
+
+        input_dir = os.path.join(os.path.dirname(_DIR), "input")
+        os.makedirs(input_dir, exist_ok=True)
+
+        # 重名自动加序号
+        target = os.path.join(input_dir, safe_name)
+        base, ext = os.path.splitext(safe_name)
+        n = 1
+        while os.path.exists(target):
+            target = os.path.join(input_dir, f"{base}_{n}{ext}")
+            n += 1
+
+        with open(target, "wb") as f:
+            f.write(raw)
+
+        self._send_json({
+            "success": True,
+            "path": target,
+            "name": os.path.basename(target),
+            "size": len(raw),
+            "dir": input_dir,
         })
 
     def _handle_chat_get(self):
+        """编排器无对话历史（链驱动执行，非聊天工具）"""
         self._send_json({"success": True, "messages": []})
 
     def _serve_config(self):
@@ -634,9 +708,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         result["search_google_cx"] = search.get("google_cx", "")
         result["search_bing_key"] = search.get("bing_key", "")
         result["search_presets"] = search.get("presets", [])
-        # 提示词
+        # 提示词（返回编排器本体系统提示词）
         result["user_prompt"] = cfg.get("prompt", {}).get("user", "")
-        result["system_prompt_raw"] = "核心工作方式：执行技能链（Pipeline），按步骤逐一执行直到完成。\n[完整提示词请查看 agent_loop.py 中的 REACT_SYSTEM_PROMPT]"
+        try:
+            from orchestrator.agent_loop import ORCHESTRATOR_SYSTEM_PROMPT
+            result["system_prompt_raw"] = ORCHESTRATOR_SYSTEM_PROMPT
+        except Exception:
+            result["system_prompt_raw"] = "（无法读取系统提示词）"
         # 技能路径
         skill_dirs = cfg.get("skills", {}).get("dirs", [])
         result["skill_dirs"] = skill_dirs if skill_dirs else []
@@ -727,6 +805,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
             skills = scan_skills(*custom_dirs) if custom_dirs else scan_skills()
             data = []
             for s in skills:
+                # 只展示可编排技能（有 scripts/ 或 CLI 入口），纯提示词技能不参与链执行
+                if not self._is_executable_skill(s):
+                    continue
                 data.append({
                     "name": s.name, "display_name": s.display_name,
                     "description": s.description, "version": s.version,
@@ -734,6 +815,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
             self._send_json({"skills": data})
         except Exception as e:
             self._send_json({"skills": [], "error": str(e)})
+
+    @staticmethod
+    def _is_executable_skill(skill) -> bool:
+        """判断技能是否可编排：能找到可执行主脚本入口（scripts/ 下与技能名匹配的脚本 或 main/cli/run 入口）。
+
+        比"scripts/ 有任意 .py"更严格：有脚本但无入口的（纯提示词/辅助脚本）不参与编排。
+        """
+        try:
+            from orchestrator.chain_engine import _get_skill_scripts, _get_main_script
+            scripts = _get_skill_scripts(skill.path)
+            if not scripts:
+                return False
+            return _get_main_script(skill.name, scripts) is not None
+        except Exception:
+            return False
 
     def _skill_scan_with_config(self) -> list:
         """统一用配置路径扫描技能"""
@@ -854,12 +950,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
             elif mode == "loop":
                 times = node.get("loop_times", 3) or node.get("times", 3)
                 output.append(f"{indent}[循环组] {display} ×{times}")
-                loop_input = prev_output
+                loop_input = prev_output  # 第一轮输入 = 链上前一步的输出
                 for t in range(times):
                     output.append(f"{indent}  第 {t+1} 次:")
-                    # 循环体：输出不回传（避免指数增长），但可以为每个循环设置独立上下文
-                    self._execute_tree(children, output, depth + 1, step_counter,
+                    # 每轮用独立收集器执行子节点，结束后提取本轮结果回传给下一轮
+                    round_lines = []
+                    self._execute_tree(children, round_lines, depth + 1, step_counter,
                                        prev_output=loop_input, indent=indent + "    ")
+                    output.extend(round_lines)
+                    # 提取本轮最后一个「结果:」作为下一轮输入（输出回传）
+                    last_result = ""
+                    for line in round_lines:
+                        if "结果:" in line:
+                            last_result = line.split("结果:", 1)[1].strip()
+                    if last_result:
+                        loop_input = last_result
 
             else:  # seq
                 if step_counter is not None: step_counter[0] += 1
@@ -873,44 +978,48 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
                     prev_output = ""
 
     def _execute_single_skill(self, name: str, display: str, params: dict, prev_output: str) -> str:
-        """通过 LLM 直接执行单个技能节点。不走 agent.run() 的 ReAct 循环。"""
-        if not self.llm:
-            raise RuntimeError(f"LLM 未初始化，无法执行 Pipeline")
+        """真执行单个技能节点：找到 skill 脚本 → subprocess 运行（params 转 CLI 参数，prev_output 作为 stdin 输入）。
 
-        # 从配置读取超时和 max_tokens
-        llm_cfg = self.config.data.get("llm", {}) if self.config else {}
-        exec_timeout = int(llm_cfg.get("timeout", 180))
-        exec_max_tokens = int(llm_cfg.get("max_tokens", 4096))
-
-        # 读 SKILL.md 摘要，注入到 prompt
-        skill_desc = self._read_skill_summary(name)
-
-        param_str = ""
-        if params:
-            param_str = "\n".join(f"  {k}: {v}" for k, v in params.items())
-
-        context = ""
-        if prev_output and prev_output.strip():
-            context = f"\n前一步骤输出作为输入:\n{prev_output[:2000]}"
-
-        prompt = (
-            f"你正在执行步骤「{display}」。\n\n"
-            f"技能说明:\n{skill_desc or '（无详细说明）'}"
-            f"{'参数:\n' + param_str if param_str else ''}"
-            f"{context}\n\n"
-            f"请直接输出该步骤的执行结果。不要解释过程，不要输出 JSON。"
+        与 chain_engine 共用同一套脚本发现/执行逻辑，保证 Web UI 与 CLI 行为一致。
+        """
+        from orchestrator.chain_engine import (
+            _find_skill_dir, _get_skill_scripts, _get_main_script, _run_script,
         )
 
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            fut = pool.submit(lambda: self.llm.chat(
-                [{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=exec_max_tokens
-            ))
-            response = fut.result(timeout=exec_timeout)
+        # 1. 找到技能目录与主脚本（支持 workday-calendar ↔ workday_calendar.py 归一化）
+        sdir = _find_skill_dir(name)
+        if not sdir:
+            return f"[错误] 找不到技能目录: {name}"
 
-        return (response or "").strip()[:3000] or "（空结果）"
+        scripts = _get_skill_scripts(sdir)
+        main_script = _get_main_script(name, scripts)
+        if not main_script:
+            return (f"[不可编排] 技能「{name}」没有可执行脚本（scripts/ 下无匹配入口），"
+                    f"纯提示词技能无法参与链执行。")
+
+        # 2. 从配置读取超时
+        llm_cfg = self.config.data.get("llm", {}) if self.config else {}
+        exec_timeout = int(llm_cfg.get("timeout", 180))
+
+        # 3. params → CLI 参数（command + args + --key value）
+        cli_args = []
+        if isinstance(params, dict):
+            cmd = params.get("command") or params.get("cmd") or params.get("subcommand")
+            if cmd:
+                cli_args.append(str(cmd))
+            args_list = params.get("args") or params.get("arguments") or []
+            if isinstance(args_list, str):
+                args_list = [args_list]
+            if isinstance(args_list, (list, tuple)):
+                cli_args.extend(str(a) for a in args_list)
+            for k, v in params.items():
+                if k in ("command", "cmd", "subcommand", "args", "arguments"):
+                    continue
+                cli_args.extend([f"--{k}", str(v)])
+
+        # 4. 真执行：subprocess 跑脚本，前步输出作为 stdin
+        return _run_script(main_script, exec_timeout, cli_args=cli_args,
+                           input_text=prev_output or None)
 
     def _read_skill_summary(self, name: str) -> str:
         """读取技能的 SKILL.md 摘要"""
@@ -1179,39 +1288,50 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
             return prev_output
 
     def _execute_chain_step(self, step, prev_output, step_idx):
-        """执行链中的单个步骤。用 llm.chat() 直接输出，不走 ReAct。"""
-        if not self.llm:
-            raise RuntimeError("LLM 未初始化，无法执行")
-
-        llm_cfg = self.config.data.get("llm", {}) if self.config else {}
-        exec_max_tokens = int(llm_cfg.get("max_tokens", 4096))
+        """执行链中的单个步骤。真执行：调用 skill 脚本，params 转 CLI 参数。"""
+        from orchestrator.chain_engine import (
+            _find_skill_dir, _get_skill_scripts, _get_main_script, _run_script,
+        )
 
         step_name = step.get("name", step.get("skill", f"步骤{step_idx}"))
         skill_name = step.get("skill", step.get("name", ""))
         params = step.get("params", {})
-        input_spec = step.get("input_spec", "")
 
-        skill_desc = self._read_skill_summary(skill_name)
-        param_str = ""
-        if params:
-            param_str = "\n".join(f"  {k}: {v}" for k, v in params.items())
-        context = ""
-        if prev_output and prev_output.strip():
-            context = f"\n前一步输出:\n{prev_output[:2000]}"
-        spec = ""
-        if input_spec:
-            spec = f"\n期望输入格式: {input_spec}"
+        # 转换步骤（skill 为空）→ 交给 LLM 转换
+        if not skill_name or step.get("_is_transform") or str(skill_name).startswith("转换:"):
+            transformed = self._llm_transform(prev_output, str(params.get("transform", "")))
+            return {"name": step_name, "success": True, "output": transformed[:5000]}
 
-        prompt = (
-            f"执行步骤「{step_name}」\n\n"
-            f"技能: {skill_name}\n"
-            f"{skill_desc}"
-            f"{'参数:\n' + param_str if param_str else ''}"
-            f"{spec}{context}\n\n"
-            f"输出该步骤的执行结果。不要解释。"
-        )
-        response = self.llm.chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=exec_max_tokens)
-        return {"name": step_name, "success": True, "output": (response or "").strip()[:5000]}
+        sdir = _find_skill_dir(skill_name)
+        if not sdir:
+            return {"name": step_name, "success": False, "error": f"找不到技能目录: {skill_name}"}
+
+        main_script = _get_main_script(skill_name, _get_skill_scripts(sdir))
+        if not main_script:
+            return {"name": step_name, "success": False,
+                    "error": f"技能「{skill_name}」无脚本，纯提示词技能不可编排"}
+
+        llm_cfg = self.config.data.get("llm", {}) if self.config else {}
+        exec_timeout = int(llm_cfg.get("timeout", 180))
+
+        cli_args = []
+        if isinstance(params, dict):
+            cmd = params.get("command") or params.get("cmd") or params.get("subcommand")
+            if cmd:
+                cli_args.append(str(cmd))
+            args_list = params.get("args") or params.get("arguments") or []
+            if isinstance(args_list, str):
+                args_list = [args_list]
+            if isinstance(args_list, (list, tuple)):
+                cli_args.extend(str(a) for a in args_list)
+            for k, v in params.items():
+                if k in ("command", "cmd", "subcommand", "args", "arguments"):
+                    continue
+                cli_args.extend([f"--{k}", str(v)])
+
+        out = _run_script(main_script, exec_timeout, cli_args=cli_args,
+                          input_text=prev_output or None)
+        return {"name": step_name, "success": True, "output": out[:5000]}
 
     def _enrich_tree_with_optimization(self, tree, steps, cohesion_checks, milestones):
         """将优化结果写入 tree 节点的 extra 字段"""
@@ -1233,8 +1353,28 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     # 链驱动对话：轮次方法
     # ==================================================================
 
+    def _user_prompt_block(self) -> str:
+        """读取用户提示词，作为前后处理的行为约束"""
+        try:
+            up = self.config.user_prompt
+            if up and up.strip():
+                return f"\n\n## 用户自定义指令（前处理/输出整理时遵循）\n{up}"
+        except Exception:
+            pass
+        return ""
+
+    def _tools_summary(self) -> str:
+        """可用工具清单（注入前处理 prompt，告诉 LLM 有哪些工具能调）"""
+        names = [
+            "db_query(SQLite查询)", "read_table(csv/xlsx摘要)", "image_info(图片元数据)",
+            "read_file", "write_file", "list_directory", "copy_file", "move_file",
+            "delete_file", "append_file", "make_dir", "find_files",
+            "web_fetch", "web_search", "python_execute", "load_skill",
+        ]
+        return "可用工具: " + ", ".join(names)
+
     def _round_analysis(self, tree, task, pipeline_id) -> str:
-        """Round 1: LLM 分析任务需求"""
+        """Round 1: LLM 分析任务需求（前处理：按用户提示词理解任务 + 用工具处理数据）"""
         skill_names = []
         def _collect(nodes):
             for n in nodes:
@@ -1254,26 +1394,63 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
                 f"## 用户任务\n{task}\n\n"
                 f"## Pipeline 名称\n{pipeline_id}\n\n"
                 f"## 技能链\n{skills_str}\n\n"
+                f"## 前处理要求\n"
+                f"如果任务涉及上传的文件/数据库/表格/图片，先用工具获取必要信息（如 db_query 查数据、read_table 看表格结构、image_info 识别图片、read_file 读文本），不要假设内容。\n"
+                f"{self._tools_summary()}\n"
                 f"请分析：\n"
                 f"1. 这个任务需要哪些步骤来完成？\n"
                 f"2. 每个步骤对应链中的哪个技能？\n"
-                f"3. 预期的最终输出是什么？\n\n"
+                f"3. 每个技能需要什么输入（来自任务文本、上传文件还是上一步输出）？\n"
+                f"4. 预期的最终输出是什么？\n\n"
                 f"用简洁的语言描述。"
+                f"{self._user_prompt_block()}"
             )
             resp = self.llm.chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=1024)
             return (resp or "").strip()[:2000] or skills_str
         except Exception as e:
             return f"任务: {task}\n技能链: {skills_str}\n（分析异常: {e}）"
 
+    def _finalize_output(self, rounds, task) -> str:
+        """输出整理：LLM 按用户提示词整理最终交付。
+
+        注意：不保证完全按提示词执行——若 Pipeline 输出已是最终形态，如实呈现。
+        """
+        if not self.llm:
+            return ""
+        try:
+            # 汇总各轮内容
+            parts = []
+            for r in rounds:
+                title = r.get("title", "")
+                content = r.get("content", "")
+                if content:
+                    parts.append(f"## {title}\n{content[:4000]}")
+            summary = "\n\n".join(parts)
+
+            prompt = (
+                f"以下是智能体链执行的完整过程记录。请按用户要求整理最终交付结果。\n\n"
+                f"## 过程记录\n{summary[:6000]}\n\n"
+                f"## 整理要求\n"
+                f"1. 以用户任务为基准，从过程记录中提炼最终结果\n"
+                f"2. 如果用户提示词指定了输出格式（如 Markdown/表格/文件路径），按它整理\n"
+                f"3. 如果过程记录本身已是完整交付物（如已生成的文件），直接说明结果与文件位置，不重复加工\n"
+                f"4. 简洁呈现，不要复述过程\n"
+                f"{self._user_prompt_block()}"
+            )
+            resp = self.llm.chat([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=2048)
+            return (resp or "").strip()[:4000]
+        except Exception:
+            return ""
+
     def _format_optimization_report(self, steps, checks, milestones) -> str:
         """格式化为可读的优化报告"""
         lines = [f"优化完成: {len(steps)} 个步骤"]
         for c in checks:
-            icon = "✅" if c.get("compatible") else "🔧"
+            icon = "[OK]" if c.get("compatible") else "[FIX]"
             lines.append(f"{icon} {c.get('from','')} → {c.get('to','')}: {c.get('note','')}")
         if milestones:
             lines.append("")
-            lines.append("🏁 里程碑:")
+            lines.append("[MS] 里程碑:")
             for m in milestones:
                 lines.append(f"   · {m.get('name','')} (在 {m.get('at','')})")
         lines.append("")
@@ -1304,7 +1481,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
                     if transform:
                         conversion = self._llm_transform(prev_output, transform)
                         prev_output = conversion
-                        lines.append(f"  🔧 黏连转换: {check.get('from','')} → {step_name}")
+                        lines.append(f"  [FIX] 黏连转换: {check.get('from','')} → {step_name}")
 
             # 执行
             sr = self._execute_chain_step(step, prev_output, i)
@@ -1313,7 +1490,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
             if sr.get("success"):
                 prev_output = sr.get("output", "")
                 out = sr.get("output", "")[:200]
-                lines.append(f"  ✅ {step_name}")
+                lines.append(f"  [OK] {step_name}")
                 if out:
                     lines.append(f"     {out}")
             else:
@@ -1323,23 +1500,25 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
             # 里程碑
             for ms in milestones:
                 if ms.get("at") == step_name:
-                    lines.append(f"  🏁 里程碑: {ms.get('name', '')}")
+                    lines.append(f"  [MS] 里程碑: {ms.get('name', '')}")
 
         return step_results, "\n".join(lines)
 
     def _recreate_llm(self):
+        """重建 LLM 客户端（界面改配置后生效）"""
         if self.config:
             self.llm = LLMClient(self.config)
 
 
-def start_web_ui(agent: "Agent" = None, config: "AgentConfig" = None,
-                 host: str = "0.0.0.0", port: int = 8765):
+def start_web_ui(config: "AgentConfig" = None, llm: "LLMClient" = None,
+                 host: str = "0.0.0.0", port: int = 8788):
     """启动 Web UI 服务器"""
-    OrchestratorHandler.agent = agent
     OrchestratorHandler.config = config
-    OrchestratorHandler.llm = LLMClient(config) if config else None
+    OrchestratorHandler.llm = llm or (LLMClient(config) if config else None)
 
-    server = socketserver.TCPServer((host, port), OrchestratorHandler)
+    server = socketserver.ThreadingTCPServer((host, port), OrchestratorHandler)
+    server.daemon_threads = True
+    server.allow_reuse_address = True
     logger.info(f"Orchestrator Web UI 启动: http://{host}:{port}")
     print(f"  Web UI: http://localhost:{port}")
     print(f"  Ctrl+C 停止")
