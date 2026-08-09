@@ -1,0 +1,695 @@
+"""
+local-rag-builder 共享核心模块
+v0.3.0
+
+纯核心层：不涉及任何 LLM 调用，不依赖外部服务。
+同时被 rag_skill.py（技能接口）和 rag_standalone.py（独立系统）导入。
+
+v0.3.0 新增：路由层（router）和重排序层（reranker）集成
+"""
+
+import os
+import json
+import re
+
+from config import load_config
+from utils import KB_DIR, MODELS_DIR, find_model_dirs
+
+
+# ── 头部块标记（is_header） ──
+
+def _looks_like_header(text: str) -> bool:
+    """轻量探测：检查文本是否包含头部区域常见模式
+
+    仅用于辅助扩展 is_header 边界（+1），不追求精确覆盖。
+    位置兜底(块0-3)才是主力。
+    """
+    t = text[:300]
+    if not t.strip():
+        return False
+    # 作者行：逗号分隔的连续短单元链（≥3个短单元，每个去空白后≤6字且含汉字）
+    # 作者行是"名，名，名"连续短链；正文是"长单元，短单元，长单元"长短交错，链断裂
+    # - 纯编号（1、2、1,2、2+）视为中性单元：不断链不计数（作者上标编号）
+    # - 英文/公式/符号单元（wA1、. . .、{IMG）断链（避免英文库误判）
+    # 相比旧正则（任意"短词,短词"部分匹配），单元级检查大幅压制"长短语误判"
+    _run = 0
+    for _u in re.split(r'[，,；;、]', t):
+        _c = re.sub(r'\s+', '', _u)
+        if not _c:
+            _run = 0
+            continue
+        if re.search(r'[\u4e00-\u9fff]', _c):
+            if len(_c) <= 6:
+                _run += 1
+                if _run >= 3:
+                    return True
+            else:
+                _run = 0
+        elif re.fullmatch(r'[\d,+*]{1,4}', _c):
+            pass  # 编号中性：不断链不计数
+        else:
+            _run = 0  # 英文公式/符号 → 断链
+    # 机构/发布方
+    if re.search(r'(大学|学院|研究所|研究院|实验室|有限公司|集团|医院|'
+                 r'中心[，。\s\n]|局[，。\s\n]|部[，。\s\n]|委员会)', t):
+        return True
+    # 论文/SOP/标准头标记
+    if re.search(r'(摘要|关键词|Keywords|中图分类号|CLC|DOI|文章编号|'
+                 r'文献标识码|基金项目|收稿日期|修回日期|录用日期|'
+                 r'文件编号|起草单位|发布单位|编制|审核|批准|代替|归口)', t[:100]):
+        return True
+    # 期刊/出版信息（第XX卷 第XX期、学报、通报等）
+    if re.search(r'(第\d+卷\s*第\d+期|Vol\.\s*\d+\s*No\.\s*\d+|'
+                 r'学报\b|通报\b|杂志\b|期刊\b|出版社\b)', t[:200]):
+        return True
+    # 文章类型（论著/综述/研究报告等）
+    if re.search(r'^(论著|综述|研究报告|研究论文|简报|简讯|信函|'
+                 r'经验交流|病例报告|技术报告|方法|标准|规范|指南)', t.strip()[:20]):
+        return True
+    return False
+
+
+def mark_header_chunks(chunks: list):
+    """给分块打 is_header 标记：逐块内容探测 + 位置兜底(0-3)
+
+    策略：
+    - 逐块内容探测：标题/作者/单位/期刊名/文章编码等任何头部信息，块0-3也参与
+    - 每命中一块，下一块也标记（边界安全，防止切分截断）
+    - 最后位置兜底：块0-3无条件标记（保底，布尔幂等，不跳过已标记块）
+    - 不连续延长：两个命中块之间不自动填充
+    """
+    if not chunks:
+        return
+
+    # 全部初始化为 False
+    for c in chunks:
+        c.metadata["is_header"] = False
+
+    max_seq = max(c.metadata.get("chunk_seq", 0) for c in chunks)
+
+    # 内容探测：逐块检查（0-3 也参与，避免头部切碎在 3/4 边界时漏扩展），命中则标记本块+下一块
+    def _set_seq(seq, val=True):
+        for nc in chunks:
+            if nc.metadata.get("chunk_seq", 999) == seq:
+                nc.metadata["is_header"] = val
+                return
+
+    for c in chunks:
+        seq = c.metadata.get("chunk_seq", 999)
+        text = c.page_content if hasattr(c, "page_content") else ""
+        if text and _looks_like_header(text):
+            _set_seq(seq, True)
+            if seq + 1 <= max_seq:
+                _set_seq(seq + 1, True)
+
+    # 位置兜底：块0-3（后置，幂等覆盖，不跳过已标记块）
+    for c in chunks:
+        seq = c.metadata.get("chunk_seq", 999)
+        if seq <= 3:
+            c.metadata["is_header"] = True
+
+
+def apply_markdown_preprocess(text: str, preprocess_cfg: dict) -> str:
+    """Markdown 标题预处理：根据正则匹配行，注入 Markdown 标题标记"""
+    if not preprocess_cfg or not preprocess_cfg.get("enabled"):
+        return text
+
+    # 构建 (level_prefix, [compiled_patterns]) 映射，按级别优先
+    patterns = []
+    for level, prefix in [(1, "# "), (2, "## "), (3, "### "), (4, "#### ")]:
+        raw_list = preprocess_cfg.get(f"h{level}_patterns", [])
+        compiled = []
+        for p in raw_list:
+            p = p.strip()
+            if p:
+                try:
+                    compiled.append((re.compile(p), prefix))
+                except re.error:
+                    pass  # 非法正�则忽略
+        patterns.extend(compiled)
+
+    if not patterns:
+        return text
+
+    lines = text.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        matched = False
+        for pattern, prefix in patterns:
+            m = pattern.match(stripped)
+            if m:
+                title = m.group(1) if m.lastindex and m.lastindex >= 1 else stripped
+                result.append(f"{prefix}{title}")
+                matched = True
+                break
+        if not matched:
+            result.append(line)
+
+    return "\n".join(result)
+
+
+# 嵌入模型缓存（同一路径只加载一次）
+_EMBEDDING_CACHE: dict = {}
+
+
+def get_embeddings(model_path=None, device="auto", kb_name=None):
+    """获取嵌入模型实例（已缓存，同一路径只加载一次）"""
+    from embeddings import SentenceTransformerEmbeddings
+    import torch
+
+    cfg = load_config()
+    emb_cfg = cfg.get("embedding", {})
+
+    # 如果指定了知识库，优先查 KB 专属模型
+    if model_path is None and kb_name:
+        try:
+            from knowledge_base_manager import get_kb_model
+            kb_model = get_kb_model(kb_name)
+            if kb_model:
+                model_path = kb_model
+        except Exception:
+            pass
+
+    if model_path is None:
+        model_path = emb_cfg.get("model_path", "")
+
+    # 如果 model_path 不是有效路径，尝试从 model_index.json 解析 model_id → 路径
+    if model_path and not os.path.exists(model_path):
+        from utils import MODELS_DIR
+        index_path = os.path.join(MODELS_DIR, "model_index.json")
+        if os.path.exists(index_path):
+            try:
+                import json
+                with open(index_path, "r", encoding="utf-8") as f:
+                    idx = json.load(f)
+                # 精确匹配 model_id
+                if model_path in idx:
+                    actual = idx[model_path].get("path", "")
+                    if actual and os.path.exists(actual):
+                        model_path = actual
+                # 模糊匹配子路径（如 model_path 是 HuggingFace ID，索引用反斜杠路径）
+                if not os.path.exists(model_path):
+                    for mid, info in idx.items():
+                        if mid.replace("/", "_") in model_path or mid == model_path:
+                            actual = info.get("path", "")
+                            if actual and os.path.exists(actual):
+                                model_path = actual
+                                break
+            except Exception:
+                pass
+
+    # 校验：路径为空或路径失效时回退到扫描 MODELS_DIR
+    if not model_path or not os.path.exists(model_path):
+        models = find_model_dirs(MODELS_DIR)
+        if not models:
+            raise ValueError("未找到嵌入模型。请先运行 embedding_model_manager.py 下载模型")
+        model_path = models[0]["path"]
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 缓存命中 → 直接返回
+    cache_key = f"{model_path}::{device}"
+    if cache_key in _EMBEDDING_CACHE:
+        return _EMBEDDING_CACHE[cache_key]
+
+    emb = SentenceTransformerEmbeddings(
+        model_name=model_path,
+        model_kwargs={"device": device, "local_files_only": True},
+        encode_kwargs={"normalize_embeddings": emb_cfg.get("normalize_embeddings", True)},
+    )
+    _EMBEDDING_CACHE[cache_key] = emb
+    return emb
+
+
+def retrieve_documents(query, kb_name="default", k=None, score_threshold=None, embeddings=None):
+    """检索相关文档"""
+    from chroma_adapter import Chroma
+
+    if embeddings is None:
+        embeddings = get_embeddings(kb_name=kb_name)
+
+    kb_path = os.path.join(KB_DIR, kb_name)
+    if not os.path.exists(kb_path) or not os.listdir(kb_path):
+        return []
+
+    # 尝试检索，HNSW 损坏时自动修复
+    import time as _t
+    for _attempt in range(2):
+        try:
+            vectorstore = Chroma(
+                persist_directory=kb_path,
+                embedding_function=embeddings,
+            )
+
+            # 懒重建：hnswlib 为空但 ChromaDB SQLite 有数据时自动重建
+            if vectorstore._hnsw.count() == 0:
+                _hnsw_rebuild_done = False
+                try:
+                    import sqlite3 as _s3
+                    _db = _s3.connect(os.path.join(kb_path, "chroma.sqlite3"))
+                    _cnt = _db.execute(
+                        "SELECT COUNT(*) FROM embedding_metadata WHERE key='chroma:document'"
+                    ).fetchone()[0]
+                    _db.close()
+                    if _cnt > 0:
+                        from knowledge_base_manager import rebuild_kb_hnsw
+                        print(f"\n{'='*50}")
+                        print(f"  ⏳ 懒重建 HNSW: {kb_name} ({_cnt} 文档)")
+                        print(f"  重建期间该 KB 暂停服务，完成后自动恢复")
+                        print(f"{'='*50}")
+                        rebuild_kb_hnsw(kb_name)
+                        _hnsw_rebuild_done = True
+                        print(f"  ✅ 懒重建完成: {kb_name}")
+                except Exception as _e:
+                    print(f"  [lazy HNSW rebuild] {kb_name}: 跳过 ({_e})")
+                if _hnsw_rebuild_done:
+                    vectorstore = Chroma(
+                        persist_directory=kb_path,
+                        embedding_function=embeddings,
+                    )
+
+            cfg = load_config()
+            ret_cfg = cfg.get("retrieval", {})
+            if k is None:
+                k = ret_cfg.get("k", 3)
+            if score_threshold is None:
+                score_threshold = ret_cfg.get("score_threshold")
+
+            if score_threshold:
+                retriever = vectorstore.as_retriever(
+                    search_type="similarity_score_threshold",
+                    search_kwargs={"score_threshold": score_threshold, "k": k},
+                )
+            else:
+                retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+
+            return retriever.invoke(query)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "hnsw" in err_str or "segment reader" in err_str or "compactor" in err_str:
+                from knowledge_base_manager import _try_repair_kb, _backup_kb
+                if _attempt == 0 and _try_repair_kb(kb_path):
+                    _backup_kb(kb_path)
+                    continue
+            raise  # 非 HNSW 错误或修复失败则透传
+
+
+def build_context(docs):
+    """从检索结果构建上下文字符串（含 NLI 标签渲染）"""
+    parts = []
+    for i, doc in enumerate(docs):
+        # 提取内容、元数据、NLI 标签（兼容 Document 和 dict 两种格式）
+        if hasattr(doc, "page_content"):
+            content = doc.page_content
+            meta = doc.metadata if hasattr(doc, "metadata") else {}
+            nli_label = meta.get("nli_label") if isinstance(meta, dict) else None
+            source = meta.get("source", meta.get("h1", f"[{i + 1}]"))
+        elif isinstance(doc, dict):
+            content = doc.get("content", str(doc))
+            meta = doc.get("metadata", {})
+            nli_label = doc.get("nli_label") or (meta.get("nli_label") if isinstance(meta, dict) else None)
+            source = meta.get("source", meta.get("h1", f"[{i + 1}]")) if isinstance(meta, dict) else f"[{i + 1}]"
+        else:
+            content = str(doc)
+            meta = {}
+            nli_label = None
+            source = f"[{i + 1}]"
+
+        # NLI 标签渲染
+        label_str = ""
+        if nli_label and isinstance(nli_label, dict):
+            max_label = max(["entailment", "neutral", "contradiction"], key=lambda k: nli_label.get(k, 0))
+            conf = nli_label.get(max_label, 0)
+            label_str = f" [NLI: {max_label}, {conf:.0%}]"
+
+        parts.append(f"[片段 {i + 1}] (来源: {source}){label_str}\n{content}")
+    return "\n\n---\n\n".join(parts)
+
+
+def retrieve_context(question, kb_name="default", k=None, score_threshold=None, embeddings=None,
+                     use_router=True, use_reranker=True, include_header=False):
+    """
+    纯检索接口：只检索和构建 context，不调用 LLM。
+
+    路由逻辑（v0.3.0）：
+    - 从 knowledge_base_manager 直接拿硬编码规则做第一次路由
+    - 失败后用 FallbackRouter（KB 签名 + 语义模型）
+    - 再失败 → broadcast 所有 KB
+    """
+    from config import load_config
+    cfg = load_config()
+
+    # ==================== 路由阶段 ====================
+    if use_router and cfg.get("router", {}).get("enabled", True):
+        from router import route_query
+        routing = route_query(question)
+        kb_names = routing["kb_names"]
+        routing_method = routing["method"]
+    else:
+        kb_names = [kb_name]
+        routing_method = "direct"
+
+    # ==================== 检索阶段 ====================
+    # Rerank 开启时自动扩容候选池，保证精排有足够的筛选空间
+    reranker_enabled = use_reranker and cfg.get("reranker", {}).get("enabled", False)
+    if reranker_enabled:
+        reranker_top_k = cfg.get("reranker", {}).get("top_k", 5)
+        default_k = cfg.get("retrieval", {}).get("k", 3)
+        effective_k = k if k is not None else max(default_k, reranker_top_k * 4)
+    else:
+        effective_k = k
+
+    all_docs = []
+    source_kb_map = {}
+    for target_kb in kb_names:
+        try:
+            docs = retrieve_documents(
+                question, kb_name=target_kb, k=effective_k,
+                score_threshold=score_threshold,
+            )
+            for d in docs:
+                if hasattr(d, "metadata"):
+                    d.metadata["_kb"] = target_kb
+                source_kb_map[id(d)] = target_kb
+            all_docs.extend(docs)
+        except Exception:
+            continue
+
+    # ==================== Rerank 阶段 ====================
+    if use_reranker and cfg.get("reranker", {}).get("enabled", True) and all_docs:
+        from reranker import Reranker
+        try:
+            reranker = Reranker(cfg)
+            reranked = reranker.rerank(question, all_docs)
+            reranked_docs = [d for d, _ in reranked]
+        except Exception:
+            reranked_docs = all_docs
+    else:
+        reranked_docs = all_docs
+
+    # ==================== NLI 分类阶段 ====================
+    # 与 reranker 完全独立的开关，用 slice 关键词对 doc 做三向分类
+    use_nli = cfg.get("nli", {}).get("enabled", False)
+    if use_nli and reranked_docs:
+        try:
+            from nli_classifier import get_nli_classifier
+            nli_cfg = cfg.get("nli", {})
+            nli_top_k = nli_cfg.get("top_k", 0)
+            classifier = get_nli_classifier(nli_cfg.get("model_path", ""))
+            nli_results = classifier.classify(question, reranked_docs, top_k=nli_top_k)
+            # 将 NLI 标签写入每个 Document 的 metadata
+            for nr in nli_results:
+                doc = nr["doc"]
+                label_dict = {k: v for k, v in nr.items() if k != "doc"}
+                if hasattr(doc, "metadata") and isinstance(doc.metadata, dict):
+                    doc.metadata["nli_label"] = label_dict
+                elif isinstance(doc, dict):
+                    doc["nli_label"] = label_dict
+        except Exception:
+            pass  # NLI 失败不影响主流程
+
+    # ==================== 构建输出 ====================
+    if not reranked_docs:
+        return {
+            "context": "",
+            "source_docs": [],
+            "source_count": 0,
+            "question": question,
+            "routing_info": {
+                "method": routing_method,
+                "kb_names": kb_names,
+                "kb_count": len(kb_names),
+            },
+        }
+
+    context = build_context(reranked_docs)
+    serialized = []
+    for d in reranked_docs:
+        source_kb = source_kb_map.get(id(d), kb_name)
+        # 提取 NLI 标签（Document metadata 或 dict 顶层）
+        nli_label = None
+        if hasattr(d, "metadata") and isinstance(d.metadata, dict):
+            nli_label = d.metadata.get("nli_label")
+        elif isinstance(d, dict):
+            nli_label = d.get("nli_label")
+        serialized.append({
+            "content": d.page_content if hasattr(d, "page_content") else str(d),
+            "metadata": d.metadata if hasattr(d, "metadata") else {},
+            "length": len(d.page_content) if hasattr(d, "page_content") else len(str(d)),
+            "nli_label": nli_label,
+            "_kb": source_kb,
+        })
+
+    # ── include_header：对每个 unique source 回取头部块 ──
+    headers_dict = {}
+    if include_header and reranked_docs:
+        seen_sources = {}
+        for d in reranked_docs:
+            meta = d.metadata if hasattr(d, "metadata") else {}
+            src = meta.get("source", "")
+            kb = source_kb_map.get(id(d), kb_name)
+            if src and (src, kb) not in seen_sources:
+                seen_sources[(src, kb)] = True
+        for (src, kb_src), _ in seen_sources.items():
+            try:
+                from chroma_adapter import Chroma
+                emb = get_embeddings(kb_name=kb_src)
+                vs = Chroma(persist_directory=os.path.join(KB_DIR, kb_src), embedding_function=emb)
+                raw = vs.get(
+                    include=['documents', 'metadatas'],
+                    where={"$and": [
+                        {"source": {"$eq": src}},
+                        {"is_header": True},
+                    ]},
+                )
+                if raw.get("documents"):
+                    texts = raw["documents"]
+                    metas = raw.get("metadatas", [{}] * len(texts))
+                    # 按 chunk_seq 排序（is_header 可能跳过中间块）
+                    paired = sorted(
+                        [(m.get("chunk_seq", 99), t) for m, t in zip(metas, texts)],
+                        key=lambda x: x[0],
+                    )
+                    headers_dict[src] = [t for _, t in paired]
+            except Exception:
+                continue
+
+    result = {
+        "context": context,
+        "source_docs": serialized,
+        "source_count": len(reranked_docs),
+        "question": question,
+        "routing_info": {
+            "method": routing_method,
+            "kb_names": kb_names,
+            "kb_count": len(kb_names),
+        },
+    }
+    if include_header:
+        result["headers"] = headers_dict
+    return result
+
+
+def format_skill_output(question, kb_name="default", k=None, score_threshold=None,
+                        embeddings=None, template=None):
+    """
+    [技能接口核心] 检索 + 格式化输出。
+    返回的 JSON 包含完整的 prompt（已填充 {context} 和 {question}），
+    任何智能体直接拿着 prompt 即可作答。
+
+    返回结构:
+    {
+      "question": str,          # 原始问题
+      "kb": str,                # 检索的知识库
+      "context": str,           # 检索到的文本块
+      "source_count": int,      # 命中的片段数
+      "source_docs": [...],     # 每个片段的详情
+      "prompt": str,            # 已填充的完整 prompt（含 context + question）
+      "prompt_template": str,   # 原始 prompt 模板
+      "has_context": bool,      # 是否找到相关内容
+    }
+    """
+    from prompt_manager import load_template, get_default_template, get_full_prompt
+
+    # 检索
+    retrieval = retrieve_context(
+        question, kb_name=kb_name, k=k,
+        score_threshold=score_threshold, embeddings=embeddings,
+    )
+
+    context = retrieval["context"]
+    has_context = bool(context)
+
+    # 获取完整 prompt（系统层 + 用户层）
+    tpl = get_full_prompt(template)
+
+    # 填充占位符
+    if has_context:
+        prompt = tpl.format(context=context, question=question)
+    else:
+        # 无 context 时也尝试填充，占位符缺失则保留原样
+        try:
+            prompt = tpl.format(context="（未检索到相关资料）", question=question)
+        except KeyError:
+            prompt = tpl.replace("{context}", "（未检索到相关资料）").replace("{question}", question)
+
+    return {
+        "question": question,
+        "kb": kb_name,
+        "context": context,
+        "source_count": retrieval["source_count"],
+        "source_docs": retrieval["source_docs"],
+        "prompt": prompt,
+        "prompt_template": tpl,
+        "has_context": has_context,
+    }
+
+
+def import_documents_to_kb(file_path, kb_name="default", embeddings=None, splitter_config=None):
+    """导入文档到知识库
+
+    v0.3.0 新增：导入后自动更新 KB 签名
+    """
+    from config import load_config
+    from text_splitter import split_pipeline
+    from knowledge_base_manager import add_documents_to_kb
+
+    # 检查 KB 是否暂停写入
+    cfg = load_config()
+    if kb_name in cfg.get("kb_paused", []):
+        return {"success": False, "error": f"知识库「{kb_name}」已暂停写入，仅可查询", "chunks_count": 0}
+
+    if embeddings is None:
+        embeddings = get_embeddings(kb_name=kb_name)
+
+    from utils import Document
+
+    try:
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(file_path)
+            docs = []
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ""
+                docs.append(Document(
+                    page_content=text,
+                    metadata={"source": os.path.basename(file_path), "page": i + 1}
+                ))
+            # 扫描版 PDF 自动回退 OCR
+            total_chars = sum(len(d.page_content) for d in docs)
+            # 无文本层（0 字符或极少字符）→ 直接 OCR，与文件名无关
+            if total_chars < 50:
+                print(f"  [OCR fallback] 提取文本仅 {total_chars} 字符，走 OCR")
+                total_chars = 0  # 强制走 OCR 回退
+            # 中文文件名 + CJK 占比过低 → 编码乱码，触发 OCR
+            fname = os.path.basename(file_path)
+            has_chinese_filename = bool(re.search(r'[\u4e00-\u9fff]', fname))
+            if total_chars >= 50 and has_chinese_filename:
+                all_text = "".join(d.page_content for d in docs)
+                total_chars = len(all_text)
+                cjk = sum(1 for c in all_text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
+                cjk_ratio = cjk / max(total_chars, 1)
+                if cjk_ratio < 0.10 and total_chars > 100:
+                    print(f"  [OCR fallback] 中文文件名但 CJK 占比 {cjk_ratio:.1%}，触发 OCR")
+                    total_chars = 0  # 强制走 OCR 回退
+            if total_chars < 50:
+                try:
+                    from pdf2image import convert_from_path
+                    import numpy as np
+                    import easyocr
+                    reader = easyocr.Reader(["ch_sim", "en"])
+                    images = convert_from_path(file_path, dpi=200)
+                    all_text = []
+                    for img in images:
+                        arr = np.array(img)
+                        result = reader.readtext(arr)
+                        all_text.append("\n".join([r[1] for r in result]))
+                    docs = [Document(
+                        page_content="\n\n--- 换页 ---\n\n".join(all_text),
+                        metadata={"source": os.path.basename(file_path), "ocr": True}
+                    )]
+                except Exception as ocr_err:
+                    raise RuntimeError(f"PDF 无文本且 OCR 失败: {ocr_err}")
+        else:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            docs = [Document(
+                page_content=content,
+                metadata={"source": os.path.basename(file_path)}
+            )]
+    except Exception as e:
+        raise RuntimeError(f"文档加载失败: {e}")
+
+    cfg = load_config()
+    split_cfg = splitter_config or cfg.get("splitting", {})
+
+    # 合并基础配置 + 策略级覆盖
+    strategy_overrides = split_cfg.get("strategy_overrides", {})
+    primary = split_cfg.get("strategy", "recursive")
+    sec_strat = split_cfg.get("secondary_strategy")
+
+    pipeline_kwargs = dict(
+        guards=split_cfg.get("guards", ["code"]),
+        primary=primary,
+        secondary=sec_strat,
+        chunk_size=split_cfg.get("chunk_size", 500),
+        chunk_overlap=split_cfg.get("chunk_overlap", 50),
+        separators=split_cfg.get("separators"),
+        headers_to_split_on=split_cfg.get("headers_to_split_on"),
+        strip_headers=split_cfg.get("strip_headers", False),
+        strategy_overrides=strategy_overrides,
+        embeddings=embeddings,
+    )
+
+    # 从 strategy_overrides 注入当前策略的专属参数
+    over = strategy_overrides.get(primary, {})
+    for k in ("separators", "headers_to_split_on", "strip_headers", "breakpoint_type", "language", "delimiters"):
+        if k in over:
+            pipeline_kwargs[k] = over[k]
+
+    # Markdown 标题预处理（守卫栈之后、切片之前）
+    preprocess_cfg = cfg.get("preprocess", {})
+    if preprocess_cfg.get("enabled"):
+        # 合并所有页的文本（MD 预处理需要全文，page 无法精确追溯，只设 source）
+        text = "\n\n".join(d.page_content for d in docs)
+        docs[0].page_content = apply_markdown_preprocess(text, preprocess_cfg)
+        primary = "headers"
+        pipeline_kwargs["primary"] = "headers"
+        if not pipeline_kwargs.get("headers_to_split_on"):
+            pipeline_kwargs["headers_to_split_on"] = [
+                ("h1", "# "), ("h2", "## "), ("h3", "### "), ("h4", "#### ")
+            ]
+        # MD 预处理路径：将合并处理后的文本切分
+        merged = split_pipeline(docs[0].page_content, **pipeline_kwargs)
+        for i, c in enumerate(merged):
+            c.metadata["source"] = os.path.basename(file_path)
+            c.metadata["chunk_seq"] = i
+        chunks = merged
+        mark_header_chunks(chunks)
+    else:
+        # 逐页切分，继承每页的完整 metadata（source + page + 其他自定义字段）
+        chunks = []
+        chunk_seq = 0
+        for page_doc in docs:
+            page_text = page_doc.page_content
+            if not page_text.strip():
+                continue
+            page_chunks = split_pipeline(page_text, **pipeline_kwargs)
+            for c in page_chunks:
+                c.metadata = dict(page_doc.metadata) if page_doc.metadata else {}
+                c.metadata["chunk_seq"] = chunk_seq
+                chunk_seq += 1
+            chunks.extend(page_chunks)
+        mark_header_chunks(chunks)
+
+    ok, msg = add_documents_to_kb(kb_name, chunks, embeddings)
+
+    return {
+        "success": ok,
+        "message": msg,
+        "chunks_count": len(chunks),
+        "source": os.path.basename(file_path),
+    }
