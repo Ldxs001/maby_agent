@@ -14,8 +14,28 @@ def _looks_like_header(text: str) -> bool:
     t = text[:300]
     if not t.strip():
         return False
-    if re.search(r'[\u4e00-\u9fff]{2,4}\s*\d?\s*[,，]\s*[\u4e00-\u9fff]{2,4}', t):
-        return True
+    # 作者行：逗号分隔的连续短单元链（≥3个短单元，每个去空白后≤6字且含汉字）
+    # 作者行是"名，名，名"连续短链；正文是"长单元，短单元，长单元"长短交错，链断裂
+    # - 纯编号（1、2、1,2、2+）视为中性单元：不断链不计数（作者上标编号）
+    # - 英文/公式/符号单元（wA1、. . .、{IMG）断链（避免英文库误判）
+    # 相比旧正则（任意"短词,短词"部分匹配），单元级检查大幅压制"长短语误判"
+    _run = 0
+    for _u in re.split(r'[，,；;、]', t):
+        _c = re.sub(r'\s+', '', _u)
+        if not _c:
+            _run = 0
+            continue
+        if re.search(r'[\u4e00-\u9fff]', _c):
+            if len(_c) <= 6:
+                _run += 1
+                if _run >= 3:
+                    return True
+            else:
+                _run = 0
+        elif re.fullmatch(r'[\d,+*]{1,4}', _c):
+            pass  # 编号中性：不断链不计数
+        else:
+            _run = 0  # 英文公式/符号 → 断链
     if re.search(r'(大学|学院|研究所|研究院|实验室|有限公司|集团|医院|'
                  r'中心[，。\s\n]|局[，。\s\n]|部[，。\s\n]|委员会)', t):
         return True
@@ -24,7 +44,7 @@ def _looks_like_header(text: str) -> bool:
                  r'文件编号|起草单位|发布单位|编制|审核|批准|代替|归口)', t[:100]):
         return True
     if re.search(r'(第\d+卷\s*第\d+期|Vol\.\s*\d+\s*No\.\s*\d+|'
-                 r'学报\b|通报\b|研究\b|杂志\b|期刊\b|出版社\b)', t[:200]):
+                 r'学报\b|通报\b|杂志\b|期刊\b|出版社\b)', t[:200]):
         return True
     if re.search(r'^(论著|综述|研究报告|研究论文|简报|简讯|信函|'
                  r'经验交流|病例报告|技术报告|方法|标准|规范|指南)', t.strip()[:20]):
@@ -78,16 +98,15 @@ def backfill_kb(kb_name: str, kb_path: str) -> tuple:
         chunks = [(r["id"], r["doc_text"]) for r in rows]
         n = len(chunks)
 
-        # 位置兜底 + 逐块探测
-        header_seqs = set(range(min(4, n)))
+        # 逐块探测（0-3 也参与，避免头部切碎在 3/4 边界时漏扩展）+ 位置兜底
+        header_seqs = set()
         max_seq = n - 1
         for i, (eid, text) in enumerate(chunks):
-            if i < 4:
-                continue
             if text and _looks_like_header(text):
                 header_seqs.add(i)
                 if i + 1 <= max_seq:
                     header_seqs.add(i + 1)
+        header_seqs |= set(range(min(4, n)))
 
         values = []
         for seq, (eid, _) in enumerate(chunks):
