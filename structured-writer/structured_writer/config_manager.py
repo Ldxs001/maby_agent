@@ -2,10 +2,12 @@
 import json
 import copy
 import os
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 USER_TEMPLATES_PATH = Path(__file__).resolve().parent.parent / "data" / "templates" / "user_templates.json"
+EXAMPLES_PATH = Path(__file__).resolve().parent.parent / "data" / "examples" / "examples.json"
 
 DEFAULT_CONFIG = {
     "planner_model": {
@@ -255,6 +257,91 @@ class ConfigManager:
                 self._config[key] = data[key]
 
         self.save()
+
+    # ── 快速范例存储（data/examples/examples.json） ──
+    # 范例条目：{name, topic, template_name, outline, article, output_file,
+    #            created_at, updated_at}；name 为唯一键。
+    # 保存范例 = 前置存大纲（article 空）+ 生成完成后回填文章（update_example_article）
+
+    def _load_examples(self) -> dict:
+        if EXAMPLES_PATH.exists():
+            try:
+                with open(EXAMPLES_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {}
+
+    def _save_examples(self, examples: dict):
+        EXAMPLES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = EXAMPLES_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(examples, f, ensure_ascii=False, indent=2)
+        tmp.replace(EXAMPLES_PATH)
+
+    def list_examples(self) -> list:
+        """返回范例摘要列表（不含全文，控制传输量），按更新时间倒序"""
+        examples = self._load_examples()
+        items = []
+        for name, ex in examples.items():
+            if not isinstance(ex, dict):
+                continue
+            items.append({
+                "name": name,
+                "topic": ex.get("topic", ""),
+                "template_name": ex.get("template_name", ""),
+                "has_article": bool(ex.get("article")),
+                "section_count": len((ex.get("outline") or {}).get("sections", [])),
+                "updated_at": ex.get("updated_at", ""),
+            })
+        items.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+        return items
+
+    def get_example(self, name: str) -> dict:
+        return self._load_examples().get(name)
+
+    def save_example(self, example: dict) -> str:
+        """保存（或覆盖）一个范例。返回范例名。"""
+        name = str(example.get("name", "")).strip()
+        if not name:
+            name = str(example.get("topic", "未命名范例")).strip() or "未命名范例"
+        examples = self._load_examples()
+        now = datetime.now().isoformat(timespec="seconds")
+        existing = examples.get(name, {})
+        entry = {
+            "name": name,
+            "topic": str(example.get("topic", "")),
+            "template_name": str(example.get("template_name", "")),
+            "outline": example.get("outline", {}),
+            "article": example.get("article", existing.get("article", "")),
+            "output_file": example.get("output_file", existing.get("output_file", "")),
+            "created_at": existing.get("created_at", now),
+            "updated_at": now,
+        }
+        examples[name] = entry
+        self._save_examples(examples)
+        return name
+
+    def update_example_article(self, name: str, article: str, output_file: str = "") -> bool:
+        """生成完成后回填文章全文。失败返回 False（范例不存在）。"""
+        examples = self._load_examples()
+        if name not in examples:
+            return False
+        examples[name]["article"] = article
+        if output_file:
+            examples[name]["output_file"] = output_file
+        examples[name]["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_examples(examples)
+        return True
+
+    def delete_example(self, name: str) -> bool:
+        examples = self._load_examples()
+        if name not in examples:
+            return False
+        del examples[name]
+        self._save_examples(examples)
+        return True
 
 
 def _convert_structure_to_mc(structure: list, style: str = "") -> dict:

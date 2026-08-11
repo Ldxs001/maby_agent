@@ -1,6 +1,7 @@
 """大纲规划器 — 调用 LLM 生成结构化文章大纲"""
 import json
 import re
+import copy
 from typing import Optional
 from .llm_client import LLMClient, LLMClientError
 
@@ -221,6 +222,7 @@ def _normalize_outline(outline: dict, content_fields: list) -> dict:
                 "_checked": True,
                 "type": cf.get("type", "section"),
                 "show_label": cf["show_label"],
+                "_tmpl_key": cf["name"],
                 "sub_sections": []
             })
     outline["sections"] = sections
@@ -243,6 +245,10 @@ def _normalize_outline(outline: dict, content_fields: list) -> dict:
         matched = [cf for cf in content_fields if cf.get("name") == stitle]
         lo = matched[0].get("logical_order") if matched else None
         s["_logical_order"] = lo if lo is not None else None
+
+        # ── 血缘标记：_tmpl_key = 模板 content 字段名（标题可改，绑定不断） ──
+        # 匹配到模板字段 → 烙该字段名；未匹配（LLM 新增节）→ 自指（desc 查表 miss=空，行为不变）
+        s["_tmpl_key"] = matched[0]["name"] if matched else s.get("title", "")
 
         # 从模板 content_fields 补充 show_label
         if matched:
@@ -390,6 +396,309 @@ def plan_outline(topic: str, template: dict = None,
     outline = _normalize_outline(outline, content_fields)
 
     return outline
+
+
+def replan_section(topic: str, hints: str, llm_client: LLMClient,
+                   target: dict, parent_section: dict = None,
+                   style: str = "", logic: str = "") -> dict:
+    """局部重规划（两级：整章 / 单子结构）。
+
+    跳过整篇 LLM 重规划，只重做目标节点。写作管线原样复用（吃更新后的 outline）。
+
+    参数:
+        topic: 文章主题
+        hints: 用户对目标节点的调整要求（可为空=按原结构重做）
+        llm_client: 规划 LLM 客户端
+        target: 目标节点 dict —— 含 sub_sections → 整章重规划；
+                否则视为单子结构 → 只重做这一个
+        parent_section: 单子结构模式时的所在章节（提供上下文，可空）
+        style/logic: 模板风格/逻辑提示词（注入供参考）
+
+    返回:
+        新节点 dict：
+        - 整章模式：{id, title, summary, word_count, _tmpl_key, show_label,
+                     is_key, rag, _logical_order, status, actual_word_count,
+                     _checked, type, sub_sections: [...]}
+        - 子结构模式：{id, title, summary, word_count, status, actual_word_count, _checked}
+
+    异常:
+        ValueError: LLM 3 次无法输出正确格式
+    """
+    is_section = isinstance(target.get("sub_sections"), list)
+
+    # ── 构建 prompt ──
+    parts = [
+        "你是结构化写作规划助手。严格执行以下命令：",
+        "",
+        "【输出规则】",
+        "- 只输出 JSON，禁止任何其他文字、解释、礼貌用语。",
+        "- 禁止 markdown 代码块标记（不要 ```json）。",
+        "- 直接以 { 开头，以 } 结尾。",
+        "",
+        f"【文章主题】\n{topic}",
+        "",
+    ]
+    if style:
+        parts.append(f"【全文风格】（仅作参考，不改变本节结构要求）\n{style}")
+        parts.append("")
+    if hints:
+        parts.append("【用户对本节点的明确要求】（优先于一切默认值，必须严格遵守）")
+        parts.append(hints)
+        parts.append("")
+
+    if is_section:
+        parts.append("【任务】对该章节重新规划：输出新章节标题和全部子结构（可增减数量）。")
+        parts.append("现有章节：")
+        parts.append(json.dumps({
+            "title": target.get("title", ""),
+            "summary": target.get("summary", ""),
+            "sub_sections": [
+                {"title": ss.get("title", ""), "summary": ss.get("summary", ""),
+                 "word_count": ss.get("word_count", 400)}
+                for ss in target.get("sub_sections", [])
+            ],
+        }, ensure_ascii=False, indent=2))
+        parts.append("")
+        parts.append("【JSON 格式】")
+        parts.append('{')
+        parts.append('  "title": "新章节标题（可沿用原标题，也可按用户要求调整）",')
+        parts.append('  "sub_sections": [')
+        parts.append('    {"title": "子结构1", "summary": "写作要点", "word_count": 400},')
+        parts.append('    {"title": "子结构2", "summary": "写作要点", "word_count": 400}')
+        parts.append('  ]')
+        parts.append('}')
+        parts.append("子结构 2-4 个、每子结构 200-800 字是默认值，用户明确要求时按用户要求。")
+    else:
+        parts.append("【任务】对该子结构重新规划方向和内容：输出新的子结构标题、要点、字数。")
+        if parent_section:
+            parts.append(f"所在章节：{parent_section.get('title', '')}")
+        parts.append("现有子结构：")
+        parts.append(json.dumps({
+            "title": target.get("title", ""),
+            "summary": target.get("summary", ""),
+            "word_count": target.get("word_count", 400),
+        }, ensure_ascii=False, indent=2))
+        parts.append("")
+        parts.append("【JSON 格式】")
+        parts.append('{')
+        parts.append('  "title": "新子结构标题",')
+        parts.append('  "summary": "写作要点",')
+        parts.append('  "word_count": 400')
+        parts.append('}')
+        parts.append("字数默认 200-800，用户明确要求时按用户要求。")
+
+    parts.append("")
+    parts.append("【后果】如果输出包含 JSON 以外的任何文字，系统将无法解析，整个流程会失败。")
+
+    messages = [
+        {"role": "system", "content": "\n".join(parts)},
+        {"role": "user", "content": "请输出该节点的 JSON。"}
+    ]
+
+    # ── 最多重试 3 次 ──
+    result = None
+    last_raw = ""
+    for attempt in range(3):
+        raw = ""
+        cont_messages = messages.copy()
+        for _cont in range(4):
+            r = llm_client.chat_detailed(cont_messages, max_tokens=max(2048, llm_client.max_tokens), temperature=None)
+            chunk = r.get("content", "")
+            finish_reason = r.get("finish_reason", "stop")
+            raw += chunk
+            if finish_reason != "length" or not chunk.strip():
+                break
+            cont_messages.append({"role": "assistant", "content": chunk})
+            cont_messages.append({"role": "user", "content": "JSON 输出被截断，请直接从截断处继续输出 JSON 内容，不要重复，不要任何解释文字。"})
+        last_raw = raw
+        parsed = parse_outline(raw)
+        if parsed is not None:
+            result = parsed
+            break
+        messages.append({"role": "assistant", "content": raw[:800]})
+        messages.append({"role": "user", "content": "【格式错误】只输出 JSON，以 { 开头，以 } 结尾，不要任何其他文字。重新生成："})
+
+    if result is None:
+        raise ValueError(f"LLM 连续 3 次无法输出正确格式。最后一次输出：\n{last_raw[:500]}")
+
+    # ── 组装新节点（身份属性显式继承，展示属性取 LLM 结果） ──
+    if is_section:
+        subs = []
+        for j, ss in enumerate(result.get("sub_sections") or []):
+            if not isinstance(ss, dict):
+                continue
+            subs.append({
+                "id": f"{target.get('id', 's')}_{j+1}",
+                "title": str(ss.get("title", "")).strip() or f"子结构{j+1}",
+                "summary": str(ss.get("summary", "")).strip(),
+                "word_count": int(ss.get("word_count") or 400),
+                "status": "pending",
+                "actual_word_count": 0,
+                "_checked": True,
+            })
+        if not subs:
+            # 极端兜底：LLM 返回空子结构 → 保留原标题的单子结构
+            subs = [{
+                "id": f"{target.get('id', 's')}_1",
+                "title": target.get("title", "正文"),
+                "summary": target.get("summary", ""),
+                "word_count": target.get("word_count", 800),
+                "status": "pending",
+                "actual_word_count": 0,
+                "_checked": True,
+            }]
+        node = {
+            "id": target.get("id", "s"),
+            "title": str(result.get("title", "")).strip() or target.get("title", "未命名章节"),
+            "subtitle": target.get("subtitle", ""),
+            "summary": str(result.get("summary", "")).strip() or target.get("summary", ""),
+            "word_count": sum(ss["word_count"] for ss in subs),
+            "is_key": target.get("is_key", False),
+            "status": "pending",
+            "actual_word_count": 0,
+            "rag": target.get("rag", {"enabled": False, "kb": ""}),
+            "_checked": True,
+            "type": "section",
+            "show_label": target.get("show_label", True),
+            "_tmpl_key": target.get("_tmpl_key", target.get("title", "")),
+            "_logical_order": target.get("_logical_order"),
+            "sub_sections": subs,
+        }
+    else:
+        node = {
+            "id": target.get("id", ""),
+            "title": str(result.get("title", "")).strip() or target.get("title", ""),
+            "summary": str(result.get("summary", "")).strip() or target.get("summary", ""),
+            "word_count": int(result.get("word_count") or target.get("word_count", 400)),
+            "status": "pending",
+            "actual_word_count": 0,
+            "_checked": True,
+        }
+
+    return node
+
+
+def adapt_outline(outline: dict, new_topic: str, llm_client: LLMClient) -> dict:
+    """范例大纲适配（快速调用勾选「适配新主题」时调用）。
+
+    只重写内容项——章节标题、章节要点(summary)、子结构标题、子结构要点；
+    结构字段（RAG 配置、辅助知识挂载、字数、子结构数量、is_key、勾选状态、
+    _tmpl_key、show_label、逻辑顺序）物理不碰——LLM 输出格式里没有这些字段，
+    结构守恒从「约束」变成「物理保证」。
+
+    方式 B：LLM 只输出文本映射 {"节点id": {"title": "...", "summary": "..."}}，
+    代码校验已知 id、只取 title/summary 写回；LLM 未返回的节点保留原文。
+
+    参数:
+        outline: 范例大纲 dict（不修改原对象，内部深拷贝）
+        new_topic: 新主题（已覆盖 outline.title）
+        llm_client: 规划 LLM 客户端
+
+    返回:
+        适配后的新 outline dict（深拷贝）
+
+    异常:
+        ValueError: LLM 3 次无法输出正确格式（此时抛错，调用方提示用户）
+    """
+    result_outline = copy.deepcopy(outline)
+
+    # ── 1. 收集节点清单（只取内容项字段） ──
+    nodes = []
+    for s in result_outline.get("sections", []):
+        nodes.append({
+            "id": s.get("id", ""),
+            "kind": s.get("type", "section"),
+            "title": s.get("title", ""),
+            "summary": s.get("summary", ""),
+        })
+        for ss in s.get("sub_sections", []):
+            nodes.append({
+                "id": ss.get("id", ""),
+                "kind": "sub",
+                "title": ss.get("title", ""),
+                "summary": ss.get("summary", ""),
+            })
+    if not nodes:
+        return result_outline
+
+    # ── 2. 构建 prompt ──
+    parts = [
+        "你是大纲适配助手。给定一篇范例大纲和一个新主题，把大纲的「内容项」适配到新主题。",
+        "",
+        "【硬性约束】",
+        "- 只输出 JSON 映射，键是节点 id，值只含 title 和 summary 两个字段。",
+        "- 只改标题(title)和写作要点(summary)，这两个是内容项；结构/数量/字数/RAG/辅助知识不在输出中，天然不变。",
+        "- 与主题无关的通用节（如\"研究方法\"、\"结论\"）可保留原标题不变。",
+        "- 文章结构、子结构数量、每节字数必须保持原样（不体现在输出中）。",
+        "- 只输出 JSON，禁止任何其他文字，禁止 markdown 代码块标记。",
+        "",
+        f"【新主题】\n{new_topic}",
+        "",
+        "【节点清单（id + 旧标题 + 旧写作要点）】",
+        json.dumps(nodes, ensure_ascii=False, indent=2),
+        "",
+        "【输出格式】",
+        '{',
+        '  "节点id1": {"title": "适配后的标题", "summary": "适配后的写作要点"},',
+        '  "节点id2": {"title": "...", "summary": "..."}',
+        '}',
+        "只需要输出「需要修改」的节点；不需要改的节点可以省略。",
+        "【后果】如果输出包含 JSON 以外的任何文字，系统将无法解析，整个流程会失败。",
+    ]
+
+    messages = [
+        {"role": "system", "content": "\n".join(parts)},
+        {"role": "user", "content": "请输出适配后的节点映射 JSON。"}
+    ]
+
+    # ── 3. 最多重试 3 次 ──
+    parsed = None
+    last_raw = ""
+    for attempt in range(3):
+        raw = ""
+        cont_messages = messages.copy()
+        for _cont in range(4):
+            r = llm_client.chat_detailed(cont_messages, max_tokens=max(2048, llm_client.max_tokens), temperature=None)
+            chunk = r.get("content", "")
+            finish_reason = r.get("finish_reason", "stop")
+            raw += chunk
+            if finish_reason != "length" or not chunk.strip():
+                break
+            cont_messages.append({"role": "assistant", "content": chunk})
+            cont_messages.append({"role": "user", "content": "JSON 输出被截断，请直接从截断处继续输出 JSON 内容，不要重复，不要任何解释文字。"})
+        last_raw = raw
+        p = parse_outline(raw)
+        if p is not None:
+            parsed = p
+            break
+        messages.append({"role": "assistant", "content": raw[:800]})
+        messages.append({"role": "user", "content": "【格式错误】只输出 JSON 映射，以 { 开头，以 } 结尾，不要任何其他文字。重新生成："})
+
+    if parsed is None:
+        raise ValueError(f"LLM 连续 3 次无法输出正确格式。最后一次输出：\n{last_raw[:500]}")
+
+    # ── 4. 校验 + 写回（只取已知 id 的 title/summary） ──
+    if isinstance(parsed, dict):
+        valid_ids = {n["id"] for n in nodes}
+        for nid, patch in parsed.items():
+            if nid not in valid_ids or not isinstance(patch, dict):
+                continue
+            for s in result_outline.get("sections", []):
+                if s.get("id") == nid:
+                    if patch.get("title"):
+                        s["title"] = str(patch["title"]).strip()
+                    if patch.get("summary") is not None:
+                        s["summary"] = str(patch["summary"]).strip()
+                    break
+                for ss in s.get("sub_sections", []):
+                    if ss.get("id") == nid:
+                        if patch.get("title"):
+                            ss["title"] = str(patch["title"]).strip()
+                        if patch.get("summary") is not None:
+                            ss["summary"] = str(patch["summary"]).strip()
+                        break
+
+    return result_outline
 
 
 # ═══════════════════════════════════════════════════════════

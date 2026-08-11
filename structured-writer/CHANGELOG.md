@@ -3,6 +3,54 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [1.9.0b0] - 2026-08-11
+### 新增（插件系统 + 大表蓝皮书取数）
+- **插件系统**（仿 RAG 形态）：`structured_writer/plugins/` 模块——`base.py`（`BasePlugin.execute(inputs) → {type, name, content}`，输出契约限定辅助知识三形态 table/text/image）、`manager.py`（扫描内置 `builtin/` + 用户 `data/plugins/` 目录、读 `plugin.json`、注册与调用）。新插件 = 一个目录（plugin.json + 实现类），消费方只按 `input_fields` 收参数、按 `output_types` 接数据，不接触写作管道
+- **预置插件「数据库数据源」（db_source）**：对接 SQLite（标准库只读 mode=ro）/ CSV / MySQL（pymysql）/ PostgreSQL（psycopg2，驱动缺失自动提示安装）。**所有设置都在插件内**（连接信息配一次固化），消费时只选插件名 → 自动取数挂到子结构「+」→ 取什么数据由使用指令决定，插件不预设 SQL。只读安全：SQLite 只读模式、MySQL/PG 仅 SELECT、表名白名单校验（只允许库内实际存在的表）、凭证仅会话内存不落盘
+- **大表蓝皮书取数**（`aux_parser.py` 重写 `select_table` + 新增 `build_blueprint`）：修复大表只给前 50 行标识的漏数据缺陷。按规模分档：小表 ≤100 行 py 全量 0 次 LLM；中表蓝皮书+全量行标识 1 次 LLM 选列行；大表 2 次 LLM——粗筛（py 统计生成蓝皮书 → LLM 选维度和分段）→ 精取（段内全量行标识 → LLM 选列行）→ py 在全量数据精确切。**2016 年在第 10 万行也取得到**
+- **蓝皮书统计（天然算法，无领域预设）**：每列唯一值分析（2~500 天然维度）→ 日期列自动聚合到年/月层级 → 随机列尝试文本前缀聚合（分隔符/字符截断）→ 数值列等频分箱。候选维度最多 5 个，category > date > prefix > number 排序
+- **前端**：子结构「+」辅助知识模态框新增「数据源插件」区——选插件 → 动态参数表单 → 执行取数 → 结果预览 → 一键挂载（复用 `addAuxFile`，与手动上传完全同管道）；`GET /api/plugins` + `POST /api/plugin/run` 两个端点
+- **侵入面**：writer.py / state_manager / 范例系统 / planner **零改动**；`select_table` 签名不变，写作注入调用点原样
+
+## [1.8.0b0] - 2026-08-11
+### 新增（快速范例适配）
+- **范例大纲适配**（快速范例栏新增「适配新主题」勾选框）：勾选后加载范例时，LLM 只重写**内容项**——章节标题、章节写作要点(summary)、子结构标题、子结构写作要点，按新主题适配；**结构字段物理不变**（RAG 开关/知识库、辅助知识挂载、每节字数、子结构数量、重点标记、勾选状态、`_tmpl_key` 血缘、show_label、逻辑顺序）——LLM 输出格式只含 `{id: {title, summary}}` 文本映射，结构守恒从「约束」变成「物理保证」
+- **`planner.adapt_outline()`**：收集节点清单 → LLM 输出文本映射 → 校验已知 id、只取 title/summary 写回；LLM 未返回的节点保留原文；3 次格式失败抛 ValueError（适配失败提示用户，不影响原大纲）
+- **`POST /api/example/use` 新增 `adapt` 参数**（True 时先适配再重置状态返回）；前端 `useExample()` 传勾选状态，加载中提示「正在按新主题适配大纲」
+- 适配语义：LLM 判断「哪些节需要适配」（prompt 允许与主题无关的通用节如"研究方法"保留原标题），文章标题由新主题覆盖（不参与适配）
+### 修复（UI 优化）
+- UI 布局与样式优化（页签圆角样式、配置面板居中、文本域样式、响应头 Content-Length 与禁缓存等）
+### 变更
+- 版本格式启用 `x.y.zbn` beta 标记（1.8.0b0）
+
+---
+
+## [1.7.0] - 2026-08-11
+### 新增（快速范例 + 两级局部重规划 + 标题可编辑）
+- **章节/子结构标题可编辑**（评审界面）：章节标题、子结构标题改为输入框直接改名；改标题不断模板绑定（见下方血缘标记）
+- **`_tmpl_key` 血缘标记**（`planner.py`）：大纲每章烙下其模板 content 源字段名；`writer.py` desc 注入、`logical_order`、`citation_check` 匹配全部改按 `_tmpl_key` 查表——「参考文献」改名「文献引用」后，GB/T 7714 权威写作要求、引用格式化、逻辑顺序原样继承，标题只负责展示
+- **快速范例**（`data/examples/examples.json`）：
+  - 「保存范例并生成」按钮（评审界面）：前置保存当前大纲为范例 → 开始写作 → **生成完成后自动回填文章全文**（前端传 output_file，后端读文件，非截断预览）
+  - 快速调用（对话发送区第二行）：范例下拉 + 新主题 + 「用范例写作（跳过规划）」——加载范例大纲，跳过 LLM 全局规划，直接进评审界面；新主题覆盖文章标题，章节结构/要点/字数保留范例原样
+  - 新端点：`GET /api/examples`、`POST /api/example/save`、`POST /api/example/update_article`、`POST /api/example/use`
+  - 调用时重置所有节点写作状态（pending），避免范例大纲携带上次 done 状态
+- **两级局部重规划**（`planner.replan_section()` + `POST /api/replan_section`）：
+  - 章节级（section-card 头部「↻重规划」）：章节内全部子结构按新交互重做，数量可变，章身份（排序/逻辑顺序/模板绑定/重点/RAG）保留
+  - 子结构级（sub-card 行尾「↻」）：只重建目标子结构，其余节点不动
+  - 身份属性（`_tmpl_key`/`show_label`/`is_key`/`rag`/`_logical_order`）显式继承，展示属性（title/summary/word_count）取 LLM 结果；`word_count` 自动 = 新子结构之和；状态重置 pending
+  - 与整篇重规划（原有「重新规划」按钮）共存，互不影响；局部重规划后原大纲卡片原地刷新，用户已做的勾选/排序/字数调整保留
+### 变更
+- `_handle_generate` 新增 `titles` 参数（章节/子结构改名应用）
+- `config_manager.py` 新增范例存储层（原子写入、更新时间倒序列表、文章回填、删除）
+- README「对外写作 API」条目更新为 v1.7.0
+
+---
+
+## [1.6.0] - 2026-08-07
+### 变更
+- **1.6.0b0 转正 1.6.0**：对外写作 API 验证通过
+- PyPI 元数据新增 project_urls（GitHub / Gitee / Documentation 三链接），页面 Project Links 区显示双平台仓库链接
+
 ---
 
 ## [1.6.0b0] - 2026-08-06（beta 验证版：对外写作 API；验证通过后转正 1.6.0）

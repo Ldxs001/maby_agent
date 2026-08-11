@@ -154,7 +154,16 @@ def generate_article(
     logic_prompt = (template or {}).get("logic", "")
     style_prompt = (template or {}).get("style", "")
     # 模板 desc 权威指令查找表：写作时按节名确定性注入【当前章节要求】
+    # 改按 _tmpl_key（血缘标记）查表——用户改了标题（如"参考文献"→"文献引用"），
+    # 模板绑定不断，desc 照常注入；_tmpl_key 缺失（LLM 新增节）回退标题查
     desc_by_title = {cf.get("name"): cf.get("desc", "") for cf in content_fields}
+
+    def _sec_desc(section: dict) -> str:
+        k = section.get("_tmpl_key") or section.get("title", "")
+        v = desc_by_title.get(k, "")
+        if not v and k != section.get("title", ""):
+            v = desc_by_title.get(section.get("title", ""), "")
+        return v
 
     # ── 提示词开关：根据 style + content desc 判断是否需要 RAG 文档元数据 ──
     needs_metadata = _needs_metadata(style_prompt)
@@ -287,7 +296,7 @@ def generate_article(
                 logic_hint=logic_prompt,
                 style_hint=style_prompt,
                 headers_text=leaf_headers_text,
-                section_desc=desc_by_title.get(section["title"], "")
+                section_desc=_sec_desc(section)
             )
             messages = [
                 {"role": "system", "content": WRITER_SYSTEM_PROMPT},
@@ -408,7 +417,7 @@ def generate_article(
                 logic_hint=logic_prompt,
                 style_hint=style_prompt,
                 headers_text=sub_headers_text,
-                section_desc=desc_by_title.get(section["title"], "")
+                section_desc=_sec_desc(section)
             )
 
             messages = [

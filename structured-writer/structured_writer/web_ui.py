@@ -1,11 +1,13 @@
 """Web UI — HTTP 服务器 + 内联 HTML/CSS/JS 界面"""
 import json
+import copy
 import os
 import sys
 import time
 import tempfile
 import subprocess
 import threading
+import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import socketserver
 import urllib.parse
@@ -18,8 +20,9 @@ from typing import Optional
 from .config_manager import ConfigManager, BUILTIN_TEMPLATE_NAMES
 from .llm_client import LLMClient, LLMClientError
 from .state_manager import StateManager
-from .planner import plan_outline, generate_template
+from .planner import plan_outline, generate_template, replan_section, adapt_outline
 from .writer import generate_article
+from .plugins import get_plugin_manager
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -84,6 +87,8 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/outputs": cls._handle_outputs_list,
             "/api/outputs/read": cls._handle_outputs_read,
             "/api/outputs/texpdf": cls._handle_outputs_texpdf,
+            "/api/examples": cls._handle_list_examples,
+            "/api/plugins": cls._handle_list_plugins,
         }
         cls.ROUTES["POST"] = {
             "/api/config": cls._handle_update_config,
@@ -101,6 +106,11 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/stop": cls._handle_stop,
             "/api/gen-template": cls._handle_gen_template,
             "/api/aux_upload": cls._handle_aux_upload,
+            "/api/example/save": cls._handle_save_example,
+            "/api/example/update_article": cls._handle_update_example_article,
+            "/api/example/use": cls._handle_use_example,
+            "/api/replan_section": cls._handle_replan_section,
+            "/api/plugin/run": cls._handle_plugin_run,
         }
 
     def do_GET(self):
@@ -151,18 +161,29 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             raise ValueError(f"JSON 解析失败: {e}, 原始内容: {text[:200]}")
 
     def _json_response(self, data: dict, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        self.wfile.write(body)
 
     def _html_response(self, html: str):
+        body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
+        # 显式 Content-Length：120KB 内联页面无边界响应会被浏览器/代理截断
+        # （症状：CSS 开头生效=无滚动轴、尾部 JS 丢失=tab 无响应、布局竖排）
+        self.send_header("Content-Length", str(len(body)))
+        # 禁缓存：INDEX_HTML 随代码更新，缓存旧页面会导致样式/功能错乱
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
-        self.wfile.write(html.encode("utf-8"))
+        self.wfile.write(body)
 
     # ---- 首页 ----
 
@@ -326,6 +347,16 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         outline = state.get("outline", {})
         user_orders = data.get("orders", {}) or state.get("user_orders", {})
         rag_options = data.get("rag", {})
+
+        # 应用标题修改（章节/子结构可改名；模板绑定走 _tmpl_key，不随标题断链）
+        titles = data.get("titles", {})
+        if titles:
+            for s in outline.get("sections", []):
+                if s["id"] in titles:
+                    s["title"] = titles[s["id"]]
+                for ss in s.get("sub_sections", []):
+                    if ss["id"] in titles:
+                        ss["title"] = titles[ss["id"]]
 
         # 应用用户的重点覆盖
         key_sections = data.get("key_sections", {})
@@ -1292,6 +1323,254 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json_response({"success": False, "error": str(e)}, 500)
 
+    # ---- 快速范例 API（前置存大纲 + 完成回填文章 + 快速调用） ----
+
+    def _handle_list_examples(self):
+        """GET /api/examples — 范例摘要列表（不含全文）"""
+        try:
+            examples = self.config_mgr.list_examples()
+            self._json_response({"success": True, "examples": examples})
+        except Exception as e:
+            self._json_response({"success": False, "error": str(e)}, 500)
+
+    def _handle_save_example(self):
+        """POST /api/example/save — 前置保存大纲为范例（article 留空，生成完成后回填）"""
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        outline = data.get("outline")
+        if not isinstance(outline, dict) or not outline.get("sections"):
+            self._json_response({"success": False, "error": "大纲为空，无法保存范例"}, 400)
+            return
+        name = str(data.get("name", "")).strip()
+        if not name:
+            name = str(outline.get("title", "未命名范例")).strip() or "未命名范例"
+        saved = self.config_mgr.save_example({
+            "name": name,
+            "topic": outline.get("title", ""),
+            "template_name": str(data.get("template_name", "")),
+            "outline": copy.deepcopy(outline),
+        })
+        self._json_response({"success": True, "name": saved})
+
+    def _handle_update_example_article(self):
+        """POST /api/example/update_article — 生成完成后回填文章全文
+        （前端只传 output_file，后端从文件读全文，避免截断预览）"""
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        name = str(data.get("name", "")).strip()
+        output_file = str(data.get("output_file", "")).strip()
+        if not name:
+            self._json_response({"success": False, "error": "缺少范例名"}, 400)
+            return
+        article = ""
+        if output_file and os.path.exists(output_file):
+            try:
+                with open(output_file, "r", encoding="utf-8") as f:
+                    article = f.read()
+            except OSError:
+                article = ""
+        ok = self.config_mgr.update_example_article(name, article, output_file)
+        if not ok:
+            self._json_response({"success": False, "error": f"范例「{name}」不存在"}, 404)
+            return
+        self._json_response({"success": True, "name": name, "article_chars": len(article)})
+
+    def _handle_use_example(self):
+        """POST /api/example/use — 快速调用：加载范例大纲，跳过 LLM 规划。
+        返回协议与 /api/plan 一致 {outline, session_id}，前端直接进评审界面。"""
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        name = str(data.get("name", "")).strip()
+        topic = str(data.get("topic", "")).strip()
+        adapt = bool(data.get("adapt", False))
+        if not name:
+            self._json_response({"success": False, "error": "缺少范例名"}, 400)
+            return
+        example = self.config_mgr.get_example(name)
+        if not example or not isinstance(example.get("outline"), dict):
+            self._json_response({"success": False, "error": f"范例「{name}」不存在或大纲为空"}, 404)
+            return
+        outline = copy.deepcopy(example["outline"])
+        if topic:
+            outline["title"] = topic
+        # 勾选「适配新主题」：LLM 只重写内容项（章节/子结构标题与要点），
+        # 结构/RAG/辅助知识/字数/数量物理不变（adapt_outline 内部深拷贝，原大纲不动）
+        if adapt:
+            try:
+                client = self._create_planner_client()
+                outline = adapt_outline(outline, outline.get("title", ""), client)
+            except (ValueError, LLMClientError) as e:
+                self._json_response({"success": False, "error": f"适配失败：{e}"}, 500)
+                return
+        # 重置写作状态（范例大纲可能带上次的 done 状态）
+        for s in outline.get("sections", []):
+            s["status"] = "pending"
+            s["actual_word_count"] = 0
+            for ss in s.get("sub_sections", []):
+                ss["status"] = "pending"
+                ss["actual_word_count"] = 0
+        sm = StateManager()
+        sm.init_session(self.config_mgr.get_all())
+        sm.set_outline(outline)
+        self._json_response({
+            "success": True,
+            "outline": outline,
+            "session_id": sm.session_id
+        })
+
+    # ---- 局部重规划（两级：整章 / 单子结构） ----
+
+    def _handle_replan_section(self):
+        """POST /api/replan_section — 只重做目标章节或子结构，其余节点不动。
+        body: {session_id, target_id, hints}"""
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        session_id = str(data.get("session_id", "")).strip()
+        target_id = str(data.get("target_id", "")).strip()
+        hints = str(data.get("hints", "")).strip()
+        if not session_id or not target_id:
+            self._json_response({"success": False, "error": "缺少 session_id 或 target_id"}, 400)
+            return
+        try:
+            sm = StateManager()
+            sm.load(session_id)
+        except FileNotFoundError:
+            self._json_response({"success": False, "error": "会话不存在"}, 404)
+            return
+
+        outline = sm.get_state().get("outline", {})
+        sections = outline.get("sections", [])
+        target = None
+        parent = None
+        is_sub = False
+        for s in sections:
+            if s.get("id") == target_id:
+                target = s
+                break
+            for ss in s.get("sub_sections", []):
+                if ss.get("id") == target_id:
+                    target = ss
+                    parent = s
+                    is_sub = True
+                    break
+            if target:
+                break
+        if target is None:
+            self._json_response({"success": False, "error": f"未找到目标节点 {target_id}"}, 404)
+            return
+
+        # 当前模板 style/logic（供局部重规划参考）
+        templates = self.config_mgr.get("templates", {})
+        selected = self.config_mgr.get("selected_template", "")
+        tmpl = templates.get(selected, {})
+        if not isinstance(tmpl, dict):
+            tmpl = {}
+
+        try:
+            client = self._create_planner_client()
+            new_node = replan_section(
+                topic=outline.get("title", ""),
+                hints=hints,
+                llm_client=client,
+                target=target,
+                parent_section=parent,
+                style=tmpl.get("style", ""),
+                logic=tmpl.get("logic", ""),
+            )
+        except (ValueError, LLMClientError) as e:
+            self._json_response({"success": False, "error": str(e)}, 500)
+            return
+
+        # 替换目标节点
+        if is_sub:
+            for j, ss in enumerate(parent.get("sub_sections", [])):
+                if ss.get("id") == target_id:
+                    parent["sub_sections"][j] = new_node
+                    break
+            parent["word_count"] = sum(ss.get("word_count", 0) for ss in parent.get("sub_sections", []))
+            parent["status"] = "pending"
+            parent["actual_word_count"] = 0
+        else:
+            for i, s in enumerate(sections):
+                if s.get("id") == target_id:
+                    sections[i] = new_node
+                    break
+
+        sm2 = StateManager()
+        sm2.load(session_id)
+        sm2._state["outline"] = outline
+        sm2.set_phase("reviewing")
+        sm2.save()
+        self._json_response({"success": True, "outline": outline})
+
+    # ═══════════════════════════════════════════════════════════
+    # 插件系统端点
+    # ═══════════════════════════════════════════════════════════
+    def _handle_list_plugins(self):
+        """GET /api/plugins — 列出已注册插件"""
+        try:
+            pm = get_plugin_manager()
+            self._json_response({"success": True, "plugins": pm.list()})
+        except Exception as e:
+            self._json_response({"success": False, "error": str(e)}, 500)
+
+    def _handle_plugin_run(self):
+        """POST /api/plugin/run — 执行插件，结果归一化三类并落盘临时文件
+        body: {plugin_id, inputs}
+        table → 写临时 CSV，返回 path（前端挂载 aux_knowledge.files 用）
+        text  → 直接返回 content
+        """
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        plugin_id = str(data.get("plugin_id", "")).strip()
+        inputs = data.get("inputs", {}) or {}
+        if not plugin_id:
+            self._json_response({"success": False, "error": "缺少 plugin_id"}, 400)
+            return
+        pm = get_plugin_manager()
+        result = pm.run(plugin_id, inputs)
+        if "error" in result:
+            self._json_response({"success": False, "error": result["error"]}, 400)
+            return
+        rtype = result.get("type", "text")
+        name = str(result.get("name", "plugin_data"))
+        content = result.get("content", "")
+        if rtype == "table":
+            # 表格 → 临时 CSV（写作时 select_table 蓝皮书取数走 path）
+            tmp_dir = Path(__file__).resolve().parent.parent / "data" / "tmp" / "plugins"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            fname = f"{uuid.uuid4().hex[:12]}_{name}"
+            fpath = tmp_dir / fname
+            fpath.write_text(content, encoding="utf-8")
+            preview_lines = content.splitlines()[:6]
+            self._json_response({
+                "success": True, "type": "table", "name": name,
+                "path": str(fpath),
+                "row_count": max(0, len(content.splitlines()) - 1),
+                "preview": preview_lines,
+            })
+            return
+        # text
+        self._json_response({
+            "success": True, "type": "text", "name": name,
+            "content": content, "preview": content[:500],
+        })
+
     def log_message(self, format, *args):
         """抑制默认日志输出"""
         pass
@@ -1328,6 +1607,10 @@ body {
   color: var(--text);
   height: 100vh;
   overflow: hidden;
+  /* 垂直布局链：topbar → tab-bar → tab-content(flex:1) → 内容区滚动。
+     缺失 → .tab-content 的 flex:1 失效、内容超高被 overflow:hidden 裁切、无滚动轴 */
+  display: flex;
+  flex-direction: column;
 }
 
 /* 顶栏 */
@@ -1343,22 +1626,105 @@ body {
 .topbar .logo { font-weight: 700; font-size: 16px; }
 .topbar .tag { font-size: 11px; opacity: 0.7; }
 
-/* Tab 导航 */
+/* Tab 导航：页签条深色底（对齐 Orchestrator .tab-bar 风格），
+   页签顶部圆角（对齐 RAG/编排体圆角卡片观感），hover 高亮 + active 色块选中 */
 .tab-bar {
   display: flex;
-  background: var(--bg-card);
+  background: var(--bg-panel);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  padding: 0 12px;
 }
 .tab-btn {
-  padding: 10px 24px;
+  padding: 10px 22px;
   cursor: pointer;
   color: var(--text-dim);
-  border-bottom: 2px solid transparent;
-  transition: all 0.2s;
   font-size: 14px;
-  border-color: var(--accent);
+  border-radius: 8px 8px 0 0;
+  margin: 6px 2px 0 0;
+  border: 1px solid transparent;
+  border-bottom: none;
+  transition: all 0.2s;
 }
+.tab-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+}
+.tab-btn.active {
+  color: var(--text);
+  background: var(--bg-card);
+  border-color: var(--border);
+}
+
+/* Tab 内容区：默认隐藏，active 时显示。
+   缺失此规则 → 所有 tab-content 垂直堆叠、active class 无视觉效果、
+   tab 点击「毫无反应」、内容被挤到竖向流式布局。*/
+.tab-content { display: none; flex: 1 1 0; min-height: 0; overflow: hidden; }
+.tab-content.active {
+  display: flex;
+  flex-direction: column;
+  /* calc 定高：100vh - (topbar 48 + tab-bar 48) = 内容区可用高度。
+     实测 flex:1 的 basis 0% 在 body 无确定高度链时不收缩（高度=内容 2012px），
+     导致配置内容被 body overflow:hidden 裁切、无滚动轴。calc 硬定高可靠。
+     页签改圆角后 tab-bar 高 48（margin-top 6 + padding 10*2 + line-height），93→96 */
+  height: calc(100vh - 96px);
+  flex: none;
+  min-height: 0;
+}
+
+/* 当前页签高亮已并入上方 .tab-btn.active（hover/active 对齐 Orchestrator 风格） */
+
+/* 配置面板：居中容器（对齐 RAG .container max-width:1000px 风格）
+   缺失 → 配置内容全宽铺开，宽屏下横跨整个屏幕 */
+.config-panel {
+  max-width: 1000px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 20px 24px 40px;
+  box-sizing: border-box;
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+/* 配置区块卡片化（对齐 RAG .card 风格） */
+.config-section {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+.config-section h3 { font-size: 14px; margin-bottom: 14px; color: var(--text); }
+/* 表单行：label 固定宽 + 控件弹性 */
+.form-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.form-row label { min-width: 76px; font-size: 13px; color: var(--text-dim); flex-shrink: 0; }
+.form-row input[type="text"], .form-row input[type="number"], .form-row select {
+  flex: 1; min-width: 150px; padding: 6px 8px;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: 4px; color: var(--text); font-size: 13px;
+}
+.form-row input:focus, .form-row select:focus { outline: none; border-color: var(--accent); }
+/* 配置区 textarea（风格/逻辑提示词等）：统一深色背景，resize 只允许上下拉动（宽度固定）。
+   缺失 → 裸 textarea 白底、可四向 resize，与整体主题脱节 */
+.config-section textarea {
+  width: 100%;
+  padding: 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.config-section textarea:focus { outline: none; border-color: var(--accent); }
 .btn {
   padding: 6px 16px;
   border: none;
@@ -1869,87 +2235,7 @@ body {
         </div>
       </div>
 
-      <!-- LLM 生成模板模态框 -->
-      <div class="modal-overlay" id="gen-template-modal">
-        <div class="modal-box">
-          <div class="modal-header">
-            <h3>从对话生成模板</h3>
-            <button class="modal-close" onclick="closeGenTemplate()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">描述你需要的文档结构，例如：</p>
-            <p style="font-size:12px;color:#f39c12;margin-bottom:8px">"我要写技术报告，需要作者、版本号、背景、技术方案、风险评估、下一步计划"</p>
-            <div style="display:flex;gap:8px;margin-bottom:8px">
-              <input type="text" id="gen-template-name" style="flex:1;padding:6px 8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px" placeholder="模板名称（留空LLM自动生成）">
-            </div>
-            <textarea id="gen-template-desc" rows="4" placeholder="在这里描述你的文档结构需求..."></textarea>
-          </div>
-          <div class="modal-footer">
-            <span id="gen-template-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
-            <button class="btn btn-secondary" onclick="closeGenTemplate()">取消</button>
-            <button class="btn btn-primary" onclick="generateTemplate()">生成并保存</button>
-          </div>
-        </div>
-      </div>
 
-      <!-- 字段要求编辑模态框 -->
-      <div class="modal-overlay" id="desc-modal" style="z-index:100">
-        <div class="modal-box" style="max-width:500px">
-          <div class="modal-header">
-            <h3>编辑字段要求</h3>
-            <button class="modal-close" onclick="closeDescModal()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">该字段的写作提示词，将作为"本节要求"确定性注入写作 prompt，指导 LLM 如何撰写此节内容。</p>
-            <p style="font-size:12px;color:#f39c12;margin-bottom:8px">如需多级子标题，在描述中写明即可，如："按 章→节→条→款 四级展开，子标题用 ####/#####"</p>
-            <textarea id="desc-editor" rows="6" placeholder="输入字段的详细意义..."></textarea>
-          </div>
-          <div class="modal-footer">
-            <span id="desc-modal-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
-            <button class="btn btn-secondary" onclick="closeDescModal()">取消</button>
-            <button class="btn btn-primary" onclick="saveDescModal()">确认</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- 另存为模板模态框 -->
-      <div class="modal-overlay" id="saveas-modal" style="z-index:100">
-        <div class="modal-box" style="max-width:400px">
-          <div class="modal-header">
-            <h3>另存为模板</h3>
-            <button class="modal-close" onclick="closeSaveAsModal()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">输入新模板名称：</p>
-            <input type="text" id="saveas-name" style="width:100%;padding:6px 8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:14px" placeholder="模板名称" autofocus>
-          </div>
-          <div class="modal-footer">
-            <span id="saveas-modal-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
-            <button class="btn btn-secondary" onclick="closeSaveAsModal()">取消</button>
-            <button class="btn btn-primary" onclick="confirmSaveAs()">确认保存</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- 重新规划输入模态框 -->
-      <div class="modal-overlay" id="replan-modal" style="z-index:100">
-        <div class="modal-box" style="max-width:500px">
-          <div class="modal-header">
-            <h3>调整规划</h3>
-            <button class="modal-close" onclick="closeReplanModal()">&times;</button>
-          </div>
-          <div class="modal-body">
-            <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">输入对当前大纲的调整要求。留空则使用原有规划不变。</p>
-            <p style="font-size:12px;color:#f39c12;margin-bottom:8px">例如：第2节加3个子结构、结论改800字、正文分5个部分每部分600字、删除第4节</p>
-            <textarea id="replan-hints" rows="6" placeholder="输入调整要求（留空则按原规划重跑）..."></textarea>
-          </div>
-          <div class="modal-footer">
-            <span id="replan-modal-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
-            <button class="btn btn-secondary" onclick="closeReplanModal()">取消</button>
-            <button class="btn btn-primary" onclick="confirmReplan()">确认重新规划</button>
-          </div>
-        </div>
-      </div>
 
       <div class="config-section">
         <h3>🔗 RAG 知识库</h3>
@@ -2026,6 +2312,17 @@ body {
           <button class="btn btn-primary" onclick="sendMessage()">发送</button>
           <button class="btn btn-success" onclick="startAutoGeneration()">自动撰写</button>
         </div>
+        <div class="example-quick-bar" style="padding:6px 16px;border-top:1px solid var(--border);background:var(--bg-card);font-size:12px;display:flex;gap:8px;align-items:center">
+          <span style="color:var(--text-dim);flex-shrink:0">快速范例：</span>
+          <select id="example-select" style="flex:1;min-width:120px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:4px 6px;font-size:12px">
+            <option value="">（选择已保存的范例）</option>
+          </select>
+          <input type="text" id="example-topic" placeholder="新主题（可选，覆盖范例标题）" style="flex:1.2;min-width:140px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:4px 6px;font-size:12px">
+          <label style="color:var(--text-dim);white-space:nowrap;cursor:pointer;flex-shrink:0" title="勾选后 LLM 按新主题重写章节/子结构标题与要点，结构/RAG/辅助知识/字数不变">
+            <input type="checkbox" id="example-adapt" style="vertical-align:middle"> 适配新主题
+          </label>
+          <button class="btn btn-sm btn-primary" style="background:var(--accent2);flex-shrink:0" onclick="useExample()" title="跳过 LLM 规划，直接基于范例大纲写作">用范例写作（跳过规划）</button>
+        </div>
         <div id="batch-progress" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-card);font-size:13px;color:var(--text-dim)"></div>
         <div id="stop-bar" style="display:none;padding:4px 16px;border-top:1px solid var(--border);background:var(--bg-card);font-size:12px;text-align:center">
           <button class="btn btn-sm btn-secondary" onclick="stopGeneration('delay')">延时停止</button>
@@ -2041,6 +2338,107 @@ body {
 
 </div>
 
+      <!-- LLM 生成模板模态框 -->
+      <div class="modal-overlay" id="gen-template-modal">
+        <div class="modal-box">
+          <div class="modal-header">
+            <h3>从对话生成模板</h3>
+            <button class="modal-close" onclick="closeGenTemplate()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">描述你需要的文档结构，例如：</p>
+            <p style="font-size:12px;color:#f39c12;margin-bottom:8px">"我要写技术报告，需要作者、版本号、背景、技术方案、风险评估、下一步计划"</p>
+            <div style="display:flex;gap:8px;margin-bottom:8px">
+              <input type="text" id="gen-template-name" style="flex:1;padding:6px 8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px" placeholder="模板名称（留空LLM自动生成）">
+            </div>
+            <textarea id="gen-template-desc" rows="4" placeholder="在这里描述你的文档结构需求..."></textarea>
+          </div>
+          <div class="modal-footer">
+            <span id="gen-template-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
+            <button class="btn btn-secondary" onclick="closeGenTemplate()">取消</button>
+            <button class="btn btn-primary" onclick="generateTemplate()">生成并保存</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 字段要求编辑模态框 -->
+      <div class="modal-overlay" id="desc-modal" style="z-index:100">
+        <div class="modal-box" style="max-width:500px">
+          <div class="modal-header">
+            <h3>编辑字段要求</h3>
+            <button class="modal-close" onclick="closeDescModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">该字段的写作提示词，将作为"本节要求"确定性注入写作 prompt，指导 LLM 如何撰写此节内容。</p>
+            <p style="font-size:12px;color:#f39c12;margin-bottom:8px">如需多级子标题，在描述中写明即可，如："按 章→节→条→款 四级展开，子标题用 ####/#####"</p>
+            <textarea id="desc-editor" rows="6" placeholder="输入字段的详细意义..."></textarea>
+          </div>
+          <div class="modal-footer">
+            <span id="desc-modal-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
+            <button class="btn btn-secondary" onclick="closeDescModal()">取消</button>
+            <button class="btn btn-primary" onclick="saveDescModal()">确认</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 另存为模板模态框 -->
+      <div class="modal-overlay" id="saveas-modal" style="z-index:100">
+        <div class="modal-box" style="max-width:400px">
+          <div class="modal-header">
+            <h3>另存为模板</h3>
+            <button class="modal-close" onclick="closeSaveAsModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">输入新模板名称：</p>
+            <input type="text" id="saveas-name" style="width:100%;padding:6px 8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:14px" placeholder="模板名称" autofocus>
+          </div>
+          <div class="modal-footer">
+            <span id="saveas-modal-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
+            <button class="btn btn-secondary" onclick="closeSaveAsModal()">取消</button>
+            <button class="btn btn-primary" onclick="confirmSaveAs()">确认保存</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 重新规划输入模态框（整篇 + 局部两级共用；_replanTarget 区分） -->
+      <div class="modal-overlay" id="replan-modal" style="z-index:100">
+        <div class="modal-box" style="max-width:500px">
+          <div class="modal-header">
+            <h3 id="replan-modal-title">调整规划</h3>
+            <button class="modal-close" onclick="closeReplanModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p id="replan-modal-hint" style="font-size:13px;color:var(--text-dim);margin-bottom:8px">输入对当前大纲的调整要求。留空则使用原有规划不变。</p>
+            <p style="font-size:12px;color:#f39c12;margin-bottom:8px">例如：第2节加3个子结构、结论改800字、正文分5个部分每部分600字、删除第4节</p>
+            <textarea id="replan-hints" rows="6" placeholder="输入调整要求（留空则按原规划重跑）..."></textarea>
+          </div>
+          <div class="modal-footer">
+            <span id="replan-modal-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
+            <button class="btn btn-secondary" onclick="closeReplanModal()">取消</button>
+            <button class="btn btn-primary" onclick="confirmReplan()">确认重新规划</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 保存范例并生成模态框 -->
+      <div class="modal-overlay" id="example-modal" style="z-index:100">
+        <div class="modal-box" style="max-width:420px">
+          <div class="modal-header">
+            <h3>保存为快速范例并生成</h3>
+            <button class="modal-close" onclick="closeExampleModal()">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p style="font-size:13px;color:var(--text-dim);margin-bottom:8px">先保存当前大纲为快速范例，然后开始写作；生成完成后文章自动回填进范例，下次可一键调用（跳过 LLM 规划）。</p>
+            <input type="text" id="example-name" style="width:100%;padding:6px 8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:14px" placeholder="范例名称（默认=文章标题）" autofocus>
+          </div>
+          <div class="modal-footer">
+            <span id="example-modal-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
+            <button class="btn btn-secondary" onclick="closeExampleModal()">取消</button>
+            <button class="btn btn-primary" onclick="confirmSaveExample()">保存并生成</button>
+          </div>
+        </div>
+      </div>
+
 <script>
 // ===== 全局状态 =====
 let currentSessionId = '';
@@ -2048,6 +2446,12 @@ let currentOutline = null;
 let isGenerating = false;
 let ragOnline = false;
 let ragKbs = [];
+let _replanTarget = null;   // 局部重规划目标 {type: 'section'|'sub', id}
+let _pendingExampleName = null;  // 保存范例并生成：等待生成完成后回填文章的范例名
+
+function escapeAttr(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
 // ===== 初始化 =====
 document.addEventListener('DOMContentLoaded', () => {
@@ -2055,6 +2459,7 @@ document.addEventListener('DOMContentLoaded', () => {
   loadSessions();
   checkRagStatus();
   loadOutputs();
+  loadExamples();
 
   // Tab 切换
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -3131,6 +3536,9 @@ function buildOutlineHTML(outline, readOnly) {
     const orderOpts = ['', ...Array.from({length: sections.length}, (_, i) => String(i+1))]
       .map(v => `<option value="${v}" ${i===0 && v==='' ? 'selected' : ''}>${v || '自动'}</option>`).join('');
     const statusIcon = s.status === 'done' ? '✅' : (s.status === 'in_progress' ? '⏳' : '');
+    const secTag = s.type === 'leaf'
+      ? '<span style="font-size:10px;color:#f39c12;background:rgba(243,156,18,0.15);padding:1px 5px;border-radius:3px;margin-left:4px">LEAF</span>'
+      : '<span style="font-size:10px;color:#5dade2;background:rgba(93,173,226,0.15);padding:1px 5px;border-radius:3px;margin-left:4px">SEC</span>';
 
     // 子结构行
     const subs = s.sub_sections || [];
@@ -3144,11 +3552,14 @@ function buildOutlineHTML(outline, readOnly) {
           <div style="display:flex;align-items:center;gap:8px;">
             ${readOnly ? '' : `<input type="checkbox" class="sc-sub-cb" ${ss._checked !== false ? 'checked' : ''} onchange="onSubToggle(this, '${s.id}')">`}
             ${readOnly ? '' : `<select class="sc-sub-order" style="width:48px;font-size:11px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" onchange="collectOutlineData()">${subOpts}</select>`}
-            <span style="font-size:13px;flex:1;color:var(--text-dim)">${ss.title}</span>
+            ${readOnly
+              ? `<span style="font-size:13px;flex:1;color:var(--text-dim)">${ss.title}</span>`
+              : `<input class="sub-title-input" data-sid="${ss.id}" value="${escapeAttr(ss.title)}" onchange="onTitleChange(this)" style="flex:1;min-width:90px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px 4px;font-size:12px">`}
             ${readOnly ? '' : `<input type="number" class="sub-words" value="${ss.word_count || 400}" style="width:58px;font-size:11px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" min="100" max="2000" onchange="onSubWordChange(this, '${ss.id}', '${s.id}')"><span style="font-size:11px;color:var(--text-dim)">字</span>`}
             ${readOnly ? `<span style="font-size:11px;color:var(--text-dim)">${ss.word_count || ''}字</span>` : ''}
             ${ss.status === 'done' ? '<span style="font-size:11px;color:var(--green)">✓</span>' : ''}
             ${readOnly ? '' : `<button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openAuxModal('${ss.id}')" title="辅助知识">+</button>`}
+            ${readOnly ? '' : `<button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openReplanModal('sub','${ss.id}')" title="重新规划该子结构（只重做这一个）">重规划</button>`}
           </div>
           ${ss.summary ? `<div style="font-size:11px;color:var(--text-dim);margin-left:80px;margin-top:2px;line-height:1.3">${ss.summary}</div>` : ''}
         </div>`;
@@ -3158,7 +3569,9 @@ function buildOutlineHTML(outline, readOnly) {
       <div class="section-card" data-sid="${s.id}">
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%">
           ${readOnly ? '' : `<input type="checkbox" class="sc-section-cb" ${s._checked !== false ? 'checked' : ''} onchange="onSectionToggle(this, '${s.id}')" style="flex-shrink:0">`}
-          <div class="sc-label" style="flex:1">${s.title} ${s.type === 'leaf' ? '<span style="font-size:10px;color:#f39c12;background:rgba(243,156,18,0.15);padding:1px 5px;border-radius:3px;margin-left:4px">LEAF</span>' : '<span style="font-size:10px;color:#5dade2;background:rgba(93,173,226,0.15);padding:1px 5px;border-radius:3px;margin-left:4px">SEC</span>'}${readOnly ? (s.is_key ? ' <span class="sc-key">⭐重点</span>' : '') : ''} ${statusIcon}</div>
+          ${readOnly
+            ? `<div class="sc-label" style="flex:1">${s.title} ${secTag}${s.is_key ? ' <span class="sc-key">⭐重点</span>' : ''} ${statusIcon}</div>`
+            : `<input class="sec-title-input" data-sid="${s.id}" value="${escapeAttr(s.title)}" onchange="onTitleChange(this)" style="flex:1;min-width:120px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:3px 6px;font-size:13px"> ${secTag} ${statusIcon}`}
           <div class="sc-meta">${s.subtitle || ''}</div>
           ${readOnly ? `<span style="font-size:12px;color:var(--text-dim)">${s.status === 'done' ? s.actual_word_count + '字' : (s.status === 'in_progress' ? '写作中...' : '')}</span>` : ''}
           ${readOnly ? '' : `<label style="font-size:12px;color:var(--sc-key);cursor:pointer"><input type="checkbox" class="sc-key-cb" ${s.is_key ? 'checked' : ''} onchange="collectOutlineData()"> ⭐重点</label>`}
@@ -3169,6 +3582,7 @@ function buildOutlineHTML(outline, readOnly) {
               : `<input type="number" class="sec-word-input" data-sid="${s.id}" value="${s.word_count || 800}" style="width:58px;font-size:11px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" min="50" max="5000" onchange="onLeafWordChange(this, '${s.id}')"><span style="font-size:13px;color:var(--text-dim)">字</span>`)
             : `<span class="sec-word-sum" data-sid="${s.id}" style="font-size:13px;color:var(--text-dim)">${s.word_count}</span><span style="font-size:13px;color:var(--text-dim)">字</span>`)}
           ${readOnly ? '' : `<label class="sc-rag"><input type="checkbox" class="sc-rag-cb" onchange="onRagToggle(this, '${s.id}')" ${!ragOnline ? 'disabled title="RAG未连接"' : ''}> RAG</label>` + (ragOnline && Array.isArray(ragKbs) ? `<select class="sc-kb" style="display:none;width:120px;font-size:12px" onchange="collectOutlineData()">${'<option value=\"\">自动KB</option>' + ragKbs.map(k => '<option value=\"' + k + '\">' + k + '</option>').join('')}</select>` : '')}
+          ${readOnly ? '' : `<button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openReplanModal('section','${s.id}')" title="重新规划该章节（子结构全部重做）">重规划</button>`}
         </div>
         ${readOnly ? '' : subHTML}
       </div>`;
@@ -3181,6 +3595,7 @@ function buildOutlineHTML(outline, readOnly) {
       <div class="outline-actions">
         <button class="btn btn-primary" onclick="startGeneration()">开始生成</button>
         <button class="btn btn-secondary" onclick="replanOutline()">重新规划</button>
+        <button class="btn btn-success" onclick="saveExampleAndGenerate()" title="先保存为快速范例，再开始生成；完成后文章自动回填进范例">保存范例并生成</button>
         <div id="rag-status-text" style="font-size:11px;color:var(--text-dim);margin-top:6px"></div>
       </div>`;
   } else {
@@ -3261,6 +3676,84 @@ function onSubWordChange(el, subId, secId) {
 
 // ===== 辅助知识模态框 =====
 let _auxModalSubId = null;
+let _pluginList = [];
+let _pluginResult = null;
+
+// ===== 数据源插件 =====
+function loadPlugins() {
+  fetch('/api/plugins').then(r => r.json()).then(d => {
+    if (!d.success) return;
+    _pluginList = d.plugins || [];
+    const sel = document.getElementById('plugin-select');
+    if (!sel) return;
+    sel.innerHTML = '<option value="">（选择插件）</option>' + _pluginList.map(p =>
+      '<option value="' + p.id + '">' + escapeHtml(p.name) + '</option>').join('');
+  }).catch(() => {});
+}
+
+function renderPluginForm() {
+  const sel = document.getElementById('plugin-select');
+  const plugin = _pluginList.find(p => p.id === sel.value);
+  const box = document.getElementById('plugin-fields');
+  const btn = document.getElementById('plugin-run-btn');
+  const resBox = document.getElementById('plugin-result');
+  _pluginResult = null;
+  if (resBox) resBox.innerHTML = '';
+  if (!plugin) { box.innerHTML = ''; btn.disabled = true; return; }
+  btn.disabled = false;
+  box.innerHTML = plugin.input_fields.map(f => {
+    let ctrl;
+    if (f.type === 'select') {
+      ctrl = `<select id="pf-${f.key}" style="flex:1;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:4px 6px;font-size:12px">` +
+        (f.options || []).map(o => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join('') + '</select>';
+    } else {
+      const itype = f.type === 'password' ? 'password' : 'text';
+      ctrl = `<input id="pf-${f.key}" type="${itype}" style="flex:1;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:4px 6px;font-size:12px" placeholder="${escapeAttr(f.hint || '')}">`;
+    }
+    return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="width:150px;font-size:12px;color:var(--text-dim);flex-shrink:0">${escapeHtml(f.label)}</span>${ctrl}</div>`;
+  }).join('');
+}
+
+function runPlugin() {
+  const sel = document.getElementById('plugin-select');
+  const plugin = _pluginList.find(p => p.id === sel.value);
+  if (!plugin) return;
+  const inputs = {};
+  plugin.input_fields.forEach(f => {
+    const el = document.getElementById('pf-' + f.key);
+    if (el) inputs[f.key] = el.value.trim();
+  });
+  const box = document.getElementById('plugin-result');
+  box.innerHTML = '<div style="font-size:12px;color:var(--text-dim)">⏳ 正在执行插件...</div>';
+  fetch('/api/plugin/run', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({plugin_id: plugin.id, inputs})
+  }).then(r => r.json()).then(d => {
+    if (!d.success) {
+      box.innerHTML = '<div style="font-size:12px;color:#e74c3c">❌ ' + escapeHtml(d.error || '') + '</div>';
+      return;
+    }
+    _pluginResult = d;
+    const preview = (d.preview || []).map(l => escapeHtml(l)).join('<br>');
+    const rowsText = d.row_count !== undefined ? ('，' + d.row_count + ' 行') : '';
+    box.innerHTML =
+      '<div style="font-size:12px;color:var(--green)">✅ 已获取「' + escapeHtml(d.name) + '」' + rowsText + '</div>' +
+      '<div style="font-family:monospace;font-size:11px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;padding:6px;margin:4px 0;max-height:130px;overflow:auto;color:var(--text)">' + preview + '</div>' +
+      '<button class="btn btn-sm btn-primary" onclick="mountPluginResult()">挂载到本子结构</button>';
+  }).catch(e => {
+    box.innerHTML = '<div style="font-size:12px;color:#e74c3c">❌ ' + escapeHtml(e.message) + '</div>';
+  });
+}
+
+function mountPluginResult() {
+  if (!_pluginResult) return;
+  const file = _pluginResult.type === 'table'
+    ? {name: _pluginResult.name, type: 'table', path: _pluginResult.path}
+    : {name: _pluginResult.name, type: 'text', content: _pluginResult.content};
+  addAuxFile(file);
+  const box = document.getElementById('plugin-result');
+  box.innerHTML = '<div style="font-size:12px;color:var(--green)">✅ 已挂载，点「保存」生效</div>';
+}
 
 function openAuxModal(subId) {
   _auxModalSubId = subId;
@@ -3287,6 +3780,8 @@ function openAuxModal(subId) {
       }
     }
   }
+  loadPlugins();
+  renderPluginForm();
   overlay.classList.add('show');
 }
 
@@ -3417,7 +3912,16 @@ function getOutlineData() {
   const subOrders = {}; // {subId: int}
   const subWords = {}; // {subId: word_count}
   const secWords = {}; // {sectionId: word_count} for leaf sections
+  const titles = {};   // {id: 修改后的标题}（章节 + 子结构）
   const auxKnowledge = currentOutline ? collectAuxKnowledge() : {};
+  card.querySelectorAll('.sec-title-input').forEach(inp => {
+    const v = inp.value.trim();
+    if (v) titles[inp.dataset.sid] = v;
+  });
+  card.querySelectorAll('.sub-title-input').forEach(inp => {
+    const v = inp.value.trim();
+    if (v) titles[inp.dataset.sid] = v;
+  });
   card.querySelectorAll('.section-card').forEach(sc => {
     const sid = sc.dataset.sid;
     const secCb = sc.querySelector('.sc-section-cb');
@@ -3444,7 +3948,7 @@ function getOutlineData() {
     const secWord = sc.querySelector('.sec-word-input')?.value;
     if (secWord !== undefined && secWord !== '') secWords[sid] = parseInt(secWord) || 0;
   });
-  return {orders, rag, keySections, checked, subOrders, subWords, secWords, auxKnowledge};
+  return {orders, rag, keySections, checked, subOrders, subWords, secWords, titles, auxKnowledge};
 }
 
 function startGeneration() {
@@ -3458,20 +3962,24 @@ function startGeneration() {
   const data = getOutlineData();
   const msgEl = addAssistantMsg('⏳ 正在启动生成任务...');
 
+  const genBody = {
+    session_id: currentSessionId,
+    orders: data?.orders || {},
+    rag: data?.rag || {},
+    key_sections: data?.keySections || {},
+    checked: data?.checked || {},
+    sub_orders: data?.subOrders || {},
+    sub_words: data?.subWords || {},
+    sec_words: data?.secWords || {},
+    titles: data?.titles || {},
+    aux_knowledge: data?.auxKnowledge || {}
+  };
+  if (_pendingExampleName) genBody.save_example_name = _pendingExampleName;
+
   fetch('/api/generate', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({
-      session_id: currentSessionId,
-      orders: data?.orders || {},
-      rag: data?.rag || {},
-      key_sections: data?.keySections || {},
-      checked: data?.checked || {},
-      sub_orders: data?.subOrders || {},
-      sub_words: data?.subWords || {},
-      sec_words: data?.secWords || {},
-      aux_knowledge: data?.auxKnowledge || {}
-    })
+    body: JSON.stringify(genBody)
   }).then(r => r.json()).then(d => {
     if (d.success) {
       msgEl.querySelector('.msg-content').innerHTML = '⏳ 生成任务已启动，正在写作...';
@@ -3613,6 +4121,22 @@ function startBatchPolling(batchId, totalCount) {
 }
 
 function replanOutline() {
+  // 整篇重规划：清空局部目标
+  _replanTarget = null;
+  document.getElementById('replan-modal-title').textContent = '调整规划';
+  document.getElementById('replan-modal-hint').textContent = '输入对当前大纲的调整要求。留空则使用原有规划不变。';
+  document.getElementById('replan-hints').value = '';
+  document.getElementById('replan-modal-status').textContent = '';
+  document.getElementById('replan-modal').classList.add('show');
+}
+
+function openReplanModal(type, id) {
+  // 局部重规划：type='section'（整章，子结构全部重做）| 'sub'（单子结构）
+  _replanTarget = {type, id};
+  document.getElementById('replan-modal-title').textContent = type === 'section' ? '重新规划章节' : '重新规划子结构';
+  document.getElementById('replan-modal-hint').textContent = type === 'section'
+    ? '输入对该章节的新要求（如方向、子结构数量、融合角度）。章节内全部子结构将按新要求重做，其他章节不受影响。'
+    : '输入对该子结构的新要求（如内容方向、重点）。只重做这一个子结构，其余内容不受影响。';
   document.getElementById('replan-hints').value = '';
   document.getElementById('replan-modal-status').textContent = '';
   document.getElementById('replan-modal').classList.add('show');
@@ -3634,6 +4158,35 @@ function closeReplanModal() {
 function confirmReplan() {
   const hints = document.getElementById('replan-hints').value.trim();
   closeReplanModal();
+
+  // ── 局部重规划分支：只重做目标节点，原卡片原地刷新 ──
+  if (_replanTarget) {
+    const t = _replanTarget;
+    _replanTarget = null;
+    addAssistantMsg('⏳ 正在重新规划目标节点...');
+    fetch('/api/replan_section', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({session_id: currentSessionId, target_id: t.id, hints})
+    }).then(r => r.json()).then(d => {
+      if (d.success) {
+        currentOutline = d.outline;
+        const card = document.getElementById('outline-card');
+        if (card) {
+          card.closest('.msg').querySelector('.msg-content').innerHTML = buildOutlineHTML(d.outline);
+        } else {
+          renderOutline(d.outline);
+        }
+        addAssistantMsg('✅ 目标节点已重新规划，其他章节保持不变');
+      } else {
+        addAssistantMsg('❌ 局部重规划失败：' + (d.error || ''));
+      }
+    }).catch(err => {
+      addAssistantMsg('❌ 请求失败：' + err.message);
+    });
+    return;
+  }
+
+  // ── 整篇重规划分支（原有逻辑） ──
   const topic = currentOutline?.title || '';
   if (!topic) return;
   addAssistantMsg(hints ? '⏳ 正在按新要求重新规划...' : '⏳ 正在重新规划...');
@@ -3658,6 +4211,98 @@ function confirmReplan() {
   }).catch(err => {
     addAssistantMsg('❌ 请求失败：' + err.message);
   });
+}
+
+// ===== 标题修改（章节/子结构可改名） =====
+function onTitleChange(input) {
+  // 标题修改收集在 getOutlineData() 中从 DOM 读取，这里仅同步 currentOutline 供前端状态一致
+  if (!currentOutline) return;
+  const id = input.dataset.sid;
+  const v = input.value.trim();
+  if (!id || !v) return;
+  (currentOutline.sections || []).forEach(s => {
+    if (s.id === id) { s.title = v; return; }
+    (s.sub_sections || []).forEach(ss => {
+      if (ss.id === id) ss.title = v;
+    });
+  });
+}
+
+// ===== 保存范例并生成（前置存大纲 + 完成回填文章） =====
+function saveExampleAndGenerate() {
+  if (isGenerating) return;
+  if (!currentSessionId || !currentOutline) {
+    addAssistantMsg('❌ 请先生成大纲');
+    return;
+  }
+  document.getElementById('example-name').value = currentOutline.title || '';
+  document.getElementById('example-modal-status').textContent = '';
+  document.getElementById('example-modal').classList.add('show');
+}
+
+function closeExampleModal() {
+  document.getElementById('example-modal').classList.remove('show');
+}
+
+function confirmSaveExample() {
+  const name = document.getElementById('example-name').value.trim();
+  if (!name) {
+    document.getElementById('example-modal-status').textContent = '范例名称不能为空';
+    return;
+  }
+  const templateName = document.getElementById('template-select').value;
+  fetch('/api/example/save', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({name, template_name: templateName, outline: currentOutline})
+  }).then(r => r.json()).then(d => {
+    if (!d.success) {
+      document.getElementById('example-modal-status').textContent = '❌ ' + (d.error || '保存失败');
+      return;
+    }
+    closeExampleModal();
+    _pendingExampleName = d.name;
+    loadExamples();
+    addAssistantMsg('✅ 大纲已保存为范例「' + escapeHtml(d.name) + '」，开始生成（完成后自动回填文章）');
+    startGeneration();
+  }).catch(err => {
+    document.getElementById('example-modal-status').textContent = '❌ ' + err.message;
+  });
+}
+
+// ===== 快速范例调用（跳过 LLM 规划） =====
+function loadExamples() {
+  fetch('/api/examples').then(r => r.json()).then(d => {
+    if (!d.success) return;
+    const sel = document.getElementById('example-select');
+    if (!sel) return;
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">（选择已保存的范例）</option>' + (d.examples || []).map(e => {
+      const badge = e.has_article ? ' ✓' : '';
+      return `<option value="${escapeAttr(e.name)}">${escapeHtml(e.name)}${badge}（${escapeHtml(e.topic || '')}）</option>`;
+    }).join('');
+    if (cur) sel.value = cur;
+  }).catch(() => {});
+}
+
+function useExample() {
+  const sel = document.getElementById('example-select');
+  const name = sel ? sel.value : '';
+  if (!name) { addAssistantMsg('❌ 请先选择一个快速范例'); return; }
+  const topic = document.getElementById('example-topic').value.trim();
+  const adapt = !!(document.getElementById('example-adapt') && document.getElementById('example-adapt').checked);
+  addAssistantMsg('⏳ 正在加载范例「' + escapeHtml(name) + '」...（跳过 LLM 规划' + (adapt ? '，正在按新主题适配大纲' : '') + '）');
+  fetch('/api/example/use', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({name, topic, adapt})
+  }).then(r => r.json()).then(d => {
+    if (!d.success) { addAssistantMsg('❌ 加载范例失败：' + (d.error || '')); return; }
+    currentSessionId = d.session_id;
+    currentOutline = d.outline;
+    addAssistantMsg(adapt ? '✅ 已加载范例并按新主题适配大纲（结构/RAG/字数不变），可开始生成或继续调整。' : '✅ 已加载范例，规划阶段已跳过。可直接开始生成，或在评审中改标题 / 局部重规划。');
+    renderOutline(d.outline);
+    loadSessions();
+    if (document.getElementById('example-topic')) document.getElementById('example-topic').value = '';
+  }).catch(err => addAssistantMsg('❌ 请求失败：' + err.message));
 }
 
 function showFileContent(filepath) {
@@ -3777,8 +4422,30 @@ function fetchResult(sessionId) {
         if (d.content) {
           resultMsg += `\n\n--- 预览 ---\n${d.content}`;
         }
+        // 保存范例并生成：生成完成后自动回填文章全文
+        if (_pendingExampleName && d.output_file) {
+          const exName = _pendingExampleName;
+          _pendingExampleName = null;
+          fetch('/api/example/update_article', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({name: exName, output_file: d.output_file})
+          }).then(r => r.json()).then(d2 => {
+            if (d2.success) {
+              addAssistantMsg('📦 范例「' + escapeHtml(exName) + '」已更新：文章已回填（' + (d2.article_chars || 0) + ' 字）');
+            } else {
+              addAssistantMsg('⚠️ 范例「' + escapeHtml(exName) + '」文章回填失败：' + (d2.error || ''));
+            }
+            loadExamples();
+          }).catch(() => loadExamples());
+        } else if (_pendingExampleName) {
+          _pendingExampleName = null;
+        }
       } else {
         resultMsg = '❌ 写作失败：' + (d.error || '');
+        if (_pendingExampleName) {
+          addAssistantMsg('⚠️ 范例「' + escapeHtml(_pendingExampleName) + '」仅保存了大纲（生成失败，文章未回填），可稍后重新生成再回填');
+          _pendingExampleName = null;
+        }
       }
       addAssistantMsg(resultMsg);
       isGenerating = false;
@@ -3955,6 +4622,17 @@ function deleteOutput(btn, name, isDir, imageCount) {
       </div>
       <input type="file" id="aux-file-input" accept=".csv,.db,.txt,.md,.png,.jpg,.jpeg,.gif" style="display:none" multiple onchange="onAuxFilesSelected(event)">
       <div class="file-list" id="aux-file-list"></div>
+      <div class="plugin-section" style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+        <div style="font-size:12px;color:var(--text-dim);margin-bottom:6px">数据源插件（对接 db/csv 取数，取什么由上方使用指令决定）：</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="plugin-select" style="flex:1;min-width:120px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:4px 6px;font-size:12px" onchange="renderPluginForm()">
+            <option value="">（选择插件）</option>
+          </select>
+          <button class="btn btn-sm btn-secondary" id="plugin-run-btn" style="flex-shrink:0" onclick="runPlugin()" disabled>执行取数</button>
+        </div>
+        <div id="plugin-fields" style="margin-top:6px"></div>
+        <div id="plugin-result" style="margin-top:6px"></div>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeAuxModal()">取消</button>
