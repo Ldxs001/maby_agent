@@ -3,6 +3,105 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [2.3.0b0] - 2026-08-15
+### 新增（会话消息持久化 / 字数差异化 / 备份全局化 / UI 实时性，2.2.0b0 之后迭代）
+- **会话消息持久化**：session 加 `messages` 字段 + `append_message`（上限 200）；`/api/plan` 规划**前**创建 session 并存入用户要求（规划跑数分钟期间切走/切回要求都在，规划失败会话保留可重试）；`/api/session/load` 返回 messages；前端 loadSession 重建用户消息（config 分支中性提示）——"切走切回什么都没有"根治
+- **通用线消息持久化**：`/api/chat` 复用/创建 session 存 user 消息（load-or-init 保留历史累积）；响应新增 `session_id` 字段（原结构保留）；前端 sendMessage 据此更新 currentSessionId；`/api/plan` 存 topic 去重（chat→生成大纲按钮→plan 链路防重复）；会话列表标题 outline 空时取消息首条截断
+- **子结构字数差异化**：规划 prompt 加 `word_count` 字段（lo-hi 区间内按内容重要度浮动，同章各段不许相同——重点段取中上/普通段中下/过渡段可短）；注册保存 LLM 值；显示优先 LLM 值（不再统一取档位 max 导致全 1500/2000/4000）
+- **项目备份兜底全局化 + 备份含正文**：`load_state` 统一兜底（文件缺失 → 自动从备份恢复 → 失败才抛明确中文错误）——plan_chapter_subs/replan/context_loader 等所有读点不再裸抛 FileNotFoundError；`_backup_state` 整目录同步（state + chapters 正文），`_restore_from_backup` 完整恢复两者
+- **前端加载自动恢复**：`/api/session/load` 小说线自动尝试恢复备份（ok/restored/missing）；前端 done/error/writing 三分支按恢复结果判定——恢复成功 → 非只读（「开始生成」续写入口）+ 恢复提示；无备份 → 只读 + 明确提示删会话重开（不再"明明能救却显示只读"）
+- **叙事视角强指令**：context_loader 文风约束段加【视角强制】（第一人称=以「我」叙述禁他/她/角色名作主语，第三人称全知/有限各自明确）；NOVEL_SYSTEM_PROMPT 声明"【视角强制】是最高优先级写作规则"——标签变可执行规则
+- **轮询实时刷新大纲卡片**：progress 轮询防抖（进度戳变化）→ 拉最新 outline 重渲染大纲卡片（两线共用）——切会话再切回，生成线程的章/子结构进度实时可见（"状态丢失、结果不体现"根治）
+- **重规划刷新分场景**：章级重规划（大纲卡片操作）→ 刷新大纲卡片 + 小说线重置确认面板；段级重规划（确认面板操作）→ 只刷确认面板，大纲卡片不动
+- **确认面板即时反馈**：确认成功立即收起面板 + 对话栏提示 + `_ncConfirming` 防重复点击（不再等 1.5s 轮询才动）
+
+### 修复
+- 切走切回会话"什么都没有"（无消息历史 + 规划期 session 不存在）→ 消息持久化 + 规划前落库
+- 子结构字数全相同（显示层取档位 max）→ LLM 定字数全链路
+- 备份只接 novel_writer 开头（L02-L05 规划裸抛 FileNotFoundError）→ load_state 统一兜底
+- 备份缺正文（只存 state）→ 整目录备份含 chapters
+- done 会话永远只读死胡同（不试恢复）→ 加载自动恢复 + 按结果判定可续写
+- 叙事视角标签无执行规则（LLM 仍写第三人称）→ 【视角强制】强指令
+- 进度轮询空实现（注释"重新加载session"但没做）→ 防抖重渲染
+- 确认后无即时反馈/可重复点击 → 收面板 + 防重复
+- confirmReplan 小说线一刀切不刷大纲卡片（章级该刷）→ 按操作入口分场景
+- 通用线 chat 会话列表标题为空 → 消息首条截断
+
+## [2.2.0b0] - 2026-08-14
+### 新增（小说线健壮性与模板一致性，2.1.0b0 之后迭代）
+- **小说标题提炼**：章大纲规划时 LLM 同步输出短标题（≤12字）；`build_outline` 按 auto 语义落地——用户填了用用户的，没填用 LLM 提炼，兜底截断原文（不再把完整需求当标题）
+- **小说线辅助知识**：前端确认面板每段「+辅助」按钮（与通用线同入口）→ `aux_knowledge` 传入 novel_writer → `_build_sub_aux` 组装（使用指令+文字/表格注入，图片跳过）→ 段 prompt 注入【辅助知识】；文案与通用线统一，RAG 独立为【RAG 参考资料】
+- **项目状态自动备份与恢复**：`save_state` 每次成功同步备份到 `data/novel/backups/`（projects 兄弟级，防误删连带）；novel_writer 检测 state 丢失 → `restore_novel_state` 自动从备份恢复（角色/设定/实体/命题框不丢），无备份才 fail-closed
+- **meta 三模式语义统一**（模板 source 唯一权威，零字段特判）：user=用户填直接抄入 LLM 不经手（通用线代码级固化）；auto=已填抄入未填 LLM 生成；llm=一律 LLM 生成。新增 `META_TO_WRITING_STYLE` 配置映射表 + `_apply_meta_to_writing_style` 通用函数（叙事视角→narrative_voice 声明式映射）；标题/叙事视角删字段特判
+- **写作上下文真正注入**：`load_context` 是 novel-weaver CLI 脚本（全程 print 无 return）→ 新增 `_load_context_captured`（redirect_stdout 捕获）→ 角色/人格/情绪/命题框/叙事视角首次真正进入段写作 prompt
+- **叙事视角生效**：场景配置 JSON 加 `writing_style` 字段（prompt 严格沿用 user 给定视角）；用户填的叙事视角按 source 语义覆盖 LLM 返回（第一人称不再被写成第三人称）
+- **规划 max_tokens 全走配置**：novel_bridge 4 处 `_llm_json` 拍死值（8192/16384）移除，统一 `llm_client.max_tokens`（用户配置）
+- **文件为真相源**：续写恢复以文件存在且非空为准——段级 done 但文件缺失/空 → 置回 pending 重写（不静默丢正文）；章级 `_chapter_files_complete` 校验子结构文件齐全，缺/0字节 → 降级段级处理；落盘后回读校验（防 0 字节假 done）
+
+### 修复
+- planner.py topic 硬塞标题（`user_meta["标题"]=topic` 旧兜底）→ 删除，小说线标题走 auto 语义
+- 空章闪跳：done 章未规划子结构（空章）→ 回 pending 重新规划，不允许空转标 done；段循环前空子结构拦截；章末尾 `_chapter_any_sub_written` 校验（勾选段至少一个落盘才标 done）
+- 写作循环空正文卡死 → 空内容重试（最多 3 次降级放弃），反馈"只输出正文不输出思考"
+- LLM 挂起无限等（urllib timeout Windows 不可靠）→ daemon 线程 + join(用户配置 timeout) 兜底
+- write-sub 失败不检查 → 落盘失败不标 done 置 pending，且改为进程内落盘 `_write_sub_inline`（写子进程在 Web 线程不可靠，0 字节根源）+ `_read_sub_content`/`_read_chapter_md` 路径修正（parent → parent.parent）
+- `novel_context_loader` CLI 串行阻断（HOOK-BLOCK + sys.exit）→ 删除，Web 串行由 novel_writer 状态机保证；段落盘失败 → 停止整章
+- 会话切换子结构残留（旧轮询弹回面板）→ loadSession/newSession 停轮询 + 响应会话守卫 + stopProgressPolling 清面板
+- error 会话死胡同（只读渲染无按钮）→ 小说线 error 会话非只读渲染（开始生成=重试/续写入口）
+- 输入框高度拉伸错位 → textarea resize:vertical（右上角无空间 → 顶部拖拽条向上拉，双击复位）
+- 题材必填前端两入口 + 后端双保险（缺失 400）；篇幅不强制（默认中篇）
+
+## [2.1.0b0] - 2026-08-14
+### 新增（小说线交互与一致性强化，2.0.0b0 之后迭代）
+- **两阶段规划 + 章级门控**：规划只出章（2 次 LLM，快）→ 写作时逐章「规划子结构 → 下方确认面板 → 确认 → 写本章」；章状态机 `pending → planning → confirmed → in_progress → done`；确认状态持久化在 session（重启/刷新不丢）
+- **章级确认面板**（固定生成控制区，不随对话滚动）：每段可**勾选跳过 / 改字数 / 标 ⭐重点 / 看概述 / 段级重规划**；`POST /api/novel/confirm` 应用调整 + 章字数汇总；`_ncConfirmId` 防轮询重复重建丢用户输入
+- **段级重规划**：`replan_novel_sub`（保留 s_key/word_count/status/word_count_target，重做 title/summary/tone/emotions/writing_prompt≥50）+ `POST /api/novel/replan_sub`（session 反查 → 更新 state+outline，章保持 planning）
+- **篇幅字数档位注入规划**：plan-chapter / replan prompt 注入【字数目标】每子结构 lo-hi 字（短篇 1000-1500 / 中篇 1500-2000 / 长篇 2000-4000），LLM 规划即知档位；写作 prompt 注入确认后字数目标
+- **续写恢复**：done 章从 novel 项目文件恢复正文跳过；章中途中断续写时已写段（status=done）从文件恢复**不重写**；confirmed 章续写不重新规划子结构（`==pending` 才规划）
+- **前文状态摘要注入**：plan-chapter 注入已规划章节的子结构摘要 + 角色表（受控规模一行一条，防漂移不线性膨胀）
+
+### 修复
+- 章大纲无概述 → 章行渲染 📖 概述（buildOutlineHTML 章级补 summary 行）
+- 章字数 800 vs 子结构 1500 矛盾 → 章字数=篇幅估算（中间值×默认3段），同步子结构后=各段汇总
+- 子结构字段缺失 → `_sync_subs_from_state` 补全 15 字段对齐通用线（is_key/rag/subtitle/type/show_label/_tmpl_key/_logical_order）
+- 确认面板藏在大纲卡片 + 文案"请在右侧确认"误导 → 面板移出大纲卡片到固定生成控制区（stop-bar 下方）
+- 指纹跨进程非确定（`_fingerprint` 遍历 set 受 PYTHONHASHSEED 影响）→ 全部 `sorted()`，跨进程指纹确定
+- `_llm_json` 一次失败即抛 → 对齐通用线 3 次重试 + 思考污染检测反馈（**不禁思考**，模型行为不动）
+- 新角色 HOOK-BLOCK 阻断死路（novel-weaver 面向 LLM 对话回路，Web 后台无回路）→ 声明即自动登记不阻断，prompt 收紧只声明有名字角色
+- write-sub 内部隐式 finalize-chapter 加载 bge/R1（3.7G）卡线程 → `NOVEL_SKIP_AUTOFINALIZE`，章检统一由 novel_writer 受配置开关控制
+- WinError 183（Windows `rename` 目标已存在不覆盖）→ `os.replace` / `Path.replace`
+- 规划阶段二次写（init 建空骨架 + _seed_characters 覆盖）→ `init_novel_project` 带 characters 一次建好，死代码删除
+- plan-chapter 指纹误拦 → 合法核心字段写入入口（plan-chapter / replan-novel-sub）跳过校验并刷新指纹
+- f-string 花括号未转义（Invalid format specifier）→ 去 `f` 前缀
+
+## [2.0.0b0] - 2026-08-14
+### 新增（小说模式 NOVEL MODE，独立一条线，按规划 P1-P4 四阶段落地）
+> 实施为一次性完成（P1-P4 连续实施），版本号直接落在 2.0.0b0；以下按方案规划的阶段路线（1.10→2.0）组织演进脉络，中间规划版本未独立发布，不伪造版本历史。
+
+#### P1 模板层 + 路由层（对应规划 1.10.0）
+- **内置「小说」模板**：meta（标题 auto / 题材 user / 篇幅 user / 叙事视角 auto / 署名 user）+ content 三节点——世界观设定 `kind=setting`、人物表 `kind=setting`（设定节点，不输出正文，存状态）、正文 `kind=chapters`（多章锚点，由 AI 自由展开 L01-L15）；style 文风六字段 + 创作铁律（show don't tell、禁元文本、禁纯抒情、对话符合人格）；logic 创作认知顺序
+- **schema 扩展**：`_normalize_template` allowed 集合放行 `novel`/`kind`；旧模板零影响，其他模板路径零改动（L3 路由天然隔离）
+- **L3 路由**：`planner.plan_outline` / `writer.generate_article` 检测 `novel.mode` 自动切小说分支；通用线一字不动
+
+#### P2 增强层（对应规划 1.11.0）
+- **`structured_writer/novel/` 子包**（移植自 novel-weaver 已停更技能，改造路径）：
+  - `novel_bridge.py`：场景配置（人物/时代/地点/冲突，含 MBTI+荣格原型）→ 章数组（短3-6/中8-10/长11-15）→ 因果链验证（概述≥12字符+因果动词，失败反馈重生成）→ 组装标准 outline（章=section，`_novel.chapter` 身份）→ 项目初始化（`data/novel/projects/`）→ plan-chapter 子结构规划（S01-S05，tone/emotions/writing_prompt≥50 硬校验，末章 is_ending）
+  - `novel_writer.py`：小说版写作引擎（复用串行骨架+续写机制+停止控制），上下文注入换血——角色表/人格/实体关系网/时间线/情绪基调/上章行为轨迹/写作命题框；逐章自动 plan-chapter；每段写入 novel 项目（原子写入+别名拦截+实体提取+字数三档校验）
+- **驱动字段保护**：小说模板「题材」「篇幅」在编辑器锁定（× 灰色不可点，UI 层）+ `validateNovelTemplate` 保存校验（改名/绕过 UI 仍拦截，保存层兜底）；另存为副本继承 novel.mode/kind（collectTemplateData 补 kind + novel 顶层标记）
+
+#### P3 模型层（对应规划 1.12.0）
+- **`data/models/`**（与 outputs/sessions/templates 平级）：bge-small-zh-v1.5（184MB）+ DeepSeek-R1-Distill-Qwen-1.5B（3.7GB），保持 HF 目录结构
+- **检查器移植**：`novel_semantic_check.py`（bge 向量语义检查）/ `novel_reasoning_check.py`（R1 独立推理审核）——`_load_model` 目录参数改 `data/models/` 直查（查找顺序 data/models → novel-weaver 缓存 → HF 默认），强制 CPU（`CUDA_VISIBLE_DEVICES=-1`）不与 LM Studio 抢显存，无模型自动降级
+- **配置面板「小说质检」区**：模型目录/检测/安装指引 + 四个开关（章检规则4检/语义bge/推理R1/全文三检），控制权全在用户；`GET /api/novel/status`、`POST /api/novel/install`、`POST /api/novel/checks` 端点；开关经 `NOVEL_SKIP_SEMANTIC`/`NOVEL_SKIP_REASON` 环境变量控制 finalize-chapter 第5/6步
+
+#### P4 检查体系（对应规划 2.0.0）
+- **章检六检**：连通性/跨章承诺链/风格校验/逻辑检查（纯规则，进程内毫秒级）+ bge 语义 + R1 推理（子进程隔离，崩溃不影响主服务，内存可回收）
+- **全文三检**：fidelity 大纲忠实度 + 结尾收束三型（封闭/开放/悬停）验证 + 完结；质检报告附加到输出 md
+- 章检 HARD 问题写入状态（不阻塞主流程，报告展示），继承 novel-weaver 降级哲学：无模型/未装依赖全部自动跳过
+
+#### 修复与行为说明
+- meta「显」语义：通用线未动（false=有值显示裸值行）；小说线专属渲染（`novel_writer._render_meta_block` false=彻底隐藏，题材/篇幅/视角不进文章）——两线解耦，其他模板输出零影响
+- UI 说明文案更新：meta 区「显」区分通用/小说两线语义；content 区「显」补充"无标题行+空内容整节跳过"
+
 ## [1.9.0b0] - 2026-08-11
 ### 新增（插件系统 + 大表蓝皮书取数）
 - **插件系统**（仿 RAG 形态）：`structured_writer/plugins/` 模块——`base.py`（`BasePlugin.execute(inputs) → {type, name, content}`，输出契约限定辅助知识三形态 table/text/image）、`manager.py`（扫描内置 `builtin/` + 用户 `data/plugins/` 目录、读 `plugin.json`、注册与调用）。新插件 = 一个目录（plugin.json + 实现类），消费方只按 `input_fields` 收参数、按 `output_types` 接数据，不接触写作管道

@@ -100,6 +100,26 @@ DEFAULT_TEMPLATES = {
         "style": "",
         "logic": ""
     },
+    "小说": {
+        "novel": {"mode": True},
+        "meta": [
+            {"name": "标题", "show_label": False, "desc": "小说标题", "source": "auto"},
+            {"name": "题材", "show_label": False, "desc": "科幻/武侠/悬疑/都市/奇幻/历史等，必须填写", "source": "user"},
+            {"name": "篇幅", "show_label": False, "desc": "短篇/中篇/长篇——决定每子结构字数目标（短篇1000-1500、中篇1500-2000、长篇2000-4000）", "source": "user"},
+            {"name": "叙事视角", "show_label": False, "desc": "第一人称/第三人称有限/第三人称全知/第二人称，留空由AI按题材推断", "source": "auto"},
+            {"name": "署名", "show_label": True, "desc": "作者署名", "source": "user"}
+        ],
+        "content": [
+            {"name": "世界观设定", "show_label": False, "type": "section", "kind": "setting",
+             "desc": "【设定节点·不输出正文】生成时代背景、核心地点、风土人情、核心冲突，写入小说状态"},
+            {"name": "人物表", "show_label": False, "type": "leaf", "kind": "setting",
+             "desc": "【设定节点·不输出正文】登记主要角色：姓名/身份/人格(MBTI+荣格原型)/动机/别名，写入小说状态"},
+            {"name": "正文", "show_label": False, "type": "section", "kind": "chapters",
+             "desc": "【多章节点·由AI展开】按场景配置生成 L01-L15 章结构，每章含概述；末章自动为结局章(is_ending)。章内子结构含情绪基调与写作命题(writing_prompt≥50字)"}
+        ],
+        "style": "文风六字段模板：叙事视角=meta.叙事视角；时态=过去式为主；句式=长短句交错；词汇=文学化；描写=中等密度(环境描写每段≤2句)。创作铁律：1)show don't tell，情绪通过人物行为/生理反应表达，禁止纯抒情段落；2)对话必须符合角色身份与人格；3)禁止元文本引用；4)禁止第三人称插入叙述(除非对白转述)；5)允许代码/协议块、系统警告标记、可量化体征数据作为修辞工具",
+        "logic": "先确立世界观设定与人物表，再按因果链推进正文各章；结局章在全文主体完成后收束，尾声最后"
+    },
 }
 
 BUILTIN_TEMPLATE_NAMES = set(DEFAULT_TEMPLATES.keys())

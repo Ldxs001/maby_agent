@@ -33,6 +33,7 @@ class StateManager:
                 "sections": []
             },
             "user_orders": {},
+            "messages": [],       # 会话消息历史（用户要求等，切会话/重启后恢复显示）
             "output_file": "",
             "phase": "config",    # config → planning → reviewing → writing → done
         }
@@ -45,6 +46,14 @@ class StateManager:
 
     def set_user_orders(self, orders: dict):
         self._state["user_orders"] = orders
+        self.save()
+
+    def append_message(self, role: str, content: str):
+        """追加会话消息（role: user/assistant），切会话/重启后 loadSession 重建显示。"""
+        msgs = self._state.setdefault("messages", [])
+        msgs.append({"role": role, "content": content})
+        if len(msgs) > 200:
+            del msgs[:len(msgs) - 200]  # 上限防膨胀
         self.save()
 
     def set_phase(self, phase: str):
@@ -88,6 +97,17 @@ class StateManager:
                 done_subs += 1 if s.get("status") == "done" else 0
 
         total_words = sum(s.get("actual_word_count", 0) for s in sections)
+        # 小说线章级门控：等待用户确认的章（status=planning）
+        awaiting = None
+        for s in sections:
+            if s.get("status") == "planning":
+                awaiting = {
+                    "id": s["id"],
+                    "title": s.get("title", ""),
+                    "chapter": (s.get("_novel") or {}).get("chapter", ""),
+                    "sub_sections": s.get("sub_sections", []),
+                }
+                break
         return {
             "total": total_subs,
             "done": done_subs,
@@ -96,7 +116,8 @@ class StateManager:
             "total_words": total_words,
             "phase": self._state.get("phase"),
             "title": self._state.get("outline", {}).get("title", ""),
-            "status_text": self._state.get("_status_text", "") if self._state.get("phase") in ("writing",) else ""
+            "status_text": self._state.get("_status_text", "") if self._state.get("phase") in ("writing",) else "",
+            "awaiting_confirm": awaiting,
         }
 
     def set_status_text(self, text: str):
@@ -136,7 +157,9 @@ class StateManager:
                         s = json.load(f)
                     sessions.append({
                         "id": s.get("session_id", p.stem),
-                        "title": s.get("outline", {}).get("title", "未命名"),
+                        "title": s.get("outline", {}).get("title", "") or (
+                            (s.get("messages") or [{}])[0].get("content", "")[:20] or "未命名"
+                        ),
                         "phase": s.get("phase", "unknown"),
                         "created_at": s.get("created_at", ""),
                         "active": not is_archived

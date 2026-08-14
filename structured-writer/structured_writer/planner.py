@@ -312,6 +312,25 @@ def plan_outline(topic: str, template: dict = None,
     if llm_client is None:
         raise ValueError("需要提供 llm_client")
 
+    # ── 小说线分支：模板含 novel.mode → 走 novel 子包规划（场景配置→章数组→因果链）──
+    if isinstance(template, dict) and (template.get("novel") or {}).get("mode"):
+        from .novel import novel_bridge
+        if not user_meta:
+            user_meta = {}
+        # 不把 topic 硬塞进 user_meta["标题"]——小说模板「标题」source=auto 语义是
+        # "由 LLM 提炼短标题"（build_outline 四级优先级处理）。用 topic 塞入会导致
+        # 完整需求文本成为标题（"写小说，要求如下\n1. ..."），且绕过模板 auto 配置——
+        # 模板怎么配就怎么走，不做线内特判。
+        plan = novel_bridge.plan_novel_outline(topic, template, user_meta, llm_client)
+        outline = plan["outline"]
+        # 会话侧记录 novel 状态（plan_novel_outline 已初始化项目，outline.sections[]._novel 带 state_path）
+        outline["_novel"] = {
+            "state_path": plan["state_path"],
+            "setting": plan["setting"],
+            "causality_issues": plan["causality_issues"],
+        }
+        return outline
+
     # 旧接口兼容
     if isinstance(template, str) or template is None:
         style = template or prompt or ""
@@ -394,6 +413,16 @@ def plan_outline(topic: str, template: dict = None,
 
     # 规范化
     outline = _normalize_outline(outline, content_fields)
+
+    # ── user 字段代码级固化：LLM 返回后强制覆盖回用户值（user = 用户填写，LLM 不经手）──
+    # prompt 里已要求"直接抄入不要修改"，但执行权在 LLM；这里做硬约束兜底，
+    # 防 LLM 篡改/占位（如填"（待填写）"）——与小说线 build_outline 同语义。
+    if isinstance(template, dict) and user_meta:
+        for f in template.get("meta", []):
+            if f.get("source") == "user":
+                fname = f.get("name", "")
+                if fname and fname in user_meta and user_meta[fname]:
+                    outline.setdefault("meta", {})[fname] = user_meta[fname]
 
     return outline
 
@@ -799,6 +828,9 @@ def _normalize_template(t: dict) -> dict:
             "desc": str(f.get("desc", "")),
             "type": f.get("type", "leaf") if f.get("type") in ("leaf", "section") else "leaf"
         }
+        # 小说节点分类（novel 子包专用：setting=设定节点 / chapters=多章展开节点）
+        if f.get("kind") in ("setting", "chapters"):
+            entry["kind"] = f["kind"]
         lo = f.get("logical_order")
         if lo is not None and lo in (0, 1, 2):
             entry["logical_order"] = lo
@@ -813,8 +845,8 @@ def _normalize_template(t: dict) -> dict:
     t.setdefault("style", "")
     t.setdefault("logic", "")
 
-    # 清理多余字段
-    allowed = {"name", "meta", "content", "style", "logic", "citation_check", "citation_format"}
+    # 清理多余字段（novel 顶层标记放行，novel 子包路由用）
+    allowed = {"name", "meta", "content", "style", "logic", "citation_check", "citation_format", "novel", "kind"}
     for k in list(t.keys()):
         if k not in allowed:
             del t[k]

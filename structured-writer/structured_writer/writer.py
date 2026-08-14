@@ -153,6 +153,25 @@ def generate_article(
     content_fields = (template or {}).get("content", [])
     logic_prompt = (template or {}).get("logic", "")
     style_prompt = (template or {}).get("style", "")
+
+    # ── 小说线分支：模板含 novel.mode 或 outline 含 _novel 标记 → 走 novel_writer ──
+    is_novel = bool((template or {}).get("novel") and (template or {}).get("novel", {}).get("mode")) \
+        or bool(outline.get("_novel")) \
+        or any((s.get("_novel")) for s in sections)
+    if is_novel:
+        from .novel.novel_writer import generate_novel_article
+        return generate_novel_article(
+            outline=outline,
+            user_orders=user_orders,
+            rag_options=rag_options or {},
+            llm_client=llm_client,
+            state_mgr=state_mgr,
+            template=template,
+            stop_check=stop_check,
+            rag_client=rag_client,
+            aux_knowledge=aux_knowledge,
+        )
+
     # 模板 desc 权威指令查找表：写作时按节名确定性注入【当前章节要求】
     # 改按 _tmpl_key（血缘标记）查表——用户改了标题（如"参考文献"→"文献引用"），
     # 模板绑定不断，desc 照常注入；_tmpl_key 缺失（LLM 新增节）回退标题查

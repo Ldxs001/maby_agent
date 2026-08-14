@@ -83,6 +83,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/sessions": cls._handle_list_sessions,
             "/api/session/load": cls._handle_session_load,
             "/api/rag/status": cls._handle_rag_status,
+            "/api/novel/status": cls._handle_novel_status,
             "/api/batch_progress": cls._handle_batch_progress,
             "/api/outputs": cls._handle_outputs_list,
             "/api/outputs/read": cls._handle_outputs_read,
@@ -99,6 +100,10 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/chat": cls._handle_chat,
             "/api/rag/start": cls._handle_rag_start,
             "/api/rag/stop": cls._handle_rag_stop,
+            "/api/novel/install": cls._handle_novel_install,
+            "/api/novel/checks": cls._handle_novel_checks,
+            "/api/novel/confirm": cls._handle_novel_confirm,
+            "/api/novel/replan_sub": cls._handle_novel_replan_sub,
             "/api/batch_auto": cls._handle_batch_auto,
             "/api/session/archive": cls._handle_session_archive,
             "/api/session/restore": cls._handle_session_restore,
@@ -280,7 +285,25 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
 
         # 用户已填的字段值（标题、作者等）
         user_meta = data.get("meta", {})
+
+        # 小说线：题材必填（题材=场景配置/世界观根，缺失整篇漂移；篇幅可不填，novel_bridge 默认中篇）
+        if (isinstance(template, dict) and (template.get("novel") or {}).get("mode")
+                and not str((user_meta or {}).get("题材", "")).strip()):
+            self._json_response({"success": False,
+                                 "error": "小说需填写「题材」（如 科幻/武侠/悬疑/都市/奇幻/历史）——题材决定场景配置与世界观，缺失会导致 AI 瞎编。篇幅可不填（默认中篇）。"}, 400)
+            return
+
         plan_hints = data.get("plan_hints", "")
+
+        # 规划前先落 session（存用户要求）——规划可能耗时数分钟（LLM 生成场景配置/大纲），
+        # 期间用户切走/切回必须能看到要求；规划失败 session 也保留（phase=config + 要求，可重试）。
+        # 去重：经 /api/chat 的 writing_request → addOutlineProposal → startPlanning 链路时，
+        # 该消息已在 _handle_chat 存过，避免重复。
+        sm = StateManager(session_id) if session_id else StateManager()
+        sm.init_session(self.config_mgr.get_all())
+        _last = (sm.get_state().get("messages") or [None])[-1]
+        if not _last or _last.get("content") != topic:
+            sm.append_message("user", topic)
 
         # 获取规划模型配置
         client = self._create_planner_client()
@@ -298,9 +321,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             self._json_response({"success": False, "error": str(e)}, 500)
             return
 
-        # 保存到状态
-        sm = StateManager(session_id) if session_id else StateManager()
-        sm.init_session(self.config_mgr.get_all())
+        # 规划完成：更新 outline（复用规划前已建的 session，含用户要求消息）
         sm.set_outline(outline)
 
         self._json_response({
@@ -885,17 +906,39 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             sm.load(session_id)
             state = sm.get_state()
             progress = sm.get_progress()
+            # 小说线：加载时自动尝试恢复项目备份（state 缺失 → 从 data/novel/backups/ 恢复）
+            # 前端据此决定：恢复成功 → 非只读可续写；恢复失败 → 只读提示项目已丢失
+            restore_result = None
+            outline = state.get("outline", {})
+            if outline.get("_novel") or any((s.get("_novel")) for s in outline.get("sections", [])):
+                from .novel.novel_bridge import restore_novel_state
+                from pathlib import Path as _P
+                state_path = ""
+                for s in outline.get("sections", []):
+                    sp_ = (s.get("_novel") or {}).get("state_path")
+                    if sp_:
+                        state_path = sp_
+                        break
+                if state_path:
+                    if _P(state_path).is_file():
+                        restore_result = {"status": "ok", "reason": "state 存在"}
+                    else:
+                        ok = restore_novel_state(state_path)
+                        restore_result = {"status": "restored" if ok else "missing",
+                                          "reason": "从备份恢复" if ok else "无可用备份"}
             self._json_response({
                 "success": True,
                 "session": {
                     "session_id": state["session_id"],
                     "phase": state.get("phase", ""),
-                    "outline": state.get("outline", {}),
+                    "outline": outline,
                     "user_orders": state.get("user_orders", {}),
                     "output_file": state.get("output_file", ""),
-                    "created_at": state.get("created_at", "")
+                    "created_at": state.get("created_at", ""),
+                    "messages": state.get("messages", [])
                 },
-                "progress": progress
+                "progress": progress,
+                "novel_restore": restore_result
             })
         except FileNotFoundError:
             self._json_response({"success": False, "error": "会话不存在"}, 404)
@@ -928,6 +971,172 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             return
         ok = StateManager().delete_session(sid)
         self._json_response({"success": ok})
+
+    # ---- 小说质检 ----
+
+    def _novel_status_data(self):
+        """bge/R1 模型就绪检测（data/models/ 优先，回退 HF 默认缓存）"""
+        try:
+            from .novel._path_utils import MODELS_DIR
+        except Exception:
+            MODELS_DIR = None
+        cfg = dict(self.config_mgr.get("novel_checks", {}) or {})
+        default = {"chapter": True, "semantic": True, "reason": True, "full": True}
+        for k in default:
+            cfg.setdefault(k, default[k])
+
+        def _has(model_dir):
+            try:
+                d = MODELS_DIR / model_dir
+                return d.is_dir() and any(d.iterdir()) if d.exists() else False
+            except Exception:
+                return False
+
+        bge = _has("models--BAAI--bge-small-zh-v1.5/snapshots")
+        r1 = _has("models--deepseek-ai--DeepSeek-R1-Distill-Qwen-1.5B/snapshots")
+        if not bge:
+            bge = (Path.home() / ".cache" / "huggingface" / "hub" / "models--BAAI--bge-small-zh-v1.5" / "snapshots").is_dir()
+        if not r1:
+            r1 = (Path.home() / ".cache" / "huggingface" / "hub" / "models--deepseek-ai--DeepSeek-R1-Distill-Qwen-1.5B" / "snapshots").is_dir()
+        return {"bge": bge, "r1": r1, "dir": str(MODELS_DIR) if MODELS_DIR else "", "config": cfg}
+
+    def _handle_novel_status(self):
+        self._json_response({"success": True, **self._novel_status_data()})
+
+    def _handle_novel_install(self):
+        """模型缺失时返回安装指引（pip 镜像 + hf-mirror），不阻塞"""
+        st = self._novel_status_data()
+        cmds = []
+        if not st.get("bge"):
+            cmds.append("pip install sentence-transformers -i https://mirrors.aliyun.com/pypi/simple/")
+            cmds.append("HF_ENDPOINT=https://hf-mirror.com python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-zh-v1.5')\"")
+        if not st.get("r1"):
+            cmds.append("pip install transformers torch accelerate -i https://mirrors.aliyun.com/pypi/simple/")
+            cmds.append("HF_ENDPOINT=https://hf-mirror.com python -c \"from transformers import AutoModel; AutoModel.from_pretrained('deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B', trust_remote_code=True)\"")
+        if cmds:
+            self._json_response({"success": True, "message": "请在终端执行以下命令安装（或确认模型已存在后点「检测模型」）", "commands": cmds})
+        else:
+            self._json_response({"success": True, "message": "模型已就绪，无需安装", "commands": []})
+
+    def _handle_novel_checks(self):
+        data = self._read_body()
+        cfg = {k: bool(data.get(k, True)) for k in ("chapter", "semantic", "reason", "full")}
+        self.config_mgr.set("novel_checks", cfg)
+        self._json_response({"success": True})
+
+    def _handle_novel_confirm(self):
+        """章级门控：用户确认当前 planning 章（应用调整 → 章 status=confirmed）。
+
+        调整项：checked（段勾选跳过）、sub_words（段字数覆盖）。
+        """
+        data = self._read_body()
+        session_id = data.get("session_id", "")
+        if not session_id:
+            self._json_response({"success": False, "error": "缺少 session_id"}, 400)
+            return
+        try:
+            sm = StateManager()
+            sm.load(session_id)
+        except Exception as e:
+            self._json_response({"success": False, "error": f"会话加载失败: {e}"}, 404)
+            return
+        outline = sm._state.get("outline", {})
+        target = None
+        for s in outline.get("sections", []):
+            if s.get("status") == "planning":
+                target = s
+                break
+        if target is None:
+            self._json_response({"success": False, "error": "没有待确认的章"}, 400)
+            return
+        # 应用确认时调整：勾选跳过 / 字数覆盖 / 重点标记
+        checked = data.get("checked", {}) or {}
+        sub_words = data.get("sub_words", {}) or {}
+        sub_keys = data.get("sub_keys", {}) or {}
+        for ss in target.get("sub_sections", []):
+            if ss["id"] in checked:
+                ss["_checked"] = bool(checked[ss["id"]])
+            if ss["id"] in sub_words:
+                try:
+                    ss["word_count"] = int(sub_words[ss["id"]])
+                except (ValueError, TypeError):
+                    pass
+            if ss["id"] in sub_keys:
+                ss["is_key"] = True
+        # 章字数 = 各子结构字数汇总（与通用线一致）
+        subs = target.get("sub_sections", [])
+        if subs:
+            target["word_count"] = sum(ss.get("word_count", 0) for ss in subs)
+        target["status"] = "confirmed"
+        sm._state["outline"] = outline
+        sm.save()
+        self._json_response({"success": True, "chapter": target.get("title", "")})
+
+    def _handle_novel_replan_sub(self):
+        """POST /api/novel/replan_sub — 段级重规划（确认面板内单个子结构）。
+
+        body: {session_id, target_id（段 id）, hints}
+        更新 novel_state.json 的 sub_structures[s_key] + session outline 该段；
+        章保持 planning（不重置 pending），确认面板由前端刷新。
+        """
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        session_id = str(data.get("session_id", "")).strip()
+        target_id = str(data.get("target_id", "")).strip()
+        hints = str(data.get("hints", "")).strip()
+        if not session_id or not target_id:
+            self._json_response({"success": False, "error": "缺少 session_id 或 target_id"}, 400)
+            return
+        try:
+            sm = StateManager()
+            sm.load(session_id)
+        except FileNotFoundError:
+            self._json_response({"success": False, "error": "会话不存在"}, 404)
+            return
+        outline = sm._state.get("outline", {})
+        # 反查目标段所属章 + 小说身份
+        parent = None
+        sub = None
+        for s in outline.get("sections", []):
+            for ss in s.get("sub_sections", []):
+                if ss.get("id") == target_id:
+                    parent, sub = s, ss
+                    break
+            if sub:
+                break
+        if sub is None:
+            self._json_response({"success": False, "error": f"未找到子结构 {target_id}"}, 404)
+            return
+        nv = sub.get("_novel") or {}
+        chapter_id = nv.get("chapter", "")
+        s_key = nv.get("s_key", "")
+        state_path = nv.get("state_path", "") or ((parent.get("_novel") or {}).get("state_path", ""))
+        if not chapter_id or not s_key or not state_path:
+            self._json_response({"success": False, "error": "该子结构缺少小说身份字段（非小说线）"}, 400)
+            return
+        try:
+            from .novel import novel_bridge as nb
+            client = self._create_planner_client()
+            new_entry = nb.replan_novel_sub(str(Path(state_path).resolve()), chapter_id, s_key, hints, client)
+        except Exception as e:
+            self._json_response({"success": False, "error": str(e)}, 500)
+            return
+        # 同步 session outline 该段（保留 id/is_key/rag/_checked/_novel，更新规划字段）
+        sub.update({
+            "title": new_entry.get("title", sub.get("title", "")),
+            "summary": new_entry.get("summary", sub.get("summary", "")),
+            "word_count": (new_entry.get("word_count_target") or {}).get("max", sub.get("word_count", 1500)),
+            "status": "pending",
+            "actual_word_count": 0,
+        })
+        if parent is not None and parent.get("sub_sections"):
+            parent["word_count"] = sum(ss.get("word_count", 0) for ss in parent["sub_sections"])
+        sm._state["outline"] = outline
+        sm.save()
+        self._json_response({"success": True, "title": sub.get("title", ""), "word_count": sub.get("word_count", 0)})
 
     # ---- RAG 状态探测 ----
 
@@ -1286,6 +1495,18 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         if not message:
             self._json_response({"success": False, "error": "消息不能为空"}, 400)
             return
+        session_id = data.get("session_id", "")
+        # 通用线对话也持久化：已有会话保留历史（load），新会话才初始化（init）——
+        # 保证同会话多轮对话消息累积，切会话/重启后 loadSession 重建显示
+        sm = StateManager(session_id) if session_id else StateManager()
+        if session_id:
+            try:
+                sm.load(session_id)
+            except FileNotFoundError:
+                sm.init_session(self.config_mgr.get_all())
+        else:
+            sm.init_session(self.config_mgr.get_all())
+        sm.append_message("user", message)
         # Phase 1 基础版：简单回显 + 尝试规划
         # 检测是否是写作请求
         if any(kw in message for kw in ["写", "生成", "创作", "撰写", "起草"]):
@@ -1293,13 +1514,15 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                 "success": True,
                 "type": "writing_request",
                 "text": "请确认：是否需要为此主题生成大纲？点击下方按钮开始规划。\n\n主题：" + message,
-                "topic": message
+                "topic": message,
+                "session_id": sm.session_id
             })
         else:
             self._json_response({
                 "success": True,
                 "type": "chat",
-                "text": f"已收到消息。如需撰写结构化文章，请直接说明主题和写作要求。\n\n您说：{message[:100]}"
+                "text": f"已收到消息。如需撰写结构化文章，请直接说明主题和写作要求。\n\n您说：{message[:100]}",
+                "session_id": sm.session_id
             })
 
     # ---- LLM 模板生成 API ----
@@ -1477,6 +1700,57 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         tmpl = templates.get(selected, {})
         if not isinstance(tmpl, dict):
             tmpl = {}
+
+        # ── 小说线分支：outline 含 _novel 标记 → 走 novel 重规划（保持小说结构，评审界面仍只显示章） ──
+        is_novel_line = bool(outline.get("_novel")) or any((s.get("_novel")) for s in sections)
+        if is_novel_line:
+            from .novel import novel_bridge as nb
+            nv = target.get("_novel") or {}
+            if not is_sub:
+                # 章级：重新规划本章子结构（hints 注入），子结构只进 state，outline 保持章级 → 章置 planning
+                chapter_id = nv.get("chapter", "")
+                state_path = nv.get("state_path", "")
+                if not chapter_id or not state_path:
+                    self._json_response({"success": False, "error": "小说章缺少身份字段"}, 400)
+                    return
+                try:
+                    client = self._create_planner_client()
+                    nb.plan_chapter_subs(str(Path(state_path).resolve()), chapter_id, tmpl, client, hints=hints)
+                except Exception as e:
+                    self._json_response({"success": False, "error": str(e)}, 500)
+                    return
+                target["status"] = "planning"   # 子结构已在 state，写作时同步；评审界面仍只显示章
+                target["sub_sections"] = []
+                sm._state["outline"] = outline
+                sm.save()
+                self._json_response({"success": True, "outline": outline})
+                return
+            # 段级（防御：评审大纲子结构行触发的段级重规划）
+            chapter_id = nv.get("chapter", "")
+            s_key = nv.get("s_key", "")
+            state_path = nv.get("state_path", "") or ((parent.get("_novel") or {}).get("state_path", ""))
+            if not chapter_id or not s_key or not state_path:
+                self._json_response({"success": False, "error": "小说子结构缺少身份字段"}, 400)
+                return
+            try:
+                client = self._create_planner_client()
+                new_entry = nb.replan_novel_sub(str(Path(state_path).resolve()), chapter_id, s_key, hints, client)
+            except Exception as e:
+                self._json_response({"success": False, "error": str(e)}, 500)
+                return
+            target.update({
+                "title": new_entry.get("title", target.get("title", "")),
+                "summary": new_entry.get("summary", target.get("summary", "")),
+                "word_count": (new_entry.get("word_count_target") or {}).get("max", target.get("word_count", 1500)),
+                "status": "pending",
+                "actual_word_count": 0,
+            })
+            if parent is not None and parent.get("sub_sections"):
+                parent["word_count"] = sum(ss.get("word_count", 0) for ss in parent["sub_sections"])
+            sm._state["outline"] = outline
+            sm.save()
+            self._json_response({"success": True, "outline": outline})
+            return
 
         try:
             client = self._create_planner_client()
@@ -1803,6 +2077,35 @@ body {
   min-width: 0;
 }
 
+/* 输入框顶部拖拽条：向上拉 = 输入框变高（往上是消息区，空间充足） */
+.input-resizer {
+  height: 6px;
+  flex-shrink: 0;
+  cursor: ns-resize;
+  background: transparent;
+  position: relative;
+  transition: background 0.15s;
+}
+.input-resizer::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 2px;
+  transform: translateX(-50%);
+  width: 48px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--border);
+  transition: background 0.15s;
+}
+.input-resizer:hover::after,
+.input-resizer.dragging::after {
+  background: var(--accent);
+}
+.input-resizer.dragging {
+  background: rgba(93, 173, 226, 0.08);
+}
+
 /* ===== 输出列表侧栏 ===== */
 .outputs-sidebar {
   width: 240px;
@@ -1920,9 +2223,9 @@ body {
   border-radius: 6px;
   color: var(--text);
   font-size: 14px;
-  resize: none;
+  resize: none;              /* 原生手柄禁用（右下角下拉空间小）；高度由顶部 .input-resizer 向上拉控制 */
   min-height: 40px;
-  max-height: 120px;
+  max-height: 60vh;          /* 最大不超过视口 60%，往上有消息区可收缩 */
   font-family: inherit;
 }
 .chat-input-area textarea:focus { outline: none; border-color: var(--accent); }
@@ -2160,7 +2463,7 @@ body {
           <label style="font-weight:600;color:#f39c12">元数据</label>
           <div style="flex:1;font-size:12px;color:var(--text-dim)">
             标识/管理信息，短数据（≤100字），以键值对渲染，不参与大纲规划。每行：名称 | 显 | 字段要求 | 填写者<br>
-            <span style="color:var(--text-dim)">显：控制该字段的标签名称是否在文章中显示（如"作者：张三"是否带"作者："前缀）</span><br>
+            <span style="color:var(--text-dim)">显：打钩=文章开头显示"字段名：值"（如"作者：张三"）；不打钩=不显示字段名标签，有值仍显示裸值（如"张三"）。<b>特殊</b>：小说模板的驱动字段（题材/篇幅/叙事视角）不打钩=彻底不显示，仅作流程参数（题材→场景配置、篇幅→字数目标）</span><br>
             <span style="color:var(--text-dim)">字段要求：该字段的写作提示词，作为元数据确定性注入写作 prompt</span><br>
             <span style="color:var(--text-dim)">填写者：<b>用户</b>（你手动填写的值）| <b>LLM</b>（由 AI 在规划时自动填写）| <b>自动</b>（你填了就保留，没填则 LLM 自动补）</span>
           </div>
@@ -2188,7 +2491,7 @@ body {
           <label style="font-weight:600;color:#5dade2">内容树</label>
           <div style="flex:1;font-size:12px;color:var(--text-dim)">
             文章主体，长文本（≥200字），参与大纲规划，可拆分子结构。每行：名称 | 显 | 字段要求 | 子结构 | 逻辑顺序 | 引用列表<br>
-            <span style="color:var(--text-dim)">显：控制该节的标题名称是否在文章中显示（如"关键词"节关闭"显"后只输出关键词列表，不带"关键词"标题）</span><br>
+            <span style="color:var(--text-dim)">显：控制该节的标题行（## 标题）是否在文章中显示。不打钩=只输出内容、无标题行；且内容为空时整节彻底跳过（如小说设定节点"世界观设定"）。内容本身不受「显」控制，写了就一定输出</span><br>
             <span style="color:var(--text-dim)">字段要求：该节的写作提示词，指导 LLM 如何撰写此节内容</span><br>
             <span style="color:var(--text-dim)">引用列表：☐ [x] = 1.（勾选框 + 正文引用标记 + 参考文献编号格式）——☐ 勾选后该节跳过 LLM 写作，由系统根据 RAG 文档自动生成规范化参考文献（需配合 RAG 使用）；[x] 为正文引用标记格式，1. 为参考文献条目编号前缀格式</span><br>
             <span style="color:var(--text-dim)">子结构：该节是否可拆分为多个子段落分别撰写</span><br>
@@ -2261,6 +2564,31 @@ body {
       </div>
 
       <div class="config-section">
+        <h3>📖 小说质检</h3>
+        <div class="form-row">
+          <label>模型目录</label>
+          <input type="text" id="novel-model-dir" value="" placeholder="data/models（bge语义 + R1推理审核）" style="flex:2">
+          <button class="btn btn-secondary btn-sm" onclick="checkNovelModels()">检测模型</button>
+        </div>
+        <div class="form-row">
+          <label>状态</label>
+          <span id="novel-model-status" style="font-weight:600">未检测</span>
+        </div>
+        <div class="form-row">
+          <label>操作</label>
+          <button class="btn btn-secondary btn-sm" id="novel-install-btn" onclick="installNovelModels()">安装缺失模型</button>
+          <span style="font-size:11px;color:var(--text-dim)">bge 33MB / R1 约3.7GB，走镜像源；无模型时小说照写，质检自动跳过</span>
+        </div>
+        <div class="form-row">
+          <label>开关</label>
+          <label style="font-size:13px;cursor:pointer"><input type="checkbox" id="novel-chk-chapter" onchange="saveNovelChecks()"> 章检规则4检</label>
+          <label style="font-size:13px;cursor:pointer;margin-left:10px"><input type="checkbox" id="novel-chk-semantic" onchange="saveNovelChecks()"> 语义检查bge</label>
+          <label style="font-size:13px;cursor:pointer;margin-left:10px"><input type="checkbox" id="novel-chk-reason" onchange="saveNovelChecks()"> 推理审核R1</label>
+          <label style="font-size:13px;cursor:pointer;margin-left:10px"><input type="checkbox" id="novel-chk-full" onchange="saveNovelChecks()"> 全文三检</label>
+        </div>
+      </div>
+
+      <div class="config-section">
         <h3>⚙️ 写作参数</h3>
         <div class="form-row">
           <label>前文回顾字数</label>
@@ -2306,6 +2634,7 @@ body {
         <div id="meta-inputs-bar" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-card);font-size:13px">
           <div style="display:flex;flex-wrap:wrap;gap:8px" id="meta-inputs-container"></div>
         </div>
+        <div class="input-resizer" id="input-resizer" title="向上拖动拉高输入框；双击复位" onmousedown="startInputResize(event)" ondblclick="resetInputResize()"></div>
         <div class="chat-input-area">
           <textarea id="chat-input" placeholder="输入写作主题...（多行=批量自动撰写）" rows="2"
             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"></textarea>
@@ -2323,11 +2652,12 @@ body {
           </label>
           <button class="btn btn-sm btn-primary" style="background:var(--accent2);flex-shrink:0" onclick="useExample()" title="跳过 LLM 规划，直接基于范例大纲写作">用范例写作（跳过规划）</button>
         </div>
-        <div id="batch-progress" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-card);font-size:13px;color:var(--text-dim)"></div>
-        <div id="stop-bar" style="display:none;padding:4px 16px;border-top:1px solid var(--border);background:var(--bg-card);font-size:12px;text-align:center">
+        <div id="batch-progress" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-card);font-size:13px;color:var(--text-dim);flex-shrink:0"></div>
+        <div id="stop-bar" style="display:none;padding:4px 16px;border-top:1px solid var(--border);background:var(--bg-card);font-size:12px;text-align:center;flex-shrink:0">
           <button class="btn btn-sm btn-secondary" onclick="stopGeneration('delay')">延时停止</button>
           <button class="btn btn-sm btn-secondary" style="background:var(--accent);color:#fff" onclick="stopGeneration('immediate')">立即停止</button>
         </div>
+        <div id="novel-confirm-panel" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-card);flex-shrink:0"></div>
       </div>
       <div class="outputs-sidebar" id="outputs-sidebar">
         <div class="sidebar-header">已完成文章</div>
@@ -2448,9 +2778,61 @@ let ragOnline = false;
 let ragKbs = [];
 let _replanTarget = null;   // 局部重规划目标 {type: 'section'|'sub', id}
 let _pendingExampleName = null;  // 保存范例并生成：等待生成完成后回填文章的范例名
+let _ncConfirmId = null;    // 章级门控确认面板：当前确认章 id（防轮询重复重建丢用户输入）
+let _ncConfirming = false;  // 确认提交中：防重复点击
 
 function escapeAttr(s) {
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ===== 输入框高度拖拽（顶部条：向上拉 = 变高；双击复位） =====
+function startInputResize(ev) {
+  ev.preventDefault();
+  const ta = document.getElementById('chat-input');
+  const resizer = document.getElementById('input-resizer');
+  if (!ta || !resizer) return;
+  const startY = ev.clientY;
+  const startH = ta.offsetHeight;
+  resizer.classList.add('dragging');
+  document.body.style.cursor = 'ns-resize';
+  document.body.style.userSelect = 'none';
+
+  function onMove(e) {
+    // 向上拖（e.clientY < startY）→ dy 为正 → 高度增加
+    const dy = startY - e.clientY;
+    // 动态上限：chat-main 总高 - 其他固定区域（stop-bar/batch/confirm-panel/example-bar/meta 等）- 消息区最小保留 120px
+    const main = ta.closest('.chat-main');
+    const mainH = main ? main.clientHeight : window.innerHeight;
+    const inputArea = ta.closest('.chat-input-area');
+    let fixedH = 0;
+    if (main) {
+      Array.from(main.children).forEach(el => {
+        if (el === inputArea || el.id === 'chat-messages') return;
+        if (el.style && el.style.display === 'none') return;
+        fixedH += el.offsetHeight || 0;
+      });
+    }
+    const nonTaH = inputArea ? (inputArea.offsetHeight - ta.offsetHeight) : 0;
+    const msgMin = 120;
+    const maxH = Math.max(40, mainH - fixedH - nonTaH - msgMin);
+    const h = Math.max(40, Math.min(startH + dy, maxH));
+    ta.style.height = h + 'px';
+  }
+  function onUp() {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    resizer.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  }
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+
+function resetInputResize() {
+  const ta = document.getElementById('chat-input');
+  if (!ta) return;
+  ta.style.height = '';
 }
 
 // ===== 初始化 =====
@@ -2561,6 +2943,8 @@ function loadConfig() {
     if (c.fact_check_enabled) document.getElementById('fact-check-enabled').checked = true;
     refreshModels('planner', pm.model);
     refreshModels('writer', wm.model);
+    // 小说质检状态（模型就绪检测 + 开关）
+    if (typeof checkNovelModels === 'function') checkNovelModels();
     // 加载完成后渲染对话区的 meta 输入框
     renderMetaInputs(selectedTemplate);
   });
@@ -2747,8 +3131,17 @@ function renderContentRows(content) {
   }
 }
 
+// 当前选中模板是否为小说线（novel.mode）
+function isNovelTemplateSelected() {
+  const sel = document.getElementById('template-select');
+  const cur = (window._lastTemplates || {})[sel ? sel.value : ''] || {};
+  return !!(cur.novel && cur.novel.mode);
+}
+
 function addMetaRow(field) {
   field = field || {name:'',show_label:true,desc:'',source:'auto'};
+  // 小说驱动字段锁定：题材/篇幅是规划输入，禁止删除（防删字段退化）
+  const lockedDel = isNovelTemplateSelected() && (field.name === '题材' || field.name === '篇幅');
   const tr = document.createElement('tr');
   tr.style.borderBottom = '1px solid var(--border)';
   tr.innerHTML = [
@@ -2756,7 +3149,9 @@ function addMetaRow(field) {
     '<td style="padding:3px 6px;text-align:center"><input type="checkbox" ' + (field.show_label ? 'checked' : '') + ' style="accent-color:var(--accent)"></td>',
     '<td style="padding:3px 6px"><span class="desc-preview" onclick="openDescModal(this)" data-full-desc="' + escHtml(field.desc) + '" style="display:block;padding:3px 4px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;cursor:pointer;color:var(--text-dim);font-size:12px;min-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:120px" title="' + escHtml(field.desc) + '">' + escHtml(field.desc ? field.desc.substring(0,9)+(field.desc.length>9?'...':'') : '点击输入...') + '</span></td>',
     '<td style="padding:3px 6px"><select style="width:100%;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;padding:3px 4px;color:var(--text);font-size:12px"><option value="user" ' + (field.source==='user'?'selected':'') + '>用户</option><option value="llm" ' + (field.source==='llm'?'selected':'') + '>LLM</option><option value="auto" ' + (field.source==='auto'?'selected':'') + '>自动</option></select></td>',
-    '<td style="padding:3px 6px;text-align:center"><button onclick="this.closest(\'tr\').remove()" title="删除此行" style="background:none;border:none;color:#e74c3c;cursor:pointer;font-size:15px;line-height:1">&times;</button></td>'
+    '<td style="padding:3px 6px;text-align:center">' + (lockedDel
+      ? '<span title="小说驱动字段，不可删除" style="color:var(--text-dim);font-size:15px;cursor:not-allowed">&times;</span>'
+      : '<button onclick="this.closest(\'tr\').remove()" title="删除此行" style="background:none;border:none;color:#e74c3c;cursor:pointer;font-size:15px;line-height:1">&times;</button>') + '</td>'
   ].join('');
   document.getElementById('meta-rows').appendChild(tr);
 }
@@ -2770,8 +3165,11 @@ function addContentRow(field) {
   const eqPos = fmtStr.indexOf('=');
   const inlineFmt = eqPos >= 0 ? fmtStr.substring(0, eqPos).trim() : fmtStr.trim();
   const refFmt = eqPos >= 0 ? fmtStr.substring(eqPos + 1).trim() : '';
+  // 小说结构节点锁定：kind=setting/chapters 是小说线声明，禁止删除
+  const lockedDel = isNovelTemplateSelected() && !!field.kind;
   const tr = document.createElement('tr');
   tr.style.borderBottom = '1px solid var(--border)';
+  if (field.kind) tr.dataset.kind = field.kind;  // 小说节点分类（setting/chapters），行内隐藏保留
   tr.innerHTML = [
     '<td style="padding:3px 6px"><input type="text" value="' + escHtml(field.name) + '" style="width:100%;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;padding:3px 4px;color:var(--text);font-size:12px" placeholder="字段名"></td>',
     '<td style="padding:3px 6px;text-align:center"><input type="checkbox" ' + (field.show_label ? 'checked' : '') + ' style="accent-color:var(--accent)"></td>',
@@ -2779,7 +3177,9 @@ function addContentRow(field) {
     '<td style="padding:3px 6px"><select style="width:100%;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;padding:3px 4px;color:var(--text);font-size:12px"><option value="leaf" ' + (field.type==='leaf'?'selected':'') + '>无</option><option value="section" ' + (field.type==='section'?'selected':'') + '>有</option></select></td>',
     '<td style="padding:3px 6px"><select style="width:100%;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;padding:3px 4px;color:var(--text);font-size:12px"><option value="" ' + (!lo && lo!==0?'selected':'') + '>自动</option><option value="0" ' + (lo===0?'selected':'') + '>先写</option><option value="1" ' + (lo===1?'selected':'') + '>其次</option><option value="2" ' + (lo===2?'selected':'') + '>最后</option></select></td>',
     '<td style="padding:3px 6px;text-align:center;white-space:nowrap"><input type="checkbox" class="cite-cb" ' + (citeCheck ? 'checked' : '') + ' style="accent-color:var(--accent);width:14px;height:14px;vertical-align:middle"> <input type="text" class="cite-inline" value="' + escHtml(inlineFmt) + '" style="width:38px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;padding:2px 2px;color:var(--text);font-size:10px;text-align:center;vertical-align:middle" placeholder="[x]" title="正文引用格式"> <span style="font-size:11px;color:var(--text-dim);vertical-align:middle">=</span> <input type="text" class="cite-ref" value="' + escHtml(refFmt) + '" style="width:38px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;padding:2px 2px;color:var(--text);font-size:10px;text-align:center;vertical-align:middle" placeholder="1." title="参考文献条目格式"></td>',
-    '<td style="padding:3px 6px;text-align:center"><button onclick="this.closest(\'tr\').remove()" title="删除此行" style="background:none;border:none;color:#e74c3c;cursor:pointer;font-size:15px;line-height:1">&times;</button></td>'
+    '<td style="padding:3px 6px;text-align:center">' + (lockedDel
+      ? '<span title="小说结构节点，不可删除" style="color:var(--text-dim);font-size:15px;cursor:not-allowed">&times;</span>'
+      : '<button onclick="this.closest(\'tr\').remove()" title="删除此行" style="background:none;border:none;color:#e74c3c;cursor:pointer;font-size:15px;line-height:1">&times;</button>') + '</td>'
   ].join('');
   document.getElementById('content-rows').appendChild(tr);
 }
@@ -2815,12 +3215,30 @@ function collectTemplateData() {
       type:inputs[2].value,
       logical_order: inputs[3].value !== '' ? parseInt(inputs[3].value) : null,
       citation_check: citeCb ? citeCb.checked : false,
-      citation_format: (citeInline ? citeInline.value.trim() || '[x]' : '[x]') + '=' + (citeRef ? citeRef.value.trim() || '1.' : '1.')
+      citation_format: (citeInline ? citeInline.value.trim() || '[x]' : '[x]') + '=' + (citeRef ? citeRef.value.trim() || '1.' : '1.'),
+      ...(tr.dataset.kind ? {kind: tr.dataset.kind} : {})
     });
   });
   const style = document.getElementById('template-style').value;
   const logic = document.getElementById('template-logic').value;
-  return {meta, content, style, logic};
+  // 小说线标记：保留当前模板的 novel.mode（另存为/保存副本不丢小说线）
+  const selTmpl = document.getElementById('template-select').value;
+  const curTpl = (window._lastTemplates || {})[selTmpl] || {};
+  const novel = (curTpl.novel && typeof curTpl.novel === 'object') ? curTpl.novel : undefined;
+  return novel ? {meta, content, style, logic, novel} : {meta, content, style, logic};
+}
+
+// ===== 小说模板驱动字段保护 =====
+// 小说线特化模板：题材/篇幅是驱动字段（题材→场景配置、篇幅→字数目标），
+// 删除会导致规划退化。保存/另存为时代码级拦截。
+function validateNovelTemplate(data) {
+  if (!(data.novel && data.novel.mode)) return '';
+  const metaNames = (data.meta || []).map(m => m.name);
+  const missing = [];
+  if (!metaNames.includes('题材')) missing.push('题材');
+  if (!metaNames.includes('篇幅')) missing.push('篇幅');
+  if (!missing.length) return '';
+  return '小说模板缺少驱动字段：' + missing.join('、') + '（题材→场景配置、篇幅→字数目标，删除会导致小说规划退化，禁止保存）';
 }
 
 // ===== 保存到当前模板 =====
@@ -2830,6 +3248,8 @@ function saveCurrentTemplate() {
   const builtins = window._lastBuiltins || [];
   if (builtins.includes(name)) { alert('内置模板只读，请使用"另存为"创建副本修改'); return; }
   const data = collectTemplateData();
+  const novelErr = validateNovelTemplate(data);
+  if (novelErr) { alert(novelErr); return; }
   const btn = document.getElementById('save-current-template-btn');
   const origText = btn ? btn.textContent : '';
   if (btn) { btn.textContent = '保存中...'; btn.disabled = true; }
@@ -2873,6 +3293,12 @@ function confirmSaveAs() {
   if (!name) { document.getElementById('saveas-modal-status').textContent = '名称不能为空'; return; }
   closeSaveAsModal();
   const data = collectTemplateData();
+  const novelErr = validateNovelTemplate(data);
+  if (novelErr) {
+    document.getElementById('saveas-modal').classList.add('show');
+    document.getElementById('saveas-modal-status').textContent = novelErr;
+    return;
+  }
   const builtins = window._lastBuiltins || [];
   if (builtins.includes(name)) {
     document.getElementById('saveas-modal-status').textContent = '名称与内置模板重复，请换一个';
@@ -3002,6 +3428,67 @@ function saveDescModal() {
   _descModalTarget.title = value || '点击编辑字段要求';
   _descModalTarget.dataset.fullDesc = value;
   closeDescModal();
+}
+
+// ===== 小说质检 =====
+let novelChecksConfig = {chapter:true, semantic:true, reason:true, full:true};
+
+async function checkNovelModels() {
+  const statusEl = document.getElementById('novel-model-status');
+  if (!statusEl) return;
+  statusEl.textContent = '检测中...';
+  try {
+    const r = await fetch('/api/novel/status');
+    const d = await r.json();
+    const parts = [];
+    if (d.bge) parts.push('<span style="color:#2ecc71">语义bge 就绪</span>');
+    else parts.push('<span style="color:#e94560">语义bge 缺失</span>');
+    if (d.r1) parts.push('<span style="color:#2ecc71">推理R1 就绪</span>');
+    else parts.push('<span style="color:#e94560">推理R1 缺失</span>');
+    statusEl.innerHTML = parts.join(' | ');
+    const dirEl = document.getElementById('novel-model-dir');
+    if (dirEl && d.dir) dirEl.value = d.dir;
+    if (d.config) {
+      novelChecksConfig = d.config;
+      const map = {chapter:'novel-chk-chapter', semantic:'novel-chk-semantic', reason:'novel-chk-reason', full:'novel-chk-full'};
+      Object.keys(map).forEach(k => {
+        const el = document.getElementById(map[k]);
+        if (el) el.checked = !!d.config[k];
+      });
+    }
+  } catch(e) { statusEl.textContent = '检测失败: ' + e; }
+}
+
+async function installNovelModels() {
+  const btn = document.getElementById('novel-install-btn');
+  const statusEl = document.getElementById('novel-model-status');
+  if (!btn || !statusEl) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/novel/install', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    const d = await r.json();
+    if (d.commands && d.commands.length) {
+      statusEl.textContent = d.message;
+      alert(d.message + '\n\n' + d.commands.join('\n'));
+    } else {
+      statusEl.textContent = d.message || '完成';
+    }
+  } catch(e) { statusEl.textContent = '安装失败: ' + e; }
+  btn.disabled = false;
+  checkNovelModels();
+}
+
+async function saveNovelChecks() {
+  const cfg = {
+    chapter: !!document.getElementById('novel-chk-chapter').checked,
+    semantic: !!document.getElementById('novel-chk-semantic').checked,
+    reason: !!document.getElementById('novel-chk-reason').checked,
+    full: !!document.getElementById('novel-chk-full').checked
+  };
+  novelChecksConfig = cfg;
+  try {
+    await fetch('/api/novel/checks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)});
+  } catch(e) { console.error('保存小说质检开关失败', e); }
 }
 
 // ===== RAG 状态管理 =====
@@ -3297,6 +3784,7 @@ function newSession() {
     if (d.success) {
       currentSessionId = d.session_id;
       currentOutline = null;
+      stopProgressPolling();  // 停旧轮询 + 隐藏确认面板 + 重置 _ncConfirmId
       const msgs = document.getElementById('chat-messages');
       msgs.innerHTML = `<div class="msg assistant"><div class="msg-label">助手</div><div class="msg-content">已创建新会话。请输入写作主题开始。</div></div>`;
       msgs.scrollTop = msgs.scrollHeight;
@@ -3360,6 +3848,9 @@ function toggleArchived() {
 function loadSession(sid) {
   currentSessionId = sid;
   currentOutline = null;
+  // 停止旧会话的进度轮询（含隐藏确认面板/重置 _ncConfirmId）——
+  // 否则切到非写作会话时，旧轮询闭包仍持有旧 sessionId，1.5s 后把旧确认面板弹回来（残留不稳定根因）
+  stopProgressPolling();
   // 清除旧消息，切换到该会话
   document.getElementById('chat-messages').innerHTML = '';
   loadSessions();
@@ -3375,8 +3866,21 @@ function loadSession(sid) {
       const p = d.progress;
       currentOutline = s.outline;
 
+      // 重建会话消息历史（用户要求等）——切会话/重启/规划未完成时切回都必须能看到输入内容
+      (s.messages || []).forEach(m => {
+        if (m.role === 'user') addUserMsg(m.content);
+      });
+
+      if (s.phase === 'config') {
+        // 规划中/通用线对话会话：outline 可能为空，历史消息已在上方重建显示
+        const msgs = s.messages || [];
+        addAssistantMsg(msgs.length
+          ? '会话已恢复：上方为历史消息。输入写作要求可生成大纲；若规划进行中请稍候。'
+          : '会话 ' + sid + ' 已切换到（尚未提交内容）');
+        return;
+      }
       if (s.phase === 'done' || s.phase === 'error') {
-        // 已完成的会话
+        // 已完成/失败的会话
         let msg = '恢复会话：' + (s.outline?.title || '未命名') + '\n';
         msg += '状态：' + (s.phase === 'done' ? '已完成' : '失败') + '\n';
         msg += '进度：' + p.done + '/' + p.total + ' 节，' + p.total_words + ' 字\n';
@@ -3385,14 +3889,37 @@ function loadSession(sid) {
         }
         addAssistantMsg(msg);
         if (s.outline?.sections?.length) {
-          renderOutline(s.outline, true);
+          // 小说线：先看后端是否恢复成功（loadSession 已自动尝试备份恢复）——
+          // 恢复成功/state 存在 → 非只读渲染（「开始生成」= 续写入口）；
+          // 恢复失败（无备份）→ 只读 + 明确提示项目已丢失
+          const isNovel = !!(s.outline._novel || (s.outline.sections || []).some(x => x._novel));
+          const nr = d.novel_restore;
+          const restoredOk = isNovel && nr && (nr.status === 'ok' || nr.status === 'restored');
+          const editable = isNovel && (s.phase === 'error' || restoredOk);
+          renderOutline(s.outline, editable ? false : true);
+          if (editable && s.phase === 'error') {
+            addAssistantMsg('⚠️ 上次写作失败（可能是模型超时/项目状态丢失）。点下方「开始生成」可重试。');
+          } else if (isNovel && nr && nr.status === 'missing') {
+            addAssistantMsg('⚠️ 项目状态已丢失且无可用备份，无法续写。大纲只读展示，请删除此会话重新规划。');
+          } else if (editable && restoredOk && nr.status === 'restored') {
+            addAssistantMsg('♻️ 项目状态已从备份自动恢复，可继续写作。点下方「开始生成」续写。');
+          }
         }
       } else if (s.phase === 'writing') {
         let msg = '恢复写作中的会话：' + (s.outline?.title || '未命名') + '\n';
         msg += '进度：' + p.done + '/' + p.total + ' 节已完成';
         addAssistantMsg(msg);
         if (s.outline?.sections?.length) {
-          renderOutline(s.outline, true);
+          // 小说线：非只读渲染（子结构可见 + 底部「开始生成」按钮 = 续写入口）；
+          // 通用线保持只读（写作中大纲不可改）
+          const isNovel = !!(s.outline._novel || (s.outline.sections || []).some(x => x._novel));
+          renderOutline(s.outline, isNovel ? false : true);
+          const nr = d.novel_restore;
+          if (isNovel && nr && nr.status === 'restored') {
+            addAssistantMsg('♻️ 项目状态已从备份自动恢复，可继续写作。点下方「开始生成」续写。');
+          } else if (isNovel && nr && nr.status === 'missing') {
+            addAssistantMsg('⚠️ 项目状态已丢失且无可用备份，无法续写。大纲只读展示，请删除此会话重新规划。');
+          }
         }
         startProgressPolling(sid);
       } else if (s.phase === 'reviewing') {
@@ -3474,6 +4001,7 @@ function sendMessage() {
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({message: text, session_id: currentSessionId})
     }).then(r => r.json()).then(d => {
+      if (d.session_id) currentSessionId = d.session_id;  // 通用线对话也建会话（消息持久化）
       if (d.type === 'writing_request') {
         addOutlineProposal(d.topic, d.text);
       } else {
@@ -3495,6 +4023,12 @@ function startPlanning(topic) {
   // 继续保留 topic 本身的上下文
   // 当前选中模板名
   const templateName = document.getElementById('template-select').value;
+  // 小说线：题材必填（题材=场景配置/世界观根，缺失整篇漂移）；篇幅可不填（默认中篇）
+  if (isNovelTemplateSelected() && !meta['题材']) {
+    statusEl.remove();
+    alert('小说需要填写「题材」（如 科幻/武侠/悬疑/都市/奇幻/历史）——题材决定场景配置与世界观，缺失会导致 AI 瞎编。篇幅可不填（默认中篇）。');
+    return;
+  }
   fetch('/api/plan', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
@@ -3584,6 +4118,7 @@ function buildOutlineHTML(outline, readOnly) {
           ${readOnly ? '' : `<label class="sc-rag"><input type="checkbox" class="sc-rag-cb" onchange="onRagToggle(this, '${s.id}')" ${!ragOnline ? 'disabled title="RAG未连接"' : ''}> RAG</label>` + (ragOnline && Array.isArray(ragKbs) ? `<select class="sc-kb" style="display:none;width:120px;font-size:12px" onchange="collectOutlineData()">${'<option value=\"\">自动KB</option>' + ragKbs.map(k => '<option value=\"' + k + '\">' + k + '</option>').join('')}</select>` : '')}
           ${readOnly ? '' : `<button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openReplanModal('section','${s.id}')" title="重新规划该章节（子结构全部重做）">重规划</button>`}
         </div>
+        ${s.summary ? `<div style="font-size:11px;color:var(--text-dim);margin:2px 0 2px 26px;line-height:1.3">📖 ${s.summary}</div>` : ''}
         ${readOnly ? '' : subHTML}
       </div>`;
   });
@@ -3958,6 +4493,7 @@ function startGeneration() {
     return;
   }
   isGenerating = true;
+  _ncConfirmId = null;  // 新一轮生成：重置章确认状态，确保首轮轮询重建确认面板
 
   const data = getOutlineData();
   const msgEl = addAssistantMsg('⏳ 正在启动生成任务...');
@@ -4016,6 +4552,12 @@ function startAutoGeneration() {
       if (val) meta[el.dataset.fieldName] = val;
     });
     const templateName = document.getElementById('template-select').value;
+    // 小说线：题材必填（自动撰写入口同样拦截）
+    if (isNovelTemplateSelected() && !meta['题材']) {
+      statusEl.remove();
+      alert('小说需要填写「题材」（如 科幻/武侠/悬疑/都市/奇幻/历史）——题材决定场景配置与世界观。篇幅可不填（默认中篇）。');
+      return;
+    }
     fetch('/api/plan', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
@@ -4163,7 +4705,28 @@ function confirmReplan() {
   if (_replanTarget) {
     const t = _replanTarget;
     _replanTarget = null;
+    // 小说线段级重规划（确认面板内的单个子结构）
+    if (t.type === 'novel_sub') {
+      addAssistantMsg('⏳ 正在重新规划该子结构...');
+      fetch('/api/novel/replan_sub', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({session_id: currentSessionId, target_id: t.id, hints})
+      }).then(r => r.json()).then(d => {
+        if (d.success) {
+          addAssistantMsg('✅ 子结构已重新规划：' + (d.title || '') + '（' + (d.word_count || '') + '字），请在下方确认面板中确认');
+          _ncConfirmId = null;  // 强制下轮轮询重建确认面板（显示新子结构）
+        } else {
+          addAssistantMsg('❌ 子结构重规划失败：' + (d.error || ''));
+        }
+      }).catch(err => {
+        addAssistantMsg('❌ 请求失败：' + err.message);
+      });
+      return;
+    }
     addAssistantMsg('⏳ 正在重新规划目标节点...');
+    // 小说线判定：章级重规划 → 大纲卡片必须刷新（章级内容更新，outline 保持章级不泄露子结构）；
+    // 段级重规划已在上方 novel_sub 分支单独处理（只刷确认面板，不碰大纲卡片）
+    const isNovelUI = !!(currentOutline && (currentOutline._novel || (currentOutline.sections || []).some(s => s._novel)));
     fetch('/api/replan_section', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({session_id: currentSessionId, target_id: t.id, hints})
@@ -4177,6 +4740,9 @@ function confirmReplan() {
           renderOutline(d.outline);
         }
         addAssistantMsg('✅ 目标节点已重新规划，其他章节保持不变');
+        if (isNovelUI) {
+          _ncConfirmId = null;  // 章级重规划后新子结构在 state，下轮轮询刷新底部确认面板
+        }
       } else {
         addAssistantMsg('❌ 局部重规划失败：' + (d.error || ''));
       }
@@ -4347,10 +4913,13 @@ function startProgressPolling(sid) {
   const sessionId = sid || currentSessionId;
   if (!sessionId) return;
   if (progressInterval) clearInterval(progressInterval);
+  _lastProgressKey = null;  // 重置防抖（每次启动轮询重新渲染一次最新状态）
 
   progressInterval = setInterval(() => {
     fetch(`/api/progress?session_id=${sessionId}`)
       .then(r => r.json()).then(d => {
+        // 会话守卫：响应返回时若已切换到其他会话，直接丢弃（防 in-flight 竞态残留）
+        if (currentSessionId !== sessionId) return;
         if (!d.success) {
           stopProgressPolling();
           return;
@@ -4371,10 +4940,57 @@ function startProgressPolling(sid) {
           statusEl.textContent = p.status_text;
         }
 
-        // 更新卡片上的状态图标
-        document.querySelectorAll('.section-card').forEach(card => {
-          // 状态轮询：重新加载session获取最新状态
-        });
+        // 小说线章级门控：待确认章 → 显示子结构 + 配置（字数/重点/概述）+ 确认按钮
+        const ncPanel = document.getElementById('novel-confirm-panel');
+        if (ncPanel) {
+          if (p.awaiting_confirm) {
+            const ac = p.awaiting_confirm;
+            if (_ncConfirmId !== ac.id) {
+              _ncConfirmId = ac.id;
+              const rows = (ac.sub_sections || []).map(ss => `
+                <div style="border:1px solid var(--border);border-radius:4px;padding:5px 8px;margin:4px 0;background:var(--bg-input)">
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <input type="checkbox" class="nc-check" data-id="${ss.id}" ${ss._checked === false ? '' : 'checked'} title="取消勾选 = 跳过该段">
+                    <span style="flex:1;min-width:100px;font-size:12px">${ss.title}</span>
+                    <input type="number" class="nc-words" data-id="${ss.id}" value="${ss.word_count || 1000}" style="width:58px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" min="100" max="5000" title="字数目标"><span style="font-size:11px;color:var(--text-dim)">字</span>
+                    <label style="font-size:11px;color:var(--sc-key);cursor:pointer"><input type="checkbox" class="nc-key" data-id="${ss.id}" ${ss.is_key ? 'checked' : ''}> ⭐重点</label>
+                    <button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openAuxModal('${ss.id}')" title="辅助知识">+辅助</button>
+                    <button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openReplanModal('novel_sub','${ss.id}')" title="只重新规划这一个子结构">重规划</button>
+                  </div>
+                  ${ss.summary ? `<div style="font-size:11px;color:var(--text-dim);margin-left:24px;margin-top:2px;line-height:1.3">${ss.summary}</div>` : ''}
+                </div>`).join('');
+              ncPanel.innerHTML = `<div style="font-size:13px;font-weight:500;margin-bottom:4px">⏸ 等待确认：${ac.chapter || ''}《${ac.title}》子结构规划（取消勾选=跳过该段；可改字数/标重点/重规划单段）</div>
+                ${rows}
+                <button class="btn btn-primary btn-sm" style="margin-top:6px" onclick="confirmNovelChapter()">确认，写本章</button>`;
+            }
+            ncPanel.style.display = 'block';
+          } else {
+            _ncConfirmId = null;
+            ncPanel.style.display = 'none';
+          }
+        }
+
+        // 更新卡片上的状态图标 + 大纲卡片（关键修复：轮询必须用 session 最新 outline 重渲染，
+        // 否则切会话再切回后，生成线程后续的章/子结构进度永远不显示——"状态丢失、结果不体现"）
+        // 防抖动：仅当进度戳变化才重渲染，避免每 1.5s 全量重绘打断用户交互
+        const pkey = (p.done || 0) + '|' + (p.total || 0) + '|' + (p.status_text || '') + '|' + (p.phase || '');
+        if (pkey !== _lastProgressKey) {
+          _lastProgressKey = pkey;
+          fetch(`/api/session/load?session_id=${sessionId}`)
+            .then(r2 => r2.json()).then(d2 => {
+              if (!d2.success) return;
+              if (currentSessionId !== sessionId) return;  // 再守卫一次（异步返回竞态）
+              const latest = d2.session.outline;
+              if (!latest || !latest.sections) return;
+              currentOutline = latest;   // 同步内存大纲（后续确认/重规划基于最新）
+              const oldCard = document.getElementById('outline-card');
+              if (oldCard && oldCard.closest('.msg')) {
+                // 写作中保持可编辑（确认面板在生成控制区，大纲卡片用最新数据重建）
+                const editable = !!(latest._novel || (latest.sections || []).some(x => x._novel));
+                oldCard.closest('.msg').querySelector('.msg-content').innerHTML = buildOutlineHTML(latest, !editable);
+              }
+            }).catch(() => {});
+        }
 
         // 检查是否完成
         if (p.phase === 'done' || p.phase === 'error') {
@@ -4389,6 +5005,45 @@ function stopProgressPolling() {
   if (progressInterval) { clearInterval(progressInterval); progressInterval = null; }
   const bar = document.getElementById('stop-bar');
   if (bar) bar.style.display = 'none';
+  const ncPanel = document.getElementById('novel-confirm-panel');
+  if (ncPanel) ncPanel.style.display = 'none';
+  _ncConfirmId = null;
+}
+
+// 小说线章级门控：确认当前章（应用勾选/字数/重点 → 章 status=confirmed → 写作线程继续）
+async function confirmNovelChapter() {
+  if (!currentSessionId) return;
+  const checked = {}, subWords = {}, subKeys = {};
+  document.querySelectorAll('#novel-confirm-panel .nc-check').forEach(cb => {
+    checked[cb.dataset.id] = cb.checked;
+  });
+  document.querySelectorAll('#novel-confirm-panel .nc-words').forEach(inp => {
+    const v = parseInt(inp.value);
+    if (!isNaN(v) && v > 0) subWords[inp.dataset.id] = v;
+  });
+  document.querySelectorAll('#novel-confirm-panel .nc-key').forEach(cb => {
+    if (cb.checked) subKeys[cb.dataset.id] = true;
+  });
+    if (_ncConfirming) return;  // 防重复点击
+    _ncConfirming = true;
+  try {
+    const r = await fetch('/api/novel/confirm', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: currentSessionId, checked, sub_words: subWords, sub_keys: subKeys})
+    });
+    const d = await r.json();
+    if (!d.success) {
+      alert(d.error || '确认失败');
+      _ncConfirming = false;
+      return;
+    }
+    // 确认成功：立即收掉确认面板（章已 confirmed，写作线程恢复；轮询随后刷新大纲卡片）
+    _ncConfirmId = null;
+    _ncConfirming = false;
+    const ncPanel = document.getElementById('novel-confirm-panel');
+    if (ncPanel) ncPanel.style.display = 'none';
+    addAssistantMsg('✅ 本章已确认，开始写作。');  // 大纲卡片状态由轮询在 1.5s 内自动刷新
+  } catch (e) { alert('确认失败: ' + e); _ncConfirming = false; }
 }
 
 function fetchResult(sessionId) {
