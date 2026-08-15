@@ -262,62 +262,26 @@ def _build_prompt(data, chapter, chapter_dir) -> str:
 以 JSON 数组格式输出, 每项格式:
 {{"dimension": "维度名", "result": "PASS"|"HARD"|"SOFT", "detail": "具体说明(20-50字)"}}
 
-必须包含全部 5 个维度, 仅输出 JSON 数组, 不要有其他文字."""
+必须包含全部 5 个维度, 仅输出 JSON 数组, 不要有其他文字.
+
+[输出示例]
+[
+  {{"dimension": "因果合理性", "result": "PASS", "detail": "前文铺垫充分，转折逻辑合理"}},
+  {{"dimension": "人物行为一致性", "result": "SOFT", "detail": "角色情绪转变略显突兀，缺过渡铺垫"}},
+  {{"dimension": "情绪弧自然度", "result": "PASS", "detail": "情绪递进自然，与事件节奏匹配"}},
+  {{"dimension": "对话匹配度", "result": "HARD", "detail": "对话用词超出角色设定，与身份不符"}},
+  {{"dimension": "论证可靠性", "result": "PASS", "detail": "推理链条完整，无逻辑漏洞"}}
+]"""
     return prompt
 
 
-def check_reasoning(state_path, chapter, chapter_dir):
-    """
-    推理审核主入口.
-    返回 issues list, 格式同 finalize-chapter 标准.
-    """
-    issues = []
-
-    sp = Path(state_path)
-    if not sp.exists():
-        return issues
-    data = json.loads(sp.read_text(encoding="utf-8-sig"))
-
-    model, tokenizer = _load_model()
-    if model is None:
-        print("\n  [推理审核] 跳过 (无 DeepSeek-R1-Distill-Qwen-1.5B 模型)")
-        return issues
-
-    print(f"\n{'='*50}")
-    print(f"[推理审核] 开始推理审核 (DeepSeek-R1-Distill-Qwen-1.5B, CPU)...")
-    print(f"{'='*50}")
-
-    prompt = _build_prompt(data, chapter, chapter_dir)
-    if not prompt:
-        print("  [推理审核] 跳过: 无法构建 prompt")
-        return issues
-
-    try:
-        from transformers import pipeline as _pipeline
-        pipe = _pipeline("text-generation", model=model, tokenizer=tokenizer, device=0 if _DEVICE == "cuda" else -1)
-        output = pipe(
-            prompt,
-            max_new_tokens=4096,
-            temperature=0.6,
-            top_p=0.95,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-        raw_output = output[0]["generated_text"]
-        if raw_output.startswith(prompt):
-            raw_output = raw_output[len(prompt):]
-    except Exception as e:
-        print(f"\n  [推理审核] 推理异常: {e}")
-        print(f"  -> 跳过推理审核, 不影响现有流程")
-        return issues
-
-    cleaned = _strip_think(raw_output)
-
-    results = None
+def _parse_reasoning_results(cleaned: str) -> list:
+    """从模型输出中提取审核结果列表（兼容代码块/裸 JSON/单对象包装）。失败返回空列表。"""
     # 先提取 ```json ... ``` 代码块
     code_match = re.search(r'```(?:json)?\s*(.*?)\s*```', cleaned, re.DOTALL)
     text_to_parse = code_match.group(1) if code_match else cleaned
 
+    results = None
     # 找所有独立的 JSON 对象
     all_objs = []
     for m in re.finditer(r'\{[^{}]*\}', text_to_parse):
@@ -352,14 +316,97 @@ def check_reasoning(state_path, chapter, chapter_dir):
             pass
     if not isinstance(results, list):
         results = [results] if results else []
+    return results
+
+
+def check_reasoning(state_path, chapter, chapter_dir):
+    """
+    推理审核主入口.
+    返回 issues list, 格式同 finalize-chapter 标准.
+    """
+    issues = []
+
+    sp = Path(state_path)
+    if not sp.exists():
+        return issues
+    data = json.loads(sp.read_text(encoding="utf-8-sig"))
+
+    model, tokenizer = _load_model()
+    if model is None:
+        print("\n  [推理审核] 跳过 (无 DeepSeek-R1-Distill-Qwen-1.5B 模型)")
+        return issues
+
+    print(f"\n{'='*50}")
+    print(f"[推理审核] 开始推理审核 (DeepSeek-R1-Distill-Qwen-1.5B, CPU)...")
+    print(f"{'='*50}")
+
+    prompt = _build_prompt(data, chapter, chapter_dir)
+    if not prompt:
+        print("  [推理审核] 跳过: 无法构建 prompt")
+        return issues
+
+    # ── 生成 + 解析（格式失败 → 打回纠正重试，最多 3 次；避免"格式漂移直接标记失败"导致审核结果不可见）──
+    try:
+        from transformers import pipeline as _pipeline
+        pipe = _pipeline("text-generation", model=model, tokenizer=tokenizer, device=0 if _DEVICE == "cuda" else -1)
+    except Exception as e:
+        print(f"\n  [推理审核] 模型加载异常: {e}")
+        return issues
+
+    results = None
+    last_raw = ""
+    for attempt in range(1, 4):  # 最多 3 次（第 1 次原始 prompt，第 2-3 次带纠错提示）
+        try:
+            output = pipe(
+                prompt,
+                max_new_tokens=4096,
+                temperature=0.6,
+                top_p=0.95,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            raw_output = output[0]["generated_text"]
+            if raw_output.startswith(prompt):
+                raw_output = raw_output[len(prompt):]
+        except Exception as e:
+            print(f"\n  [推理审核] 推理异常(第{attempt}次): {e}")
+            if attempt == 3:
+                print("  -> 跳过推理审核, 不影响现有流程")
+                return issues
+            continue
+
+        last_raw = raw_output
+        cleaned = _strip_think(raw_output)
+
+        results = _parse_reasoning_results(cleaned)
+        if results:
+            if attempt > 1:
+                print(f"  [推理审核] ✅ 第{attempt}次纠正后解析成功")
+            break
+
+        # 解析失败 → 打回纠正：把原始输出 + 错误说明喂回，要求重新按格式输出
+        print(f"  [推理审核] ⚠️ 第{attempt}次输出格式不规范，打回纠正重试...")
+        prompt = (
+            "你上一次的输出格式不符合要求（必须是 JSON 数组，每项含 dimension/result/detail，"
+            "result 只能是 PASS/HARD/SOFT 之一）。\n\n"
+            "你上一次的输出如下：\n"
+            f"---\n{last_raw[:800]}\n---\n\n"
+            "请忽略上一次输出，重新严格按以下 JSON 数组格式审核同一章节，仅输出 JSON 数组，不要任何解释：\n"
+            "[\n"
+            '  {"dimension": "因果合理性", "result": "PASS|HARD|SOFT", "detail": "说明"},\n'
+            '  {"dimension": "人物行为一致性", "result": "PASS|HARD|SOFT", "detail": "说明"},\n'
+            '  {"dimension": "情绪弧自然度", "result": "PASS|HARD|SOFT", "detail": "说明"},\n'
+            '  {"dimension": "对话匹配度", "result": "PASS|HARD|SOFT", "detail": "说明"},\n'
+            '  {"dimension": "论证可靠性", "result": "PASS|HARD|SOFT", "detail": "说明"}\n'
+            "]"
+        )
 
     if not results:
-        # 解析失败兜底：不再静默通过——明确标记「推理审核失败」为 SOFT 问题，
-        # 调用方聚合时可见（不阻断完结但人工必须知晓审核未完成）
-        print("  [推理审核] ⚠️ 无法解析审核结果 — 标记审核失败（SOFT，需人工复核）")
+        # 3 次重试仍失败：明确标记「推理审核失败」（SOFT，调用方聚合可见，人工复核）
+        print("  [推理审核] ⚠️ 3 次重试后仍无法解析 — 标记审核失败（SOFT，需人工复核）")
         issues.append({
             "file": chapter,
-            "problem": "推理审核失败：模型输出无法解析（JSON 提取为空——可能思考截断/格式漂移/模型异常）",
+            "problem": "推理审核失败：模型 3 次输出均无法解析为审核 JSON（格式持续漂移/模型异常）",
             "position": f"{chapter} reasoning",
             "severity": "SOFT",
             "suggestion": "推理审核未完成：本章因果/人格/情绪弧未经模型审核。可重跑完结审核，或人工复核后确认。"

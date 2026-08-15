@@ -82,6 +82,10 @@ def _detect_new_chars_in_plan(data: dict, chapter: str, subs: list):
             if a and len(a) >= 2:
                 existing_names.add(a)
 
+    # 占位符精确挡截：LLM 规划常写【新角色：无】等占位标记（不登记为角色）
+    # 集合整串相等匹配，不误伤"无风/无面人"等含占位字的名字
+    PLACEHOLDER_NAMES = {"无", "未知", "待定", "None", "暂无", "未定", "未命名"}
+
     new_chars = []
     for s in subs:
         for field in ("summary", "title", "writing_prompt"):
@@ -89,6 +93,8 @@ def _detect_new_chars_in_plan(data: dict, chapter: str, subs: list):
             # 显式声明式新角色：【新角色: 名字】或【新角色：名字】
             for m in re.findall(r"【新角色\s*[:：]\s*([^\s【】]{1,8})】", text):
                 name = m.strip()
+                if name in PLACEHOLDER_NAMES:
+                    continue  # 占位符不登记（精确匹配，不误伤"无风/无面人"）
                 if name and name not in existing_names:
                     new_chars.append(name)
                     existing_names.add(name)
@@ -367,6 +373,34 @@ def write_sub(state_path, chapter, sub_key, target_dir):
             if line.strip():
                 print(f"  {line.strip()}")
 
+    # ── 步骤5: behavior_extractor.extract — 角色行为提取（逐段，LLM 优先+正则回退，非阻断）──
+    behavior_extractor = SCRIPTS_DIR / "novel_behavior_extractor.py"
+    bh_result = subprocess.run(
+        [sys.executable, str(behavior_extractor),
+         state_path, chapter, sub_key, content_file],
+        capture_output=True, text=True, encoding="utf-8"
+    )
+    if bh_result.returncode != 0:
+        print(f"  [INFO] behavior-extract 跳过: {bh_result.stderr.strip()}")
+    else:
+        for line in bh_result.stdout.strip().split("\n"):
+            if line.strip():
+                print(f"  {line.strip()}")
+
+    # ── 步骤6: timeline_extractor.extract — 故事内时间线提取（逐段，LLM 优先+正则回退，非阻断）──
+    timeline_extractor = SCRIPTS_DIR / "novel_timeline_extractor.py"
+    tl_result = subprocess.run(
+        [sys.executable, str(timeline_extractor),
+         state_path, chapter, sub_key, content_file],
+        capture_output=True, text=True, encoding="utf-8"
+    )
+    if tl_result.returncode != 0:
+        print(f"  [INFO] timeline-extract 跳过: {tl_result.stderr.strip()}")
+    else:
+        for line in tl_result.stdout.strip().split("\n"):
+            if line.strip():
+                print(f"  {line.strip()}")
+
     print(f"[write-sub] {chapter}{sub_key} [OK] 已完成")
     print(f"  字数: {word_count}")
 
@@ -568,7 +602,9 @@ def finalize_chapter(state_path, chapter, chapter_dir, report_dir):
         _atomic_write_json(sp, state_data)
 
         # ── 跨章行为摘要提取 ──
-        _generate_behavior_summary(state_path, chapter, str(chapter_dir))
+        # B 方案：行为已在 write-sub 逐段提取（novel_behavior_extractor，LLM 优先+正则回退）
+        # 整章正则提取会覆盖逐段 LLM 结果 → 不再调用（函数保留供 CLI 手动兜底）
+        # _generate_behavior_summary(state_path, chapter, str(chapter_dir))
 
         print(f"[完结] {chapter}: [OK] 全部完成")
 

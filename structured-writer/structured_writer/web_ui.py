@@ -30,6 +30,10 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 _generation_tasks = {}
 _gen_lock = threading.Lock()
 
+# 修复引擎状态（T1 整段重构后台线程）
+_repair_state = {"done": False, "result": None, "chapter": "", "session_id": ""}
+_repair_lock = threading.Lock()
+
 # 小说模型后台安装状态（点击「安装缺失模型」→ 后端自动下载，不弹窗不自装）
 _install_state = {"running": False, "models": [], "log": [], "done": False}
 _INSTALL_CMDS = {
@@ -122,6 +126,9 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/session/load": cls._handle_session_load,
             "/api/rag/status": cls._handle_rag_status,
             "/api/novel/status": cls._handle_novel_status,
+            "/api/novel/replan_status": cls._handle_novel_replan_status,
+            "/api/novel/repair/preview": cls._handle_repair_preview,
+            "/api/novel/repair/status": cls._handle_repair_status,
             "/api/batch_progress": cls._handle_batch_progress,
             "/api/outputs": cls._handle_outputs_list,
             "/api/outputs/read": cls._handle_outputs_read,
@@ -143,6 +150,8 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/novel/checks": cls._handle_novel_checks,
             "/api/novel/confirm": cls._handle_novel_confirm,
             "/api/novel/replan_sub": cls._handle_novel_replan_sub,
+            "/api/novel/repair/apply": cls._handle_repair_apply,
+            "/api/novel/repair/rollback": cls._handle_repair_rollback,
             "/api/batch_auto": cls._handle_batch_auto,
             "/api/session/archive": cls._handle_session_archive,
             "/api/session/restore": cls._handle_session_restore,
@@ -405,6 +414,27 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
 
         state = sm.get_state()
         outline = state.get("outline", {})
+
+        # 竞态防护：小说线重规划在途（章级/子结构）→ 拒绝启动生成。
+        # 否则写作线程基于旧 outline/旧子结构开跑，与重规划返回的新数据竞态。
+        # 前端 _replanBusy 已拦截正常路径；此处后端兜底（绕过前端直接 POST 也拒绝）。
+        # 整篇重规划（/api/plan）不登记 _replan_inflight，由前端 _replanBusy 拦截。
+        inflight_all = state.get("_replan_inflight", []) or []
+        if inflight_all:
+            import time as _t
+            _now = _t.time()
+            inflight_live = [t for t in inflight_all if (_now - float(t.get("started_at", 0))) <= 1800]
+            if len(inflight_live) != len(inflight_all):
+                sm._state["_replan_inflight"] = inflight_live
+                sm.save()
+            if inflight_live:
+                descs = ", ".join(f"{t.get('chapter_id','?')}{t.get('s_key','')}" for t in inflight_live)
+                self._json_response(
+                    {"success": False, "error": f"小说线有重规划正在进行中（{descs}），请等待其完成后再开始生成"},
+                    409,
+                )
+                return
+
         user_orders = data.get("orders", {}) or state.get("user_orders", {})
         rag_options = data.get("rag", {})
 
@@ -1056,6 +1086,14 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                         ok = restore_novel_state(state_path)
                         restore_result = {"status": "restored" if ok else "missing",
                                           "reason": "从备份恢复" if ok else "无可用备份"}
+            # 重规划在途：过滤僵尸（1800s）后随 session 返回，供前端刷新/重连后恢复禁用态
+            import time as _t
+            _now = _t.time()
+            inflight_all = state.get("_replan_inflight", []) or []
+            inflight_live = [t for t in inflight_all if (_now - float(t.get("started_at", 0))) <= 1800]
+            if len(inflight_live) != len(inflight_all):
+                sm._state["_replan_inflight"] = inflight_live
+                sm.save()
             self._json_response({
                 "success": True,
                 "session": {
@@ -1065,13 +1103,42 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                     "user_orders": state.get("user_orders", {}),
                     "output_file": state.get("output_file", ""),
                     "created_at": state.get("created_at", ""),
-                    "messages": state.get("messages", [])
+                    "messages": state.get("messages", []),
+                    "_replan_inflight": inflight_live
                 },
                 "progress": progress,
                 "novel_restore": restore_result
             })
         except FileNotFoundError:
             self._json_response({"success": False, "error": "会话不存在"}, 404)
+
+    def _handle_novel_replan_status(self):
+        """GET /api/novel/replan_status — 轻量查询活的重规划 in-flight（供前端刷新后轮询恢复）。
+
+        只返回过滤僵尸（1800s）后的 in-flight 数组；无则返回空数组。
+        与 _handle_session_load 同规则，避免每次轮询拉全量 outline。
+        """
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query
+        )
+        session_id = (params.get("session_id") or [""])[0]
+        if not session_id:
+            self._json_response({"success": False, "error": "缺少 session_id"}, 400)
+            return
+        try:
+            sm = StateManager()
+            sm.load(session_id)
+        except Exception:
+            self._json_response({"success": False, "inflight": []})
+            return
+        inflight_all = sm._state.get("_replan_inflight", []) or []
+        import time as _t
+        _now = _t.time()
+        inflight_live = [t for t in inflight_all if (_now - float(t.get("started_at", 0))) <= 1800]
+        if len(inflight_live) != len(inflight_all):
+            sm._state["_replan_inflight"] = inflight_live
+            sm.save()
+        self._json_response({"success": True, "inflight": inflight_live})
 
     # ---- 会话归档/恢复/删除 ----
 
@@ -1203,7 +1270,15 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
 
     def _handle_novel_checks(self):
         data = self._read_body()
-        cfg = {k: bool(data.get(k, True)) for k in ("chapter", "semantic", "reason", "full")}
+        cfg = {}
+        for k in ("chapter", "semantic", "reason", "full", "auto_repair"):
+            if k in data:
+                cfg[k] = bool(data.get(k))
+        if "repair_rounds" in data:
+            try:
+                cfg["repair_rounds"] = max(1, min(5, int(data.get("repair_rounds"))))
+            except (ValueError, TypeError):
+                cfg["repair_rounds"] = 3
         self.config_mgr.set("novel_checks", cfg)
         self._json_response({"success": True})
 
@@ -1232,10 +1307,33 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         if target is None:
             self._json_response({"success": False, "error": "没有待确认的章"}, 400)
             return
+        # 竞态防护：该章有子结构正在被重规划 → 拒绝确认
+        # 否则 LLM 跑完后端返回时会把 outline sub 改写，写作线程却已基于旧数据开写（状态错乱）
+        target_chapter_id = (target.get("_novel") or {}).get("chapter", "")
+        inflight_all = sm._state.get("_replan_inflight", []) or []
+        # 僵尸清理：started_at 超过 1800s（30 分钟）视为进程崩溃遗留，自动丢弃
+        import time as _t
+        _now = _t.time()
+        inflight_live = [t for t in inflight_all if (_now - float(t.get("started_at", 0))) <= 1800]
+        if len(inflight_live) != len(inflight_all):
+            sm._state["_replan_inflight"] = inflight_live
+            sm.save()
+        conflict = [
+            t for t in inflight_live
+            if t.get("chapter_id") == target_chapter_id  # 任意类型（novel_sub/section）覆盖该章均拒
+        ]
+        if conflict:
+            descs = ", ".join(f"{t.get('chapter_id')}{t.get('s_key','')}" for t in conflict)
+            self._json_response(
+                {"success": False, "error": f"该章有子结构正在重规划中（{descs}），请等待其完成后再确认本章"},
+                409,
+            )
+            return
         # 应用确认时调整：勾选跳过 / 字数覆盖 / 重点标记
         checked = data.get("checked", {}) or {}
         sub_words = data.get("sub_words", {}) or {}
         sub_keys = data.get("sub_keys", {}) or {}
+        sub_orders = data.get("sub_orders", {}) or {}
         for ss in target.get("sub_sections", []):
             if ss["id"] in checked:
                 ss["_checked"] = bool(checked[ss["id"]])
@@ -1246,19 +1344,222 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                     pass
             if ss["id"] in sub_keys:
                 ss["is_key"] = True
+        # 应用子结构顺序（复用通用线 sub_orders 语义：s1/s2 → sort；无显式排序的段排最后）
+        if sub_orders:
+            def sub_sort_key(ss):
+                ro = sub_orders.get(ss["id"], "")
+                try:
+                    return int(ro.lstrip("s"))
+                except (ValueError, TypeError):
+                    return 999
+            target["sub_sections"].sort(key=sub_sort_key)
         # 章字数 = 各子结构字数汇总（与通用线一致）
         subs = target.get("sub_sections", [])
         if subs:
             target["word_count"] = sum(ss.get("word_count", 0) for ss in subs)
+        # 同步 novel_state 的 sub_structures dict 顺序（s_key 不变、顺序变）——
+        # 小说线写作线程按 state 的 dict 序写子结构，outline 重排不生效，必须同步
+        nv = target.get("_novel") or {}
+        if sub_orders and nv.get("state_path"):
+            from pathlib import Path as _P
+            _sp = _P(nv["state_path"])
+            if _sp.is_file():
+                from .novel.novel_state_manager import load_state, save_state
+                nd = load_state(str(_sp))
+                _ch = next((c for c in nd.get("chapters", []) if c["id"] == nv.get("chapter", "")), None)
+                if _ch and _ch.get("sub_structures"):
+                    ordered_keys = []
+                    for ss in target["sub_sections"]:
+                        sk = (ss.get("_novel") or {}).get("s_key", "")
+                        if sk and sk in _ch["sub_structures"] and sk not in ordered_keys:
+                            ordered_keys.append(sk)
+                    # 未出现在 outline 的 s_key 追加到末尾（防御）
+                    for k in _ch["sub_structures"]:
+                        if k not in ordered_keys:
+                            ordered_keys.append(k)
+                    _ch["sub_structures"] = {k: _ch["sub_structures"][k] for k in ordered_keys}
+                    save_state(str(_sp), nd, caller="novel-confirm")
         target["status"] = "confirmed"
         sm._state["outline"] = outline
         sm.save()
         self._json_response({"success": True, "chapter": target.get("title", "")})
 
+    # ---- 修复引擎 API（P3） ----
+
+    def _repair_engine_for(self, session_id):
+        """加载 session + 解析出 state_path / chapter_dir。
+
+        从 outline 的 _novel.state_path 定位当前项目——不 glob 猜第一个
+        （多个 novel 项目时 glob 会选到最老的项目，修复引擎跑错目录导致"文件不存在"）。
+        """
+        from .state_manager import StateManager as _SM
+        sm = _SM()
+        sm.load(session_id)
+        outline = sm._state.get("outline", {})
+        state_path = ""
+        for s in outline.get("sections", []):
+            sp_ = (s.get("_novel") or {}).get("state_path", "")
+            if sp_:
+                state_path = sp_
+                break
+        if not state_path or not Path(state_path).is_file():
+            return None, None, None, None
+        proj = Path(state_path).parent.parent  # .../projects/<id>/data/novel_state.json → .../projects/<id>
+        return sm, state_path, str(proj / "chapters"), outline
+
+    def _handle_repair_preview(self):
+        """GET /api/novel/repair/preview?session_id=X&chapter=L02
+        返回该章 T0（自动修） + T1（待勾选重构）清单。"""
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        session_id = (params.get("session_id") or [""])[0]
+        chapter = (params.get("chapter") or [""])[0]
+        if not session_id or not chapter:
+            self._json_response({"success": False, "error": "缺少 session_id/chapter"}, 400)
+            return
+        try:
+            sm, state_path, chapter_dir, outline = self._repair_engine_for(session_id)
+            if state_path is None:
+                self._json_response({"success": False, "error": "novel 项目目录未找到"}, 404)
+                return
+            hints = sm.get_repair_hints()
+            hint = hints.get(chapter, {})
+            if not hint:
+                self._json_response({"success": True, "preview": None,
+                                     "message": "该章无章检结果（可能未跑六检）"})
+                return
+            # 解析 stdout 里的问题行（HARD/SOFT + 文件定位）
+            issues = []
+            for ln in (hint.get("output") or "").split("\n"):
+                ln = ln.strip()
+                if not ln or not (ln.startswith("[") and ("HARD" in ln or "SOFT" in ln or "FAIL" in ln or "WARN" in ln)):
+                    continue
+                issues.append(ln[:150])
+            # 从 output 提取涉及的文件名（S0X）
+            import re as _re
+            files_hit = sorted(set(_re.findall(r"S\d+\.txt", hint.get("output", ""))))
+            self._json_response({
+                "success": True,
+                "preview": {
+                    "chapter": chapter,
+                    "ok": hint.get("ok", False),
+                    "timeout": hint.get("timeout", False),
+                    "issues": issues,
+                    "files": files_hit,
+                }
+            })
+        except Exception as e:
+            self._json_response({"success": False, "error": f"预览失败: {e}"}, 500)
+
+    def _handle_repair_apply(self):
+        """POST /api/novel/repair/apply  {session_id, chapter, checked_subs: ["S01.txt",...], mode}
+        执行 T0 自动修 + T1 勾选段整段重构（后台线程）。"""
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        session_id = str(data.get("session_id", "")).strip()
+        chapter = str(data.get("chapter", "")).strip()
+        checked = data.get("checked_subs") or None
+        mode = str(data.get("mode", "manual"))
+        if not session_id or not chapter:
+            self._json_response({"success": False, "error": "缺少 session_id/chapter"}, 400)
+            return
+        sm, state_path, chapter_dir, outline = self._repair_engine_for(session_id)
+        if state_path is None:
+            self._json_response({"success": False, "error": "novel 项目目录未找到"}, 404)
+            return
+        # 构造 issues 清单（从 hints 的 output 解析为结构化问题，供 apply_t0 / 重构）
+        hints = sm.get_repair_hints()
+        hint = hints.get(chapter, {}) or {}
+        structured = self._parse_check_output(hint.get("output", ""))
+        if not structured:
+            self._json_response({"success": False, "error": "该章无可用检查输出"}, 400)
+            return
+        from .novel import novel_repair_engine as reng
+        # 后台线程执行（T1 重构慢）
+        def _run():
+            try:
+                rep = reng.run(state_path, chapter_dir, chapter, structured,
+                               mode=mode, config_mgr=self.config_mgr,
+                               checked_subs=checked)
+                with _repair_lock:
+                    _repair_state["result"] = rep
+                    _repair_state["done"] = True
+                # 标记该章已处理修复（前端 repair_pending 消失，不再重复弹面板）
+                try:
+                    sm2 = StateManager()
+                    sm2.load(session_id)
+                    hints = sm2.get_repair_hints()
+                    if chapter in hints:
+                        hints[chapter]["_repaired"] = True
+                        hints[chapter]["_repair_result"] = {
+                            "t0_fixed": len((rep.get("t0") or {}).get("fixed", [])),
+                            "t1_rewritten": sum(1 for x in ((rep.get("t1") or {}).get("results") or []) if x.get("status") == "rewritten"),
+                        }
+                        sm2._state["_repair_hints"] = hints
+                        sm2.save()
+                except Exception:
+                    pass
+            except Exception as e:
+                with _repair_lock:
+                    _repair_state["result"] = {"error": f"{type(e).__name__}: {e}"}
+                    _repair_state["done"] = True
+        with _repair_lock:
+            _repair_state.update({"done": False, "result": None, "chapter": chapter, "session_id": session_id})
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        self._json_response({"success": True, "started": True, "chapter": chapter,
+                             "checked_subs": checked, "mode": mode})
+
+    def _parse_check_output(self, output: str) -> list:
+        """把章检 stdout 解析为结构化 issues（供修复引擎）。"""
+        issues = []
+        import re as _re
+        for ln in (output or "").split("\n"):
+            ln = ln.strip()
+            if not ln or not ln.startswith("["):
+                continue
+            sev = None
+            for s in ("HARD", "SOFT", "WARN", "FAIL"):
+                if s in ln:
+                    sev = s
+                    break
+            if sev is None:
+                continue
+            m = _re.search(r"S\d+\.txt", ln)
+            fname = m.group(0) if m else ""
+            problem = ln.split("]", 1)[-1].strip()[:120]
+            issues.append({"file": fname, "problem": problem, "severity": sev})
+        return issues
+
+    def _handle_repair_rollback(self):
+        """POST /api/novel/repair/rollback  {session_id, chapter, round}"""
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        session_id = str(data.get("session_id", "")).strip()
+        chapter = str(data.get("chapter", "")).strip()
+        round_no = int(data.get("round", 1))
+        sm, state_path, chapter_dir, outline = self._repair_engine_for(session_id)
+        if state_path is None:
+            self._json_response({"success": False, "error": "novel 项目目录未找到"}, 404)
+            return
+        from .novel import novel_repair_engine as reng
+        restored = reng.rollback_round(chapter_dir, round_no, state_path)
+        self._json_response({"success": True, "restored": restored})
+
+    def _handle_repair_status(self):
+        """GET /api/novel/repair/status — 修复进度轮询"""
+        with _repair_lock:
+            self._json_response({"success": True, "state": dict(_repair_state)})
+
     def _handle_novel_replan_sub(self):
         """POST /api/novel/replan_sub — 段级重规划（确认面板内单个子结构）。
 
-        body: {session_id, target_id（段 id）, hints}
+        body: {session_id, target_id（段 id）, hints, aux（段级辅助知识，可选）}
         更新 novel_state.json 的 sub_structures[s_key] + session outline 该段；
         章保持 planning（不重置 pending），确认面板由前端刷新。
         """
@@ -1270,6 +1571,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         session_id = str(data.get("session_id", "")).strip()
         target_id = str(data.get("target_id", "")).strip()
         hints = str(data.get("hints", "")).strip()
+        aux = data.get("aux") or None   # 段级辅助知识 {text, files}（前端从该段 aux_knowledge 传入）
         if not session_id or not target_id:
             self._json_response({"success": False, "error": "缺少 session_id 或 target_id"}, 400)
             return
@@ -1300,26 +1602,41 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         if not chapter_id or not s_key or not state_path:
             self._json_response({"success": False, "error": "该子结构缺少小说身份字段（非小说线）"}, 400)
             return
-        try:
-            from .novel import novel_bridge as nb
-            client = self._create_planner_client()
-            new_entry = nb.replan_novel_sub(str(Path(state_path).resolve()), chapter_id, s_key, hints, client)
-        except Exception as e:
-            self._json_response({"success": False, "error": str(e)}, 500)
-            return
-        # 同步 session outline 该段（保留 id/is_key/rag/_checked/_novel，更新规划字段）
-        sub.update({
-            "title": new_entry.get("title", sub.get("title", "")),
-            "summary": new_entry.get("summary", sub.get("summary", "")),
-            "word_count": (new_entry.get("word_count_target") or {}).get("max", sub.get("word_count", 1500)),
-            "status": "pending",
-            "actual_word_count": 0,
-        })
-        if parent is not None and parent.get("sub_sections"):
-            parent["word_count"] = sum(ss.get("word_count", 0) for ss in parent["sub_sections"])
-        sm._state["outline"] = outline
+        # ── 注册 in-flight 标记（防与章确认并发：确认接口拒绝有 in-flight 子结构的章） ─
+        inflight = sm._state.setdefault("_replan_inflight", [])
+        token = {"type": "novel_sub", "target_id": target_id, "chapter_id": chapter_id, "s_key": s_key, "started_at": time.time()}
+        inflight.append(token)
         sm.save()
-        self._json_response({"success": True, "title": sub.get("title", ""), "word_count": sub.get("word_count", 0)})
+        try:
+            try:
+                from .novel import novel_bridge as nb
+                client = self._create_planner_client()
+                new_entry = nb.replan_novel_sub(str(Path(state_path).resolve()), chapter_id, s_key, hints, client,
+                                                aux_knowledge={s_key: aux} if aux else None)
+            except Exception as e:
+                self._json_response({"success": False, "error": str(e)}, 500)
+                return
+            # 同步 session outline 该段（保留 id/is_key/rag/_checked/_novel，更新规划字段）
+            sub.update({
+                "title": new_entry.get("title", sub.get("title", "")),
+                "summary": new_entry.get("summary", sub.get("summary", "")),
+                "word_count": (new_entry.get("word_count_target") or {}).get("max", sub.get("word_count", 1500)),
+                "status": "pending",
+                "actual_word_count": 0,
+            })
+            if parent is not None and parent.get("sub_sections"):
+                parent["word_count"] = sum(ss.get("word_count", 0) for ss in parent["sub_sections"])
+            sm._state["outline"] = outline
+            sm.save()
+            self._json_response({"success": True, "title": sub.get("title", ""), "word_count": sub.get("word_count", 0)})
+        finally:
+            # 清理 in-flight 标记（finally 保证异常路径也清理）
+            inflight_now = sm._state.get("_replan_inflight", [])
+            sm._state["_replan_inflight"] = [
+                t for t in inflight_now
+                if not (t.get("type") == token["type"] and t.get("target_id") == token["target_id"] and t.get("started_at") == token["started_at"])
+            ]
+            sm.save()
 
     # ---- RAG 状态探测 ----
 
@@ -1890,23 +2207,41 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             from .novel import novel_bridge as nb
             nv = target.get("_novel") or {}
             if not is_sub:
-                # 章级：重新规划本章子结构（hints 注入），子结构只进 state，outline 保持章级 → 章置 planning
+                # 章级：重做该章级大纲条目（title + overview，hints 一次性驱动）。
+                # 两级分离语义：章级重规划不碰子结构——子结构是写作阶段 plan_chapter_subs 的事。
+                # 章状态回 pending（子结构需按新概述重新规划），outline 保持章级。
                 chapter_id = nv.get("chapter", "")
                 state_path = nv.get("state_path", "")
                 if not chapter_id or not state_path:
                     self._json_response({"success": False, "error": "小说章缺少身份字段"}, 400)
                     return
-                try:
-                    client = self._create_planner_client()
-                    nb.plan_chapter_subs(str(Path(state_path).resolve()), chapter_id, tmpl, client, hints=hints)
-                except Exception as e:
-                    self._json_response({"success": False, "error": str(e)}, 500)
-                    return
-                target["status"] = "planning"   # 子结构已在 state，写作时同步；评审界面仍只显示章
-                target["sub_sections"] = []
-                sm._state["outline"] = outline
+                # 注册 in-flight 标记（章级重规划期间拒绝确认）
+                inflight = sm._state.setdefault("_replan_inflight", [])
+                token = {"type": "section", "target_id": target_id, "chapter_id": chapter_id, "started_at": time.time()}
+                inflight.append(token)
                 sm.save()
-                self._json_response({"success": True, "outline": outline})
+                try:
+                    try:
+                        client = self._create_planner_client()
+                        new_entry = nb.replan_novel_chapter(str(Path(state_path).resolve()), chapter_id, hints, client)
+                    except Exception as e:
+                        self._json_response({"success": False, "error": str(e)}, 500)
+                        return
+                    # 同步 session outline 该章（章级条目更新；子结构交给写作阶段按新概述重新规划）
+                    target["title"] = new_entry.get("title", target.get("title", ""))
+                    target["summary"] = new_entry.get("overview", target.get("summary", ""))
+                    target["status"] = "pending"   # 子结构需重新规划
+                    target["sub_sections"] = []
+                    sm._state["outline"] = outline
+                    sm.save()
+                    self._json_response({"success": True, "outline": outline})
+                finally:
+                    inflight_now = sm._state.get("_replan_inflight", [])
+                    sm._state["_replan_inflight"] = [
+                        t for t in inflight_now
+                        if not (t.get("type") == token["type"] and t.get("target_id") == token["target_id"] and t.get("started_at") == token["started_at"])
+                    ]
+                    sm.save()
                 return
             # 段级（防御：评审大纲子结构行触发的段级重规划）
             chapter_id = nv.get("chapter", "")
@@ -1915,24 +2250,37 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             if not chapter_id or not s_key or not state_path:
                 self._json_response({"success": False, "error": "小说子结构缺少身份字段"}, 400)
                 return
-            try:
-                client = self._create_planner_client()
-                new_entry = nb.replan_novel_sub(str(Path(state_path).resolve()), chapter_id, s_key, hints, client)
-            except Exception as e:
-                self._json_response({"success": False, "error": str(e)}, 500)
-                return
-            target.update({
-                "title": new_entry.get("title", target.get("title", "")),
-                "summary": new_entry.get("summary", target.get("summary", "")),
-                "word_count": (new_entry.get("word_count_target") or {}).get("max", target.get("word_count", 1500)),
-                "status": "pending",
-                "actual_word_count": 0,
-            })
-            if parent is not None and parent.get("sub_sections"):
-                parent["word_count"] = sum(ss.get("word_count", 0) for ss in parent["sub_sections"])
-            sm._state["outline"] = outline
+            # 注册 in-flight 标记
+            inflight = sm._state.setdefault("_replan_inflight", [])
+            token = {"type": "novel_sub", "target_id": target_id, "chapter_id": chapter_id, "s_key": s_key, "started_at": time.time()}
+            inflight.append(token)
             sm.save()
-            self._json_response({"success": True, "outline": outline})
+            try:
+                try:
+                    client = self._create_planner_client()
+                    new_entry = nb.replan_novel_sub(str(Path(state_path).resolve()), chapter_id, s_key, hints, client)
+                except Exception as e:
+                    self._json_response({"success": False, "error": str(e)}, 500)
+                    return
+                target.update({
+                    "title": new_entry.get("title", target.get("title", "")),
+                    "summary": new_entry.get("summary", target.get("summary", "")),
+                    "word_count": (new_entry.get("word_count_target") or {}).get("max", target.get("word_count", 1500)),
+                    "status": "pending",
+                    "actual_word_count": 0,
+                })
+                if parent is not None and parent.get("sub_sections"):
+                    parent["word_count"] = sum(ss.get("word_count", 0) for ss in parent["sub_sections"])
+                sm._state["outline"] = outline
+                sm.save()
+                self._json_response({"success": True, "outline": outline})
+            finally:
+                inflight_now = sm._state.get("_replan_inflight", [])
+                sm._state["_replan_inflight"] = [
+                    t for t in inflight_now
+                    if not (t.get("type") == token["type"] and t.get("target_id") == token["target_id"] and t.get("started_at") == token["started_at"])
+                ]
+                sm.save()
             return
 
         try:
@@ -2788,6 +3136,8 @@ body {
           <label style="font-size:13px;cursor:pointer;margin-left:10px"><input type="checkbox" id="novel-chk-semantic" onchange="saveNovelChecks()"> 语义检查bge</label>
           <label style="font-size:13px;cursor:pointer;margin-left:10px"><input type="checkbox" id="novel-chk-reason" onchange="saveNovelChecks()"> 推理审核R1</label>
           <label style="font-size:13px;cursor:pointer;margin-left:10px"><input type="checkbox" id="novel-chk-full" onchange="saveNovelChecks()"> 全文三检</label>
+          <label style="font-size:13px;cursor:pointer;margin-left:16px;color:var(--sc-key)"><input type="checkbox" id="novel-chk-autorepair" onchange="saveNovelChecks()"> 自动修复</label>
+          <label style="font-size:13px;margin-left:8px;color:var(--text-dim)">轮次 <input type="number" id="novel-chk-rounds" value="3" min="1" max="5" style="width:44px;font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:1px 4px" onchange="saveNovelChecks()"></label>
         </div>
       </div>
 
@@ -2861,6 +3211,7 @@ body {
           <button class="btn btn-sm btn-secondary" style="background:var(--accent);color:#fff" onclick="stopGeneration('immediate')">立即停止</button>
         </div>
         <div id="novel-confirm-panel" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-card);flex-shrink:0"></div>
+        <div id="novel-repair-panel" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-card);flex-shrink:0"></div>
       </div>
       <div class="outputs-sidebar" id="outputs-sidebar">
         <div class="sidebar-header">已完成文章</div>
@@ -2980,6 +3331,7 @@ let isGenerating = false;
 let ragOnline = false;
 let ragKbs = [];
 let _replanTarget = null;   // 局部重规划目标 {type: 'section'|'sub', id}
+let _replanBusy = null;     // 局部重规划在途 {type:'novel_sub'|'section'|'sub', id}：行内反馈 + 防确认竞态
 let _pendingExampleName = null;  // 保存范例并生成：等待生成完成后回填文章的范例名
 let _ncConfirmId = null;    // 章级门控确认面板：当前确认章 id（防轮询重复重建丢用户输入）
 let _ncConfirming = false;  // 确认提交中：防重复点击
@@ -3634,7 +3986,7 @@ function saveDescModal() {
 }
 
 // ===== 小说质检 =====
-let novelChecksConfig = {chapter:true, semantic:true, reason:true, full:true};
+let novelChecksConfig = {chapter:true, semantic:true, reason:true, full:true, auto_repair:false, repair_rounds:3};
 
 async function checkNovelModels() {
   const statusEl = document.getElementById('novel-model-status');
@@ -3655,11 +4007,13 @@ async function checkNovelModels() {
     if (dirEl && d.dir) dirEl.value = d.dir;
     if (d.config) {
       novelChecksConfig = d.config;
-      const map = {chapter:'novel-chk-chapter', semantic:'novel-chk-semantic', reason:'novel-chk-reason', full:'novel-chk-full'};
+      const map = {chapter:'novel-chk-chapter', semantic:'novel-chk-semantic', reason:'novel-chk-reason', full:'novel-chk-full', auto_repair:'novel-chk-autorepair'};
       Object.keys(map).forEach(k => {
         const el = document.getElementById(map[k]);
         if (el) el.checked = !!d.config[k];
       });
+      const roundsEl = document.getElementById('novel-chk-rounds');
+      if (roundsEl && d.config.repair_rounds) roundsEl.value = d.config.repair_rounds;
     }
   } catch(e) { statusEl.textContent = '检测失败: ' + e; }
 }
@@ -3698,11 +4052,14 @@ async function installNovelModels() {
 }
 
 async function saveNovelChecks() {
+  const roundsEl = document.getElementById('novel-chk-rounds');
   const cfg = {
     chapter: !!document.getElementById('novel-chk-chapter').checked,
     semantic: !!document.getElementById('novel-chk-semantic').checked,
     reason: !!document.getElementById('novel-chk-reason').checked,
-    full: !!document.getElementById('novel-chk-full').checked
+    full: !!document.getElementById('novel-chk-full').checked,
+    auto_repair: !!document.getElementById('novel-chk-autorepair').checked,
+    repair_rounds: roundsEl ? (parseInt(roundsEl.value) || 3) : 3
   };
   novelChecksConfig = cfg;
   try {
@@ -4070,6 +4427,7 @@ function loadSession(sid) {
   // 停止旧会话的进度轮询（含隐藏确认面板/重置 _ncConfirmId）——
   // 否则切到非写作会话时，旧轮询闭包仍持有旧 sessionId，1.5s 后把旧确认面板弹回来（残留不稳定根因）
   stopProgressPolling();
+  stopReplanRecoverPolling();  // 切会话/重载时停旧的重规划恢复轮询
   // 清除旧消息，切换到该会话
   document.getElementById('chat-messages').innerHTML = '';
   loadSessions();
@@ -4157,7 +4515,50 @@ function loadSession(sid) {
       } else {
         addAssistantMsg('已切换到会话 ' + sid);
       }
+      // 重规划在途恢复（刷新/重连后）：session/load 返回活 in-flight →
+      // 重建 _replanBusy + 禁用三按钮/章卡片/确认面板行，轮询直到重规划完成自动恢复。
+      // 必须在 renderOutline 之后执行（按钮 HTML 已渲染，才能禁用到位）
+      const inflight = s._replan_inflight || [];
+      if (inflight.length) {
+        const fi = inflight[0];
+        _replanBusy = {type: fi.type, id: fi.target_id || null};
+        _markActionButtonsBusy(true);
+        if (fi.type === 'section') _markSectionBusy(fi.target_id, true);
+        if (fi.type === 'novel_sub') _markReplanRowBusy(fi.target_id, true);
+        addAssistantMsg('⚠️ 检测到重规划进行中（' + (fi.type === 'section' ? '章节' : '子结构') + '），操作按钮已禁用，完成后自动恢复');
+        startReplanRecoverPolling(sid, fi.type, fi.target_id);
+      }
     });
+}
+
+// ===== 重规划在途恢复轮询（刷新/重连后） =====
+// 刷新后 _replanBusy（内存态）丢失，但后端 _replan_inflight 持久化——从 session/load 恢复禁用态后，
+// 轮询轻量接口直到 in-flight 清空（重规划完成）→ 恢复按钮 + 提示
+let _replanRecoverTimer = null;
+function startReplanRecoverPolling(sid, type, id) {
+  stopReplanRecoverPolling();
+  _replanRecoverTimer = setInterval(() => {
+    fetch(`/api/novel/replan_status?session_id=${sid}`)
+      .then(r => r.json()).then(d => {
+        if (!d.success) return;
+        if (!d.inflight || !d.inflight.length) {
+          // 重规划完成：恢复全部禁用态
+          _replanBusy = null;
+          _markActionButtonsBusy(false);
+          if (type === 'section') _markSectionBusy(id, false);
+          if (type === 'novel_sub') _markReplanRowBusy(id, false);
+          if (currentOutline) _syncActionButtonsBusy();
+          stopReplanRecoverPolling();
+          addAssistantMsg('✅ 重规划已完成，操作按钮已恢复');
+        }
+      }).catch(() => {});
+  }, 2000);
+}
+function stopReplanRecoverPolling() {
+  if (_replanRecoverTimer) {
+    clearInterval(_replanRecoverTimer);
+    _replanRecoverTimer = null;
+  }
 }
 
 // ===== 元数据输入框渲染 =====
@@ -4288,6 +4689,8 @@ function renderOutline(outline, readOnly) {
   readOnly = readOnly || false;
   const html = buildOutlineHTML(outline, readOnly);
   addAssistantMsg(html);
+  // 重渲染后同步按钮状态：若 _replanBusy 仍在途，重建按钮不会被禁用，需重新应用
+  if (!readOnly) _syncActionButtonsBusy();
 }
 
 function buildOutlineHTML(outline, readOnly) {
@@ -4343,7 +4746,7 @@ function buildOutlineHTML(outline, readOnly) {
               : `<input type="number" class="sec-word-input" data-sid="${s.id}" value="${s.word_count || 800}" style="width:58px;font-size:11px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" min="50" max="5000" onchange="onLeafWordChange(this, '${s.id}')"><span style="font-size:13px;color:var(--text-dim)">字</span>`)
             : `<span class="sec-word-sum" data-sid="${s.id}" style="font-size:13px;color:var(--text-dim)">${s.word_count}</span><span style="font-size:13px;color:var(--text-dim)">字</span>`)}
           ${readOnly ? '' : `<label class="sc-rag"><input type="checkbox" class="sc-rag-cb" onchange="onRagToggle(this, '${s.id}')" ${!ragOnline ? 'disabled title="RAG未连接"' : ''}> RAG</label>` + (ragOnline && Array.isArray(ragKbs) ? `<select class="sc-kb" style="display:none;width:120px;font-size:12px" onchange="collectOutlineData()">${'<option value=\"\">自动KB</option>' + ragKbs.map(k => '<option value=\"' + k + '\">' + k + '</option>').join('')}</select>` : '')}
-          ${readOnly ? '' : `<button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openReplanModal('section','${s.id}')" title="重新规划该章节（子结构全部重做）">重规划</button>`}
+          ${readOnly ? '' : `<button class="btn btn-sm btn-secondary sec-replan-btn" style="font-size:10px;padding:2px 6px" onclick="openReplanModal('section','${s.id}')" title="重新规划该章节（子结构全部重做）">重规划</button>`}
         </div>
         ${s.summary ? `<div style="font-size:11px;color:var(--text-dim);margin:2px 0 2px 26px;line-height:1.3">📖 ${s.summary}</div>` : ''}
         ${readOnly ? '' : subHTML}
@@ -4355,9 +4758,9 @@ function buildOutlineHTML(outline, readOnly) {
     actionsHTML = `
       <div class="progress-bar" id="progress-bar"><div class="fill" style="width:0%"></div></div>
       <div class="outline-actions">
-        <button class="btn btn-primary" onclick="startGeneration()">开始生成</button>
-        <button class="btn btn-secondary" onclick="replanOutline()">重新规划</button>
-        <button class="btn btn-success" onclick="saveExampleAndGenerate()" title="先保存为快速范例，再开始生成；完成后文章自动回填进范例">保存范例并生成</button>
+        <button class="btn btn-primary" id="btn-start-gen" onclick="startGeneration()">开始生成</button>
+        <button class="btn btn-secondary" id="btn-replan-outline" onclick="replanOutline()">重新规划</button>
+        <button class="btn btn-success" id="btn-save-example" onclick="saveExampleAndGenerate()" title="先保存为快速范例，再开始生成；完成后文章自动回填进范例">保存范例并生成</button>
         <div id="rag-status-text" style="font-size:11px;color:var(--text-dim);margin-top:6px"></div>
       </div>`;
   } else {
@@ -4715,6 +5118,12 @@ function getOutlineData() {
 
 function startGeneration() {
   if (isGenerating) return;
+  // 重规划在途拦截：章级/子结构/整篇重规划进行中禁止启动生成，
+  // 否则写作线程基于旧 outline/旧子结构开跑，与重规划返回的新数据竞态
+  if (_replanBusy) {
+    addAssistantMsg('⚠️ 有重规划正在进行中，请等待其完成后再开始生成。');
+    return;
+  }
   if (!currentSessionId || !currentOutline) {
     addAssistantMsg('❌ 请先生成大纲');
     return;
@@ -4891,6 +5300,11 @@ function startBatchPolling(batchId, totalCount) {
 
 function replanOutline() {
   // 整篇重规划：清空局部目标
+  // 在途保护：有局部重规划或整篇重规划在途时禁止再开（防止请求互相覆盖）
+  if (_replanBusy) {
+    addAssistantMsg('⚠️ 已有重规划进行中，请等待其完成后再发起新的重规划。');
+    return;
+  }
   _replanTarget = null;
   document.getElementById('replan-modal-title').textContent = '调整规划';
   document.getElementById('replan-modal-hint').textContent = '输入对当前大纲的调整要求。留空则使用原有规划不变。';
@@ -4900,7 +5314,12 @@ function replanOutline() {
 }
 
 function openReplanModal(type, id) {
-  // 局部重规划：type='section'（整章，子结构全部重做）| 'sub'（单子结构）
+  // 局部重规划：type='section'（整章，子结构全部重做）| 'sub'|'novel_sub'（单子结构）
+  // 在途保护：已有节点在重规划（LLM 未返回）时禁止再开新重规划，防止多个请求互相覆盖
+  if (_replanBusy) {
+    addAssistantMsg('⚠️ 已有重规划进行中，请等待其完成后再发起新的重规划。');
+    return;
+  }
   _replanTarget = {type, id};
   document.getElementById('replan-modal-title').textContent = type === 'section' ? '重新规划章节' : '重新规划子结构';
   document.getElementById('replan-modal-hint').textContent = type === 'section'
@@ -4924,6 +5343,78 @@ function closeReplanModal() {
   document.getElementById('replan-modal').classList.remove('show');
 }
 
+// 确认面板行内反馈 + 底部确认按钮实时同步（不等轮询重建）
+// 关键：重规划期间按钮 HTML 已固化，必须主动操作 DOM 设 disabled，
+// 否则用户可绕过 JS 守卫点击确认导致竞态（虽然后端也会拒绝，但前端视觉必须一致）。
+// subId: 被点击的子结构 id；busy=true 进入 / false 离开
+function _markReplanRowBusy(subId, busy) {
+  const panel = document.getElementById('novel-confirm-panel');
+  if (!panel) return;
+  // 1. 底部"确认，写本章"按钮：必须实时同步（HTML 渲染时按 _replanBusy 加 disabled，
+  //    但重规划期间面板不会重建，按钮 HTML 早已固化——只能 DOM 直改）
+  const confirmBtn = panel.querySelector('.nc-confirm-btn');
+  if (confirmBtn) {
+    if (busy) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = '重规划中...';
+      confirmBtn.title = '有子结构正在重规划，完成后才能确认';
+    } else if (!_replanBusy) {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = '确认，写本章';
+      confirmBtn.title = '';
+    }
+  }
+  // 2. 该子结构所在行：行内反馈（只有被点击的那行显示"重规划中..."）
+  const row = panel.querySelector(`[data-subid="${subId}"]`);
+  if (row) {
+    const replBtn = row.querySelector('.nc-replan-btn');
+    const statusEl = row.querySelector('.nc-replan-status');
+    if (busy) {
+      if (replBtn) replBtn.style.display = 'none';
+      if (statusEl) {
+        statusEl.textContent = '⏳ 重规划中...';
+        statusEl.style.display = 'inline';
+      }
+      row.style.opacity = '0.6';
+    } else {
+      if (replBtn) replBtn.style.display = '';
+      if (statusEl) statusEl.style.display = 'none';
+      row.style.opacity = '';
+    }
+  }
+}
+
+// 章卡片行内反馈：章级重规划在途 → 该章"重规划"按钮禁用 + 文案变"重规划中..." + 卡片半透明
+function _markSectionBusy(sectionId, busy) {
+  const card = document.querySelector(`.section-card[data-sid="${sectionId}"]`);
+  if (!card) return;
+  const replBtn = card.querySelector('.sec-replan-btn');
+  if (replBtn) {
+    replBtn.disabled = busy;
+    replBtn.textContent = busy ? '重规划中...' : '重规划';
+    replBtn.title = busy ? '该章正在重规划，请等待完成' : '重新规划该章节（子结构全部重做）';
+  }
+  card.style.opacity = busy ? '0.6' : '';
+}
+
+// 底部三个按钮反馈：开始生成 / 重新规划 / 保存范例并生成
+// 重规划在途时统一禁用，恢复时还原。文案一字不改——按钮就该是按钮样，按钮禁用不需要告诉用户原因
+function _markActionButtonsBusy(busy) {
+  const btns = [
+    document.getElementById('btn-start-gen'),
+    document.getElementById('btn-replan-outline'),
+    document.getElementById('btn-save-example'),
+  ];
+  for (const el of btns) {
+    if (el) el.disabled = busy;
+  }
+}
+
+// 每次 outline 重渲染后调用：根据当前 _replanBusy 状态同步按钮（防止重渲染丢 disable）
+function _syncActionButtonsBusy() {
+  _markActionButtonsBusy(!!_replanBusy);
+}
+
 function confirmReplan() {
   const hints = document.getElementById('replan-hints').value.trim();
   closeReplanModal();
@@ -4934,23 +5425,50 @@ function confirmReplan() {
     _replanTarget = null;
     // 小说线段级重规划（确认面板内的单个子结构）
     if (t.type === 'novel_sub') {
+      // 在途标记：确认面板该行显示"重规划中..."，同时禁用"确认，写本章"（防旧数据确认竞态）；
+      // 底部三按钮（开始生成/重新规划/保存范例并生成）同步禁用（防竞态启动生成）
+      _replanBusy = {type: 'novel_sub', id: t.id};
+      _markReplanRowBusy(t.id, true);
+      _markActionButtonsBusy(true);
       addAssistantMsg('⏳ 正在重新规划该子结构...');
+      // 该段的辅助知识（+按钮挂载的）→ 注入重规划参考层（有才传）
+      let subAux = null;
+      if (currentOutline) {
+        for (const sec of currentOutline.sections || []) {
+          const ss = (sec.sub_sections || []).find(x => x.id === t.id);
+          if (ss && ss.aux_knowledge && (ss.aux_knowledge.text || (ss.aux_knowledge.files || []).length)) {
+            subAux = ss.aux_knowledge;
+          }
+        }
+      }
       fetch('/api/novel/replan_sub', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({session_id: currentSessionId, target_id: t.id, hints})
+        body: JSON.stringify({session_id: currentSessionId, target_id: t.id, hints, aux: subAux})
       }).then(r => r.json()).then(d => {
+        _replanBusy = null;
+        _markActionButtonsBusy(false);
         if (d.success) {
           addAssistantMsg('✅ 子结构已重新规划：' + (d.title || '') + '（' + (d.word_count || '') + '字），请在下方确认面板中确认');
           _ncConfirmId = null;  // 强制下轮轮询重建确认面板（显示新子结构）
         } else {
           addAssistantMsg('❌ 子结构重规划失败：' + (d.error || ''));
+          _markReplanRowBusy(t.id, false);
         }
       }).catch(err => {
+        _replanBusy = null;
+        _markActionButtonsBusy(false);
         addAssistantMsg('❌ 请求失败：' + err.message);
+        _markReplanRowBusy(t.id, false);
       });
       return;
     }
     addAssistantMsg('⏳ 正在重新规划目标节点...');
+    // 章级重规划在途：该章卡片"重规划"按钮禁用 + 文案变"重规划中..." + 卡片半透明；
+    // 确认面板同步禁用"确认，写本章"（新子结构将写入 state，等待轮询刷新）；
+    // 底部三按钮（开始生成/重新规划/保存范例并生成）同步禁用（防竞态启动生成）
+    _replanBusy = {type: t.type, id: t.id};
+    if (t.type === 'section') _markSectionBusy(t.id, true);
+    _markActionButtonsBusy(true);
     // 小说线判定：章级重规划 → 大纲卡片必须刷新（章级内容更新，outline 保持章级不泄露子结构）；
     // 段级重规划已在上方 novel_sub 分支单独处理（只刷确认面板，不碰大纲卡片）
     const isNovelUI = !!(currentOutline && (currentOutline._novel || (currentOutline.sections || []).some(s => s._novel)));
@@ -4958,11 +5476,15 @@ function confirmReplan() {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({session_id: currentSessionId, target_id: t.id, hints})
     }).then(r => r.json()).then(d => {
+      _replanBusy = null;
+      _markActionButtonsBusy(false);
+      if (t.type === 'section') _markSectionBusy(t.id, false);
       if (d.success) {
         currentOutline = d.outline;
         const card = document.getElementById('outline-card');
         if (card) {
           card.closest('.msg').querySelector('.msg-content').innerHTML = buildOutlineHTML(d.outline);
+          _syncActionButtonsBusy();
         } else {
           renderOutline(d.outline);
         }
@@ -4974,6 +5496,9 @@ function confirmReplan() {
         addAssistantMsg('❌ 局部重规划失败：' + (d.error || ''));
       }
     }).catch(err => {
+      _replanBusy = null;
+      _markActionButtonsBusy(false);
+      if (t.type === 'section') _markSectionBusy(t.id, false);
       addAssistantMsg('❌ 请求失败：' + err.message);
     });
     return;
@@ -4982,6 +5507,9 @@ function confirmReplan() {
   // ── 整篇重规划分支（原有逻辑） ──
   const topic = currentOutline?.title || '';
   if (!topic) return;
+  // 整篇重规划在途：底部三个按钮（开始生成/重新规划/保存范例并生成）统一禁用 + 文案变化
+  _replanBusy = {type: 'outline', id: null};
+  _markActionButtonsBusy(true);
   addAssistantMsg(hints ? '⏳ 正在按新要求重新规划...' : '⏳ 正在重新规划...');
   const meta = {};
   document.querySelectorAll('#meta-inputs-container .meta-field-input').forEach(el => {
@@ -4993,6 +5521,8 @@ function confirmReplan() {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({topic, session_id: currentSessionId, template_name: templateName, meta, plan_hints: hints})
   }).then(r => r.json()).then(d => {
+    _replanBusy = null;
+    _markActionButtonsBusy(false);
     if (d.success) {
       currentSessionId = d.session_id;
       currentOutline = d.outline;
@@ -5002,6 +5532,8 @@ function confirmReplan() {
       addAssistantMsg('❌ 重新规划失败：' + (d.error || ''));
     }
   }).catch(err => {
+    _replanBusy = null;
+    _markActionButtonsBusy(false);
     addAssistantMsg('❌ 请求失败：' + err.message);
   });
 }
@@ -5024,6 +5556,11 @@ function onTitleChange(input) {
 // ===== 保存范例并生成（前置存大纲 + 完成回填文章） =====
 function saveExampleAndGenerate() {
   if (isGenerating) return;
+  // 重规划在途拦截：与 startGeneration 一致，重规划进行中禁止进入"保存范例并生成"流程
+  if (_replanBusy) {
+    addAssistantMsg('⚠️ 有重规划正在进行中，请等待其完成后再保存范例并生成。');
+    return;
+  }
   if (!currentSessionId || !currentOutline) {
     addAssistantMsg('❌ 请先生成大纲');
     return;
@@ -5174,21 +5711,31 @@ function startProgressPolling(sid) {
             const ac = p.awaiting_confirm;
             if (_ncConfirmId !== ac.id) {
               _ncConfirmId = ac.id;
-              const rows = (ac.sub_sections || []).map(ss => `
-                <div style="border:1px solid var(--border);border-radius:4px;padding:5px 8px;margin:4px 0;background:var(--bg-input)">
+              const rows = (ac.sub_sections || []).map(ss => {
+                // 行内重规划状态：在途 → 该行禁用重规划按钮 + 显示"重规划中..."
+                const rowBusy = !!(_replanBusy && _replanBusy.type === 'novel_sub' && _replanBusy.id === ss.id);
+                // 子结构顺序下拉（复用通用线 sc-sub-order 语义：自动/s1/s2/s3，确认前可调写作顺序）
+                const subCount = (ac.sub_sections || []).length;
+                const subOpts = ['', ...Array.from({length: subCount}, (_, i) => `s${i+1}`)]
+                  .map(v => `<option value="${v}" ${ss.id.endsWith('_1') && v === '' ? 'selected' : ''}>${v === '' ? '自动' : v}</option>`).join('');
+                return `
+                <div data-subid="${ss.id}" style="border:1px solid var(--border);border-radius:4px;padding:5px 8px;margin:4px 0;background:var(--bg-input);${rowBusy ? 'opacity:0.6' : ''}">
                   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                     <input type="checkbox" class="nc-check" data-id="${ss.id}" ${ss._checked === false ? '' : 'checked'} title="取消勾选 = 跳过该段">
+                    <select class="nc-order" data-id="${ss.id}" style="width:52px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" title="调整该段在写作中的顺序">${subOpts}</select>
                     <span style="flex:1;min-width:100px;font-size:12px">${ss.title}</span>
                     <input type="number" class="nc-words" data-id="${ss.id}" value="${ss.word_count || 1000}" style="width:58px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" min="100" max="5000" title="字数目标"><span style="font-size:11px;color:var(--text-dim)">字</span>
                     <label style="font-size:11px;color:var(--sc-key);cursor:pointer"><input type="checkbox" class="nc-key" data-id="${ss.id}" ${ss.is_key ? 'checked' : ''}> ⭐重点</label>
                     <button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openAuxModal('${ss.id}')" title="辅助知识">+辅助</button>
-                    <button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openReplanModal('novel_sub','${ss.id}')" title="只重新规划这一个子结构">重规划</button>
+                    <button class="btn btn-sm btn-secondary nc-replan-btn" style="font-size:10px;padding:2px 6px;${rowBusy ? 'display:none' : ''}" onclick="openReplanModal('novel_sub','${ss.id}')" title="只重新规划这一个子结构">重规划</button>
+                    <span class="nc-replan-status" style="font-size:10px;color:#f39c12;display:${rowBusy ? 'inline' : 'none'}">⏳ 重规划中...</span>
                   </div>
                   ${ss.summary ? `<div style="font-size:11px;color:var(--text-dim);margin-left:24px;margin-top:2px;line-height:1.3">${ss.summary}</div>` : ''}
-                </div>`).join('');
+                </div>`;
+              }).join('');
               ncPanel.innerHTML = `<div style="font-size:13px;font-weight:500;margin-bottom:4px">⏸ 等待确认：${ac.chapter || ''}《${ac.title}》子结构规划（取消勾选=跳过该段；可改字数/标重点/重规划单段）</div>
                 ${rows}
-                <button class="btn btn-primary btn-sm" style="margin-top:6px" onclick="confirmNovelChapter()">确认，写本章</button>`;
+                <button class="btn btn-primary btn-sm nc-confirm-btn" style="margin-top:6px" onclick="confirmNovelChapter()" ${_replanBusy ? 'disabled title="有子结构正在重规划，完成后才能确认"' : ''}>${_replanBusy ? '重规划中...' : '确认，写本章'}</button>`;
             }
             ncPanel.style.display = 'block';
           } else {
@@ -5224,6 +5771,13 @@ function startProgressPolling(sid) {
           stopProgressPolling();
           fetchResult(sessionId);
         }
+
+        // 修复引擎章级触发：finalize 后有 HARD 且未修复 → 弹修复面板（不依赖全书 done）
+        // 后端 get_progress 的 repair_pending 只在该章 session 章级 done + hint 有 HARD 且未标记 _repaired 时返回
+        if (p.repair_pending && p.repair_pending.chapter) {
+          const chId = p.repair_pending.chapter;
+          showRepairPanel(chId);
+        }
       }).catch(() => {});
   }, 1500);
 }
@@ -5240,7 +5794,12 @@ function stopProgressPolling() {
 // 小说线章级门控：确认当前章（应用勾选/字数/重点 → 章 status=confirmed → 写作线程继续）
 async function confirmNovelChapter() {
   if (!currentSessionId) return;
-  const checked = {}, subWords = {}, subKeys = {};
+  // 重规划在途守卫：子结构重规划未返回前确认 = 用旧子结构写本章（新规划覆盖后状态错乱）
+  if (_replanBusy) {
+    addAssistantMsg('⚠️ 有子结构正在重规划，请等待其完成后再确认本章。');
+    return;
+  }
+  const checked = {}, subWords = {}, subKeys = {}, subOrders = {};
   document.querySelectorAll('#novel-confirm-panel .nc-check').forEach(cb => {
     checked[cb.dataset.id] = cb.checked;
   });
@@ -5251,12 +5810,15 @@ async function confirmNovelChapter() {
   document.querySelectorAll('#novel-confirm-panel .nc-key').forEach(cb => {
     if (cb.checked) subKeys[cb.dataset.id] = true;
   });
+  document.querySelectorAll('#novel-confirm-panel .nc-order').forEach(sel => {
+    if (sel.value) subOrders[sel.dataset.id] = sel.value;
+  });
     if (_ncConfirming) return;  // 防重复点击
     _ncConfirming = true;
   try {
     const r = await fetch('/api/novel/confirm', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({session_id: currentSessionId, checked, sub_words: subWords, sub_keys: subKeys})
+      body: JSON.stringify({session_id: currentSessionId, checked, sub_words: subWords, sub_keys: subKeys, sub_orders: subOrders})
     });
     const d = await r.json();
     if (!d.success) {
@@ -5271,6 +5833,114 @@ async function confirmNovelChapter() {
     if (ncPanel) ncPanel.style.display = 'none';
     addAssistantMsg('✅ 本章已确认，开始写作。');  // 大纲卡片状态由轮询在 1.5s 内自动刷新
   } catch (e) { alert('确认失败: ' + e); _ncConfirming = false; }
+}
+
+// ===== 修复引擎面板（P3：章检问题 → 勾选子结构 → 写作模型整段重构） =====
+let _repairPollTimer = null;
+let _repairPanelChapter = null;  // 当前已弹出的修复章（防轮询重复弹）
+
+function showRepairPanel(chapter) {
+  const panel = document.getElementById('novel-repair-panel');
+  if (!panel || !currentSessionId) return;
+  // 防重：同一章已在展示中（或修复中）→ 不重复弹
+  if (_repairPanelChapter === chapter && panel.style.display === 'block') return;
+  if (_repairPanelChapter === chapter && _repairPollTimer) return;  // 修复轮询中
+  _repairPanelChapter = chapter;
+  // P4 自动模式：配置 auto_repair=on → 不弹面板，直接全选自动修复
+  if (novelChecksConfig && novelChecksConfig.auto_repair) {
+    fetch(`/api/novel/repair/preview?session_id=${encodeURIComponent(currentSessionId)}&chapter=${encodeURIComponent(chapter)}`)
+      .then(r => r.json()).then(d => {
+        if (!d.success || !d.preview) return;
+        const files = d.preview.files || [];
+        if (!files.length) return;
+        addAssistantMsg('⚡ 自动修复模式：' + chapter + ' 检出 ' + files.length + ' 个子结构问题，开始自动重构...');
+        fetch('/api/novel/repair/apply', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({session_id: currentSessionId, chapter, checked_subs: files, mode: 'auto'})
+        }).then(r2 => r2.json()).then(d2 => {
+          if (d2.success) {
+            _repairPollTimer = setInterval(() => pollRepairStatus(chapter), 5000);
+          } else {
+            addAssistantMsg('❌ 自动修复启动失败：' + (d2.error || ''));
+          }
+        }).catch(e => addAssistantMsg('❌ 自动修复启动失败：' + e.message));
+      }).catch(() => {});
+    return;
+  }
+  fetch(`/api/novel/repair/preview?session_id=${encodeURIComponent(currentSessionId)}&chapter=${encodeURIComponent(chapter)}`)
+    .then(r => r.json()).then(d => {
+      if (!d.success || !d.preview) { panel.style.display = 'none'; return; }
+      const pv = d.preview;
+      const t0Lines = (pv.issues || []).filter(l => l.includes('末行') || l.includes('禁用模式'));
+      const t1Lines = (pv.issues || []).filter(l => !l.includes('末行') && !l.includes('禁用模式'));
+      // 按文件聚合 T1
+      const fileMap = {};
+      (pv.files || []).forEach(f => { if (!fileMap[f]) fileMap[f] = {problems: []}; });
+      t1Lines.forEach(l => {
+        const m = l.match(/S\d+\.txt/);
+        const f = m ? m[0] : '';
+        if (f && fileMap[f]) fileMap[f].problems.push(l.replace(/^\[(HARD|SOFT|WARN|FAIL)\]/, '').trim());
+        else if (f) { fileMap[f] = {problems: [l.replace(/^\[(HARD|SOFT|WARN|FAIL)\]/, '').trim()]}; }
+      });
+      const subRows = Object.keys(fileMap).map(f => {
+        const probs = (fileMap[f].problems || []).slice(0, 3).map(p => `<div style="font-size:11px;color:var(--text-dim);margin-left:26px">• ${escapeHtml(p.slice(0, 60))}</div>`).join('');
+        return `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;border-bottom:1px solid var(--border)">
+          <input type="checkbox" class="rp-check" data-file="${f}" checked>
+          <span style="font-size:12px;flex:1">${f.replace('.txt','')}</span>
+        </label>${probs}`;
+      }).join('');
+      const t0Msg = t0Lines.length ? `<div style="font-size:12px;color:#2ecc71;margin:2px 0">⚡ T0 已自动修复：${t0Lines.length} 处格式问题</div>` : '';
+      panel.innerHTML = `<div style="font-size:13px;font-weight:500;margin-bottom:4px">🔧 ${pv.chapter} 六检结果：${pv.ok ? '通过' : (pv.timeout ? '超时' : '需修复')}（HARD/SOFT ${t1Lines.length} 条）</div>
+        ${t0Msg}
+        <div style="font-size:12px;color:var(--text-dim);margin:4px 0">选择要修复的子结构（勾掉 = 跳过，写作模型整段重构，字数±15%）</div>
+        ${subRows || '<div style="font-size:12px;color:var(--text-dim)">（无可重构的子结构）</div>'}
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn btn-sm btn-secondary" onclick="closeRepairPanel()">关闭</button>
+          <button class="btn btn-sm btn-primary" onclick="applyRepair('${pv.chapter}')">开始修复</button>
+        </div>
+        <div id="repair-status" style="font-size:12px;color:var(--text-dim);margin-top:6px"></div>`;
+      panel.style.display = 'block';
+    }).catch(() => {});
+}
+
+function closeRepairPanel() {
+  const panel = document.getElementById('novel-repair-panel');
+  if (panel) panel.style.display = 'none';
+  if (_repairPollTimer) { clearInterval(_repairPollTimer); _repairPollTimer = null; }
+  _repairPanelChapter = null;
+}
+
+function applyRepair(chapter) {
+  const checked = [...document.querySelectorAll('.rp-check:checked')].map(cb => cb.dataset.file);
+  const stEl = document.getElementById('repair-status');
+  if (!checked.length) { stEl.textContent = '未选择任何子结构'; return; }
+  stEl.textContent = '⏳ 修复中（写作模型重构 + 重检，每段 3-10 分钟）...';
+  fetch('/api/novel/repair/apply', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: currentSessionId, chapter, checked_subs: checked, mode: 'manual'})
+  }).then(r => r.json()).then(d => {
+    if (!d.success) { stEl.textContent = '❌ ' + (d.error || '启动失败'); return; }
+    _repairPollTimer = setInterval(() => pollRepairStatus(chapter), 4000);
+  }).catch(e => { stEl.textContent = '❌ ' + e.message; });
+}
+
+function pollRepairStatus(chapter) {
+  fetch('/api/novel/repair/status').then(r => r.json()).then(d => {
+    if (!d.success) return;
+    const st = d.state || {};
+    if (!st.done) { const el = document.getElementById('repair-status'); if (el) el.textContent = '⏳ 修复中...'; return; }
+    clearInterval(_repairPollTimer); _repairPollTimer = null;
+    const el = document.getElementById('repair-status');
+    if (!el) return;
+    const res = st.result || {};
+    if (res.error) { el.textContent = '❌ 修复失败：' + res.error; return; }
+    const t1 = (res.t1 && res.t1.results) || [];
+    const okN = t1.filter(x => x.status === 'rewritten').length;
+    const failN = t1.filter(x => x.status === 'failed').length;
+    el.textContent = `✅ 修复完成：重写 ${okN} 段${failN ? '，失败 ' + failN + ' 段（已保留原稿）' : ''}。可点「关闭」后查看，或重新完结章节重检。`;
+    el.style.color = failN ? '#e94560' : '#2ecc71';
+    // 触发一次章检重跑（由用户手动 finalize 或下一轮自动）
+  }).catch(() => {});
 }
 
 function fetchResult(sessionId) {

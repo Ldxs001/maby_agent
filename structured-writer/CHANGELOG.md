@@ -3,6 +3,148 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [2.4.0b0] - 2026-08-16
+### 新增（重规划全链路 UI 反馈与竞态防护，2.3.29b0 之后）
+- **重规划在途反馈**：子结构/章级/整篇重规划进行中——行内"重规划中..."、章卡片/底部三按钮（开始生成/重新规划/保存范例并生成）视觉禁用（文案不变）、防重复发起
+- **后端竞态防护三层**：重规划登记 `_replan_inflight`（try/finally 清理）；确认/生成接口检查活 in-flight → 409 拒绝（1800s 僵尸自动清理）；前端 JS 守卫双保险
+- **刷新后 in-flight 恢复**：`/api/session/load` 返回活 in-flight；新增轻量 `GET /api/novel/replan_status`；前端恢复禁用态 + 2s 轮询，重规划完成自动恢复按钮
+- **确认面板子结构排序**：复用通用线 `sub_orders` 链路（s1/s2 下拉）→ 确认时重排 outline + 同步 novel_state `sub_structures` dict 顺序（s_key 不变、顺序变；save_state 白名单加 `novel-confirm`）
+- **规划/写作上下文升级**：三层分区（目的★★★/背景★★/参考★）；原始需求全量注入（规划/写作/章级重规划，移除 500 字截断）；人物档案完整性格；后续章大纲预告；前文章节概述；实体/行为/时间线参考层
+- **三提取器统一**（实体/行为/时间线）：write-sub 逐段提取，LLM（Qwen2.5-3B）优先 + 正则兜底（模型缺失不丢数据）；时间线从空壳接活（day 累计解析：第一天/次日/三天后）
+- **写作阶段三层分级**：6 块（实体/人格/行为/收尾/钩子/关键人物）从 main 块移入函数（Web 场景首次拿到）；补时间线/原始需求注入
+### 修复
+- **章级重规划语义修正**：章卡片重规划改为重做单章 title+overview（`replan_novel_chapter`），不再误调子结构规划（两级分离）
+- **重规划 title 污染**：LLM 输出 `S05《xxx》` 编号前缀——prompt 明确 s_key 沿用/禁止编号入 title（与初规划对齐引导，不搞后端清洗）
+- **修复引擎 preview/status 路由挂错表**：挂在 POST 表但前端 GET 调 → 404 → 面板被隐藏（按钮不出现）；已移入 GET 表
+- **修复引擎选错项目**：`_repair_engine_for` glob 取第一个项目（最老），改为从 session `_novel.state_path` 定位当前项目（否则"文件不存在"全失败）
+- **修复面板文案**：写死的"35b 整段重构"改为"写作模型"（实际模型 = 配置 writer_model）
+- 版本 2.3.29b0 → 2.4.0b0
+
+## [2.3.29b0] - 2026-08-15
+### 修复（HARD 拦截判定用 ok 字段导致永不拦截，2.3.28b0 之后）
+- **现象**：L03 有 HARD（推理审核-对话匹配度），但没弹修复面板直接规划 L04
+- **根因**：novel_writer 章检拦截用 `fc.get("ok")` 判定——但 `finalize_novel_chapter` 的 ok 是**子进程退出码==0**（workflow_engine 有 HARD 只写 fixes 正常 return，退出码 0）→ **ok 恒 True，不可信**！L02/L03 的 hint 都是 ok=True 但 issues 有 HARD。state_manager 的 repair_pending 已改用 issues 判定，但 novel_writer 主循环拦截漏了（同一 bug 修漏一处）→ 拦截永不触发 → HARD 不拦截直接推进下一章
+- **修复**：novel_writer 全部改用 `fc.get("issues")` 非空判定 HARD（拦截/重检通过/3轮判定），ok 字段弃用
+- **存量**：session L03 done → pending（待修复）、L04 in_progress → pending（等 L03 完成后规划）；repair_pending 验证返回 L03 ✅
+- 版本 2.3.28b0 → 2.3.29b0
+### 修复（段级续写重复重写，2.3.27b0 之后）
+- **现象**：L03/S01《逻辑重构与试探》已写好（21:02 落盘），续写又从 S01 重写一遍
+- **根因**：段级续写跳过逻辑只认 `sub.status == "done"`（novel_writer 493 行）——与章级 2.3.26b0 修的同一个 bug：session 状态滞后（写段线程更新 session 前被中断/重启，n3_1 停留在 in_progress）→ 文件在但 session 说没写完 → 重写。2.3.26b0 只修了章级，漏了段级
+- **修复**：段级改为文件真相源——**无论 session 状态**，`_read_sub_content` 有内容即视为已写：跳过 + 同步 session 为 done；文件缺失/空才重写
+- **存量**：session L03/S01 in_progress → done（wc=2008 回填）；误写线程已 /api/stop（S01 原稿 21:02 完好）
+- 验证：L03/S01 文件在 → 跳过 ✅；S02 无文件 → 重写 ✅
+- 版本 2.3.27b0 → 2.3.28b0
+### 修复（CLI 写入路径改真原子写，2.3.26b0 之后）
+- **背景**：CLI 路径 `validate_and_write_body`（novel_atomic_writer）是两段式写入——`open(fp,"w")` 写正文 + `open(fp,"a")` 追加末行标记。中断在两步之间 → 文件缺末行标记 → 章检报"末行缺失" HARD
+- **修复**：改为真原子写——组装完整内容（标题/空行/正文/别名/末行一次成型）→ 写 tmp → fsync → `os.replace`，与 `_write_sub_inline` 完全一致；中断只留 .tmp 残留，目标文件要么旧完整版要么新完整版
+- **CLI 保留**（用户明确：有直接调用场景），逻辑与 web 写段统一
+- 验证：CLI 落盘结构 标题/正文/别名/末行 一次成型 ✅；中断残留 tmp 不影响目标文件 ✅
+- 版本 2.3.26b0 → 2.3.27b0
+### 修复（续写重复重写已写章，2.3.25b0 之后）
+- **现象**：重启后点开始生成，从 L02 重新开始写（本地 L02 四段早已落盘）
+- **根因**：续写恢复逻辑只在 `section.status == "done"` 时才检查文件齐全（novel_writer 378 行）——session 状态不是 done 的章（in_progress/pending，旧 server 写段完成只更新 novel_state 不同步 session 的残留），文件再多也不看直接重写。2.3.14b0 修过"写段只更新 novel_state 不同步 session"，当时只同步了存量数据，代码层 TODO 未做 → 复发
+- **修复**：
+  1. **文件为真相源**：续写恢复改为"文件齐全 → 无论 session 状态如何都跳过 + 同步 session 为 done"（不再依赖 session 状态判定是否重写）
+  2. 文件不齐时仍按原逻辑降级（done 空章回 pending / 文件不全降级段级处理）
+- **存量修复**：session 20260815_170214 的 L02 in_progress → done（子结构 done + 字数按 novel_state 回填）；L02 磁盘原稿备份 L02.bak_2039（防覆盖）；已调用 /api/stop 停止误写线程（S01 原稿 19:03 完好）
+- 验证：续写判断模拟 L01/L02 文件齐全 → 跳过 ✅，L03（confirmed 未写）→ 正常进入 ✅
+- 版本 2.3.25b0 → 2.3.26b0
+### 修复（实体清洗/注册死循环，2.3.24b0 之后）
+- **现象**：每轮 extract 打印"清洗历史碎片: 6 → 5"+"角色注册: 新增 1"，无限循环
+- **根因链**：规划 LLM 在 L02/S02 规划文本写了 `【新角色：无】` 占位标记 → "新角色自动登记"正则（`{1,8}` 抓任意字符）把 `'无'` 注册进 characters → extract 每轮：清洗端删 `'无'`（len<2 规则）+ 注册端从 characters 加回 → 死循环
+- **修复**：
+  1. 自动登记 `_detect_new_chars_in_plan`：占位符精确枚举挡截（`无/未知/待定/None/暂无/未定/未命名`，集合整串相等，不误伤"无风/无面人"）
+  2. 清洗 `_sanitize_legacy`：删掉 `len<2` 伪语义规则（单字可能是合法名"渊"，长度不是语义判断）；只保留标点残留（FRAGMENT_RE）确定性清洗；**character 类型永不删**（权威源）
+  3. 注册 `_ensure_characters_registered`：占位符精确挡截（与规划端同源 PLACEHOLDER_NAMES 双端一致）
+  4. 存量数据修复：characters 4→3（删 '无'），entity_tracker 7→6，关系无损；备份 novel_state.json.bak_20260815_2036
+- 验证：清洗不误删单字角色/保护 character/清标点残留 ✅；注册挡 '无' 放 '无风' ✅；2 轮模拟稳定 3 实体无循环 ✅
+### 修复（repair_pending 取最近章，2.3.23b0 之后）
+- **根因**：`get_progress` 的 repair_pending 用 `break` 只取第一个未修复章——L01 的旧 HARD 永远占位，L02 的新 HARD 永远轮不到 → 前端弹的永远是 L01，L02 写完不弹
+- **修复**：遍历全部章不 break，最后命中的 = 最近 finalize 的待修复章（写一章弹一章语义）
+- 验证：真实 session 170214 的 repair_pending 从 L01 → L02（2 条 HARD 正确返回）✅
+
+## [2.3.23b0] - 2026-08-15
+### 修复（六检 HARD 章级触发 + 主循环拦截，2.3.22b0 之后）
+- **根因**：修复面板弹窗挂在 session 级 done（全书完成才弹），单章有 HARD 不弹；写段循环先标 done 后跑 finalize，HARD 不阻断主流程 → 直接推进下一章（《计算无法抵达处》L01 有 HARD 但直接规划 L02）
+- **弹窗改章级触发**：`get_progress` 新增 `repair_pending`（hint.issues 非空且未标记 `_repaired` 即返回）→ 前端轮询发现即弹修复面板，不依赖 phase/status_text；`_repairPanelChapter` 防重（同章不重复弹）
+- **判定修正**：以 `hint.issues` 非空为准（ok 字段被旧数据污染不可信）
+- **主循环拦截**：novel_writer finalize 有 HARD → 先检后标 done（finalize 是章级裁判）；章级 done 撤回，轮询 hint._repaired 等修复引擎（≤3 轮），修复后全六检重检，通过才标 done；3 轮仍 HARD → 章回 pending 交人工（正文保留）
+- **apply 完成标记** `_repaired=True` → repair_pending 消失，不重复弹
+- 验证：真实 session 170214 的 L01 HARD → repair_pending 正确返回；标记 _repaired 后消失 ✅
+### 修复（实体抽取格式漂移，2.3.21b0 之后）
+- **`_extract_llm` 增强**（照搬 R1 审核已验证的套路）：
+  1. prompt 加 **few-shot 完整示例**（治本：模型一次输出正确格式）
+  2. 解析失败 → **打回纠正重试最多 3 次**（原始输出+错误说明回喂）
+  3. WARN 时**打印原始输出前 200 字**（可诊断）
+- **`_extract_json` 解析容错增强**：
+  - `NaN/Infinity/-Infinity` → `null`（模型偶发输出非标准数字）
+  - **截断修复**：从末尾找最大合法 JSON 前缀 + 补全闭合括号（模型被 max_new_tokens 截断时不再丢本轮抽取）
+- 实测：真实长正文（1688 字）——第 1 次格式漂移 → **第 2 次纠正后解析成功**（entities=7 relations=5），重试兜底生效；8 个解析用例全过
+- 说明：角色注册（"新增 4 个 character"）是纯代码链路，与 LLM 抽取失败无关——两条独立链路
+
+## [2.3.21b0] - 2026-08-15
+### 新增（修复引擎 P4：自动模式 + 重构后同步）
+- **自动修复模式**：
+  - 配置面板新增 `auto_repair` 开关 + `repair_rounds` 轮次（小说质检区，默认关/3 轮）
+  - 前端轮询章 done 后：auto_repair=on → 不弹面板，全选自动重构（后台线程 + 轮询）
+  - 手动/自动模式：配置面板=全局默认，修复面板=单次覆盖
+- **重构后同步**（关键：重构改正文 → 实体/时间线必须跟随）：
+  - `extract()` 加 `force_status=True`：状态覆盖式刷新（原仅增量填缺，重构后 alive→injured 更新）
+  - `sync_after_rewrite`：重构落盘后重跑 extract（force），实体状态以新正文为准
+  - 挂进 `run`：每段重构成功后自动 sync
+  - 双份备份（正文+state）保证回滚一致
+- 实测：临时副本，艾琳 alive → unconscious 覆盖成功（force 生效）
+
+## [2.3.20b0] - 2026-08-15
+### 新增（修复引擎 P3：UI 修复面板）
+- **章检结果落盘**：novel_writer 章检后 `save_repair_hint(chapter_id, result)` 存 session（含 HARD/FAIL 行 + 完整 stdout 供前端解析 T0/T1）
+- **StateManager**：`save_repair_hint` / `get_repair_hints`
+- **后端 4 API**：
+  - `/api/novel/repair/preview` — 章检结果 → T0（自动修）/ T1（按文件聚合）清单
+  - `/api/novel/repair/apply` — {session, chapter, checked_subs, mode} → 后台线程 T0+T1 重构
+  - `/api/novel/repair/rollback` — 回滚指定轮（正文+state）
+  - `/api/novel/repair/status` — 修复进度轮询
+- **前端修复面板**（`novel-repair-panel`）：章 done 后自动弹出 → 列问题 + 子结构勾选（勾掉=跳过）→ 开始修复 → 4s 轮询状态 → 显示重写/失败段数
+- 修复模型配置驱动（config writer_model 全参数继承，零新增配置）
+
+## [2.3.19b0] - 2026-08-15
+### 新增（修复引擎 P2：T1 整段重构）
+- **`rewrite_segment`**：35b 整段重构单子结构（novel_repair_engine.py）：
+  - 契约 prompt：保留首行标题/末行编号/别名行 + 字数 ±15% + 衔接上下文（上段尾/下段头 100 字，已净化仅正文）+ 子结构规划 + 问题清单
+  - `_validate_rewrite`：输出校验 4 项（标题/末行/别名/字数），不合格拒绝落盘保留原稿
+  - `_create_repair_client`：**配置驱动**——读 config `writer_model`，timeout/max_tokens 全继承，零新增配置
+- **`run` 引擎**：T0 自动修 + T1 按段聚合重构（checked_subs 勾选过滤）
+- `_prev_tail`/`_next_head`：衔接上下文净化（去掉标题/别名/末行，只留正文）
+- 实测：35b 真实重构 S01（10 分钟），契约三行全保留、字数 1264（原 1209 +4.5%）、内容质量提升
+
+## [2.3.18b0] - 2026-08-15
+### 新增（修复引擎 P1：T0 自动修复）
+- **新增 `novel_repair_engine.py`**（六检问题修复引擎，v0.3 设计落地第一步）：
+  - `apply_t0`：纯代码修复格式问题——末行编号缺失补全（旧格式 S01 兼容跳过）、禁用模式行删除（元文本/指令残留）
+  - `backup_segment` / `rollback_round`：**双份备份**（正文 + novel_state 快照），按轮回滚（正文与实体状态永远一致）
+  - `run` 引擎骨架（P1 只做 T0，T1 整段重构待 P2）
+- 修复模型配置驱动（读 config writer_model，参数全继承），不写死
+- 设计文档：`docs/repair_engine_design.md`（v0.3 定稿：T0/T1/T2 分级、整段重构契约、同步步骤、双份回滚、3 轮上限）
+
+## [2.3.17b0] - 2026-08-15
+### 修复（2.3.16b0 之后）
+- **推理审核格式漂移根因修复**（novel_reasoning_check.py）：
+  - 根因：prompt 只有一行格式说明、无示例 → R1-1.5B 输出 result 字段填中文/填反（"通过"/"合理"），后端 3 个兜底穷举填错姿势（376/378/382 行）把正面判断猜成 SOFT → 每次审核产生 5 个"通过型 SOFT"噪音
+  - 治本：prompt 增加 **few-shot 完整输出示例**（5 维 JSON 数组，含 PASS/SOFT/HARD 三态）→ 模型一次输出正确格式（实测 5/5 漂移 → 一次通过）
+  - 治标改治本：解析失败不再直接标记"审核失败"（用户看不到审核结果）——**打回纠正重试最多 3 次**（把原始输出+错误说明喂回要求重新输出），3 次仍失败才标记「推理审核失败」SOFT（人工可见）
+  - 解析逻辑抽为 `_parse_reasoning_results()` 独立函数
+- 实测：L02 一次通过，输出 1 HARD（对话匹配度，真问题）+ 1 SOFT（人物行为一致性，模型有意判定），无格式噪音
+
+## [2.3.16b0] - 2026-08-15
+### 数据修复（《模拟失败报告》实体表清洗）
+- **历史正则碎片清除**：entity_tracker 从 425 实体（85.6% 为 `'但我没有'`/`'噪音逐渐平息'` 等句法碎片）清洗至 121 个纯名词性实体，上下文注入体积从 ~27KB 降至 ~7.4KB（-72%），续写 prompt 不再被垃圾实体污染
+- 清洗策略（三级）：
+  1. 白名单保底：character + 关系两端永不删
+  2. Qwen2.5-3B 语义判定（421 个分批，保留 218）
+  3. 规则兜底：动词结尾/方位结尾/助词/代词/判断句黑名单（218 → 149 → 121）
+- 关系完整性：19 条关系全部保留、引用零悬空（id 重映射）
+- 备份：`novel_state.json.bak_20260815_1503`
+
 ## [2.3.15b0] - 2026-08-15
 ### 修复（2.3.14b0 之后）
 - **章级确认面板不再主动弹出**：原 loadSession 加载 writing 会话时无条件 `startProgressPolling`，而 `get_progress` 的 `awaiting_confirm` 是静态推断（只要有 planning 章就返回，不管生成线程是否在跑）→ 加载即弹确认面板，语义混乱。改：

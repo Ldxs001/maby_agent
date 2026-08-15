@@ -180,31 +180,48 @@ def load_context(state_path, chapter, sub_key):
     else:
         word_count_note = f"  篇幅: {length_label}（未设定字数目标，请运行 plan-chapter 更新）"
 
-    # ── 输出标准上下文 ──
+    # ── 输出标准上下文（三层分级：目的★★★ / 背景★★ / 参考★，与规划阶段一致） ──
     print(f"{'='*50}")
     print(f"[上下文] {chapter}{sub_key}")
+    print(f"{'='*50}")
+    print(f"【优先级】★ 分级说明：")
+    print(f"  ★★★ 目的 = 本次写作必须围绕（当前段 + 字数 + 命题框）")
+    print(f"  ★★  背景 = 必须遵循的硬约束（文风/视角/署名/人格/收尾/原始需求）")
+    print(f"  ★   参考 = 前文事实，尽量参考（实体/行为/时间线/节奏/钩子）")
+    print(f"{'='*50}\n")
+
+    # ── [目的★★★] 当前段（写作对象） ──
+    print(f"{'='*50}")
+    print(f"[目的★★★] 当前子结构（本次写作对象）")
+    print(f"{'='*50}")
     print(f"[章节概述] {ch_info.get('overview', '')}")
     print(f"[子结构规划] title={subs[sub_key].get('title','')}")
     print(f"[子结构概述] {subs[sub_key].get('summary','')}")
     print(f"{_format_emotions(subs[sub_key])}")
-    if prev_lines:
-        print(f"[上一子结构末3行]:")
-        for l in prev_lines:
-            print(f"  | {l}")
+    print(f"{'='*50}\n")
+
+    # ── [目的★★★] 字数约束 ──
     print(f"{'='*50}")
-    # 字数约束单独分段输出，确保 LLM 看到
-    print(f"\n{'='*50}")
-    print(f"[硬性] 字数约束")
+    print(f"[目的★★★] 字数约束")
     print(f"{'='*50}")
     print(word_count_note)
     print(f"  提示: 以叙事单位自然结束为准，不强行撑到目标")
     print(f"{'='*50}\n")
 
-    # ── [硬性] 文风约束（硬性） ──
+    # ── [背景★★] 原始需求（用户最初输入，全量注入，写作须贴合） ──
+    project_raw = str(data.get("project", "")).strip()
+    if project_raw:
+        print(f"\n{'='*50}")
+        print(f"[背景★★] 原始需求（用户最初输入，全量，必须遵循）")
+        print(f"{'='*50}")
+        print(f"  {project_raw}")
+        print(f"{'='*50}\n")
+
+    # ── [背景★★] 文风约束 ──
     ws = data.get("writing_style", {})
     if ws:
         print(f"\n{'='*50}")
-        print(f"[硬性] 文风约束（硬性）")
+        print(f"[背景★★] 文风约束")
         print(f"{'='*50}")
         for key, label in [("narrative_voice", "叙事视角"),
                            ("tense", "时态"),
@@ -232,13 +249,13 @@ def load_context(state_path, chapter, sub_key):
         print(f"  提示: 全文文风一致，不可偏离")
         print(f"{'='*50}\n")
 
-    # ── [硬性] 署名约束（代码级硬阻断） ──
+    # ── [背景★★] 署名约束（代码级硬阻断） ──
     sig = data.get("signature", {"enabled": False, "text": ""})
     sig_enabled = sig.get("enabled", False)
     sig_text = sig.get("text", "")
     print(f"\n{'='*50}")
     if sig_enabled:
-        print(f"[硬性] 署名约束（硬性）")
+        print(f"[背景★★] 署名约束")
         print(f"{'='*50}")
         print(f"  状态: 已开启")
         if sig_text:
@@ -246,18 +263,18 @@ def load_context(state_path, chapter, sub_key):
         print(f"  允许在作品末尾添加署名")
         print(f"  禁止使用自行编造的署名文本（必须 = 配置值）")
     else:
-        print(f"[硬性] 署名约束（代码级硬阻断）")
+        print(f"[背景★★] 署名约束（代码级硬阻断）")
         print(f"{'='*50}")
         print(f"  状态: 已关闭")
         print(f"  禁止在正文中出现任何署名/代名内容")
         print(f"  atomic_writer 代码级阻断，写入即报错")
     print(f"{'='*50}\n")
 
-    # ── [硬性] 写作命题框（必填，缺失则 HARD-BLOCK） ──
+    # ── [目的★★★] 写作命题框（必填，缺失则 HARD-BLOCK） ──
     _check_writing_prompt(subs[sub_key], chapter, sub_key)
     wp = subs[sub_key].get("writing_prompt", "")
     print(f"\n{'='*50}")
-    print(f"[硬性] 写作命题框（规划阶段预先编写 — 硬性约束）")
+    print(f"[目的★★★] 写作命题框（规划阶段预先编写 — 必填）")
     print(f"{'='*50}")
     print(wp)
     print(f"\n  {'─'*40}")
@@ -271,7 +288,7 @@ def load_context(state_path, chapter, sub_key):
     _is_first = (current_idx == 0)
     _is_last_sub = (current_idx == len(sub_keys) - 1)
     print(f"{'='*50}")
-    print(f"[参考] 叙事节奏参考")
+    print(f"[参考★] 叙事节奏参考")
     print(f"{'='*50}")
     print(f"  建议按 建立→发展→收束 的弧线自然推进：")
     print(f"  开头：场景锚定 + 人物入场/状态")
@@ -289,7 +306,7 @@ def load_context(state_path, chapter, sub_key):
     ch_tag = chapter[1:]
     sk_tag = sub_key[1:]
     print(f"\n{'='*50}")
-    print(f"[硬性] 输出模板（系统组装 — LLM 只需填写下方正文区域）")
+    print(f"[目的★★★] 输出模板（系统组装 — LLM 只需填写下方正文区域）")
     print(f"{'='*50}")
     print("┌─ 填写正文 ──────────────────────────────────────────────")
     print("| <填入正文叙事内容>")
@@ -318,12 +335,14 @@ def load_context(state_path, chapter, sub_key):
     print("  [可选] 【别名】无")
     print("  EOF")
     print(f"{'='*50}\n")
-if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("用法: python novel_context_loader.py <state_path> <chapter> <sub_key>")
-        sys.exit(1)
-    load_context(sys.argv[1], sys.argv[2], sys.argv[3])
-    # ── [硬性] 已出场关键人物（登场即累加，不按章节过滤）──
+
+    # ═══════════════════════════════════════════════
+    # 以下 6 块原嵌在 if __name__=="__main__" 里——Web 场景（_load_context_captured 只调
+    # load_context 函数）永远拿不到，且 main 块访问 data/subs（本函数局部变量）会 NameError。
+    # 已移入函数内 + 统一三层分级标签。
+    # ═══════════════════════════════════════════════
+
+    # ── [背景★★] 已出场关键人物（登场即累加，不按章节过滤）──
     char_entries = []
     for c in data.get("characters", []):
         fa = c.get("first_appearance", "")
@@ -332,32 +351,31 @@ if __name__ == "__main__":
         role = c.get("role", "")
         func = c.get("function", "")
         label = f"{c['name']}({role})" if role else c['name']
-        # 若有别名，追加显示
         aliases = c.get("aliases", [])
         if aliases and isinstance(aliases, list):
             label += f" [别名: {'/'.join(aliases)}]"
         if func:
             char_entries.append(f"  {label}: {func}")
         else:
-            print(f"[HOOK-BLOCK] 角色 \"{c['name']}\" 已注册但未填写 function")
-            print(f"[要求] 角色规划必须填写 function 字段，请运行 add-char 补充：")
-            print(f"  python novel_state_manager.py add-char <state_path> \"{c['name']}\" \"{c.get('role','')}\" \"{fa}\" \"{','.join(c.get('traits',[]))}\" \"{c.get('mbti','')}\" \"{c.get('archetype','')}\" \"<功能描述>\"")
-            sys.exit(1)
+            # function 为可选字段（历史数据常缺）：不阻断，降级仅显示姓名+角色
+            # 曾用 sys.exit(1) 阻断——Web 场景会掐断后续所有上下文块（实体/行为/时间线等），
+            # 且 function 缺失不影响写作一致性，改为降级显示。
+            char_entries.append(f"  {label}")
     if char_entries:
         print(f"{'='*50}")
-        print(f"[硬性] 已出场关键人物")
+        print(f"[背景★★] 已出场关键人物")
         print(f"{'='*50}")
         for line in char_entries:
             print(line)
         print(f"{'='*50}\n")
 
-    # ── [硬性] 人格约束（硬性） ──
+    # ── [背景★★] 人格约束 ──
     involved = _find_characters_in_chapter(data, chapter, sub_key)
     if involved:
         has_personality = any(c.get("mbti") or c.get("archetype") for c in involved)
         if has_personality:
             print(f"\n{'='*50}")
-            print(f"[硬性] 人格约束（硬性）")
+            print(f"[背景★★] 人格约束")
             print(f"{'='*50}")
             for c in involved:
                 mbti = c.get("mbti", "")
@@ -370,12 +388,11 @@ if __name__ == "__main__":
             print(f"  提示: 角色言行必须符合其人格设定")
             print(f"{'='*50}\n")
 
-    # ── [硬性] 实体关系网（累计，登场即累加）──
+    # ── [参考★] 实体关系网（累计，登场即累加）──
     tracker = data.get("entity_tracker", {"entities": [], "relations": []})
     all_entities = tracker.get("entities", [])
     all_relations = tracker.get("relations", [])
     if all_entities:
-        # 实体列表分类输出
         ent_lines = []
         type_order = {"character": "角色", "object": "物品", "location": "地点", "organization": "组织", "data": "数据"}
         for ent_type in ["character", "object", "location", "organization", "data"]:
@@ -394,11 +411,10 @@ if __name__ == "__main__":
                 ent_lines.append(f"    {'  '.join(parts)}")
         if ent_lines:
             print(f"{'='*50}")
-            print(f"[硬性] 实体关系网（累计 {len(all_entities)} 实体, {len(all_relations)} 关系）")
+            print(f"[参考★] 实体关系网（累计 {len(all_entities)} 实体, {len(all_relations)} 关系）")
             print(f"{'='*50}")
             for line in ent_lines:
                 print(line)
-            # 关系列表（全量输出，与实体同策略）
             rel_lines = []
             for r in all_relations:
                 from_e = next((e for e in all_entities if e["id"] == r.get("from_entity")), None)
@@ -413,39 +429,52 @@ if __name__ == "__main__":
                     print(line)
             print(f"{'='*50}\n")
 
-    # ── [硬性] 上一章行为轨迹 ──
+    # ── [参考★] 上一章行为轨迹 ──
     prev_behavior = None
     chapters_list = data.get("chapters", [])
+    prev_ch_id = ""
     for ci, ch in enumerate(chapters_list):
         if ch["id"] == chapter and ci > 0:
             prev_ch = chapters_list[ci - 1]
+            prev_ch_id = prev_ch["id"]
             prev_behavior = prev_ch.get("behavior_summary", {})
             break
     if prev_behavior:
         behavior_lines = []
         for char_name, actions in prev_behavior.items():
             if actions:
-                actions_str = " → ".join(actions[:4])
+                actions_str = " → ".join(str(a) for a in actions[:4])
                 behavior_lines.append(f"  {char_name}: {actions_str}")
         if behavior_lines:
             print(f"{'='*50}")
-            print(f"[硬性] 上一章行为轨迹（{chapters_list[ci-1]['id']}）")
+            print(f"[参考★] 上一章行为轨迹（{prev_ch_id}）")
             print(f"{'='*50}")
             for line in behavior_lines:
                 print(line)
             print(f"  提示: 当前章应自然延续以上轨迹，无重大断裂")
             print(f"{'='*50}\n")
 
-    # ── [硬性] 收尾命题框（is_ending=true 时追加） ──
+    # ── [参考★] 时间线（故事进行到第几天，供时间推进参考）──
+    tl = data.get("timeline", []) or []
+    if tl:
+        print(f"{'='*50}")
+        print(f"[参考★] 时间线（最近 5 条，故事进行到）")
+        print(f"{'='*50}")
+        for t in tl[-5:]:
+            day = f"day{t.get('day','?')}" if t.get("day") is not None else str(t.get("time_point", "?"))
+            print(f"  {day}: {str(t.get('event',''))[:50]}")
+        print(f"  提示: 当前段时间推进应顺延以上时间轴，勿倒序/跳变")
+        print(f"{'='*50}\n")
+
+    # ── [背景★★] 收尾命题框（is_ending=true 时追加） ──
     if subs[sub_key].get("is_ending"):
         ending_type = subs[sub_key].get("ending_type", "未指定")
         project = data.get("project", "未知项目")
         core_conflict = data.get("core_conflict", "未知冲突")
         protagonist = data.get("protagonist", "未知主角")
         theme = data.get("theme", "未知主题")
-
         print(f"\n{'='*50}")
-        print(f"[硬性] 收尾约束（硬性）")
+        print(f"[背景★★] 收尾约束")
         print(f"{'='*50}")
         print(f"  收尾类型: {ending_type}")
         print(f"  {'─'*40}")
@@ -472,10 +501,8 @@ if __name__ == "__main__":
         print(f"  提示: 以上为命题约束，不可偏离")
         print(f"{'='*50}\n")
 
-    # ── [参考] 钩子位建议（is_hook_possible=true 时输出，不阻断） ──
+    # ── [参考★] 钩子位建议（is_hook_possible=true 时输出，不阻断） ──
     if subs[sub_key].get("is_hook_possible"):
-        # 找下一章标题
-        chapters_list = data.get("chapters", [])
         next_ch_title = ""
         for ci, ch in enumerate(chapters_list):
             if ch["id"] == chapter and ci + 1 < len(chapters_list):
@@ -483,7 +510,7 @@ if __name__ == "__main__":
                 next_ch_title = f"{next_ch.get('id', '')}: {next_ch.get('title', '')}"
                 break
         print(f"\n{'='*50}")
-        print(f"[参考] 钩子位建议（不强制）")
+        print(f"[参考★] 钩子位建议（不强制）")
         print(f"{'='*50}")
         print(f"  本子结构是本章末子结构，可考虑设为伏笔/悬念/承诺")
         if next_ch_title:
@@ -494,7 +521,6 @@ if __name__ == "__main__":
         print(f"    - 承诺：暗示下一章将有重要发展")
         print(f"  如不设伏笔，请确保本子结构自然收束（非悬停式结尾）")
         print(f"{'='*50}\n")
-
 
 
 def _load_context_captured(state_path, chapter, sub_key) -> str:
@@ -512,3 +538,10 @@ def _load_context_captured(state_path, chapter, sub_key) -> str:
         # CLI 串行阻断（上一子结构未完成等）→ Web 场景降级返回已捕获内容（不杀进程）
         pass
     return buf.getvalue().strip()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("用法: python novel_context_loader.py <state_path> <chapter> <sub_key>")
+        sys.exit(1)
+    load_context(sys.argv[1], sys.argv[2], sys.argv[3])

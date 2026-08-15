@@ -108,6 +108,29 @@ class StateManager:
                     "sub_sections": s.get("sub_sections", []),
                 }
                 break
+        # 修复引擎章级触发：finalize 后有 HARD 且未修复的章
+        # （前端轮询发现 repair_pending 非空即弹修复面板，不依赖 phase/status_text）
+        # 取"最近 finalize 的待修复章"——不 break，遍历全部章，最后命中的就是最新的
+        # （避免旧章 HARD 永远占位挡住新章；写一章弹一章的语义）
+        repair_pending = None
+        hints = self._state.get("_repair_hints", {})
+        if self._state.get("phase") in ("writing", "done"):
+            for s in sections:
+                ch = (s.get("_novel") or {}).get("chapter", "")
+                hint = hints.get(ch)
+                if not hint:
+                    continue
+                # 判定依据：issues 非空 = 有 HARD/FAIL 行需要修复（ok 字段可能被旧数据污染，不可信）
+                if not hint.get("issues"):
+                    continue  # 无 HARD，无需修复
+                # 有 HARD/FAIL 且该章未标记"已修复/已跳过" → 待弹面板（覆盖式：最后命中=最近章）
+                if not hint.get("_repaired"):
+                    repair_pending = {
+                        "chapter": ch,
+                        "section_id": s["id"],
+                        "issues": hint.get("issues", [])[:20],
+                        "has_output": bool(hint.get("output")),
+                    }
         return {
             "total": total_subs,
             "done": done_subs,
@@ -118,12 +141,23 @@ class StateManager:
             "title": self._state.get("outline", {}).get("title", ""),
             "status_text": self._state.get("_status_text", "") if self._state.get("phase") in ("writing",) else "",
             "awaiting_confirm": awaiting,
+            "repair_pending": repair_pending,
         }
 
     def set_status_text(self, text: str):
         """设置当前状态文本（显示在进度条下方）"""
         self._state["_status_text"] = text
         self.save()
+
+    def save_repair_hint(self, chapter_id: str, result: dict):
+        """保存章检结果（供前端修复面板读取：T0/T1 分级清单）。"""
+        hints = self._state.setdefault("_repair_hints", {})
+        hints[chapter_id] = result
+        self.save()
+
+    def get_repair_hints(self) -> dict:
+        """读取全部章检结果。"""
+        return copy.deepcopy(self._state.get("_repair_hints", {}))
 
     def get_state(self):
         return copy.deepcopy(self._state)
@@ -136,6 +170,8 @@ class StateManager:
                 self._state = json.load(f)
             self.session_id = sid
             self.path = p
+            # 注意：不要在这里清空 _replan_inflight——会误杀进程内正在进行的 in-flight 标记
+            # 僵尸标记判定放在调用方（_handle_novel_confirm），按 started_at + timeout 自动清理
         else:
             raise FileNotFoundError(f"Session {sid} 不存在")
 

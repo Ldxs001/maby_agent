@@ -83,6 +83,20 @@ def _reload_session_section(session_id: str, sid: str) -> dict:
     return {}
 
 
+def _reload_repair_hint(state_mgr, chapter_id: str) -> dict:
+    """重载 session 文件中指定章的修复 hint（修复引擎 apply 完成后写 _repaired=True）"""
+    try:
+        p = SESSIONS_DIR / f"{state_mgr.session_id}.json"
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        hints = data.get("_repair_hints", {}) or {}
+        return hints.get(chapter_id, {}) or {}
+    except Exception:
+        pass
+    return {}
+
+
 def _wait_confirm(state_mgr, sid: str, stop_check) -> dict | None:
     """轮询等待用户确认当前章（planning → confirmed），返回确认后的章 outline。
 
@@ -172,6 +186,18 @@ def _write_sub_inline(state_path: str, chapter_id: str, s_key: str, title: str, 
         try:
             from .novel_entity_extractor import extract
             extract(str(Path(state_path).resolve()), chapter_id, s_key, clean_body)
+        except Exception:
+            pass
+        # 行为提取（write-sub 逐段，LLM 优先 + 正则回退，进程内执行）
+        try:
+            from .novel_behavior_extractor import extract_behavior
+            extract_behavior(str(Path(state_path).resolve()), chapter_id, s_key, clean_body)
+        except Exception:
+            pass
+        # 时间线提取（write-sub 逐段，LLM 优先 + 正则回退，进程内执行）
+        try:
+            from .novel_timeline_extractor import extract_timeline
+            extract_timeline(str(Path(state_path).resolve()), chapter_id, s_key, clean_body)
         except Exception:
             pass
         # 更新 state：字数 + 状态（运行时字段，不触发指纹）
@@ -360,11 +386,20 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
         chapter_id = (section.get("_novel") or {}).get("chapter", "")
         sid = section["id"]
 
-        # ── 续写恢复：已 done 章从文件读正文，跳过（但须校验文件真实齐全——文件为真相源） ──
+        # ── 续写恢复：文件为真相源 ──
+        # 只要该章子结构文件真实齐全（磁盘写完），无论 session 状态如何（done/in_progress/pending）
+        # 都视为"实际写完"→ 跳过 + 同步 session 为 done（防 session 与磁盘分叉导致重复重写）。
+        # 历史根因：写段完成只更新 novel_state（update_sub），session 子结构状态不同步 →
+        # 重启后 session 章状态停留在 in_progress/planning → 续写无视磁盘文件直接重写。
+        if _chapter_files_complete(state_path, section, ndata):
+            if section.get("status") != "done":
+                _logger.warning(f"续写恢复：{chapter_id} 文件齐全但 session 状态为 {section.get('status')}，同步为 done（文件为真相源）")
+                state_mgr.update_section(sid, {"status": "done",
+                                               "actual_word_count": len(_read_chapter_md(state_path, section, ndata).replace(" ", "").replace("\n", ""))})
+            md_parts.append(_read_chapter_md(state_path, section, ndata))
+            continue
+        # 文件不齐全：才看 session 状态决定行为
         if section.get("status") == "done":
-            if _chapter_files_complete(state_path, section, ndata):
-                md_parts.append(_read_chapter_md(state_path, section, ndata))
-                continue
             if not _chapter_has_subs(section, ndata):
                 # 空章：从未规划过子结构却被标 done（历史误标）→ 回 pending 重新规划
                 _logger.warning(f"续写恢复：{chapter_id} 标记 done 但从未规划子结构（空章），回 pending 重新规划")
@@ -462,13 +497,18 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
                 state_mgr.set_status_text(f"已停止: {sub['title']}（立即停止）")
                 break
             ssid = sub["id"]
-            # 续写恢复：以文件为真相——标记 done 且文件真实落盘（非空）才跳过；
-            # 标记 done 但文件缺失/空 = 实际没写 → 置回 pending 重写（不静默丢正文）
+            # 续写恢复：以文件为真相——**无论 session 状态**，文件真实落盘（非空）即视为已写，跳过；
+            # 文件缺失/空 = 实际没写 → 重写该段（不静默丢正文）。
+            # 历史根因：段级只看 sub.status==done（同章级 bug），session 状态滞后（写段完成前
+            # 线程中断/重启）→ 已写好的段被重写。
+            sub_content = _read_sub_content(state_path, chapter_id, sub["_novel"]["s_key"])
+            if sub_content:
+                if sub.get("status") != "done":
+                    _logger.warning(f"续写恢复：{chapter_id}{sub['_novel']['s_key']} 文件已存在但 session 状态为 {sub.get('status')}，同步为 done（文件为真相源）")
+                    state_mgr.update_section(ssid, {"status": "done", "actual_word_count": len(sub_content.replace(" ", "").replace("\n", ""))})
+                section_md += f"### {sub['title']}\n\n{sub_content}\n"
+                continue
             if sub.get("status") == "done":
-                sub_content = _read_sub_content(state_path, chapter_id, sub["_novel"]["s_key"])
-                if sub_content:
-                    section_md += f"### {sub['title']}\n\n{sub_content}\n"
-                    continue
                 _logger.warning(f"续写恢复：{chapter_id}{sub['_novel']['s_key']} 标记 done 但文件缺失/为空，视为未写，重写该段")
                 state_mgr.update_section(ssid, {"status": "pending"})
                 # 不 continue：落到下方正常写作流程（重写该段）
@@ -557,26 +597,84 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
             state_mgr.update_section(ssid, {"status": "done", "actual_word_count": actual_chars})
 
         md_parts.append(section_md)
-        # 章末尾标 done 前校验：勾选的子结构必须至少一个真实落盘（文件为真相源）。
+        # 章末尾落盘校验：勾选的子结构必须至少一个真实落盘（文件为真相源）。
         # 全勾选段都未落盘（写失败/全跳过）→ 章不标 done，回 pending 等重试；
         # 全部取消勾选（用户主动跳过本章）→ 视为用户选择，标 done 允许跳过。
         if not _chapter_any_sub_written(state_path, section):
             _logger.warning(f"{chapter_id} 勾选子结构均未落盘，章不标 done，回 pending")
             state_mgr.update_section(sid, {"status": "pending"})
             continue
+
+        # 章检六检（规则4检 + bge/R1，子进程；失败不阻断主流程；开关控制）
+        # 顺序：先检后标 done——finalize 是章级裁判，有 HARD → 拦截等修复，通过后才标 done
+        # 判定用 issues 非空（HARD/FAIL 行）而非 fc.ok——ok 是子进程退出码==0，
+        # 有 HARD 时 workflow_engine 只写 fixes 正常 return（退出码 0），ok 恒 True，不可信。
+        _fc_final = None
+        try:
+            fc = novel_bridge.finalize_novel_chapter(state_path, chapter_id, checks=_checks)
+            _fc_final = fc
+            _has_hard = bool(fc.get("issues"))
+            if _has_hard:
+                state_mgr.set_status_text(f"章检发现 HARD 问题: {chapter_id}（等待修复）")
+            # 保存章检结果到 state（供前端修复面板读取：T0/T1 分级清单）
+            try:
+                _checks_result = {
+                    "chapter": chapter_id,
+                    "ok": fc.get("ok", False),
+                    "timeout": fc.get("timeout", False),
+                    "issues": fc.get("issues", []),           # HARD/FAIL 行
+                    "output": (fc.get("output") or "")[-3000:],  # 完整 stdout（含 SOFT）
+                }
+                state_mgr.save_repair_hint(chapter_id, _checks_result)
+            except Exception:
+                pass
+            # ── HARD 拦截：章级待修复，主循环暂停等修复引擎（最多 max_repair_rounds 轮） ──
+            if _has_hard:
+                _repair_rounds = int(_checks.get("repair_rounds", 3) or 3)
+                _round = 0
+                while _round < _repair_rounds:
+                    _round += 1
+                    state_mgr.set_status_text(f"章检 HARD: {chapter_id}（修复轮次 {_round}/{_repair_rounds}，等待修复引擎）")
+                    # 轮询 hint._repaired（修复引擎 apply 完成后置 True）；支持停止
+                    _hint = _reload_repair_hint(state_mgr, chapter_id)
+                    while not (_hint and _hint.get("_repaired")):
+                        if stop_check and stop_check() == "immediate":
+                            state_mgr.set_status_text(f"已停止（{chapter_id} 修复等待中被中断）")
+                            return None
+                        time.sleep(2)
+                        _hint = _reload_repair_hint(state_mgr, chapter_id)
+                    # 修复完成 → 重检全六检（聚合重检：修复后全跑）
+                    state_mgr.set_status_text(f"重检: {chapter_id}（修复后第 {_round} 轮全六检）")
+                    fc2 = novel_bridge.finalize_novel_chapter(state_path, chapter_id, checks=_checks)
+                    _fc_final = fc2
+                    _checks_result2 = {
+                        "chapter": chapter_id,
+                        "ok": fc2.get("ok", False),
+                        "timeout": fc2.get("timeout", False),
+                        "issues": fc2.get("issues", []),
+                        "output": (fc2.get("output") or "")[-3000:],
+                        "_repaired": True,
+                    }
+                    state_mgr.save_repair_hint(chapter_id, _checks_result2)
+                    if not fc2.get("issues"):
+                        break  # 重检通过（issues 无 HARD）
+                    # 重检仍 HARD → 重置 _repaired，再弹面板等下一轮修复
+                    _checks_result3 = dict(_checks_result2)
+                    _checks_result3["_repaired"] = False
+                    state_mgr.save_repair_hint(chapter_id, _checks_result3)
+                if _fc_final is None or _fc_final.get("issues"):
+                    # 3 轮仍 HARD → 章回 pending 交人工（正文保留，可手动改后重 finalize）
+                    state_mgr.update_section(sid, {"status": "pending"})
+                    state_mgr.set_status_text(f"{chapter_id} 修复 {_repair_rounds} 轮仍未通过，章回 pending 待人工处理")
+                    continue  # 跳过本章，继续下一章
+        except Exception as e:
+            _logger.error(f"finalize-chapter 异常 {chapter_id}: {e}")
+
+        # finalize 通过（或异常兜底按通过处理）→ 标章级 done
         state_mgr.update_section(sid, {
             "status": "done",
             "actual_word_count": len(section_md.replace(" ", "").replace("\n", "")),
         })
-        state_mgr.set_status_text(f"章检: {chapter_id} {section['title']}")
-
-        # 章检六检（规则4检 + bge/R1，子进程；失败不阻断主流程；开关控制）
-        try:
-            fc = novel_bridge.finalize_novel_chapter(state_path, chapter_id, checks=_checks)
-            if not fc.get("ok"):
-                state_mgr.set_status_text(f"章检发现 HARD 问题: {chapter_id}（见报告）")
-        except Exception as e:
-            _logger.error(f"finalize-chapter 异常 {chapter_id}: {e}")
 
         # 章级 md 实时落盘（树状输出：题目下挂已完成章，随时可读；整本由手动「拼合」生成）
         try:

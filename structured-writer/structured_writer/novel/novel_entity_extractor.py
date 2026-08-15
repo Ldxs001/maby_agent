@@ -44,6 +44,27 @@ MERGE_SIM_THRESHOLD = 0.85
 # 碎片特征：含标点/百分号/括号等残留（正则时代的产物）
 FRAGMENT_RE = re.compile(r"[，。；：！？、】》「」\"'…%【】()（）]")
 
+# ── 正则兜底提取（LLM 缺失/失败时启用，来源：novel-weaver v1.21.5 正则版） ──
+LOCATION_SUFFIX = ["巷", "街", "路", "区", "市", "城", "楼", "大厦", "厂", "院", "铺", "摊", "场"]
+ORGANIZATION_SUFFIX = ["公司", "集团", "协会", "会", "组织", "联盟", "厂", "社", "所", "院", "局", "处"]
+STATUS_CHANGE_TRIGGERS = {
+    "摧毁": "destroyed", "损坏": "damaged", "烧毁": "destroyed",
+    "修复": "repaired", "重建": "rebuilt", "关闭": "closed",
+    "开启": "open", "建立": "active", "成立": "active",
+    "出售": "sold", "购买": "owned", "送给": "given",
+    "抢夺": "stolen", "丢失": "lost", "死亡": "dead",
+    "负伤": "injured", "受伤": "injured", "昏迷": "unconscious",
+    "苏醒": "active", "恢复": "active",
+}
+REL_PATTERNS = [
+    (r"(把|将)\s*(.{1,8})\s*(交给|递给|卖给|送给|还给)", "转移"),
+    (r"(在|位于|来到|前往|离开)\s*(.{1,8})(?:巷|街|路|区|市|楼|厂|铺|场)", "位于"),
+    (r"是\s*.{0,4}(?:的|一位|一名)\s*(?:员工|成员|头目|领导|首领)", "归属"),
+    (r"领导\s*.{1,8}(?:组织|团体|联盟|会)", "领导"),
+    (r"装有|配备|携带|持有|拥有|带着\s*.{1,8}", "拥有"),
+    (r"来自\s*.{1,8}(?:公司|集团|组织|协会)", "来自"),
+]
+
 _EXTRACT_PIPE = None  # text-generation pipeline（Qwen2.5-3B）
 _BGE_MODEL = None     # SentenceTransformer（bge-small-zh）
 
@@ -122,11 +143,20 @@ def _load_bge():
 # ── 清洗 / 注册 ──
 
 def _sanitize_legacy(entities: list) -> list:
-    """幂等清洗历史碎片（正则时代产物）：超短名 / 含标点残留 → 删除。"""
+    """幂等清洗历史碎片（正则时代产物）：仅删含标点残留的实体。
+
+    设计原则（v2.3.25b0）：
+    - 只做**确定性**清洗：名字里带标点（，。；：！？等）必然不是合法实体名
+    - 不做**伪语义**判断：不按长度删（单字可能是合法名"渊"），"是否像名字"是语义判断，硬编码规则无权审判
+    - character 类型永不删（角色来自 characters 权威源，硬编码规则无权删除）
+    """
     keep = []
     for e in entities:
         name = (e.get("name") or "").strip()
-        if len(name) < 2:
+        if e.get("type") == "character":
+            keep.append(e)  # 角色权威数据，永不删
+            continue
+        if not name:
             continue
         if FRAGMENT_RE.search(name):
             continue
@@ -135,7 +165,12 @@ def _sanitize_legacy(entities: list) -> list:
 
 
 def _ensure_characters_registered(data: dict, entities: list) -> int:
-    """characters（含别名）强制注册为 character 实体，返回新增数。"""
+    """characters（含别名）强制注册为 character 实体，返回新增数。
+
+    v2.3.25b0：占位符精确挡截（无/未知/待定/None 等不注册）——与规划端
+    _detect_new_chars_in_plan 的 PLACEHOLDER_NAMES 同源，双端一致，防脏角色再进表。
+    """
+    PLACEHOLDER_NAMES = {"无", "未知", "待定", "None", "暂无", "未定", "未命名"}
     known_names = {e.get("name") for e in entities}
     added = 0
     for c in data.get("characters", []):
@@ -143,6 +178,8 @@ def _ensure_characters_registered(data: dict, entities: list) -> int:
         if not name:
             continue
         for cand in [name] + list(c.get("aliases") or []):
+            if cand in PLACEHOLDER_NAMES:
+                continue  # 占位符不注册（精确匹配，不误伤"无风/无面人"）
             if cand in known_names:
                 continue
             entities.append({
@@ -161,26 +198,56 @@ def _ensure_characters_registered(data: dict, entities: list) -> int:
 # ── LLM 抽取 ──
 
 def _extract_json(text: str) -> dict | None:
-    """从模型输出中提取 JSON（剥思考/围栏/前后废话），失败返回 None。"""
+    """从模型输出中提取 JSON（剥思考/围栏/前后废话），失败返回 None。
+
+    v2.3.22b0 增强：
+    - NaN/Infinity/-Infinity 替换为 null（模型偶发输出非标准 JSON 数字）
+    - 截断修复：JSON 不完整时（找最大合法前缀），尝试补全闭合括号
+    """
     cleaned = text.strip()
     m = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
     if m:
         cleaned = m.group(1)
     # 去掉思考标记（若有）
     cleaned = re.sub(r"<\|?think\|?>.*?<\|?/\s*think\|?>", "", cleaned, flags=re.DOTALL)
-    # 取第一个 { 到最后一个 }
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start < 0 or end <= start:
+    # 非标准 JSON 数字 → null（模型偶发输出）
+    cleaned = re.sub(r"\b(NaN|Infinity|-Infinity)\b", "null", cleaned)
+    # 取第一个 {
+    start = cleaned.find("{")
+    if start < 0:
         return None
+    # 截断修复：从最后往前找可解析的 JSON 边界（模型可能被 max_new_tokens 截断，
+    # 表现为缺失闭合括号；这里取最大合法前缀 + 补全闭合）
+    end = cleaned.rfind("}")
+    if end < 0:
+        end = len(cleaned)
+    candidate = cleaned[start:end + 1]
     try:
-        obj = json.loads(cleaned[start:end + 1])
-        return obj if isinstance(obj, dict) else None
+        obj = json.loads(candidate)
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
-        return None
+        pass
+    # 最大合法前缀：从末尾逐步缩进，找第一个可解析的完整对象
+    for e in range(end, start, -1):
+        trial = cleaned[start:e]
+        # 补全缺失的闭合括号
+        for depth in range(1, 5):
+            t2 = trial + "}" * depth
+            try:
+                obj = json.loads(t2)
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 def _extract_llm(content: str, char_hint: str) -> dict | None:
-    """Qwen2.5-3B 抽取 {entities, relations, status_changes}；失败返回 None。"""
+    """Qwen2.5-3B 抽取 {entities, relations, status_changes}；失败返回 None。
+
+    v2.3.22b0：few-shot 示例（治本）+ 打回重试最多 3 次（偶发格式漂移兜底）+ WARN 打印原始输出。
+    """
     loaded = _load_extract_model()
     if loaded is None:
         return None
@@ -196,33 +263,148 @@ def _extract_llm(content: str, char_hint: str) -> dict | None:
         "- 只抽有意义的实体（人物/关键事物/概念/地点），不要碎片短语、不要单字\n"
         "- 正文有状态变化（死亡/昏迷/摧毁/修复/苏醒等）才写 status，否则省略\n"
         "- 关系无则 relations 为空数组\n"
+        "输出示例：\n"
+        '{"entities": [{"name": "陈默", "type": "character"}, {"name": "防火墙", "type": "object", "status": "damaged"}], '
+        '"relations": [{"from": "陈默", "predicate": "关闭", "to": "防火墙"}]}\n'
         f"已知角色：{char_hint or '无'}\n"
         f"正文：\n{content}"
     )
-    try:
-        # 走 ChatML（Qwen2 系标准格式） + model.generate：
-        # 不用 pipeline（generation_config 混传导致 max_length=20 生效/BPE 后处理清空输出，实测空输出 288s）
-        # 不用 apply_chat_template（本地 Qwen2.5-3B-Instruct 的 tokenizer.chat_template 缺失）
-        import torch
-        chatml = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        model_inputs = tokenizer(chatml, return_tensors="pt")
-        with torch.no_grad():
-            gen_out = model.generate(
-                model_inputs["input_ids"],
-                max_new_tokens=EXTRACT_MAX_TOKENS,
-                do_sample=False,
-                temperature=0.2,
-                pad_token_id=tokenizer.eos_token_id,
+    import torch
+    last_raw = ""
+    for attempt in range(1, 4):  # 最多 3 次（第 1 次原始 prompt，第 2-3 次带纠错提示）
+        try:
+            # 走 ChatML（Qwen2 系标准格式） + model.generate：
+            # 不用 pipeline（generation_config 混传导致 max_length=20 生效/BPE 后处理清空输出，实测空输出 288s）
+            # 不用 apply_chat_template（本地 Qwen2.5-3B-Instruct 的 tokenizer.chat_template 缺失）
+            chatml = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            model_inputs = tokenizer(chatml, return_tensors="pt")
+            with torch.no_grad():
+                gen_out = model.generate(
+                    model_inputs["input_ids"],
+                    max_new_tokens=EXTRACT_MAX_TOKENS,
+                    do_sample=False,
+                    temperature=0.2,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            raw = tokenizer.decode(gen_out[0][model_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            last_raw = raw
+            result = _extract_json(raw)
+            if result is not None:
+                if attempt > 1:
+                    print(f"  [entity-extract] ✅ 第{attempt}次纠正后解析成功")
+                return result
+            print(f"  [entity-extract] ⚠️ 第{attempt}次输出格式不规范，打回纠正重试...")
+            if attempt == 1:
+                print(f"    [原始输出前200字] {raw[:200]!r}")
+            prompt = (
+                "你上一次的输出不是合法的 JSON 对象（必须是 {\"entities\": [...], \"relations\": [...]} 结构）。\n\n"
+                "你上一次的输出：\n"
+                f"---\n{last_raw[:500]}\n---\n\n"
+                "请忽略上一次输出，重新严格按以下格式输出同一段正文的实体关系，仅输出 JSON 对象，不要任何解释：\n"
+                '{"entities": [{"name": "实体名", "type": "character|object|location|organization|abstract", "status": "..."}], '
+                '"relations": [{"from": "实体名", "predicate": "谓词", "to": "实体名"}]}'
             )
-        raw = tokenizer.decode(gen_out[0][model_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        result = _extract_json(raw)
-        if result is None:
-            print("  [entity-extract] [WARN] 模型输出无法解析为 JSON，本轮抽取跳过")
-            return None
-        return result
-    except Exception as e:
-        print(f"  [entity-extract] [WARN] 抽取调用异常（非阻断）: {e}")
+        except Exception as e:
+            print(f"  [entity-extract] [WARN] 抽取调用异常（第{attempt}次，非阻断）: {e}")
+            if attempt == 3:
+                return None
+            continue
+    print("  [entity-extract] [WARN] 模型 3 次输出均无法解析为 JSON，本轮抽取跳过")
+    return None
+
+
+# ── 正则兜底（LLM 缺失/失败时启用，来源：novel-weaver v1.21.5 正则版改编） ──
+
+def _regex_classify_type(name: str) -> str:
+    """根据名称猜测实体类型（后缀匹配）"""
+    if any(name.endswith(s) for s in LOCATION_SUFFIX):
+        return "location"
+    if any(name.endswith(s) for s in ORGANIZATION_SUFFIX):
+        return "organization"
+    if re.match(r"^[\d.]+%?$", name):
+        return "abstract"
+    return "object"
+
+
+def _regex_extract_noun_entities(text: str) -> list:
+    """从正文中提取疑似实体的名词短语（引号内容/地点后缀/组织后缀/介词后名词）"""
+    candidates = set()
+    for m in re.finditer(r'[「《"\'][^」》"\']{2,8}[」》"\']', text):
+        candidates.add(m.group()[1:-1])
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,6}(?:巷|街|路|区|市|楼|厂|铺|场|院|社|所)", text):
+        candidates.add(m.group())
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,8}(?:公司|集团|协会|联盟|组织)", text):
+        candidates.add(m.group())
+    for m in re.finditer(r"(?<=[的把在被和与到对从给向关于])([\u4e00-\u9fff]{2,6})(?=[，。；：！？\s])", text):
+        candidates.add(m.group(1))
+    return list(candidates)
+
+
+def _regex_extract_status_changes(text: str) -> list:
+    """检测正文中的状态变更关键词，返回 [(实体名, 新状态, 触发词)]"""
+    changes = []
+    for trigger_word, new_status in STATUS_CHANGE_TRIGGERS.items():
+        if trigger_word in text:
+            pattern = rf"(.{{1,8}}){trigger_word}"
+            for m in re.finditer(pattern, text):
+                target = m.group(1).strip()
+                target = re.sub(r"^[的把将被由从给向对与和了]", "", target)
+                target = re.sub(r"[的，。；：！？、\s]+$", "", target)
+                if target and 2 <= len(target) <= 8:
+                    changes.append((target, new_status, trigger_word))
+    return changes
+
+
+def _extract_regex(content: str, char_hint: str) -> dict | None:
+    """正则兜底：从正文提取实体关系（schema 与 _extract_llm 一致，供同一归并管线消费）。
+
+    返回 {"entities": [{"name","type","status"}], "relations": [{"from","predicate","to"}]}。
+    LLM 缺失/失败时调用——不丢数据（降级优于跳过）。
+    """
+    known_chars = {c for c in char_hint.split("，") if c} if char_hint else set()
+    entities = []
+    entities_by_name = {}
+
+    def _add_entity(name, etype, status=None):
+        name = name.strip()
+        if not name or len(name) < 2:
+            return
+        if name in entities_by_name:
+            if status:
+                entities_by_name[name]["status"] = status
+            return
+        ent = {"name": name, "type": etype}
+        if status:
+            ent["status"] = status
+        entities.append(ent)
+        entities_by_name[name] = ent
+
+    # 1. 状态变更
+    for target_name, new_status, trigger in _regex_extract_status_changes(content):
+        # 目标若是已知角色 → character，否则按后缀猜类型
+        etype = "character" if target_name in known_chars else _regex_classify_type(target_name)
+        _add_entity(target_name, etype, new_status)
+    # 2. 名词候选
+    for cand in _regex_extract_noun_entities(content):
+        etype = "character" if cand in known_chars else _regex_classify_type(cand)
+        _add_entity(cand, etype)
+    # 3. 关系（模式匹配，两端取实体名）
+    relations = []
+    for pattern, default_pred in REL_PATTERNS:
+        for m in re.finditer(pattern, content):
+            matched = []
+            for name in entities_by_name:
+                if name in m.group():
+                    matched.append(name)
+            for c in known_chars:
+                if c in m.group() and c not in matched:
+                    _add_entity(c, "character")
+                    matched.append(c)
+            if len(matched) >= 2:
+                relations.append({"from": matched[0], "predicate": default_pred, "to": matched[1]})
+    if not entities and not relations:
         return None
+    return {"entities": entities, "relations": relations}
 
 
 # ── 归并 ──
@@ -292,7 +474,7 @@ def _merge_or_create(new_ent: dict, existing: list, name_emb: dict, bge) -> str:
 
 # ── 主入口 ──
 
-def extract(state_path: str, chapter: str, sub_key: str, content: str):
+def extract(state_path: str, chapter: str, sub_key: str, content: str, force_status: bool = False):
     """从子结构正文 LLM 抽取实体关系，增量合并 entity_tracker。失败非阻断。"""
     sp = Path(state_path)
     if not sp.exists():
@@ -320,12 +502,18 @@ def extract(state_path: str, chapter: str, sub_key: str, content: str):
     result = _extract_llm(content, char_hint)
 
     if result is None:
-        # 抽取失败 → 保存清洗/注册结果，非阻断
+        # LLM 缺失/失败 → 正则兜底（降级优于跳过：不丢数据）
+        result = _extract_regex(content, char_hint)
+        if result is not None:
+            print("  [entity-extract] ⚠️ LLM 抽取不可用，已用正则兜底提取实体关系")
+
+    if result is None:
+        # 正则兜底也空（正文过短/无实体）→ 保存清洗/注册结果，非阻断
         tracker["entities"] = entities
         tracker["relations"] = relations
         data["entity_tracker"] = tracker
         sp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("  [entity-extract] 本轮抽取跳过（模型缺失或失败），实体表已清洗/注册")
+        print("  [entity-extract] 本轮抽取跳过（模型缺失且正则无命中），实体表已清洗/注册")
         return
 
     new_ents = result.get("entities", []) or []
@@ -359,8 +547,12 @@ def extract(state_path: str, chapter: str, sub_key: str, content: str):
                 if e["id"] == eid:
                     e["last_chapter"] = chapter
                     e["last_sub"] = sub_key
-                    if ne.get("status") and not e.get("attributes", {}).get("status"):
-                        e.setdefault("attributes", {})["status"] = ne["status"]
+                    if ne.get("status"):
+                        if force_status:
+                            # force（重构后同步）：状态以新正文为准，覆盖式刷新
+                            e.setdefault("attributes", {})["status"] = ne["status"]
+                        elif not e.get("attributes", {}).get("status"):
+                            e.setdefault("attributes", {})["status"] = ne["status"]
                     break
         else:
             new_count += 1

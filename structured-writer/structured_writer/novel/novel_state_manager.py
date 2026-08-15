@@ -126,7 +126,7 @@ def save_state(path, data, caller="auto"):
     # 硬校验 + summary 字数校验），跳过指纹拦截——否则多章规划时每章注册都会因"新增了
     # 上一章没有的子结构"导致哈希变化而误阻断（指纹只应拦"绕过管道的非法修改"）。
     fp_path = _fingerprint_path(path)
-    if fp_path.exists() and caller not in ("plan-chapter", "replan-novel-sub"):
+    if fp_path.exists() and caller not in ("plan-chapter", "replan-novel-sub", "replan-novel-chapter", "novel-confirm"):
         expected_fp = fp_path.read_text(encoding="utf-8").strip()
         current_fp = _fingerprint(data)
         if current_fp != expected_fp:
@@ -174,8 +174,8 @@ def save_state(path, data, caller="auto"):
     except Exception:
         pass
 
-    # plan-chapter / replan-novel-sub 成功后更新指纹，使后续写入不被误阻断
-    if caller in ("plan-chapter", "replan-novel-sub"):
+    # plan-chapter / replan-novel-sub / replan-novel-chapter / novel-confirm 成功后更新指纹，使后续写入不被误阻断
+    if caller in ("plan-chapter", "replan-novel-sub", "replan-novel-chapter", "novel-confirm"):
         fp_path.parent.mkdir(parents=True, exist_ok=True)
         new_fp = _fingerprint(data)
         fp_path.write_text(new_fp, encoding="utf-8")

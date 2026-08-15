@@ -438,10 +438,12 @@ def plan_novel_outline(topic, template, user_meta, llm_client) -> dict:
 # 子结构规划 + 检查编排
 # ─────────────────────────────────────────────
 
-def plan_chapter_subs(state_path, chapter_id, template, llm_client, hints: str = "") -> list:
+def plan_chapter_subs(state_path, chapter_id, template, llm_client, hints: str = "",
+                      aux_knowledge=None) -> list:
     """步骤6：子结构先行规划（LLM 生成 S01-S05，注册进 state，writing_prompt ≥50 硬校验）
 
-    hints: 章级重规划时的新要求（注入规划 prompt，其余流程不变）
+    hints: 重规划时的新要求（一次性驱动，注入目的层；初规划为空）
+    aux_knowledge: 章级辅助知识 {section_id: {text, files}}（注入参考层，有才渲染）
     返回已注册的 subs 列表
     """
     from .novel_state_manager import load_state
@@ -454,10 +456,11 @@ def plan_chapter_subs(state_path, chapter_id, template, llm_client, hints: str =
     sys_prompt = """你是小说章节规划师。为指定章节规划子结构（S01-S05）。
 【输出规则】只输出 JSON 数组，禁止任何其他文字。格式：
 [{{"s_key":"S01","title":"子结构标题","summary":"概述（≥12有效字符，含动作+人物+事件）","tone":"情绪基调（紧张/平静/悬疑/温馨/愤怒/悲伤/恐惧/欢乐等）","emotions":[{{"type":"情绪","intensity":0.0-1.0}}],"word_count":1200,"writing_prompt":"预编写作命题（≥50字符，含场景建立+核心事件+情绪弧的完整剧情指令）","is_key":false}}]
-【word_count】该段正文目标字数（数字），必须在 user 消息【本章字数目标】的 lo-hi 区间内，**按内容重要度浮动，同章各段不许相同**：重点段（is_key=true）/高潮/冲突爆发段取区间中上或接近上限；普通段取中下；开头/过渡/收尾段可更短。is_key=true 的段 word_count 应明显大于同章普通段。
+【word_count】该段正文目标字数（数字），必须在 user 消息【目的】层的字数档位区间内，**按内容重要度浮动，同章各段不许相同**：重点段（is_key=true）/高潮/冲突爆发段取区间中上或接近上限；普通段取中下；开头/过渡/收尾段可更短。is_key=true 的段 word_count 应明显大于同章普通段。
 【is_key】true = 重点段（本章高潮/冲突爆发/关键转折的段），word_count 给区间中上（重点段目标字数已含上浮，写作按 word_count 执行，无需再放大）；false = 普通段。每章最多 1-2 个重点段。
 【要求】每章 3-5 个子结构；每个 summary 必须因果递进；writing_prompt 必须 ≥50 字符且包含具体剧情指令；末章末子结构 summary 末尾标注收尾类型。
-【新角色声明】若子结构引入了【有名字的具体角色】（如"王医生""老陈"），必须在 summary 中用【新角色: 名字】标注（系统将自动登记）；泛化职业称呼（医生/护士/警察/司机/路人等）和一次性出场人物**不需要**标注；场景配置已有的角色（见 user 消息中场景配置的 characters）无需标注。
+【新角色声明】若子结构引入了【有名字的具体角色】（如"王医生""老陈"），必须在 summary 中用【新角色: 名字】标注（系统将自动登记）；泛化职业称呼（医生/护士/警察/司机/路人等）和一次性出场人物**不需要**标注；场景配置已有的角色（见 user 消息中背景层的场景配置/人物档案）无需标注。
+【优先级】user 消息按【目的】★★★ >【背景】★★ >【参考】★ 分档：目的层必须围绕，背景层必须遵循，参考层尽量参考。
 【完整示例】（照着这个结构填，writing_prompt 必须写足剧情）：
 [
   {"s_key": "S01", "title": "实验室初试", "summary": "林铁生首次接触AI核心，紧张中触发异常警报", "tone": "紧张",
@@ -469,35 +472,12 @@ def plan_chapter_subs(state_path, chapter_id, template, llm_client, hints: str =
    "word_count": 1100,
    "writing_prompt": "导师把林铁生叫到办公室，语气严肃警告不要多管闲事。林铁生注意到导师眼神回避、手指轻敲桌面，他决定暗中调查。", "is_key": false}
 ]"""
-    # 前文状态摘要（防漂移）：已注册章节的子结构 + 角色表 + 行为轨迹
-    # 规模受控（一行一条摘要，不是全量前文），随篇幅增长不线性膨胀
-    prev_plan_lines = []
-    for pc in data.get("chapters", []):
-        if pc["id"] >= chapter_id:
-            break
-        subs_state = pc.get("sub_structures", {}) or {}
-        if not subs_state:
-            continue
-        prev_plan_lines.append(f"{pc['id']}《{pc.get('title','')}》：")
-        for sk in sorted(subs_state.keys()):
-            sv = subs_state[sk]
-            prev_plan_lines.append(f"  {sk} {sv.get('title','')} — {sv.get('summary','')[:40]}（{sv.get('tone','')}）")
-    prev_plan = "\n".join(prev_plan_lines) if prev_plan_lines else "（无前文规划，本章为第一章）"
-    char_lines = [
-        f"{c.get('name','')}[{c.get('role','')}|{c.get('mbti','')}|{c.get('archetype','')}]"
-        for c in data.get("characters", [])
-    ]
-    chars = "、".join(char_lines) if char_lines else "（暂无角色）"
+    # 三层分区上下文（目的/背景/参考 + 人物档案完整性格 + 后续章大纲 + 前文/实体/行为/时间线/辅助知识）
+    context = _build_planning_context(data, chapter_id, hints=hints, lo=lo, hi=hi,
+                                      aux_knowledge=aux_knowledge)
     user_msg = (
-        f"章节：{chapter_id}《{ch_info.get('title','')}》\n"
-        f"章概述：{ch_info.get('overview','')}\n"
-        + (f"【新要求】（章级重规划指令，规划须体现）\n{hints}\n" if hints else "")
-        + f"【本章字数目标】每个子结构约 {lo}-{hi} 字（篇幅档位：短篇1000-1500 / 中篇1500-2000 / 长篇2000-4000）。子结构的数量与单段内容容量须与该档位匹配——篇幅越长，每段内容越充实；篇幅越短，每段越精炼。\n"
-        f"【前文已规划章节】（规划当前章时须与之衔接，伏笔/情绪/角色状态连贯）\n{prev_plan}\n\n"
-        f"【角色表】\n{chars}\n\n"
-        f"场景配置：{json.dumps(data.get('setting', {}), ensure_ascii=False)}\n"
-        f"文风：{json.dumps(data.get('writing_style', {}), ensure_ascii=False)}\n"
-        f"请生成该章子结构 JSON 数组，与前文规划保持因果与情绪连贯。"
+        context
+        + "\n\n请生成该章子结构 JSON 数组，与前文规划保持因果与情绪连贯。"
     )
     messages = [
         {"role": "system", "content": sys_prompt},
@@ -536,13 +516,328 @@ def build_writing_context(state_path, chapter_id, sub_key) -> str:
         return f"（上下文加载降级: {e}）"
 
 
-def replan_novel_sub(state_path, chapter_id, s_key, hints, llm_client) -> dict:
+# ─────────────────────────────────────────────
+# 三层分区上下文构造（plan_chapter_subs / replan_novel_sub 共用）
+# 目的★★★ 必须围绕 / 背景★★ 必须遵循 / 参考★ 尽量参考（空块整段跳过）
+# ─────────────────────────────────────────────
+
+def _fmt_personality(c) -> str:
+    """人物档案单行格式：name[role|MBTI|原型] 特质:... 动机:... 别名:..."""
+    name = c.get("name", "")
+    if not name:
+        return ""
+    parts = [name]
+    role = c.get("role", "")
+    mbti = c.get("mbti", "")
+    arch = c.get("archetype", "")
+    tag = "|".join(x for x in [role, mbti, arch] if x)
+    if tag:
+        parts.append(f"[{tag}]")
+    traits = c.get("traits") or []
+    if traits:
+        parts.append(f"特质:{'/'.join(traits)}")
+    motivation = c.get("motivation", "")
+    if motivation:
+        parts.append(f"动机:{motivation}")
+    aliases = c.get("aliases") or []
+    if aliases:
+        parts.append(f"别名:{'/'.join(aliases)}")
+    return " ".join(parts)
+
+
+def _fmt_prev_plan(data: dict, chapter_id: str) -> str:
+    """前文章节规划摘要（章概述行 + 子结构行），供参考层衔接。"""
+    lines = []
+    for pc in data.get("chapters", []):
+        if pc["id"] >= chapter_id:
+            break
+        subs_state = pc.get("sub_structures", {}) or {}
+        if not subs_state:
+            continue
+        lines.append(f"{pc['id']}《{pc.get('title','')}》概述:{str(pc.get('overview',''))[:80]}")
+        for sk in sorted(subs_state.keys()):
+            sv = subs_state[sk]
+            lines.append(f"  {sk} {sv.get('title','')} — {sv.get('summary','')[:40]}（{sv.get('tone','')}）")
+    return "\n".join(lines) if lines else "（无前文规划，本章为第一章）"
+
+
+def _fmt_next_chapters(data: dict, chapter_id: str) -> str:
+    """后续章节大纲（预告，埋钩子用）：当前章之后所有章 title+overview。"""
+    lines = []
+    all_ch = data.get("chapters", [])
+    start = False
+    for ch in all_ch:
+        if ch["id"] == chapter_id:
+            start = True
+            continue
+        if start:
+            ending = ""
+            ov = str(ch.get("overview", ""))
+            if ch.get("is_final") and ("收尾类型" in ov):
+                ending = f"（{ov[ov.find('收尾类型'):]}）"
+            lines.append(f"{ch['id']}《{ch.get('title','')}》{ov[:60]}{ending}")
+    return "\n".join(lines) if lines else "（本章为最后一章，无后续）"
+
+
+def _fmt_entity_tracker(data: dict) -> str:
+    """实体关系网摘要（前文已写）：实体 + 关系。空则返回空串。"""
+    tracker = data.get("entity_tracker") or {}
+    ents = tracker.get("entities", []) or []
+    rels = tracker.get("relations", []) or []
+    if not ents and not rels:
+        return ""
+    lines = []
+    if ents:
+        for e in ents[:10]:
+            attr = ""
+            if e.get("attributes"):
+                av = " ".join(f"{k}={v}" for k, v in e["attributes"].items() if v)
+                if av:
+                    attr = f" [{av}]"
+            lines.append(f"  {e.get('type','?')}「{e.get('name','')}」{attr}")
+    if rels:
+        name_by_id = {e.get("id"): e.get("name", "") for e in ents}
+        for r in rels[:5]:
+            f_ = name_by_id.get(r.get("from_entity"), "?")
+            t_ = name_by_id.get(r.get("to_entity"), "?")
+            lines.append(f"  {f_} → {r.get('predicate','?')} → {t_}")
+    return "\n".join(lines)
+
+
+def _fmt_behavior_summary(data: dict, chapter_id: str) -> str:
+    """上章行为轨迹（前文章 behavior_summary）。空返回空串。"""
+    all_ch = data.get("chapters", [])
+    idx = next((i for i, c in enumerate(all_ch) if c["id"] == chapter_id), None)
+    if idx is None or idx == 0:
+        return ""
+    prev_ch = all_ch[idx - 1]
+    bs = prev_ch.get("behavior_summary", {}) or {}
+    if not bs:
+        return ""
+    lines = [f"{prev_ch['id']}《{prev_ch.get('title','')}》角色行为："]
+    for name, actions in list(bs.items())[:6]:
+        if actions:
+            lines.append(f"  {name}: {' → '.join(str(a)[:20] for a in actions[:3])}")
+    return "\n".join(lines)
+
+
+def _fmt_timeline(data: dict) -> str:
+    """时间线摘要（最近 5 条，故事进行到第几天）。空返回空串。"""
+    tl = data.get("timeline", []) or []
+    if not tl:
+        return ""
+    lines = []
+    for t in tl[-5:]:
+        day = f"day{t.get('day','?')}" if t.get("day") is not None else str(t.get("time_point", "?"))
+        lines.append(f"  {day}: {str(t.get('event',''))[:40]}")
+    return "\n".join(lines)
+
+
+def _fmt_aux(aux_knowledge, ssid: str = "") -> str:
+    """组装辅助知识（与 novel_writer._build_sub_aux 同语义，供规划阶段注入）。空返回空串。
+
+    aux_knowledge 支持两种形态：
+      {ssid: {text, files}} — 按 id 匹配（段级/章级映射）
+      {text, files}          — 直接单对象（调用方已定位到目标段）
+    """
+    if not aux_knowledge:
+        return ""
+    ak = aux_knowledge
+    if ssid and isinstance(aux_knowledge, dict) and ssid in aux_knowledge:
+        ak = aux_knowledge[ssid]
+    if not isinstance(ak, dict):
+        return ""
+    cmd = ak.get("text", "") or ""
+    parts = []
+    for f in ak.get("files") or []:
+        ftype = f.get("type", "text")
+        fname = f.get("name", "file")
+        if ftype in ("text", "table") and f.get("content"):
+            parts.append(f"[{fname}]\n{str(f['content'])[:3000]}")
+        elif ftype == "table" and f.get("path"):
+            try:
+                from pathlib import Path as _P
+                fp = _P(f["path"])
+                if fp.is_file():
+                    parts.append(f"[{fname}]\n{fp.read_text(encoding='utf-8-sig', errors='ignore')[:3000]}")
+            except Exception:
+                pass
+    if cmd:
+        parts.insert(0, cmd)
+    return "\n\n---\n\n".join(parts) if parts else ""
+
+
+def _build_planning_context(data, chapter_id, hints="", lo=1000, hi=1500,
+                            aux_knowledge=None, target_subs=None, prev_plan_extra=None) -> str:
+    """三层分区规划上下文（plan_chapter_subs / replan_novel_sub 共用）。
+
+    目的★★★：当前章/段 + 字数档位 + 新要求 hints（重规划时一次性驱动）
+    背景★★：原始需求 / 场景配置 / 文风 / 人物档案(完整) / 后续章节大纲
+    参考★：前文摘要 / 实体关系网 / 上章行为轨迹 / 时间线 / 辅助知识（有数据才渲染）
+
+    target_subs: replan_novel_sub 专用——同章其他段摘要 + 该段完整原规划（参考层）。
+    prev_plan_extra: replan_novel_sub 专用——额外的段级上下文文本（拼接进前文区）。
+    """
+    ch_info = next((c for c in data.get("chapters", []) if c["id"] == chapter_id), None)
+    ch_title = (ch_info or {}).get("title", chapter_id)
+    ch_overview = str((ch_info or {}).get("overview", ""))
+
+    # ── 目的层 ──
+    target_desc = f"当前章：{chapter_id}《{ch_title}》"
+    if ch_overview:
+        target_desc += f" 概述：{ch_overview[:120]}"
+    if target_subs:
+        target_desc += f"\n目标子结构（内部编号 {target_subs.get('s_key','')} 沿用不变、仅供定位，禁止写入 title）：《{target_subs.get('title','')}》"
+    hints_line = f"【新要求】（本次规划的唯一方向输入，必须体现在输出中）：\n{hints}\n" if hints else ""
+    goal = (
+        "【目的】★★★ 最高优先 — 本章子结构规划必须围绕以下目标\n"
+        f"  {target_desc}\n"
+        f"  字数档位：每个子结构约 {lo}-{hi} 字\n"
+        + (f"  {hints_line}" if hints_line else "")
+    )
+
+    # ── 背景层 ──
+    bg_lines = []
+    # 原始需求（全量注入：用户原始输入是意图根源，任何截断都会丢失需求细节）
+    project = str(data.get("project", "")).strip()
+    if project:
+        bg_lines.append(f"【原始需求】（用户最初输入，全量，必须遵循）：\n{project}")
+    # 场景配置
+    setting = data.get("setting") or {}
+    if setting:
+        bg_lines.append(f"【场景配置】：\n{json.dumps(setting, ensure_ascii=False)[:800]}")
+    # 文风
+    ws = data.get("writing_style") or {}
+    if ws:
+        bg_lines.append(f"【文风】：\n{json.dumps(ws, ensure_ascii=False)[:500]}")
+    # 人物档案（完整性格）
+    char_lines = [_fmt_personality(c) for c in data.get("characters", []) if _fmt_personality(c)]
+    if char_lines:
+        bg_lines.append("【人物档案】（言行须符合性格设定）：\n" + "\n".join(char_lines))
+    # 后续章节大纲
+    next_ch = _fmt_next_chapters(data, chapter_id)
+    if next_ch and "（本章为最后一章" not in next_ch:
+        bg_lines.append(f"【后续章节大纲】（未写，仅预告，用于埋钩子）：\n{next_ch}")
+    background = (
+        "【背景】★★ 必须遵循 — 剧情一致性硬约束，规划必须符合\n"
+        + "\n\n".join(bg_lines) if bg_lines else "【背景】★★ 必须遵循\n（无）"
+    )
+
+    # ── 参考层 ──
+    ref_lines = []
+    # 前文规划摘要（含章概述行）
+    prev_plan = _fmt_prev_plan(data, chapter_id)
+    ref_lines.append(f"【前文章节规划】（衔接参考）：\n{prev_plan}")
+    if prev_plan_extra:
+        ref_lines.append(prev_plan_extra)
+    # 实体关系网
+    ent = _fmt_entity_tracker(data)
+    if ent:
+        ref_lines.append(f"【实体关系网】（前文已写）：\n{ent}")
+    # 上章行为轨迹
+    beh = _fmt_behavior_summary(data, chapter_id)
+    if beh:
+        ref_lines.append(f"【上章行为轨迹】：\n{beh}")
+    # 时间线
+    tl = _fmt_timeline(data)
+    if tl:
+        ref_lines.append(f"【时间线】（故事进行到）：\n{tl}")
+    # 辅助知识（段级：target_subs 的 s_key；章级：无 target_subs 时用 chapter_id 或直传单对象）
+    if aux_knowledge:
+        ak_id = ""
+        if target_subs:
+            ak_id = target_subs.get("s_key", "")
+        elif not isinstance(aux_knowledge, dict) or ("text" in aux_knowledge or "files" in aux_knowledge):
+            ak_id = ""   # 直传单对象
+        else:
+            ak_id = chapter_id  # {id: {...}} 映射按章 id 匹配
+        aux_text = _fmt_aux(aux_knowledge, ak_id)
+        if aux_text:
+            ref_lines.append(f"【辅助知识】（用户指定参考内容，请优先采用，化用进叙事）：\n{aux_text}")
+    reference = (
+        "【参考】★ 尽量参考 — 前文已生成事实，有则参考，无则跳过\n"
+        + "\n\n".join(ref_lines) if ref_lines else "【参考】★ 尽量参考\n（无）"
+    )
+
+    return f"{goal}\n\n{background}\n\n{reference}"
+
+
+def replan_novel_chapter(state_path, chapter_id, hints, llm_client) -> dict:
+    """章级重规划：重做单个章级大纲条目（title + overview），不碰子结构。
+
+    两级分离语义：章级大纲与子结构是两个阶段，章级重规划只重写章条目本身；
+    子结构是写作阶段逐章规划（plan_chapter_subs），与本函数无关。
+    hints 为一次性输入（驱动重写方向），重写完成即消费，不留存。
+
+    更新 novel_state.json 的 chapters[].title/overview（caller=replan-novel-chapter 跳过指纹并刷新）。
+    返回 {"title", "overview"}（供 session outline 同步）。
+    """
+    from .novel_state_manager import load_state, save_state
+    data = load_state(state_path)
+    ch_info = next((c for c in data.get("chapters", []) if c["id"] == chapter_id), None)
+    if ch_info is None:
+        raise ValueError(f"章节 {chapter_id} 未找到")
+    sys_prompt = """你是小说章级大纲重规划师。根据新要求重写【单个章级条目】（章标题 + 章概述），其余章节不变。
+【输出规则】只输出 JSON 对象（不是数组），禁止任何其他文字。格式：
+{"title":"章标题（≤12字，精炼有记忆点）","overview":"章概述（≥12有效字符，必须含因果动词：因为/所以/导致/发现/决定/开始/被迫/意识到，描述"谁做了什么事导致什么"）"}
+【保持】章 ID 不变；is_key 不变；末章若为最后一章，overview 末尾保留【收尾类型: 封闭式/开放式/悬停式】三选一。
+【新要求】必须体现在重写后的 title 和 overview 中（hints 是本次重写的唯一方向输入）。"""
+    # 上下文：前后章标题（供因果衔接参考）
+    all_ch = data.get("chapters", [])
+    idx = next((i for i, c in enumerate(all_ch) if c["id"] == chapter_id), 0)
+    prev_line = ""
+    next_line = ""
+    if idx > 0:
+        prev_line = f"前章: {all_ch[idx-1]['id']}《{all_ch[idx-1].get('title','')}》概述:{str(all_ch[idx-1].get('overview',''))[:60]}"
+    if idx + 1 < len(all_ch):
+        next_line = f"后章: {all_ch[idx+1]['id']}《{all_ch[idx+1].get('title','')}》概述:{str(all_ch[idx+1].get('overview',''))[:60]}"
+    user_msg = (
+        f"章节：{chapter_id}《{ch_info.get('title','')}》\n"
+        f"原概述：{ch_info.get('overview','')}\n"
+        f"【新要求】{hints or '（无，按原方向优化重写）'}\n"
+        + (f"{prev_line}\n" if prev_line else "")
+        + (f"{next_line}\n" if next_line else "")
+        + (f"【原始需求】（用户最初输入，全量，章级条目须符合整体意图）：\n{str(data.get('project','')).strip()}\n" if str(data.get("project", "")).strip() else "")
+        + f"场景配置：{json.dumps(data.get('setting', {}), ensure_ascii=False)}\n"
+        f"文风：{json.dumps(data.get('writing_style', {}), ensure_ascii=False)}\n"
+        f"请重写该章级条目的 JSON 对象。"
+    )
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_msg},
+    ]
+    obj = _llm_json(messages, llm_client, f"章级重规划 {chapter_id}")
+    if not isinstance(obj, dict):
+        raise ValueError(f"[章级重规划 {chapter_id}] LLM 未返回对象")
+    new_title = str(obj.get("title", ch_info.get("title", ""))).strip()
+    new_overview = str(obj.get("overview", ch_info.get("overview", ""))).strip()
+    # 概述硬校验（与 verify_causality 同规则：≥12 有效字符 + 因果动词）
+    import re as _re
+    clean_ov = _re.sub(r"[\s,，。！？、；：\"\"''【】《》（）\n\t]", "", new_overview)
+    if len(clean_ov) < 12:
+        raise ValueError(f"[章级重规划 {chapter_id}] 概述过短（{len(clean_ov)}有效字符 < 12），拒绝更新")
+    if not any(v in new_overview for v in CAUSAL_VERBS):
+        raise ValueError(f"[章级重规划 {chapter_id}] 概述缺少因果动词（因为/所以/导致/发现/决定/开始/被迫/意识到），拒绝更新")
+    if not new_title:
+        raise ValueError(f"[章级重规划 {chapter_id}] 标题为空，拒绝更新")
+    # 更新 state（保留 id/is_key/is_final/sub_structures）
+    ch_info["title"] = new_title
+    ch_info["overview"] = new_overview
+    save_state(state_path, data, caller="replan-novel-chapter")
+    return {"title": new_title, "overview": new_overview}
+
+
+def replan_novel_sub(state_path, chapter_id, s_key, hints, llm_client,
+                     aux_knowledge=None) -> dict:
     """段级重规划：单个子结构重新生成（保留 s_key/word_count/status/word_count_target，
     重做 title/summary/tone/emotions/writing_prompt）。
 
     与通用线 replan_section 的区别：保留小说字段（tone/emotions/writing_prompt≥50），
     更新 novel_state.json 的 sub_structures[s_key]（caller=replan-novel-sub 跳过指纹并刷新）。
     返回新子结构（供 session outline 同步）。
+
+    hints: 一次性驱动输入（目的层）；aux_knowledge: 段级辅助知识 {section_id: {...}}（参考层）。
+    参考层含：同章其他段摘要 + 该段完整原规划（精修基线，防段间脱节）。
     """
     from .novel_state_manager import load_state, save_state
     data = load_state(state_path)
@@ -558,36 +853,43 @@ def replan_novel_sub(state_path, chapter_id, s_key, hints, llm_client) -> dict:
     sys_prompt = """你是小说子结构重规划师。根据新要求重新规划【单个子结构】，其余子结构不变。
 【输出规则】只输出 JSON 对象（不是数组），禁止任何其他文字。格式：
 {"title":"子结构标题","summary":"概述（≥12有效字符，含动作+人物+事件）","tone":"情绪基调","emotions":[{"type":"情绪","intensity":0.0-1.0}],"writing_prompt":"预编写作命题（≥50字符，含场景建立+核心事件+情绪弧的完整剧情指令）"}
-【新角色声明】若引入有名字的具体角色（如"王医生""老陈"），必须在 summary 中用【新角色: 名字】标注（系统将自动登记）；泛化职业（医生/护士/警察等）不需要标注。"""
-    prev_lines = []
-    for pc in data.get("chapters", []):
-        if pc["id"] >= chapter_id:
-            break
-        psubs = pc.get("sub_structures", {}) or {}
-        if not psubs:
+【s_key】该子结构的内部编号（如 S05）由系统沿用原值，你无需输出编号、不得生成新编号；title 只写标题文字本身，禁止包含 S 编号、书名号《》或任何编号前缀（如"S05 苏醒""S05《苏醒》"均违规）。
+【新角色声明】若引入有名字的具体角色（如"王医生""老陈"），必须在 summary 中用【新角色: 名字】标注（系统将自动登记）；泛化职业（医生/护士/警察等）不需要标注。
+【优先级】user 消息按【目的】★★★ >【背景】★★ >【参考】★ 分档：目的层（含新要求）必须围绕，背景层必须遵循，参考层尽量参考。"""
+    # 同章其他段摘要（防重规划段与同章脱节）
+    other_subs = []
+    for sk2 in sorted(subs_state.keys()):
+        if sk2 == s_key:
             continue
-        prev_lines.append(f"{pc['id']}《{pc.get('title','')}》：")
-        for sk in sorted(psubs.keys()):
-            sv = psubs[sk]
-            prev_lines.append(f"  {sk} {sv.get('title','')} — {sv.get('summary','')[:40]}（{sv.get('tone','')}）")
-    prev_plan = "\n".join(prev_lines) if prev_lines else "（无前文规划）"
-    char_lines = [
-        f"{c.get('name','')}[{c.get('role','')}|{c.get('mbti','')}|{c.get('archetype','')}]"
-        for c in data.get("characters", [])
-    ]
-    chars = "、".join(char_lines) if char_lines else "（暂无角色）"
-    user_msg = (
-        f"章节：{chapter_id}《{ch_info.get('title','')}》\n"
-        f"要重规划的子结构：{s_key}《{old.get('title','')}》\n"
-        f"原概述：{old.get('summary','')}\n"
-        f"新要求：{hints or '（无，按原方向优化）'}\n"
-        f"【字数目标】该子结构约 {lo}-{hi} 字（篇幅档位约束，内容容量须匹配）\n"
-        f"【前文已规划章节】\n{prev_plan}\n\n"
-        f"【角色表】\n{chars}\n\n"
-        f"场景配置：{json.dumps(data.get('setting', {}), ensure_ascii=False)}\n"
-        f"文风：{json.dumps(data.get('writing_style', {}), ensure_ascii=False)}\n"
-        f"请重新生成该子结构 JSON 对象。"
+        sv2 = subs_state[sk2]
+        other_subs.append(f"  {sk2} {sv2.get('title','')} — {sv2.get('summary','')[:50]}（{sv2.get('tone','')}）")
+    # 该段完整原规划（精修基线）
+    old_wp = str(old.get("writing_prompt", ""))
+    old_emos = ""
+    if isinstance(old.get("emotions"), list) and old["emotions"]:
+        old_emos = " ".join(f"{e.get('type','')}:{e.get('intensity','')}" for e in old["emotions"])
+    orig_plan = (
+        f"原 title: {old.get('title','')}\n"
+        f"原 summary: {old.get('summary','')}\n"
+        f"原 tone: {old.get('tone','')}\n"
+        + (f"原 emotions: {old_emos}\n" if old_emos else "")
+        + (f"原 is_key: {old.get('is_key','')}\n" if old.get('is_key') is not None else "")
+        + (f"原 writing_prompt: {old_wp[:150]}\n" if old_wp else "")
     )
+    # 目标段信息（供目的层 + 辅助知识匹配）
+    target_subs = {"s_key": s_key, "title": old.get("title", "")}
+    prev_plan_extra = (
+        f"【同章其他子结构】（重规划该段时须与之衔接）：\n"
+        + ("\n".join(other_subs) if other_subs else "（本章无其他子结构）")
+        + f"\n\n【该段完整原规划】（精修基线，新规划应在原方向上优化，不推翻整体）：\n{orig_plan}"
+    )
+    # 三层分区上下文（目的含 hints；背景含人物档案/后续章大纲；参考含前文/实体/行为/时间线/同章段/原规划/段级辅助知识）
+    context = _build_planning_context(
+        data, chapter_id, hints=hints, lo=lo, hi=hi,
+        aux_knowledge=aux_knowledge, target_subs=target_subs,
+        prev_plan_extra=prev_plan_extra,
+    )
+    user_msg = context + "\n\n请重新生成该子结构 JSON 对象。"
     messages = [
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": user_msg},

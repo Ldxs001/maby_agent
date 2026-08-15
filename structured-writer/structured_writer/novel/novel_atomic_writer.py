@@ -158,21 +158,24 @@ def validate_and_write_body(body_text, filepath, chapter, sub_key, title,
                         print(f"[HOOK-BLOCK] 正文第{i}行署名与配置值不匹配: {line.strip()}")
                         return False
 
-    # ── 组装最终内容（系统生成标题行+别名行+标记行）──
-    final_lines = [title_line, "", clean_body, alias_line]
-    final_content = "\n".join(final_lines)
+    # ── 组装最终内容（系统生成标题行+别名行+末行标记，一次成型）──
+    # v5：真原子写——先写 tmp 再 os.replace（与 _write_sub_inline 一致）。
+    # 旧版两段式（w 写正文 + a 追加末行）中断会缺末行标记 → 改为单文件原子替换，
+    # 中断只留 .tmp 残留，目标文件要么旧完整版要么新完整版，绝不半写。
+    final_lines = [title_line, "", clean_body, alias_line, sub_marker]
+    final_content = "\n".join(final_lines) + "\n"
 
-    # ── 原子写入（不含末行标记，由最后一步追加）──
-    with open(fp, "w", encoding="utf-8") as f:
+    tmp = fp.with_suffix(fp.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(final_content)
         f.flush()
         os.fsync(f.fileno())
+    os.replace(tmp, fp)
 
-    # ── 追加子结构编号标记 ──
-    with open(fp, "a", encoding="utf-8") as f:
-        f.write(f"\n{sub_marker}\n")
-        f.flush()
-        os.fsync(f.fileno())
+    # ── 落盘回读校验：文件真实存在且非空才算成功（防 0 字节假标记）──
+    if not fp.is_file() or fp.stat().st_size == 0:
+        print(f"[HOOK-BLOCK] 落盘回读校验失败 {filepath}: 文件缺失或 0 字节")
+        return False
 
     print(f"[WRITE-OK] {filepath}")
     print(f"  标题: {title_line}")
