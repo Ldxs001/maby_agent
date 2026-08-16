@@ -108,10 +108,9 @@ class StateManager:
                     "sub_sections": s.get("sub_sections", []),
                 }
                 break
-        # 修复引擎章级触发：finalize 后有 HARD 且未修复的章
-        # （前端轮询发现 repair_pending 非空即弹修复面板，不依赖 phase/status_text）
-        # 取"最近 finalize 的待修复章"——不 break，遍历全部章，最后命中的就是最新的
-        # （避免旧章 HARD 永远占位挡住新章；写一章弹一章的语义）
+        # 修复引擎章级触发：章检（finalize-chapter 写 issues）与全文三检（finalize-novel 写 full_items）
+        # 是串行的两个功能点位——最后一章章检通过后才触发全文三检，同一章不会同时有 issues 和 full_items。
+        # 一套循环统一判定两个字段，覆盖式最近章（前端轮询发现 repair_pending 非空即弹修复面板）。
         repair_pending = None
         hints = self._state.get("_repair_hints", {})
         if self._state.get("phase") in ("writing", "done"):
@@ -120,16 +119,21 @@ class StateManager:
                 hint = hints.get(ch)
                 if not hint:
                     continue
-                # 判定依据：issues 非空 = 有 HARD/FAIL 行需要修复（ok 字段可能被旧数据污染，不可信）
-                if not hint.get("issues"):
-                    continue  # 无 HARD，无需修复
-                # 有 HARD/FAIL 且该章未标记"已修复/已跳过" → 待弹面板（覆盖式：最后命中=最近章）
+                issues = hint.get("issues") or []
+                full_items = hint.get("full_items") or []
+                # 判定依据：章检 HARD/FAIL 行（SOFT 非阻断——不触发弹窗，仅进修复面板展示）
+                # 或三检 full_items 非空 = 有待处理
+                hard_lines = [ln for ln in issues if "[HARD]" in ln or "[FAIL]" in ln]
+                if not hard_lines and not full_items:
+                    continue
+                # 该章未标记"已处理/已跳过" → 待弹面板（覆盖式：最后命中=最近章）
                 if not hint.get("_repaired"):
                     repair_pending = {
                         "chapter": ch,
                         "section_id": s["id"],
-                        "issues": hint.get("issues", [])[:20],
+                        "issues": issues[:20],
                         "has_output": bool(hint.get("output")),
+                        "full_items": full_items,
                     }
         return {
             "total": total_subs,

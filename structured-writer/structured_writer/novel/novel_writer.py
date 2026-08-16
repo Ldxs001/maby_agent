@@ -605,15 +605,15 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
             state_mgr.update_section(sid, {"status": "pending"})
             continue
 
-        # 章检六检（规则4检 + bge/R1，子进程；失败不阻断主流程；开关控制）
+        # 章检（4维 3B + 格式 + 逻辑 + 推理R1，子进程；失败不阻断主流程；开关控制）
         # 顺序：先检后标 done——finalize 是章级裁判，有 HARD → 拦截等修复，通过后才标 done
-        # 判定用 issues 非空（HARD/FAIL 行）而非 fc.ok——ok 是子进程退出码==0，
-        # 有 HARD 时 workflow_engine 只写 fixes 正常 return（退出码 0），ok 恒 True，不可信。
+        # 判定用 HARD/FAIL 行（issues 现在含 SOFT 非阻断项，供弹窗显示但不拦截）而非 fc.ok——
+        # ok 是子进程退出码==0，有 HARD 时 workflow_engine 只写 fixes 正常 return（退出码 0），ok 恒 True，不可信。
         _fc_final = None
         try:
             fc = novel_bridge.finalize_novel_chapter(state_path, chapter_id, checks=_checks)
             _fc_final = fc
-            _has_hard = bool(fc.get("issues"))
+            _has_hard = any(("[HARD]" in ln or "[FAIL]" in ln) for ln in (fc.get("issues") or []))
             if _has_hard:
                 state_mgr.set_status_text(f"章检发现 HARD 问题: {chapter_id}（等待修复）")
             # 保存章检结果到 state（供前端修复面板读取：T0/T1 分级清单）
@@ -622,7 +622,7 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
                     "chapter": chapter_id,
                     "ok": fc.get("ok", False),
                     "timeout": fc.get("timeout", False),
-                    "issues": fc.get("issues", []),           # HARD/FAIL 行
+                    "issues": fc.get("issues", []),           # HARD/FAIL/SOFT 行（SOFT 供弹窗显示，不阻断）
                     "output": (fc.get("output") or "")[-3000:],  # 完整 stdout（含 SOFT）
                 }
                 state_mgr.save_repair_hint(chapter_id, _checks_result)
@@ -656,13 +656,14 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
                         "_repaired": True,
                     }
                     state_mgr.save_repair_hint(chapter_id, _checks_result2)
-                    if not fc2.get("issues"):
+                    # 重检通过 = 无 HARD/FAIL（SOFT 残留不阻断，避免 SOFT 修不完死循环）
+                    if not any(("[HARD]" in ln or "[FAIL]" in ln) for ln in (fc2.get("issues") or [])):
                         break  # 重检通过（issues 无 HARD）
                     # 重检仍 HARD → 重置 _repaired，再弹面板等下一轮修复
                     _checks_result3 = dict(_checks_result2)
                     _checks_result3["_repaired"] = False
                     state_mgr.save_repair_hint(chapter_id, _checks_result3)
-                if _fc_final is None or _fc_final.get("issues"):
+                if _fc_final is None or any(("[HARD]" in ln or "[FAIL]" in ln) for ln in (_fc_final.get("issues") or [])):
                     # 3 轮仍 HARD → 章回 pending 交人工（正文保留，可手动改后重 finalize）
                     state_mgr.update_section(sid, {"status": "pending"})
                     state_mgr.set_status_text(f"{chapter_id} 修复 {_repair_rounds} 轮仍未通过，章回 pending 待人工处理")
@@ -694,6 +695,25 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
     state_mgr.set_status_text("全文质检中（忠实度+结尾收束）…")
     try:
         fn = novel_bridge.finalize_novel_full(state_path, checks=_checks)
+        # 三检修复项同步进 session._repair_hints（统一存储：与章检 issues 同层同判定）
+        # finalize-novel 子进程只拿 state_path，写 novel_state._full_repair；这里桥接进 session
+        try:
+            _d = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
+            _fr = _d.get("_full_repair") or {}
+            if _fr:
+                _hints = state_mgr._state.get("_repair_hints") or {}
+                for _ch, _v in _fr.items():
+                    _items = _v.get("items") or []
+                    if not _items:
+                        continue
+                    _h = _hints.get(_ch) or {}
+                    _h["full_items"] = _items
+                    _h.setdefault("_repaired", False)
+                    _hints[_ch] = _h
+                state_mgr._state["_repair_hints"] = _hints
+                state_mgr.save()
+        except Exception as _e:
+            _logger.error(f"三检修复项同步 session 异常: {_e}")
         if fn.get("issues"):
             article_md += "\n\n---\n\n## 质检报告（HARD/FAIL 问题）\n\n" + "\n".join(f"- {i}" for i in fn["issues"][:20])
         elif fn.get("output"):

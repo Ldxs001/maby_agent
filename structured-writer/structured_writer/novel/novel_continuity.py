@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Continuity Check — 连通性补充与校验
+Continuity Check — 章内连通性补充与校验
 - check: 章内子结构首尾3行连续性（时间词重叠）
-- cross-chapter: 跨章承诺链检查（上一章尾的关键词是否在下一章头被续接）
 - auto-fix: 生成过渡信息
+- _extract_keywords: 动态关键词提取（供 fidelity_check 复用）
+（跨章承诺检查 cross_chapter 已废弃删除，由全文三检的承诺检查替代）
 """
 import json, sys, re
 from pathlib import Path
@@ -173,113 +174,18 @@ def _extract_keywords(data):
     return kws
 
 
-def cross_chapter(state_path, chapters_dir):
-    """
-    跨章承诺链检查（通用版，无硬编码）：
-    从 novel_state.json 动态提取关键词，检测上章尾 vs 下章头的匹配度。
-    """
-    sp = Path(state_path)
-    data = json.loads(sp.read_text(encoding="utf-8-sig"))
-    chs = [c["id"] for c in data.get("chapters", []) if c.get("status") == "completed"]
-
-    # 动态提取关键词
-    kw_set = _extract_keywords(data)
-    # 按长度降序排列（避免长词被短词的前缀覆盖）
-    kw_list = sorted(kw_set, key=len, reverse=True)
-    if not kw_list:
-        print("[跨章检查] 无可用关键词（characters/technical_notes 为空）")
-        return []
-    key_pattern = re.compile('|'.join(re.escape(p) for p in kw_list))
-
-    issues = []
-    for i in range(len(chs) - 1):
-        prev_ch = chs[i]
-        next_ch = chs[i + 1]
-        prev_dir = Path(chapters_dir) / prev_ch
-        next_dir = Path(chapters_dir) / next_ch
-
-        prev_files = sorted(prev_dir.glob("S*.txt"))
-        if not prev_files:
-            continue
-        last_file = prev_files[-1]
-        last_content = last_file.read_text(encoding="utf-8-sig").strip()
-        last_lines = [l for l in last_content.split("\n") if l.strip() and not re.match(rf'{prev_ch}S\d+', l.strip())]
-        prev_tail = "\n".join(last_lines[-3:]) if len(last_lines) >= 3 else "\n".join(last_lines)
-
-        next_files = sorted(next_dir.glob("S*.txt"))
-        if not next_files:
-            continue
-        first_file = next_files[0]
-        first_content = first_file.read_text(encoding="utf-8-sig").strip()
-        first_lines = [l for l in first_content.split("\n") if l.strip() and not re.match(rf'{next_ch}S\d+', l.strip())]
-        next_head = "\n".join(first_lines[:3]) if len(first_lines) >= 3 else "\n".join(first_lines)
-
-        tail_keys = set(key_pattern.findall(prev_tail))
-        head_keys = set(key_pattern.findall(next_head))
-
-        # 只报告实际缺失的语义关键词（排除单字/通用语气词）
-        missing = tail_keys - head_keys
-        missing = {w for w in missing if len(w) >= 2}
-
-        print(f"\n--- {prev_ch} -> {next_ch} ---")
-        print(f"  尾: {prev_tail[:80]}...")
-        print(f"  头: {next_head[:80]}...")
-
-        if missing:
-            print(f"  [WARN] 未续接的承诺: {missing}")
-            issues.append({
-                "from_chapter": prev_ch,
-                "to_chapter": next_ch,
-                "prev_tail": prev_tail[:100],
-                "next_head": next_head[:100],
-                "unresolved_promises": list(missing)
-            })
-        else:
-            print(f"  [OK] 承诺链完整")
-
-    sp = Path(state_path)
-    if sp.exists():
-        data = json.loads(sp.read_text(encoding="utf-8-sig"))
-        data["cross_chapter_check"] = issues
-        sp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    if not issues:
-        print("\n[跨章检查] 全部通过")
-    else:
-        print(f"\n[跨章检查] 发现 {len(issues)} 处断点")
-        for iss in issues:
-            print(f"  [WARN] {iss['from_chapter']} -> {iss['to_chapter']}: {iss['unresolved_promises']}")
-
-    # 转为结构化结果（带 severity + suggestion）
-    structured = []
-    for iss in issues:
-        missing_str = ", ".join(iss["unresolved_promises"][:5])
-        structured.append({
-            "file": f"{iss['from_chapter']} → {iss['to_chapter']}",
-            "problem": f"上章承诺关键词 [{missing_str}] 未在 {iss['to_chapter']} 开头续接",
-            "position": f"{iss['to_chapter']} 开头3行",
-            "severity": "SOFT",
-            "suggestion": f"在{iss['to_chapter']}开头通过叙事自然提及 [{missing_str}]"
-        })
-
-    return structured
-
-
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print("用法:")
         print("  章内: python novel_continuity.py check <chapter_dir> <chapter> <state_path>")
         print("    → chapter_dir 可省略（用 . 占位），自动从 state_path 推导: {state_path}/../chapters/<chapter>")
         print("    → 示例: python novel_continuity.py check L02 <state_path>")
-        print("  跨章: python novel_continuity.py cross-chapter <state_path> <chapters_dir>")
         print("  fix:  python novel_continuity.py auto-fix <chapter_dir> <chapter> <state_path>")
         sys.exit(1)
 
     cmd = sys.argv[1]
     if cmd == "check":
         check_continuity(sys.argv[2], sys.argv[3], sys.argv[4])
-    elif cmd == "cross-chapter":
-        cross_chapter(sys.argv[2], sys.argv[3])
     elif cmd == "auto-fix":
         auto_fix(sys.argv[2], sys.argv[3])
         if len(sys.argv) > 4:

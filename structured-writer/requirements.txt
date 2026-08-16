@@ -1,3 +1,11 @@
 # Structured Writer 依赖
 # Python 标准库（无第三方 Web 框架依赖）
 # 仅需要 LLM 后端服务（LM Studio / Ollama）在外部运行
+#
+# ── 本地 R1/3B 推理（可选功能，非 pip install -r 强制） ──
+# 章内推理审核（DeepSeek-R1-Distill-Qwen-1.5B）与实体提取/4维判定/忠实度复核
+# （Qwen2.5-3B-Instruct）需要以下包；缺失时 setup.bat 启动阶段自动安装
+# （python -m structured_writer.novel.model_env_check，阿里云镜像）：
+#   transformers
+#   torch
+#   accelerate（可选，单卡小模型不需要）

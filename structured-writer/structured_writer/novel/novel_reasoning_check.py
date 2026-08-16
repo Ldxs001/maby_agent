@@ -260,17 +260,18 @@ def _build_prompt(data, chapter, chapter_dir) -> str:
 
 [输出要求]
 以 JSON 数组格式输出, 每项格式:
-{{"dimension": "维度名", "result": "PASS"|"HARD"|"SOFT", "detail": "具体说明(20-50字)"}}
-
+{{"dimension": "维度名", "result": "PASS"|"HARD"|"SOFT", "detail": "具体说明(20-50字)", "sub": "涉及的具体子结构编号"}}
+sub 字段：从[正文预览]的段标识（-- S01 -- 等）定位该问题主要涉及的子结构，填 "S01"/"S02"...；
+不涉及具体某段（整章性/跨段问题）或无法定位时填 null。
 必须包含全部 5 个维度, 仅输出 JSON 数组, 不要有其他文字.
 
 [输出示例]
 [
-  {{"dimension": "因果合理性", "result": "PASS", "detail": "前文铺垫充分，转折逻辑合理"}},
-  {{"dimension": "人物行为一致性", "result": "SOFT", "detail": "角色情绪转变略显突兀，缺过渡铺垫"}},
-  {{"dimension": "情绪弧自然度", "result": "PASS", "detail": "情绪递进自然，与事件节奏匹配"}},
-  {{"dimension": "对话匹配度", "result": "HARD", "detail": "对话用词超出角色设定，与身份不符"}},
-  {{"dimension": "论证可靠性", "result": "PASS", "detail": "推理链条完整，无逻辑漏洞"}}
+  {{"dimension": "因果合理性", "result": "PASS", "detail": "前文铺垫充分，转折逻辑合理", "sub": null}},
+  {{"dimension": "人物行为一致性", "result": "SOFT", "detail": "角色情绪转变略显突兀，缺过渡铺垫", "sub": "S03"}},
+  {{"dimension": "情绪弧自然度", "result": "PASS", "detail": "情绪递进自然，与事件节奏匹配", "sub": null}},
+  {{"dimension": "对话匹配度", "result": "HARD", "detail": "对话用词超出角色设定，与身份不符", "sub": "S02"}},
+  {{"dimension": "论证可靠性", "result": "PASS", "detail": "推理链条完整，无逻辑漏洞", "sub": null}}
 ]"""
     return prompt
 
@@ -387,17 +388,17 @@ def check_reasoning(state_path, chapter, chapter_dir):
         # 解析失败 → 打回纠正：把原始输出 + 错误说明喂回，要求重新按格式输出
         print(f"  [推理审核] ⚠️ 第{attempt}次输出格式不规范，打回纠正重试...")
         prompt = (
-            "你上一次的输出格式不符合要求（必须是 JSON 数组，每项含 dimension/result/detail，"
+            "你上一次的输出格式不符合要求（必须是 JSON 数组，每项含 dimension/result/detail/sub，"
             "result 只能是 PASS/HARD/SOFT 之一）。\n\n"
             "你上一次的输出如下：\n"
             f"---\n{last_raw[:800]}\n---\n\n"
             "请忽略上一次输出，重新严格按以下 JSON 数组格式审核同一章节，仅输出 JSON 数组，不要任何解释：\n"
             "[\n"
-            '  {"dimension": "因果合理性", "result": "PASS|HARD|SOFT", "detail": "说明"},\n'
-            '  {"dimension": "人物行为一致性", "result": "PASS|HARD|SOFT", "detail": "说明"},\n'
-            '  {"dimension": "情绪弧自然度", "result": "PASS|HARD|SOFT", "detail": "说明"},\n'
-            '  {"dimension": "对话匹配度", "result": "PASS|HARD|SOFT", "detail": "说明"},\n'
-            '  {"dimension": "论证可靠性", "result": "PASS|HARD|SOFT", "detail": "说明"}\n'
+            '  {"dimension": "因果合理性", "result": "PASS|HARD|SOFT", "detail": "说明", "sub": "S01"},\n'
+            '  {"dimension": "人物行为一致性", "result": "PASS|HARD|SOFT", "detail": "说明", "sub": null},\n'
+            '  {"dimension": "情绪弧自然度", "result": "PASS|HARD|SOFT", "detail": "说明", "sub": "S02"},\n'
+            '  {"dimension": "对话匹配度", "result": "PASS|HARD|SOFT", "detail": "说明", "sub": "S03"},\n'
+            '  {"dimension": "论证可靠性", "result": "PASS|HARD|SOFT", "detail": "说明", "sub": null}\n'
             "]"
         )
 
@@ -430,19 +431,23 @@ def check_reasoning(state_path, chapter, chapter_dir):
         result = result.upper()
         if result == "PASS":
             continue
+        # sub 定位：模型输出 S01/S02 → 子结构文件（修复面板可勾选重构）；否则章级
+        sub = str(item.get("sub") or "").strip()
+        issue_file = f"{sub}.txt" if re.match(r"^S\d+$", sub) else chapter
+        issue_pos = f"{sub} {chapter} reasoning" if issue_file != chapter else f"{chapter} reasoning"
         if result == "HARD":
             issues.append({
-                "file": chapter,
+                "file": issue_file,
                 "problem": f"推理审核 - {dim}: {detail}",
-                "position": f"{chapter} reasoning",
+                "position": issue_pos,
                 "severity": "HARD",
                 "suggestion": f"请检查{dim}问题, 根据审核建议修改后重新 finalize-chapter"
             })
         elif result == "SOFT":
             issues.append({
-                "file": chapter,
+                "file": issue_file,
                 "problem": f"推理审核 - {dim}: {detail}",
-                "position": f"{chapter} reasoning",
+                "position": issue_pos,
                 "severity": "SOFT",
                 "suggestion": "参考审核建议, 如需要可手动修改"
             })

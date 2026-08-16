@@ -151,13 +151,16 @@ def _create_repair_client(config_mgr=None):
 
 
 def _build_rewrite_prompt(original: str, title_line: str, alias_line: str, tail_marker: str,
-                          plan: dict, prev_tail: str, next_head: str, problems: list) -> str:
-    """整段重构契约 prompt（v0.3 设计 4.1 节）。"""
+                          plan: dict, prev_tail: str, next_head: str, problems: list,
+                          repair_type: str = "", source_text: str = "") -> str:
+    """整段重构契约 prompt（v0.3 设计 4.1 节）。repair_type 支持三检类型化修复：
+    fidelity（正文兑现概述承诺）/ pledge（移除悬置承诺+平滑衔接）/ ending（收尾类型符合规划）。"""
     original_wc = len(original)
     lo, hi = int(original_wc * 0.85), int(original_wc * 1.15)
     prob_lines = "\n".join(f"- {p}" for p in problems)
     emo = plan.get("emotions") or []
     emo_str = ", ".join(str(e) for e in emo) if emo else "（无）"
+    repair_goal = _repair_goal_block(repair_type, plan, source_text)
     return f"""你是小说重写编辑。根据问题清单重写下面的子结构正文，只输出重写后的正文，不要任何解释、思考或 markdown 围栏。
 
 [保留格式]
@@ -183,10 +186,24 @@ def _build_rewrite_prompt(original: str, title_line: str, alias_line: str, tail_
 [需解决的问题]
 {prob_lines}
 
+[修复目标]{repair_goal}
+
 [原文]
 {original}
 
 输出：仅重写后的正文（保留上述三行格式）。"""
+
+
+def _repair_goal_block(repair_type: str, plan: dict, source_text: str) -> str:
+    """按修复类型生成 [修复目标] 指令（三检类型化；章检 T1 无类型 → 空）。"""
+    if repair_type == "fidelity":
+        summary = (plan.get("summary") or "").strip()
+        return f"\n该段正文未兑现子结构概述承诺。重写使正文完整实现概述中的承诺内容（关键事件/状态不得缺失或反转），保持文风。概述：{summary[:150]}"
+    if repair_type == "pledge":
+        return f"\n该段包含未兑现的悬置承诺「{source_text or '（已定位）'}」。重写时移除该承诺意图并平滑衔接上下文，保持文风与字数。"
+    if repair_type == "ending":
+        return "\n本章结尾收束验证未通过。重写末段使其收尾类型符合规划（封闭式：冲突全解决；开放式：留未来可能；悬停式：悬而未决），保持文风。"
+    return ""
 
 
 def _validate_rewrite(new_text: str, title_line: str, alias_line: str, tail_marker: str,
@@ -210,8 +227,10 @@ def _validate_rewrite(new_text: str, title_line: str, alias_line: str, tail_mark
 
 def rewrite_segment(chapter_dir: str, file_name: str, chapter: str, plan: dict,
                     prev_tail: str, next_head: str, problems: list,
-                    config_mgr=None, timeout_extra=180) -> dict:
-    """T1: 整段重构单个子结构。返回 {ok, new_text, problems, wc}。"""
+                    config_mgr=None, timeout_extra=180,
+                    repair_type: str = "", source_text: str = "", guided: bool = False) -> dict:
+    """T1: 整段重构单个子结构；guided=True（R1 推理审核）→ 完整正文 + 问题描述引导局部改写。
+    返回 {ok, new_text, problems, wc}。"""
     f = Path(chapter_dir) / file_name
     if not f.exists():
         return {"ok": False, "problems": [f"文件不存在: {file_name}"]}
@@ -223,8 +242,32 @@ def rewrite_segment(chapter_dir: str, file_name: str, chapter: str, plan: dict,
     body = "\n".join(l for l in lines[1:] if l.strip() and not l.startswith("【别名】")
                      and not SUFFIX_RE.match(l.strip()))
 
+    # 引导式局部改写（R1 推理审核）：R1 的 detail 问题描述本身就是引导——
+    # writer 拿到完整正文 + 描述，自行定位问题句并只改那里，其余逐字保留
+    if guided:
+        prompt = _build_guided_prompt(body, title_line, alias_line, tail_marker, problems)
+        client = _create_repair_client(config_mgr)
+        call_timeout = int(getattr(client, "timeout", None) or 300) + timeout_extra
+        try:
+            r = client.chat_detailed(
+                [{"role": "user", "content": prompt}],
+                timeout=call_timeout,
+            )
+        except Exception as e:
+            return {"ok": False, "problems": [f"LLM 调用失败: {type(e).__name__}: {e}"]}
+        content = (r or {}).get("content") or ""
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```[a-z]*\n?", "", content)
+            content = re.sub(r"\n?```$", "", content)
+        valid = _validate_guided(content, body, title_line, alias_line, tail_marker)
+        if valid["ok"]:
+            return {"ok": True, "new_text": content, "problems": [], "wc": valid["wc"]}
+        return {"ok": False, "problems": valid["problems"], "wc": valid["wc"]}
+
     prompt = _build_rewrite_prompt(body, title_line, alias_line, tail_marker,
-                                   plan, prev_tail, next_head, problems)
+                                   plan, prev_tail, next_head, problems,
+                                   repair_type=repair_type, source_text=source_text)
     client = _create_repair_client(config_mgr)
     # 超时 = 配置 timeout + 额外余量（thinking 模型重写长文）
     call_timeout = int(getattr(client, "timeout", None) or 300) + timeout_extra
@@ -248,12 +291,61 @@ def rewrite_segment(chapter_dir: str, file_name: str, chapter: str, plan: dict,
     return {"ok": True, "new_text": content, "problems": [], "wc": valid["wc"]}
 
 
+def _build_guided_prompt(body: str, title_line: str, alias_line: str, tail_marker: str,
+                         problems: list) -> str:
+    """引导式局部改写契约：完整正文 + R1 的问题描述（detail 本身就是引导），
+    writer 自行定位问题句并只改那里，其余正文逐字保留。"""
+    prob_lines = "\n".join(f"- {p}" for p in problems)
+    return f"""你是小说局部改写编辑。以下正文存在审核发现的问题，只改写与问题描述直接相关的句子，其余正文必须逐字保留（不得增删改任何其他字符）。
+
+[保留格式]
+- 首行标题必须原样保留: {title_line}
+- 末行编号必须原样保留: {tail_marker}
+- 别名行必须原样保留: {alias_line}
+
+[问题说明]（审核模型判定——问题就出在以下描述指出的句子/行为上，请在[正文]中定位并仅改写该处）
+{prob_lines}
+
+[改写要求]
+- 仅修改问题描述直接指出的句子，其余正文逐字保留（不得增删改）
+- 修正后符合角色设定/身份处境/推理逻辑，保持文风与字数
+- 输出完整正文（含保留格式三行），不要任何解释
+
+[正文]
+{body}
+
+输出：仅改写后的完整正文。"""
+
+
+def _validate_guided(new_text: str, body: str, title_line: str, alias_line: str,
+                     tail_marker: str) -> dict:
+    """引导式局部改写校验：三行保留 + 输出与原文确有差异（防止未改写空转）。"""
+    problems = []
+    if not new_text.strip():
+        problems.append("输出为空")
+    if title_line and title_line not in new_text:
+        problems.append(f"首行标题丢失: {title_line[:30]}")
+    if tail_marker and tail_marker not in new_text:
+        problems.append(f"末行编号丢失: {tail_marker}")
+    if alias_line and alias_line not in new_text:
+        problems.append(f"别名行丢失: {alias_line[:20]}")
+    orig_full = (title_line + "\n" if title_line else "") \
+        + (alias_line + "\n" if alias_line else "") \
+        + body + ("\n" + tail_marker if tail_marker else "")
+    if new_text.strip() == orig_full.strip():
+        problems.append("输出与原文完全一致（未改写）")
+    return {"ok": not problems, "problems": problems,
+            "wc": len(new_text.strip())}
+
+
 # ── 引擎（P1 T0 + P2 T1 骨架） ──
 
 def run(state_path: str, chapter_dir: str, chapter: str, issues: list,
         mode: str = "manual", max_rounds: int = 3, config_mgr=None,
-        checked_subs: list = None):
-    """修复引擎入口。T0 自动修；T1 按勾选子结构整段重构（P2）。"""
+        checked_subs: list = None, repair_types: dict = None):
+    """修复引擎入口。T0 自动修；T1 按勾选子结构整段重构（P2）。
+    repair_types: {file: "fidelity"/"pledge"/"ending"} 三检类型化重构（可选）。
+    R1 推理审核问题（problem 含"推理审核"）自动走引导式局部改写（detail 描述引导）。"""
     report = {"chapter": chapter, "rounds": [], "mode": mode}
     t0_result = apply_t0(chapter_dir, chapter, issues)
     report["t0"] = t0_result
@@ -272,19 +364,39 @@ def run(state_path: str, chapter_dir: str, chapter: str, issues: list,
     if checked_subs is not None:
         seg_map = {k: v for k, v in seg_map.items() if k in checked_subs}
 
+    # 三检 source_text 定位（从 state._full_repair 按 chapter+sub 查）
+    src_map = {}
+    if repair_types:
+        try:
+            _d = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
+            for _ch, _frc in (_d.get("_full_repair", {}) or {}).items():
+                for _it in (_frc.get("items") or []):
+                    if _it.get("sub"):
+                        src_map[_it["sub"] + ".txt"] = _it.get("source_text", "")
+        except Exception:
+            pass
+
     results = []
     syncs = []
     for fname, probs in seg_map.items():
+        rt = (repair_types or {}).get(fname, "")
+        # R1 推理审核问题（problem 以"推理审核"开头）→ 引导式局部改写（detail 描述引导 writer 只改问题句）
+        guided = any("推理审核" in p for p in probs)
         r = rewrite_segment(chapter_dir, fname, chapter, _load_plan(state_path, chapter, fname),
                             _prev_tail(chapter_dir, fname), _next_head(chapter_dir, fname),
-                            probs, config_mgr=config_mgr)
+                            probs, config_mgr=config_mgr,
+                            repair_type=rt, source_text=src_map.get(fname, ""),
+                            guided=guided)
         if r["ok"]:
             backup_segment(chapter_dir, fname, state_path, 1)
             _atomic_write(Path(chapter_dir) / fname, r["new_text"])
             # 重构后同步：实体状态 force 刷新（新正文为准）+ 时间线重扫
             sync_result = sync_after_rewrite(state_path, chapter_dir, fname)
             syncs.append({"file": fname, **sync_result})
-            results.append({"file": fname, "status": "rewritten", "wc": r["wc"]})
+            _entry = {"file": fname, "status": "rewritten", "wc": r["wc"]}
+            if r.get("problems"):
+                _entry["note"] = "; ".join(r["problems"])
+            results.append(_entry)
         else:
             results.append({"file": fname, "status": "failed", "problems": r["problems"]})
     report["t1"] = {"results": results, "syncs": syncs}

@@ -29,6 +29,101 @@ KEY_OPEN_HINT = ["也许", "或许", "不知道", "会不会", "是否", "可能
 KEY_SUSPENSE = ["不知道", "会不会", "是否", "还是未知数", "尚未"]
 KEY_FORBIDDEN = ["未完待续", "预知后事如何", "一切才刚刚开始", "故事还在继续"]
 
+ENDING_TYPES = ("封闭式", "开放式", "悬停式")
+
+
+def _classify_ending_rules(content: str) -> str | None:
+    """特征词回退：判结尾属于封闭式/开放式/悬停式。无法判定返回 None。"""
+    if not content:
+        return None
+    tail = content[-400:] if len(content) > 400 else content
+    score = {"封闭式": 0, "开放式": 0, "悬停式": 0}
+    for kw in KEY_CLOSURE_RESOLVE:
+        if kw in tail:
+            score["封闭式"] += 1
+    for kw in KEY_OPEN_OUTCOME + KEY_OPEN_HINT:
+        if kw in tail:
+            score["开放式"] += 1
+    for kw in KEY_SUSPENSE:
+        if kw in tail:
+            score["悬停式"] += 1
+    best = max(score, key=score.get)
+    if score[best] == 0:
+        return None  # 无特征词命中 → 无法判定，交给 LLM 或原规则
+    return best
+
+
+def _classify_ending_llm(content: str) -> tuple | None:
+    """Qwen2.5-3B（本地 CPU，复用实体提取器加载）判结尾属于哪种收尾类型。
+
+    返回 (ending_type, reason)；模型不可用/输出不可解析返回 None（触发特征词回退）。
+    输入取最后 3 段（段落级，不按字符硬截）；3B 无 think，max_new_tokens=1024 足够。
+    （1.5B 实测判收尾类型不可靠——封闭式判成悬停式，改用 3B。）
+    """
+    try:
+        sys.path.insert(0, SCRIPTS_DIR)
+        from novel_entity_extractor import _load_extract_model
+        pipe = _load_extract_model()
+        if pipe is None:
+            return None
+        model, tok = pipe
+        # 取最后 3 段（段落级切分，保留完整信息）
+        paras = [p.strip() for p in content.split("\n") if p.strip()]
+        ending_text = "\n".join(paras[-3:]) if len(paras) >= 3 else content
+        prompt = f"""你是小说收尾类型判定器。判断下面的【结尾段落】属于哪种收尾类型。
+
+【收尾类型判据】
+- 封闭式：主要冲突全部解决，无遗留悬念，有明确结束感（所有线闭合、角色获得安定、"从此以后"式收束）
+- 开放式：冲突基本解决但留有"也许/未来/可能回来/门还开着"等开放信号，即使角色离开或启程，只要未来仍不确定就是开放式，不是封闭式
+- 悬停式：关键冲突未解决，戛然而止（危机未解除、决定未做出、"不知如何是好"）
+
+【结尾段落】
+{ending_text}
+
+请只输出：封闭式 / 开放式 / 悬停式（三选一）+ 一句话理由。"""
+        inputs = tok(prompt, return_tensors="pt").to(model.device)
+        with __import__("torch").no_grad():
+            out = model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+        resp = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        # 提取三选一（3B 无 think，直接输出判定）
+        for t in ENDING_TYPES:
+            if t in resp:
+                after = resp.split(t, 1)[1]
+                reason = after.strip().split("\n")[0].strip(" ：:，,。")[:60]
+                return (t, reason or "（无理由）")
+        return None
+    except Exception as e:
+        print(f"[收尾判定] 3B 判定失败（回退特征词）: {e}")
+        return None
+
+
+def _model_ending_verdict(content: str, planned_type: str) -> dict | None:
+    """模型层收尾判定：1.5B 判实际类型 → 与规划类型对比。
+
+    返回 verdict dict（直接作为 verify_ending 结果返回），或 None（模型不可用 → 走原规则）。
+    判据：类型一致 → PASS；不一致 → FAIL（模型说实际是 X，规划是 Y）。
+    """
+    actual = _classify_ending_llm(content)
+    if actual is None:
+        # 1.5B 不可用 → 特征词回退
+        actual = _classify_ending_rules(content)
+        source = "特征词"
+    else:
+        source = "1.5B"
+    if actual is None:
+        return None  # 特征词也无法判定 → 原规则细查
+
+    match = (actual == planned_type)
+    if match:
+        return {"pass": True, "ending_type": planned_type,
+                "summary": f"{source} 判定「{actual}」与规划一致",
+                "details": [{"name": "收尾类型匹配", "pass": True,
+                             "reason": f"{source} 判定实际为{actual}，与规划一致", "required": True}]}
+    return {"pass": False, "ending_type": planned_type,
+            "summary": f"{source} 判定实际为「{actual}」，与规划的「{planned_type}」不一致",
+            "details": [{"name": "收尾类型匹配", "pass": False,
+                         "reason": f"{source} 判定实际为{actual}，规划要求{planned_type}", "required": True}]}
+
 
 def _locate_ending_sub(data: dict) -> tuple | None:
     """从 novel_state.json 定位 marked is_ending 的子结构"""
@@ -100,6 +195,12 @@ def verify_ending(project_dir: str) -> dict:
     core_conflict = data.get("core_conflict", data.get("project", ""))
     protagonist = data.get("protagonist", "")
     theme = data.get("theme", "")
+
+    # 3.5 模型层收尾类型判定（1.5B 判类型 → 与规划对比；回退特征词）
+    # 主判定：模型判出的类型 == 规划类型 → PASS；不一致 → FAIL（给理由）
+    model_result = _model_ending_verdict(content, ending_type)
+    if model_result is not None:
+        return model_result
 
     # 4. 按类型执行检查
     checks = []

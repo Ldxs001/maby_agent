@@ -923,7 +923,7 @@ def write_novel_sub(state_path, chapter_id, sub_key, body) -> dict:
 
     注意：跳过 write-sub 内部的自动 finalize-chapter（NOVEL_SKIP_AUTOFINALIZE=1）——
     Web 场景章检由 novel_writer 统一控制（受配置开关），避免写最后一段时隐式加载
-    bge/R1 跑六检卡死线程。
+    模型跑六检卡死线程。
     """
     r = _run_script("novel_workflow_engine.py", ["write-sub", state_path, chapter_id, sub_key],
                     input_text=body, env_extra={"NOVEL_SKIP_AUTOFINALIZE": "1"})
@@ -933,34 +933,50 @@ def write_novel_sub(state_path, chapter_id, sub_key, body) -> dict:
 
 
 def finalize_novel_chapter(state_path, chapter_id, checks=None) -> dict:
-    """章检六检（规则4检 + bge语义 + R1推理），HARD 阻断返回 issues
+    """章检（4维 3B + 格式 + 逻辑 + 推理R1），HARD 阻断返回 issues
 
-    checks: {"chapter": bool, "semantic": bool, "reason": bool, "full": bool}
+    checks: {"chapter": bool, "format": bool, "reason": bool, "full": bool}
+    （semantic 已废弃——向量模型 bge 移除，4维不可用时回退规则连通性）
     """
     if checks and not checks.get("chapter", True):
         return {"ok": True, "skipped": True, "issues": []}
     env_extra = {}
-    if checks and not checks.get("semantic", True):
-        env_extra["NOVEL_SKIP_SEMANTIC"] = "1"
+    if checks and not checks.get("format", True):
+        env_extra["NOVEL_SKIP_FORMAT"] = "1"
     if checks and not checks.get("reason", True):
         env_extra["NOVEL_SKIP_REASON"] = "1"
     r = _run_script("novel_workflow_engine.py", ["finalize-chapter", state_path, chapter_id], timeout=1800, env_extra=env_extra)
     if r is None:
         return {"ok": False, "timeout": True, "issues": []}
     stdout = r.stdout or ""
-    issues = [ln for ln in stdout.split("\n") if "[HARD]" in ln or "[FAIL]" in ln]
+    # HARD/FAIL 阻断 + SOFT 非阻断（4维 SOFT 等必须进 hint.issues——之前只收 HARD/FAIL，
+    # 弹窗靠 output 补 4维，output 截断（stdout[-3000:]）就丢，L01 即此案例）
+    issues = [ln for ln in stdout.split("\n") if "[HARD]" in ln or "[FAIL]" in ln or "[SOFT]" in ln]
     return {"ok": r.returncode == 0, "issues": issues, "output": stdout[-3000:]}
 
 
 def finalize_novel_full(state_path, checks=None) -> dict:
-    """全文三检（fidelity 忠实度 + 结尾收束 + 完结）"""
-    if checks and not checks.get("full", True):
+    """全文三检（fidelity 忠实度 / pledge 承诺 / ending 收束，各自独立开关）"""
+    checks = checks or {}
+    # 兼容旧配置：只有 "full" 字段时三检同开关
+    full_legacy = checks.get("full", True)
+    chk_fid = checks.get("full_fidelity", full_legacy)
+    chk_pledge = checks.get("full_pledge", full_legacy)
+    chk_ending = checks.get("full_ending", full_legacy)
+    if not (chk_fid or chk_pledge or chk_ending):
         return {"ok": True, "skipped": True, "issues": []}
-    r = _run_script("novel_workflow_engine.py", ["finalize-novel", state_path], timeout=1800)
+    r = _run_script(
+        "novel_workflow_engine.py", ["finalize-novel", state_path], timeout=1800,
+        env_extra={
+            "NOVEL_CHK_FIDELITY": "1" if chk_fid else "0",
+            "NOVEL_CHK_PLEDGE": "1" if chk_pledge else "0",
+            "NOVEL_CHK_ENDING": "1" if chk_ending else "0",
+        },
+    )
     if r is None:
         return {"ok": False, "timeout": True, "issues": []}
     stdout = r.stdout or ""
-    issues = [ln for ln in stdout.split("\n") if "[HARD]" in ln or "[FAIL]" in ln]
+    issues = [ln for ln in stdout.split("\n") if "[HARD]" in ln or "[FAIL]" in ln or "[SOFT]" in ln]
     return {"ok": r.returncode == 0, "issues": issues, "output": stdout[-3000:]}
 
 

@@ -533,8 +533,13 @@ def generate_report(chapter_dir: str, state_path: str, report_path: str):
             elif "时间" in dim:
                 suggestion = f"在章节中补充时间过渡交代"
 
+            # 子结构定位：detail 以 S0X.txt 开头（_check_* 内部已带 fname）→ 落子结构级可勾选；
+            # 提取不到（如 timeline 全局问题）→ 章级（仅查看）
+            m_sub = re.search(r'S\d+\.txt', detail)
+            fname_out = m_sub.group(0) if m_sub else os.path.basename(chapter_dir)
+
             structured.append({
-                "file": os.path.basename(chapter_dir),
+                "file": fname_out,
                 "problem": detail[:120],
                 "position": dim,
                 "severity": severity,

@@ -37,15 +37,14 @@ _repair_lock = threading.Lock()
 # 小说模型后台安装状态（点击「安装缺失模型」→ 后端自动下载，不弹窗不自装）
 _install_state = {"running": False, "models": [], "log": [], "done": False}
 _INSTALL_CMDS = {
-    "bge": ['python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer(\'BAAI/bge-small-zh-v1.5\')"'],
     "r1": ['python -c "from transformers import AutoModel; AutoModel.from_pretrained(\'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B\', trust_remote_code=True)"'],
     "qwen25": ['python -c "from transformers import AutoModel; AutoModel.from_pretrained(\'Qwen/Qwen2.5-3B-Instruct\', trust_remote_code=True)"'],
 }
-_INSTALL_LABELS = {"bge": "语义bge", "r1": "推理R1", "qwen25": "实体抽取Qwen2.5-3B"}
+_INSTALL_LABELS = {"r1": "推理R1", "qwen25": "实体抽取Qwen2.5-3B"}
 
 
 def _run_model_install(models: list):
-    """后台下载缺失模型（hf-mirror + transformers/sentence_transformers），日志写 _install_state。"""
+    """后台下载缺失模型（hf-mirror + transformers），日志写 _install_state。"""
     global _install_state
     log = []
     def _log(msg):
@@ -152,6 +151,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/novel/replan_sub": cls._handle_novel_replan_sub,
             "/api/novel/repair/apply": cls._handle_repair_apply,
             "/api/novel/repair/rollback": cls._handle_repair_rollback,
+            "/api/novel/repair/skip": cls._handle_repair_skip,
             "/api/batch_auto": cls._handle_batch_auto,
             "/api/session/archive": cls._handle_session_archive,
             "/api/session/restore": cls._handle_session_restore,
@@ -1172,13 +1172,13 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
     # ---- 小说质检 ----
 
     def _novel_status_data(self):
-        """bge/R1 模型就绪检测（data/models/ 优先，回退 HF 默认缓存）"""
+        """R1/3B 模型就绪检测（data/models/ 优先，回退 HF 默认缓存）"""
         try:
             from .novel._path_utils import MODELS_DIR
         except Exception:
             MODELS_DIR = None
         cfg = dict(self.config_mgr.get("novel_checks", {}) or {})
-        default = {"chapter": True, "semantic": True, "reason": True, "full": True}
+        default = {"chapter": True, "format": True, "reason": True, "full": True}
         for k in default:
             cfg.setdefault(k, default[k])
 
@@ -1231,16 +1231,13 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                         return True
             return False
 
-        bge = _has("models--BAAI--bge-small-zh-v1.5/snapshots")
         r1 = _has("models--deepseek-ai--DeepSeek-R1-Distill-Qwen-1.5B/snapshots")
         qwen25 = _has("models--Qwen--Qwen2.5-3B-Instruct/snapshots")
-        if not bge:
-            bge = _hf_cache("BAAI/bge-small-zh-v1.5").is_dir() if _hf_cache("BAAI/bge-small-zh-v1.5") else False
         if not r1:
             r1 = _hf_cache("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B").is_dir() if _hf_cache("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B") else False
         if not qwen25:
             qwen25 = _model_ready("Qwen/Qwen2.5-3B-Instruct")
-        return {"bge": bge, "r1": r1, "qwen25": qwen25, "dir": str(MODELS_DIR) if MODELS_DIR else "", "config": cfg,
+        return {"r1": r1, "qwen25": qwen25, "dir": str(MODELS_DIR) if MODELS_DIR else "", "config": cfg,
                 "install": dict(_install_state)}
 
     def _handle_novel_status(self):
@@ -1250,7 +1247,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         """点击「安装缺失模型」→ 后端后台线程自动下载（hf-mirror），不弹窗、不给命令让用户手动装"""
         global _install_state
         st = self._novel_status_data()
-        missing = [k for k in ("bge", "r1", "qwen25") if not st.get(k)]
+        missing = [k for k in ("r1", "qwen25") if not st.get(k)]
         if not missing:
             self._json_response({"success": True, "message": "模型已就绪，无需安装", "started": False, "models": []})
             return
@@ -1271,7 +1268,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
     def _handle_novel_checks(self):
         data = self._read_body()
         cfg = {}
-        for k in ("chapter", "semantic", "reason", "full", "auto_repair"):
+        for k in ("chapter", "format", "reason", "full", "full_fidelity", "full_pledge", "full_ending", "auto_repair"):
             if k in data:
                 cfg[k] = bool(data.get(k))
         if "repair_rounds" in data:
@@ -1427,16 +1424,40 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                 self._json_response({"success": True, "preview": None,
                                      "message": "该章无章检结果（可能未跑六检）"})
                 return
-            # 解析 stdout 里的问题行（HARD/SOFT + 文件定位）
+            # 直接从 hint.issues（章检跑完时记录的真实问题清单）解析——
+            # hint.output 是 stdout 可能截断（如 finalize_chapter 在某步异常退出），
+            # 解析 output 会误判为"无问题"。hint.issues 是当时章检记录的真实列表，更可靠。
+            all_structured = self._parse_hint_issues(hint.get("issues") or [], hint.get("output", ""))
+            # 拆分：子结构问题（file 带 .txt，可勾选）vs 章级问题（file=章级，仅查看）
+            structured = [it for it in all_structured if it.get("file", "").endswith(".txt")]
+            chapter_only = [it for it in all_structured if not it.get("file", "").endswith(".txt")]
             issues = []
-            for ln in (hint.get("output") or "").split("\n"):
-                ln = ln.strip()
-                if not ln or not (ln.startswith("[") and ("HARD" in ln or "SOFT" in ln or "FAIL" in ln or "WARN" in ln)):
-                    continue
-                issues.append(ln[:150])
-            # 从 output 提取涉及的文件名（S0X）
-            import re as _re
-            files_hit = sorted(set(_re.findall(r"S\d+\.txt", hint.get("output", ""))))
+            files_set = set()
+            for it in structured:
+                prefix = f"{it['file']}: " if it.get("file") else ""
+                issues.append(f"{prefix}[{it['severity']}] {it['problem']}")
+                # 只收 T1（需 LLM 重构）问题的文件进勾选列表；
+                # T0（末行/禁用模式/行数）由 apply_t0 自动修复，用户无需勾选，issues 保留供"T0 已自动修复"计数
+                if it.get("file") and not any(k in it["problem"] for k in ("末行", "禁用模式", "行数")):
+                    files_set.add(it["file"])
+            # 环节优先级：4维 先修 → 格式/逻辑 → 推理审核后修（用户要求"4维 先、R1 后"）
+            # 聚合打印把全部 HARD 放 SOFT 前（R1 HARD 反而在前），必须显式按环节排序
+            def _ring_rank(p: str) -> int:
+                p = p or ""
+                if "4维" in p or p.startswith("[时间衔接]") or p.startswith("[情绪匹配]") \
+                        or p.startswith("[话题过渡]") or p.startswith("[角色承接]"):
+                    return 0
+                if "推理审核" in p:
+                    return 2
+                return 1
+            _rank_of = {}
+            for it in structured:
+                f = it.get("file")
+                if f and f not in _rank_of:
+                    _rank_of[f] = _ring_rank(it.get("problem", ""))
+            files_hit = sorted(files_set, key=lambda f: _rank_of.get(f, 1))
+            # 章级问题拼接成 issue 字符串（用于面板顶部"仅查看"展示）
+            ch_only_lines = [f"{it['severity']}: {it['problem']}" for it in chapter_only]
             self._json_response({
                 "success": True,
                 "preview": {
@@ -1445,6 +1466,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                     "timeout": hint.get("timeout", False),
                     "issues": issues,
                     "files": files_hit,
+                    "chapter_only": ch_only_lines,
                 }
             })
         except Exception as e:
@@ -1461,18 +1483,26 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         session_id = str(data.get("session_id", "")).strip()
         chapter = str(data.get("chapter", "")).strip()
         checked = data.get("checked_subs") or None
+        full_types = data.get("full_types") or None
         mode = str(data.get("mode", "manual"))
         if not session_id or not chapter:
             self._json_response({"success": False, "error": "缺少 session_id/chapter"}, 400)
             return
+        # 三检类型化：full_types 与 checked_subs 一一对应 → {file: type}
+        repair_types = None
+        if full_types and checked and len(full_types) == len(checked):
+            repair_types = {str(f): str(t) for f, t in zip(checked, full_types) if t}
         sm, state_path, chapter_dir, outline = self._repair_engine_for(session_id)
         if state_path is None:
             self._json_response({"success": False, "error": "novel 项目目录未找到"}, 404)
             return
-        # 构造 issues 清单（从 hints 的 output 解析为结构化问题，供 apply_t0 / 重构）
+        # chapter_dir 是 chapters 根 → 拼章级子目录（子结构文件在 chapters/<chapter>/ 下）
+        from pathlib import Path as _P
+        chapter_dir = str(_P(chapter_dir) / chapter)
+        # 构造 issues 清单（从 hint.issues + output 补 4 维判定；hint.output 可能截断）
         hints = sm.get_repair_hints()
         hint = hints.get(chapter, {}) or {}
-        structured = self._parse_check_output(hint.get("output", ""))
+        structured = self._parse_hint_issues(hint.get("issues") or [], hint.get("output", ""))
         if not structured:
             self._json_response({"success": False, "error": "该章无可用检查输出"}, 400)
             return
@@ -1482,25 +1512,95 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             try:
                 rep = reng.run(state_path, chapter_dir, chapter, structured,
                                mode=mode, config_mgr=self.config_mgr,
-                               checked_subs=checked)
-                with _repair_lock:
-                    _repair_state["result"] = rep
-                    _repair_state["done"] = True
-                # 标记该章已处理修复（前端 repair_pending 消失，不再重复弹面板）
+                               checked_subs=checked, repair_types=repair_types)
+                # 标记该章修复结果（含三检当场重检）——done 在重检完成后才置 True，
+                # 前端轮询在重检期间持续显示"修复中"（用户勾选即默认承担重检成本）
                 try:
                     sm2 = StateManager()
                     sm2.load(session_id)
                     hints = sm2.get_repair_hints()
-                    if chapter in hints:
-                        hints[chapter]["_repaired"] = True
+                    t1_res = (rep.get("t1") or {}).get("results") or []
+                    failed_n = sum(1 for x in t1_res if x.get("status") == "failed")
+                    if repair_types:
+                        # ── 三检场景：重构成功后当场重检验证（全文完结无"下次"，勾选即承担成本） ──
+                        # 三检项存于 _repair_hints[chapter].full_items。
+                        # 时序：三检在最后一章章检通过后才触发，该章 issues 必然已空——不存在并存。
+                        if failed_n == 0:
+                            hint = hints.get(chapter) or {}
+                            ch_items = hint.get("full_items") or []
+                            checked_keys = {(t, f.replace(".txt", "")) for f, t in repair_types.items()}
+                            ok_keys = _recheck_full_items(state_path, chapter, repair_types, ch_items)
+                            # 勾选且重检通过 → 移除；未勾选 → 接受问题移除；勾选未通过 → 保留（面板再弹可继续修）
+                            kept = []
+                            for it in ch_items:
+                                key = (it.get("type"), it.get("sub"))
+                                if key in ok_keys:
+                                    continue
+                                if key in checked_keys:
+                                    kept.append(it)
+                            hint["full_items"] = kept
+                            # 三检阶段章检已全部通过，full_items 清空即标记通过
+                            if not kept:
+                                hint["_repaired"] = True
+                            hints[chapter] = hint
+                            sm2._state["_repair_hints"] = hints
+                            sm2.save()
+                    elif chapter in hints:
+                        import re as _re
                         hints[chapter]["_repair_result"] = {
                             "t0_fixed": len((rep.get("t0") or {}).get("fixed", [])),
-                            "t1_rewritten": sum(1 for x in ((rep.get("t1") or {}).get("results") or []) if x.get("status") == "rewritten"),
+                            "t1_rewritten": sum(1 for x in t1_res if x.get("status") == "rewritten"),
                         }
+                        # 未勾选段 → 立即标记通过：从该章 issues 中移除这些段的问题
+                        if checked:
+                            checked_set = set(checked)
+                            all_files = {s.get("file") for s in structured if s.get("file")}
+                            unchecked = all_files - checked_set
+                            hints[chapter]["_skipped_subs"] = sorted(unchecked)
+                            if unchecked:
+                                kept = []
+                                for ln in hints[chapter].get("issues", []):
+                                    m = _re.findall(r"S\d+(?:\.txt)?", ln)
+                                    files_in_line = {f if f.endswith(".txt") else f + ".txt" for f in m}
+                                    if files_in_line and (files_in_line & unchecked):
+                                        continue  # 属于未勾选段 → 跳过
+                                    kept.append(ln)
+                                hints[chapter]["issues"] = kept
+                        else:
+                            hints[chapter]["_skipped_subs"] = []
+                        if failed_n == 0:
+                            # 修复全部成功 → 重检验证（过滤已跳过段后无问题才标记通过）
+                            try:
+                                from .novel.novel_bridge import finalize_novel_chapter
+                                fc = finalize_novel_chapter(state_path, chapter)
+                                skipped = set(hints[chapter].get("_skipped_subs") or [])
+                                kept = []
+                                for ln in (fc.get("issues") or []):
+                                    m = _re.findall(r"S\d+(?:\.txt)?", ln)
+                                    files_in_line = {f if f.endswith(".txt") else f + ".txt" for f in m}
+                                    if files_in_line and (files_in_line & skipped):
+                                        continue
+                                    kept.append(ln)
+                                if kept:
+                                    hard_kept = [ln for ln in kept if "[HARD]" in ln or "[FAIL]" in ln]
+                                    if hard_kept:
+                                        hints[chapter]["issues"] = kept  # 重检仍有 HARD → 保持未通过（面板再弹可继续修）
+                                    else:
+                                        # 重检只剩 SOFT（非阻断）→ 标记通过；issues 保留供展示
+                                        hints[chapter]["_repaired"] = True
+                                        hints[chapter]["issues"] = kept
+                                else:
+                                    # 章检阶段全文三检未触发（串行时序），issues 清空即标记通过
+                                    hints[chapter]["_repaired"] = True  # 重检通过 → 标记通过
+                            except Exception:
+                                hints[chapter]["_repaired"] = True  # 重检异常兜底按通过
                         sm2._state["_repair_hints"] = hints
                         sm2.save()
                 except Exception:
                     pass
+                with _repair_lock:
+                    _repair_state["result"] = rep
+                    _repair_state["done"] = True
             except Exception as e:
                 with _repair_lock:
                     _repair_state["result"] = {"error": f"{type(e).__name__}: {e}"}
@@ -1512,13 +1612,20 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         self._json_response({"success": True, "started": True, "chapter": chapter,
                              "checked_subs": checked, "mode": mode})
 
-    def _parse_check_output(self, output: str) -> list:
-        """把章检 stdout 解析为结构化 issues（供修复引擎）。"""
-        issues = []
+    @staticmethod
+    def _parse_hint_issues(issues: list, output: str = "") -> list:
+        """从 hint.issues（章检跑完时记录的真实问题列表，含 HARD/FAIL/SOFT 全量）+ hint.output 补 4 维判定合并 structured。
+
+        hint.issues 是章检完成时记录的最终问题（字符串列表），更可靠；
+        hint.output 是 stdout 可能截断（如某步异常退出），仅作为 4 维判定行兜底补充
+        （finalize 在聚合打印前异常退出时 hint.issues 为空，靠 output 的 [4维判定] 行补）。
+        """
         import re as _re
-        for ln in (output or "").split("\n"):
-            ln = ln.strip()
-            if not ln or not ln.startswith("["):
+        structured = []
+
+        # 1. 解析 hint.issues 字符串列表（如 "[HARD] [L01] 推理审核 - 对话匹配度: ..."）
+        for ln in (issues or []):
+            if not ln or "[" not in ln:
                 continue
             sev = None
             for s in ("HARD", "SOFT", "WARN", "FAIL"):
@@ -1527,11 +1634,179 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                     break
             if sev is None:
                 continue
-            m = _re.search(r"S\d+\.txt", ln)
+            # 提取文件（如 "[L01]" → L01；子结构 S0X 优先）
+            fname = ""
+            m_sub = _re.search(r"S\d+\.txt", ln)
+            if m_sub:
+                fname = m_sub.group(0)
+            else:
+                m_ch = _re.search(r"\[L\d+\]", ln)
+                if m_ch:
+                    fname = m_ch.group(0).strip("[]")  # L01（章级问题，无子结构关联）
+            # problem 去掉前缀 [HARD]/[SOFT] 与 [S01.txt]（`[\w.]+` 兼容 .txt 后缀）
+            problem = _re.sub(r"^\s*\[[^\]]*\]\s*(?:\[[^\]]*\]\s*)?", "", ln).strip()[:120]
+            if not problem:
+                problem = ln[:120]
+            structured.append({"file": fname, "problem": problem, "severity": sev})
+
+        # 2. 补充：4 维判定行（hint.issues 是当时写入的，4 维判定行可能未完全归入）
+        for ln in (output or "").split("\n"):
+            ln = ln.strip()
+            m_4dim = _re.search(r"\[4维判定\]\s*S(\d+)[→\-\-]+S(\d+):\s*t=(\w+)\s+e=(\w+)\s+p=(\w+)\s+c=(\w+)", ln)
+            if not m_4dim:
+                continue
+            s1, s2, t, e, p, c = m_4dim.groups()
+            labels = {"t": "时间衔接", "e": "情绪匹配", "p": "话题过渡", "c": "角色承接"}
+            for k, ok in (("t", t), ("e", e), ("p", p), ("c", c)):
+                if ok == "False":
+                    structured.append({
+                        "file": f"S{s1}.txt",
+                        "problem": f"4维-{labels[k]}不通过",
+                        "position": f"S{s1}→S{s2}",
+                        "severity": "SOFT",
+                        "suggestion": "LLM 重构使该段满足维度",
+                    })
+        return structured
+
+    def _parse_check_output(self, output: str) -> list:
+        """把章检 stdout 解析为结构化 issues（供修复引擎）。
+
+        兼容三种格式：
+        - 行首带 [ 的问题行（如 "[HARD][L01] ..."）
+        - 缩进行 "→ [HARD] 阻断：语义跳断"（历史语义检查格式；前一行有段间标记 "S01→S02"，
+          HARD 行通过 last_files 跨行关联到涉及的文件）
+        - 4维判定行 "[4维判定] S01→S02: t=True e=True p=False c=False"
+          （False 维度生成 SOFT issue，file 关联到前段）
+        """
+        issues = []
+        import re as _re
+        last_files = []
+        for ln in (output or "").split("\n"):
+            ln = ln.strip()
+            # 段间标记行（无 [ 前缀）：记录涉及的子结构文件，供后续 HARD 行关联
+            m_pair = _re.search(r"S(\d+)[→\-\-]+S(\d+)", ln)
+            if m_pair:
+                last_files = [f"S{m_pair.group(1)}.txt", f"S{m_pair.group(2)}.txt"]
+            # 4维判定行（[4维判定] S01→S02: t/e/p/c=True/False）
+            m_4dim = _re.search(r"\[4维判定\]\s*S(\d+)[→\-\-]+S(\d+):\s*t=(\w+)\s+e=(\w+)\s+p=(\w+)\s+c=(\w+)", ln)
+            if m_4dim:
+                s1, s2, t, e, p, c = m_4dim.groups()
+                last_files = [f"S{s1}.txt", f"S{s2}.txt"]
+                labels = {"t": "时间衔接", "e": "情绪匹配", "p": "话题过渡", "c": "角色承接"}
+                for k, ok in (("t", t), ("e", e), ("p", p), ("c", c)):
+                    if ok == "False":
+                        issues.append({
+                            "file": f"S{s1}.txt",
+                            "problem": f"4维-{labels[k]}不通过",
+                            "position": f"S{s1}→S{s2}",
+                            "severity": "SOFT",
+                            "suggestion": "LLM 重构使该段满足维度",
+                        })
+                continue
+            if not ln or "[" not in ln:
+                continue
+            sev = None
+            for s in ("HARD", "SOFT", "WARN", "FAIL"):
+                if s in ln:
+                    sev = s
+                    break
+            if sev is None:
+                continue
+            # 过滤统计/进度行（如 "[语义检查] 完成: 1 HARD + 2 SOFT"）——不是具体问题
+            if "完成:" in ln or "开始" in ln or "加载模型" in ln or "检查文件数" in ln:
+                continue
+            # 过滤连通性"通过"标记（[WARN][角色OK] = 通过，不是问题）
+            if "角色OK" in ln:
+                continue
+            m = _re.search(r"S\d+(?:\.txt)?", ln)
             fname = m.group(0) if m else ""
+            if fname and not fname.endswith(".txt"):
+                fname += ".txt"
+            if not fname and last_files:
+                # HARD 行本身无文件名 → 关联最近的段间标记（取第一个涉及文件）
+                fname = last_files[0]
             problem = ln.split("]", 1)[-1].strip()[:120]
             issues.append({"file": fname, "problem": problem, "severity": sev})
         return issues
+
+    @staticmethod
+    def _recheck_full_items(state_path, chapter, repair_types, items):
+        """三检修复项当场重检验证（全文完结无"下次"，勾选即承担成本）。
+
+        按类型重跑对应检查，返回"重检通过"的 (type, sub) 集合：
+        - fidelity → 重跑 fidelity_check，该 (chapter, sub) 不在 fail_items = 通过
+        - pledge  → 重跑 extract_pledges + check_pledges，该章无该 sub 的承诺问题 = 通过
+        - ending  → 重跑 verify_ending，pass = 通过
+        """
+        from pathlib import Path as _P
+        chapters_dir = str(_P(state_path).parent.parent / "chapters")
+        ok_keys = set()
+        types_needed = {t for t in repair_types.values()}
+        if "fidelity" in types_needed:
+            try:
+                from .novel.novel_workflow_engine import fidelity_check
+                _, _, _, _, fail_items = fidelity_check(state_path, chapters_dir)
+                fail_subs = {(it.get("chapter"), it.get("sub")) for it in fail_items}
+                for f, t in repair_types.items():
+                    if t == "fidelity":
+                        sub = f.replace(".txt", "")
+                        if (chapter, sub) not in fail_subs:
+                            ok_keys.add((t, sub))
+            except Exception as e:
+                print(f"[三检重检] fidelity 异常（按未通过处理）: {e}")
+        if "pledge" in types_needed:
+            try:
+                from .novel.novel_pledge_check import extract_pledges, check_pledges
+                if extract_pledges(state_path, chapters_dir):
+                    pledge_issues = check_pledges(state_path, chapters_dir)
+                else:
+                    pledge_issues = []
+                ch_bad_subs = {it.get("sub") for it in pledge_issues if it.get("file") == chapter}
+                for f, t in repair_types.items():
+                    if t == "pledge":
+                        sub = f.replace(".txt", "")
+                        if sub not in ch_bad_subs:
+                            ok_keys.add((t, sub))
+            except Exception as e:
+                print(f"[三检重检] pledge 异常（按未通过处理）: {e}")
+        if "ending" in types_needed:
+            try:
+                from .novel.novel_fidelity import verify_ending
+                r = verify_ending(str(_P(state_path).parent))
+                if r.get("pass"):
+                    for f, t in repair_types.items():
+                        if t == "ending":
+                            ok_keys.add((t, f.replace(".txt", "")))
+            except Exception as e:
+                print(f"[三检重检] ending 异常（按未通过处理）: {e}")
+        return ok_keys
+
+    def _handle_repair_skip(self):
+        """POST /api/novel/repair/skip  {session_id, chapter}
+        全部跳过：用户确认该章所有检出问题都不修复 → 标记通过（_repaired=True），不再弹面板。"""
+        try:
+            data = self._read_body()
+        except ValueError as e:
+            self._json_response({"success": False, "error": str(e)}, 400)
+            return
+        session_id = str(data.get("session_id", "")).strip()
+        chapter = str(data.get("chapter", "")).strip()
+        if not session_id or not chapter:
+            self._json_response({"success": False, "error": "缺少 session_id/chapter"}, 400)
+            return
+        sm = StateManager()
+        sm.load(session_id)
+        hints = sm.get_repair_hints()
+        if chapter in hints:
+            # 全部跳过：章检阶段清 issues、三检阶段清 full_items（串行时序二选一，统一清两字段一套代码）
+            hints[chapter]["_repaired"] = True
+            hints[chapter]["_skipped_all"] = True
+            hints[chapter]["issues"] = []
+            hints[chapter]["full_items"] = []
+            hints[chapter]["_repair_result"] = {"skipped": True}
+            sm._state["_repair_hints"] = hints
+        sm.save()
+        self._json_response({"success": True, "chapter": chapter})
 
     def _handle_repair_rollback(self):
         """POST /api/novel/repair/rollback  {session_id, chapter, round}"""
@@ -3118,7 +3393,7 @@ body {
         <h3>📖 小说质检</h3>
         <div class="form-row">
           <label>模型目录</label>
-          <input type="text" id="novel-model-dir" value="" placeholder="data/models（bge语义 + R1推理审核）" style="flex:2">
+          <input type="text" id="novel-model-dir" value="" placeholder="data/models（R1推理 + 3B提取）" style="flex:2">
           <button class="btn btn-secondary btn-sm" onclick="checkNovelModels()">检测模型</button>
         </div>
         <div class="form-row">
@@ -3128,16 +3403,29 @@ body {
         <div class="form-row">
           <label>操作</label>
           <button class="btn btn-secondary btn-sm" id="novel-install-btn" onclick="installNovelModels()">安装缺失模型</button>
-          <span style="font-size:11px;color:var(--text-dim)">bge 33MB / R1 约3.7GB / Qwen2.5-3B 约1.9GB，走镜像源；无模型时小说照写，质检/抽取自动跳过</span>
+          <span style="font-size:11px;color:var(--text-dim)">R1 约3.7GB / Qwen2.5-3B 约1.9GB，走镜像源；无模型时小说照写，质检/抽取自动跳过</span>
         </div>
         <div class="form-row">
-          <label>开关</label>
-          <label style="font-size:13px;cursor:pointer"><input type="checkbox" id="novel-chk-chapter" onchange="saveNovelChecks()"> 章检规则4检</label>
-          <label style="font-size:13px;cursor:pointer;margin-left:10px"><input type="checkbox" id="novel-chk-semantic" onchange="saveNovelChecks()"> 语义检查bge</label>
-          <label style="font-size:13px;cursor:pointer;margin-left:10px"><input type="checkbox" id="novel-chk-reason" onchange="saveNovelChecks()"> 推理审核R1</label>
-          <label style="font-size:13px;cursor:pointer;margin-left:10px"><input type="checkbox" id="novel-chk-full" onchange="saveNovelChecks()"> 全文三检</label>
-          <label style="font-size:13px;cursor:pointer;margin-left:16px;color:var(--sc-key)"><input type="checkbox" id="novel-chk-autorepair" onchange="saveNovelChecks()"> 自动修复</label>
-          <label style="font-size:13px;margin-left:8px;color:var(--text-dim)">轮次 <input type="number" id="novel-chk-rounds" value="3" min="1" max="5" style="width:44px;font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:1px 4px" onchange="saveNovelChecks()"></label>
+          <label>章内检测</label>
+          <span style="font-size:11px;color:var(--text-dim)">点位：每章完结 finalize-chapter 时执行</span>
+        </div>
+        <div class="form-row">
+          <label style="padding-left:16px">开关</label>
+          <label style="font-size:12px;cursor:pointer" title="3B 一次判时间衔接/情绪匹配/话题过渡/角色承接，约2-4分钟/章；3B 缺失自动回退规则连通性+逻辑检查"><input type="checkbox" id="novel-chk-chapter" onchange="saveNovelChecks()"> 章内连贯性4维（3B）</label>
+          <label style="font-size:12px;cursor:pointer;margin-left:10px" title="末行标记/禁用模式/文件数，规则毫秒级"><input type="checkbox" id="novel-chk-format" onchange="saveNovelChecks()"> 格式校验（规则）</label>
+          <label style="font-size:12px;cursor:pointer;margin-left:10px" title="对话匹配/行为一致，R1 本地离线，约1分钟/章"><input type="checkbox" id="novel-chk-reason" onchange="saveNovelChecks()"> 推理审核（R1）</label>
+          <label style="font-size:12px;cursor:pointer;margin-left:16px;color:var(--sc-key)" title="章检 HARD 时自动全选修复，T0 格式自动修 + T1 写作模型重构"><input type="checkbox" id="novel-chk-autorepair" onchange="saveNovelChecks()"> 自动修复</label>
+          <label style="font-size:12px;margin-left:8px;color:var(--text-dim)">轮次 <input type="number" id="novel-chk-rounds" value="3" min="1" max="5" style="width:44px;font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:1px 4px" onchange="saveNovelChecks()"></label>
+        </div>
+        <div class="form-row">
+          <label>全文检测</label>
+          <span style="font-size:11px;color:var(--text-dim)">点位：全部写完 finalize-novel 时执行</span>
+        </div>
+        <div class="form-row">
+          <label style="padding-left:16px">开关</label>
+          <label style="font-size:12px;cursor:pointer" title="子结构概述 vs 正文，词面全量筛 + 可疑段 3B 复核，约30s-1分钟；慢但比纯词面提升大（抓同义改写/语义反转）"><input type="checkbox" id="novel-chk-fid" onchange="saveNovelChecks()"> 大纲忠实度（3B复核）</label>
+          <label style="font-size:12px;cursor:pointer;margin-left:10px;color:#e67e22" title="3B 提取 flag + 写作模型推理兑现，⚠️ 约3-5分钟/次（模型思考慢）；慢但提升大——flag 收束检查是纯规则做不到的"><input type="checkbox" id="novel-chk-pledge" onchange="saveNovelChecks()"> 全文承诺（⚠️慢，提升大）</label>
+          <label style="font-size:12px;cursor:pointer;margin-left:10px" title="最后一段判收尾类型（封闭/开放/悬停），3B 约15s，回退特征词"><input type="checkbox" id="novel-chk-ending" onchange="saveNovelChecks()"> 结尾收束（3B）</label>
         </div>
       </div>
 
@@ -3211,7 +3499,11 @@ body {
           <button class="btn btn-sm btn-secondary" style="background:var(--accent);color:#fff" onclick="stopGeneration('immediate')">立即停止</button>
         </div>
         <div id="novel-confirm-panel" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-card);flex-shrink:0"></div>
-        <div id="novel-repair-panel" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-card);flex-shrink:0"></div>
+        <div id="novel-repair-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:2000;align-items:center;justify-content:center">
+          <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;width:90%;max-width:560px;max-height:80vh;display:flex;flex-direction:column">
+            <div id="novel-repair-panel" style="padding:14px 18px;display:flex;flex-direction:column;overflow:hidden"></div>
+          </div>
+        </div>
       </div>
       <div class="outputs-sidebar" id="outputs-sidebar">
         <div class="sidebar-header">已完成文章</div>
@@ -3986,7 +4278,7 @@ function saveDescModal() {
 }
 
 // ===== 小说质检 =====
-let novelChecksConfig = {chapter:true, semantic:true, reason:true, full:true, auto_repair:false, repair_rounds:3};
+let novelChecksConfig = {chapter:true, format:true, reason:true, full_fidelity:true, full_pledge:true, full_ending:true, auto_repair:false, repair_rounds:3};
 
 async function checkNovelModels() {
   const statusEl = document.getElementById('novel-model-status');
@@ -3996,8 +4288,6 @@ async function checkNovelModels() {
     const r = await fetch('/api/novel/status');
     const d = await r.json();
     const parts = [];
-    if (d.bge) parts.push('<span style="color:#2ecc71">语义bge 就绪</span>');
-    else parts.push('<span style="color:#e94560">语义bge 缺失</span>');
     if (d.r1) parts.push('<span style="color:#2ecc71">推理R1 就绪</span>');
     else parts.push('<span style="color:#e94560">推理R1 缺失</span>');
     if (d.qwen25) parts.push('<span style="color:#2ecc71">实体抽取Qwen2.5-3B 就绪</span>');
@@ -4007,10 +4297,12 @@ async function checkNovelModels() {
     if (dirEl && d.dir) dirEl.value = d.dir;
     if (d.config) {
       novelChecksConfig = d.config;
-      const map = {chapter:'novel-chk-chapter', semantic:'novel-chk-semantic', reason:'novel-chk-reason', full:'novel-chk-full', auto_repair:'novel-chk-autorepair'};
+      const map = {chapter:'novel-chk-chapter', format:'novel-chk-format', reason:'novel-chk-reason', full_fidelity:'novel-chk-fid', full_pledge:'novel-chk-pledge', full_ending:'novel-chk-ending', auto_repair:'novel-chk-autorepair'};
       Object.keys(map).forEach(k => {
         const el = document.getElementById(map[k]);
-        if (el) el.checked = !!d.config[k];
+        // 旧配置只有 full → 三检同开关
+        const v = d.config[k] !== undefined ? d.config[k] : d.config.full;
+        if (el && v !== undefined) el.checked = !!v;
       });
       const roundsEl = document.getElementById('novel-chk-rounds');
       if (roundsEl && d.config.repair_rounds) roundsEl.value = d.config.repair_rounds;
@@ -4055,9 +4347,11 @@ async function saveNovelChecks() {
   const roundsEl = document.getElementById('novel-chk-rounds');
   const cfg = {
     chapter: !!document.getElementById('novel-chk-chapter').checked,
-    semantic: !!document.getElementById('novel-chk-semantic').checked,
+    format: !!document.getElementById('novel-chk-format').checked,
     reason: !!document.getElementById('novel-chk-reason').checked,
-    full: !!document.getElementById('novel-chk-full').checked,
+    full_fidelity: !!document.getElementById('novel-chk-fid').checked,
+    full_pledge: !!document.getElementById('novel-chk-pledge').checked,
+    full_ending: !!document.getElementById('novel-chk-ending').checked,
     auto_repair: !!document.getElementById('novel-chk-autorepair').checked,
     repair_rounds: roundsEl ? (parseInt(roundsEl.value) || 3) : 3
   };
@@ -5776,7 +6070,7 @@ function startProgressPolling(sid) {
         // 后端 get_progress 的 repair_pending 只在该章 session 章级 done + hint 有 HARD 且未标记 _repaired 时返回
         if (p.repair_pending && p.repair_pending.chapter) {
           const chId = p.repair_pending.chapter;
-          showRepairPanel(chId);
+          showRepairPanel(chId, p.repair_pending.full_items);
         }
       }).catch(() => {});
   }, 1500);
@@ -5838,16 +6132,45 @@ async function confirmNovelChapter() {
 // ===== 修复引擎面板（P3：章检问题 → 勾选子结构 → 写作模型整段重构） =====
 let _repairPollTimer = null;
 let _repairPanelChapter = null;  // 当前已弹出的修复章（防轮询重复弹）
+let _autoRecheckRound = 0;      // 自动重检轮次（修复完成后自动重检并迭代修复）
+let _repairMode = 'manual';     // 修复模式：manual=重检有问题刷新面板让人再点（无上限）；auto=自动循环修复到通过/超次数
 
-function showRepairPanel(chapter) {
+function showRepairPanel(chapter, fullItems) {
   const panel = document.getElementById('novel-repair-panel');
-  if (!panel || !currentSessionId) return;
+  const modal = document.getElementById('novel-repair-modal');
+  if (!panel || !modal || !currentSessionId) return;
   // 防重：同一章已在展示中（或修复中）→ 不重复弹
-  if (_repairPanelChapter === chapter && panel.style.display === 'block') return;
+  if (_repairPanelChapter === chapter && modal.style.display === 'flex') return;
   if (_repairPanelChapter === chapter && _repairPollTimer) return;  // 修复轮询中
   _repairPanelChapter = chapter;
+  _autoRecheckRound = 0;  // 新弹窗：重置自动重检轮次
+  // 全文三检修复项（fidelity/pledge/ending）：直接渲染，不走 preview
+  if (fullItems && fullItems.length) {
+    const typeNames = {fidelity: '大纲忠实度', pledge: '全文承诺', ending: '结尾收束'};
+    const rows = fullItems.map((it, idx) => {
+      const subLabel = it.sub ? it.sub.replace('.txt','') : '（章级）';
+      return `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;border-bottom:1px solid var(--border)">
+        <input type="checkbox" class="rp-check" data-file="${it.sub ? it.sub + '.txt' : ''}" data-type="${it.type || ''}" checked>
+        <span style="font-size:11px;color:var(--accent);flex-shrink:0">[${typeNames[it.type] || it.type}]</span>
+        <span style="font-size:12px;flex:1">${subLabel}：${escapeHtml((it.problem || '').slice(0, 80))}</span>
+      </label>`;
+    }).join('');
+    panel.innerHTML = `<div style="font-size:13px;font-weight:500;margin-bottom:4px">🔧 ${chapter} 全文质检需处理（三检修复项）</div>
+      <div id="repair-scroll-body" style="flex:1 1 auto;overflow-y:auto;min-height:40px;max-height:calc(80vh - 130px);padding-right:4px">
+        <div style="font-size:12px;color:var(--text-dim);margin:4px 0">勾选 = 用写作模型重构修复（保持文风）；不勾选 = 立即标记通过</div>
+        ${rows}
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px;padding-top:6px;border-top:1px solid var(--border);background:var(--bg-card)">
+        <button class="btn btn-sm btn-secondary" onclick="skipAllRepair('${chapter}')" title="确认该章所有全文质检问题都不修复，标记通过，不再弹出">全部跳过</button>
+        <button class="btn btn-sm btn-primary" onclick="applyFullRepair('${chapter}')">开始修复</button>
+      </div>
+      <div id="repair-status" style="font-size:12px;color:var(--text-dim);margin-top:6px"></div>`;
+    modal.style.display = 'flex';
+    return;
+  }
   // P4 自动模式：配置 auto_repair=on → 不弹面板，直接全选自动修复
   if (novelChecksConfig && novelChecksConfig.auto_repair) {
+    _repairMode = 'auto';  // 自动循环修复：重检有问题继续自动修，直到通过或超次数
     fetch(`/api/novel/repair/preview?session_id=${encodeURIComponent(currentSessionId)}&chapter=${encodeURIComponent(chapter)}`)
       .then(r => r.json()).then(d => {
         if (!d.success || !d.preview) return;
@@ -5867,9 +6190,18 @@ function showRepairPanel(chapter) {
       }).catch(() => {});
     return;
   }
+  _repairMode = 'manual';
+  renderRepairPreview(chapter);
+}
+
+// 拉 preview 渲染修复面板（手动模式首次弹出 + 重检后刷新共用）
+function renderRepairPreview(chapter) {
+  const modal = document.getElementById('novel-repair-modal');
+  const panel = document.getElementById('novel-repair-panel');
+  if (!modal || !panel) return;
   fetch(`/api/novel/repair/preview?session_id=${encodeURIComponent(currentSessionId)}&chapter=${encodeURIComponent(chapter)}`)
     .then(r => r.json()).then(d => {
-      if (!d.success || !d.preview) { panel.style.display = 'none'; return; }
+      if (!d.success || !d.preview) { modal.style.display = 'none'; return; }
       const pv = d.preview;
       const t0Lines = (pv.issues || []).filter(l => l.includes('末行') || l.includes('禁用模式'));
       const t1Lines = (pv.issues || []).filter(l => !l.includes('末行') && !l.includes('禁用模式'));
@@ -5890,37 +6222,81 @@ function showRepairPanel(chapter) {
         </label>${probs}`;
       }).join('');
       const t0Msg = t0Lines.length ? `<div style="font-size:12px;color:#2ecc71;margin:2px 0">⚡ T0 已自动修复：${t0Lines.length} 处格式问题</div>` : '';
-      panel.innerHTML = `<div style="font-size:13px;font-weight:500;margin-bottom:4px">🔧 ${pv.chapter} 六检结果：${pv.ok ? '通过' : (pv.timeout ? '超时' : '需修复')}（HARD/SOFT ${t1Lines.length} 条）</div>
+      const chOnlyMsg = (pv.chapter_only && pv.chapter_only.length) ? `<div style="font-size:12px;color:#e94560;margin:6px 0;padding:6px 8px;background:var(--bg-input);border-radius:4px;border-left:3px solid #e94560">⚠️ 章级问题（无法整段重构，需人工处理或全部跳过）：${pv.chapter_only.map(escapeHtml).join('；')}</div>` : '';
+      panel.innerHTML = `<div style="font-size:13px;font-weight:500;margin-bottom:4px">🔧 ${pv.chapter} 六检结果：${pv.ok ? '通过' : (pv.timeout ? '超时' : '需修复')}（HARD/SOFT ${t1Lines.length + (pv.chapter_only ? pv.chapter_only.length : 0)} 条）</div>
         ${t0Msg}
-        <div style="font-size:12px;color:var(--text-dim);margin:4px 0">选择要修复的子结构（勾掉 = 跳过，写作模型整段重构，字数±15%）</div>
-        ${subRows || '<div style="font-size:12px;color:var(--text-dim)">（无可重构的子结构）</div>'}
-        <div style="display:flex;gap:8px;margin-top:8px">
-          <button class="btn btn-sm btn-secondary" onclick="closeRepairPanel()">关闭</button>
+        ${chOnlyMsg}
+        <div id="repair-scroll-body" style="flex:1 1 auto;overflow-y:auto;min-height:40px;max-height:calc(80vh - 130px);padding-right:4px">
+          <div style="font-size:12px;color:var(--text-dim);margin:4px 0">选择要修复的子结构（勾掉 = 跳过，写作模型整段重构，字数±15%）</div>
+          ${subRows || '<div style="font-size:12px;color:var(--text-dim)">（无可重构的子结构）</div>'}
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px;padding-top:6px;border-top:1px solid var(--border);background:var(--bg-card)">
+          <button class="btn btn-sm btn-secondary" onclick="skipAllRepair('${pv.chapter}')" title="确认该章所有检出问题都不修复，标记通过，不再弹出">全部跳过</button>
           <button class="btn btn-sm btn-primary" onclick="applyRepair('${pv.chapter}')">开始修复</button>
         </div>
         <div id="repair-status" style="font-size:12px;color:var(--text-dim);margin-top:6px"></div>`;
-      panel.style.display = 'block';
+      panel.style.display = 'flex';
+      modal.style.display = 'flex';
     }).catch(() => {});
 }
 
 function closeRepairPanel() {
-  const panel = document.getElementById('novel-repair-panel');
-  if (panel) panel.style.display = 'none';
+  const modal = document.getElementById('novel-repair-modal');
+  if (modal) modal.style.display = 'none';
   if (_repairPollTimer) { clearInterval(_repairPollTimer); _repairPollTimer = null; }
   _repairPanelChapter = null;
+}
+
+function skipAllRepair(chapter) {
+  // 全部跳过：确认该章所有检出问题都不修复 → 后端标记通过（_repaired=True），不再弹
+  const modal = document.getElementById('novel-repair-modal');
+  fetch('/api/novel/repair/skip', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: currentSessionId, chapter})
+  }).then(r => r.json()).then(d => {
+    if (d.success) {
+      if (modal) modal.style.display = 'none';
+      if (_repairPollTimer) { clearInterval(_repairPollTimer); _repairPollTimer = null; }
+      _repairPanelChapter = null;
+      addAssistantMsg('✅ ' + chapter + ' 全部跳过：检出问题已确认不修复，标记通过');
+    } else {
+      addAssistantMsg('❌ 跳过失败：' + (d.error || ''));
+    }
+  }).catch(e => addAssistantMsg('❌ 请求失败：' + e.message));
 }
 
 function applyRepair(chapter) {
   const checked = [...document.querySelectorAll('.rp-check:checked')].map(cb => cb.dataset.file);
   const stEl = document.getElementById('repair-status');
   if (!checked.length) { stEl.textContent = '未选择任何子结构'; return; }
-  stEl.textContent = '⏳ 修复中（写作模型重构 + 重检，每段 3-10 分钟）...';
-  fetch('/api/novel/repair/apply', {
+  _repairMode = 'manual';  // 手动：重检有问题刷新面板让人再点（无上限）
+  stEl.textContent = '⏳ 修复中（写作模型重构 + 重检，每段 3-10 分钟）...';  fetch('/api/novel/repair/apply', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({session_id: currentSessionId, chapter, checked_subs: checked, mode: 'manual'})
   }).then(r => r.json()).then(d => {
     if (!d.success) { stEl.textContent = '❌ ' + (d.error || '启动失败'); return; }
     _repairPollTimer = setInterval(() => pollRepairStatus(chapter), 4000);
+  }).catch(e => { stEl.textContent = '❌ ' + e.message; });
+}
+
+function applyFullRepair(chapter) {
+  // 三检修复项：勾选带 data-file + data-type → 后端类型化重构（fidelity/pledge/ending）
+  const items = [...document.querySelectorAll('.rp-check:checked')].map(cb => ({file: cb.dataset.file, type: cb.dataset.type}));
+  const stEl = document.getElementById('repair-status');
+  if (!items.length) { stEl.textContent = '未选择任何修复项'; return; }
+  _repairMode = 'manual';
+  stEl.textContent = '⏳ 修复中（写作模型类型化重构 + 平滑衔接，可能需要几分钟）...';
+  fetch('/api/novel/repair/apply', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      session_id: currentSessionId, chapter,
+      checked_subs: items.map(x => x.file),
+      full_types: items.map(x => x.type),
+      mode: 'manual'
+    })
+  }).then(r => r.json()).then(d => {
+    if (!d.success) { stEl.textContent = '❌ ' + (d.error || '启动失败'); return; }
+    _repairPollTimer = setInterval(() => pollRepairStatus(chapter), 5000);
   }).catch(e => { stEl.textContent = '❌ ' + e.message; });
 }
 
@@ -5933,14 +6309,91 @@ function pollRepairStatus(chapter) {
     const el = document.getElementById('repair-status');
     if (!el) return;
     const res = st.result || {};
-    if (res.error) { el.textContent = '❌ 修复失败：' + res.error; return; }
+    if (res.error) { el.textContent = '❌ 修复失败：' + res.error; _autoRecheckRound = 0; return; }
     const t1 = (res.t1 && res.t1.results) || [];
     const okN = t1.filter(x => x.status === 'rewritten').length;
     const failN = t1.filter(x => x.status === 'failed').length;
-    el.textContent = `✅ 修复完成：重写 ${okN} 段${failN ? '，失败 ' + failN + ' 段（已保留原稿）' : ''}。可点「关闭」后查看，或重新完结章节重检。`;
-    el.style.color = failN ? '#e94560' : '#2ecc71';
-    // 触发一次章检重跑（由用户手动 finalize 或下一轮自动）
+    const maxRounds = (novelChecksConfig && novelChecksConfig.repair_rounds) || 3;
+    _autoRecheckRound++;
+    const base = `修复完成：重写 ${okN} 段${failN ? '，失败 ' + failN + ' 段（已保留原稿）' : ''}`;
+    if (_repairMode === 'manual') {
+      // 手动：重检一次，有问题刷新面板让人再点（无上限）
+      el.textContent = `🔄 ${base}。自动重检中...`;
+      el.style.color = failN ? '#e94560' : '#2ecc71';
+      triggerRecheck(chapter, 0);
+    } else {
+      // 自动：循环修复到通过或超次数
+      el.textContent = `🔄 ${base}。自动重检中 (${_autoRecheckRound}/${maxRounds})...`;
+      el.style.color = failN ? '#e94560' : '#2ecc71';
+      triggerRecheck(chapter, maxRounds);
+    }
   }).catch(() => {});
+}
+
+// 修复完成后自动重检（手动/自动共用）：
+// 手动：有问题 → 刷新面板显示本次问题（无上限，全凭人）；无问题 → 关闭界面走下一章
+// 自动：有问题 & 未超轮次 → 继续 apply 全量修复；无问题 → 关闭；超轮次 → 保留让用户处理
+function triggerRecheck(chapter, maxRounds) {
+  const modal = document.getElementById('novel-repair-modal');
+  if (!modal || modal.style.display === 'none' || _repairPanelChapter !== chapter) {
+    // 已被用户跳过/全部跳过/关闭，重置轮次
+    _autoRecheckRound = 0;
+    return;
+  }
+  fetch(`/api/novel/repair/preview?session_id=${encodeURIComponent(currentSessionId)}&chapter=${encodeURIComponent(chapter)}`)
+    .then(r => r.json()).then(d => {
+      const el = document.getElementById('repair-status');
+      if (!d.success || !d.preview) {
+        // 拿不到预览 = _repaired=True 已清空 issues → 全通过
+        _autoRecheckRound = 0;
+        if (el) el.textContent = '✅ 自动重检：全通过，章节已合格';
+        if (modal) modal.style.display = 'none';
+        _repairPanelChapter = null;
+        return;
+      }
+      const files = d.preview.files || [];
+      const chapterOnly = d.preview.chapter_only || [];
+      if (!files.length && !chapterOnly.length) {
+        _autoRecheckRound = 0;
+        if (el) el.textContent = '✅ 自动重检：全通过，章节已合格';
+        if (modal) modal.style.display = 'none';
+        _repairPanelChapter = null;
+        return;
+      }
+      if (_repairMode === 'manual') {
+        // 手动：重检还有问题 → 界面不关，刷新为本次问题与勾选（无上限，全凭人点不点）
+        _autoRecheckRound = 0;
+        renderRepairPreview(chapter);
+        return;
+      }
+      // 自动模式：还有问题
+      if (_autoRecheckRound >= maxRounds) {
+        if (el) el.textContent = `⚠️ 已自动修复 ${maxRounds} 轮，仍有 ${files.length} 个子结构问题未解决，请人工处理或全部跳过`;
+        if (el) el.style.color = '#e94560';
+        _autoRecheckRound = 0;
+        return;  // 保留 modal
+      }
+      // 继续下一轮（自动全量修复）
+      if (el) el.textContent = `🔄 重检发现 ${files.length} 个子结构问题，自动继续修复 (${_autoRecheckRound + 1}/${maxRounds})...`;
+      fetch('/api/novel/repair/apply', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({session_id: currentSessionId, chapter, checked_subs: files, mode: 'auto'})
+      }).then(r2 => r2.json()).then(d2 => {
+        if (d2.success) {
+          _repairPollTimer = setInterval(() => pollRepairStatus(chapter), 5000);
+        } else {
+          if (el) el.textContent = '❌ 继续修复启动失败：' + (d2.error || '');
+          _autoRecheckRound = 0;
+        }
+      }).catch(e => {
+        if (el) el.textContent = '❌ 继续修复失败：' + e.message;
+        _autoRecheckRound = 0;
+      });
+    }).catch(() => {
+      const el = document.getElementById('repair-status');
+      _autoRecheckRound = 0;
+      if (el) el.textContent = '⚠️ 重检请求失败';
+    });
 }
 
 function fetchResult(sessionId) {

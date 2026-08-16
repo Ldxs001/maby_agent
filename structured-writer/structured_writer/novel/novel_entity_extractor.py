@@ -7,7 +7,7 @@ Entity Extractor — 实体关系提取器（LLM 驱动版）。
 
 v2.3.7b0 架构（替代纯正则版）：
 - 抽取：Qwen2.5-3B-Instruct（transformers 本地，非思考，CPU 可跑）——LLM 语义抽取实体/关系/状态
-- 归并：bge-small-zh-v1.5 嵌入相似度（>0.85 合并，防同一实体多种写法重复建档）
+- 归并：精确名 → 子串（防包裹式命名重复建档）
 - 注册：characters（含别名）强制注册为 character 实体，杜绝人物缺失
 - 清洗：历史正则时代碎片（标点残留/超短名）幂等过滤
 - 模型走 transformers 本地（data/models 优先 → HF 缓存回退），不走 LM Studio；失败非阻断
@@ -39,8 +39,6 @@ from pathlib import Path
 EXTRACT_MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 # 实体+关系 JSON 通常几百 token；1024 足够且 3B CPU 生成快（4096 会让写段阻塞 1-3 分钟/段）
 EXTRACT_MAX_TOKENS = 2048  # 上限而非消耗：模型写完 JSON 自动停（实测 213/472 token），调大零成本，防长篇多实体截断
-BGE_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
-MERGE_SIM_THRESHOLD = 0.85
 # 碎片特征：含标点/百分号/括号等残留（正则时代的产物）
 FRAGMENT_RE = re.compile(r"[，。；：！？、】》「」\"'…%【】()（）]")
 
@@ -66,10 +64,9 @@ REL_PATTERNS = [
 ]
 
 _EXTRACT_PIPE = None  # text-generation pipeline（Qwen2.5-3B）
-_BGE_MODEL = None     # SentenceTransformer（bge-small-zh）
 
 
-# ── 模型加载（照抄 novel_semantic_check / novel_reasoning_check 模式） ──
+# ── 模型加载（照抄 novel_reasoning_check 模式） ──
 
 def _find_local_model(model_id: str) -> str | None:
     """data/models/ 优先 → HF 默认缓存回退；返回 snapshot 目录，无则 None"""
@@ -115,29 +112,6 @@ def _load_extract_model():
         print(f"[entity-extract] 抽取模型加载失败（非阻断）: {e}")
         _EXTRACT_PIPE = None
     return _EXTRACT_PIPE
-
-
-def _load_bge():
-    """懒加载 bge-small-zh（实体归并嵌入，CPU）。缺失 → None。"""
-    global _BGE_MODEL
-    if _BGE_MODEL is not None:
-        return _BGE_MODEL
-    try:
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
-        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-        model_path = _find_local_model(BGE_MODEL_NAME)
-        if model_path is None:
-            print("[entity-extract] bge 归并模型缺失，跳过嵌入归并（仅名字/子串匹配）")
-            _BGE_MODEL = None
-            return None
-        from sentence_transformers import SentenceTransformer
-        _BGE_MODEL = SentenceTransformer(model_path)
-    except ImportError:
-        _BGE_MODEL = None
-    except Exception as e:
-        print(f"[entity-extract] bge 加载失败（非阻断）: {e}")
-        _BGE_MODEL = None
-    return _BGE_MODEL
 
 
 # ── 清洗 / 注册 ──
@@ -427,16 +401,8 @@ def _make_relation_id(existing: list) -> str:
     return f"rel_{max_id + 1:03d}"
 
 
-def _cosine(a, b):
-    import math
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a)) or 1.0
-    nb = math.sqrt(sum(x * x for x in b)) or 1.0
-    return dot / (na * nb)
-
-
-def _merge_or_create(new_ent: dict, existing: list, name_emb: dict, bge) -> str:
-    """归并策略：精确名 → 子串 → bge 相似度>0.85 合并；否则新建。返回实体 id。"""
+def _merge_or_create(new_ent: dict, existing: list) -> str:
+    """归并策略：精确名 → 子串；否则新建。返回实体 id。（bge 相似度档已移除）"""
     new_name = new_ent.get("name", "").strip()
     if not new_name:
         return ""
@@ -449,14 +415,6 @@ def _merge_or_create(new_ent: dict, existing: list, name_emb: dict, bge) -> str:
         en = e.get("name", "")
         if en and (new_name in en or en in new_name) and (len(en) >= 2 or len(new_name) >= 2):
             return e["id"]
-    # 3. bge 嵌入相似度
-    if bge is not None and name_emb:
-        nv = name_emb.get(new_name)
-        if nv is not None:
-            for e in existing:
-                ev = name_emb.get(e.get("name"))
-                if ev is not None and _cosine(nv, ev) > MERGE_SIM_THRESHOLD:
-                    return e["id"]
     # 新建
     eid = _make_entity_id(existing)
     existing.append({
@@ -519,28 +477,14 @@ def extract(state_path: str, chapter: str, sub_key: str, content: str, force_sta
     new_ents = result.get("entities", []) or []
     new_rels = result.get("relations", []) or []
 
-    # 4. 归并（名字 + bge 相似度）
-    bge = _load_bge()
-    name_emb = {}
-    if bge is not None:
-        all_names = [e.get("name", "") for e in entities if e.get("name")] + \
-                    [n.get("name", "") for n in new_ents if n.get("name")]
-        all_names = list(dict.fromkeys(all_names))
-        if all_names:
-            try:
-                vecs = bge.encode(all_names, normalize_embeddings=True)
-                name_emb = dict(zip(all_names, [v.tolist() for v in vecs]))
-            except Exception as e:
-                print(f"  [entity-extract] bge 编码失败（降级名字匹配）: {e}")
-                name_emb = {}
-
+    # 4. 归并（精确名 → 子串；bge 相似度档已移除）
     new_count = 0
     for ne in new_ents:
         ne["first_chapter"] = chapter
         ne["first_sub"] = sub_key
         ne["last_chapter"] = chapter
         ne["last_sub"] = sub_key
-        eid = _merge_or_create(ne, entities, name_emb, bge)
+        eid = _merge_or_create(ne, entities)
         if eid:
             # 已合并 → 更新 last 出现
             for e in entities:

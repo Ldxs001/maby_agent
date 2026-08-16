@@ -3,6 +3,108 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [3.0.0b9] - 2026-08-16
+### 修复（手动/自动模式行为拆分）
+- **b8 缺陷**：手动模式也被套进"自动重检循环"（有问题自动继续 apply + 轮次上限）——违背用户定义
+- **手动模式（无上限，全凭人）**：允许中途点"全部跳过"；点"开始修复" → 修复 → 自动重检一次 → **有问题 → 界面不关，`renderRepairPreview` 刷新为本次问题与勾选**（用户再勾选/跳过/继续点）；无问题 → 关闭界面走下一章。**无重试上限**
+- **自动模式（有上限）**：修复 → 重检 → 有问题继续自动全量修复 → 重检 → ... 直到通过或超 `repair_rounds`（默认 3）次
+- **实现**：模块级 `_repairMode`（manual/auto）——自动分支（auto_repair 配置）设 auto，applyRepair/applyFullRepair 设 manual；`triggerRecheck` 按模式分支：manual → 刷新面板，auto → 循环 apply + 轮次判定
+- 渲染抽取：showRepairPanel 的 preview 渲染抽成 `renderRepairPreview(chapter)`（首次弹出 + 手动重检刷新共用）
+
+## [3.0.0b8] - 2026-08-16
+### 修复（修复面板：删"关闭"文案 + 修复完自动重检循环）
+- **删"关闭"按钮文案**：原成功消息"可点「关闭」后查看，或重新完结章节重检"——用户没有"关闭"按钮（点击外部不关闭），文案自相矛盾；改为"🔄 修复完成：重写 X 段。自动重检中 (N/M)..."
+- **修复完自动重检**：`pollRepairStatus` 拿到 done → 触发 `triggerRecheck`：拉 preview → 有问题 & 未超轮次（默认 3 次，配置 `novel_checks.repair_rounds`）→ 继续 apply → 继续 poll；preview 无问题 → 关闭 modal + 提示"全通过"；超轮次仍有 → 保留 modal 让用户人工处理/全部跳过
+- **统一手动/自动模式**：手动模式也走自动重检循环（用户原话"修复完了不自动重检？"）；配置 auto_repair 仅决定"是否弹面板"（自动模式不弹），不影响自动重检循环
+- **防误触发**：triggerRecheck 检查 modal 未关闭 且 `_repairPanelChapter === chapter`——用户中途点"全部跳过"后不会触发"通过"误判
+- 轮次计数器模块级 `_autoRecheckRound`，新弹窗重置，超轮次/通过/失败时重置
+
+## [3.0.0b7] - 2026-08-16
+### 重构（R1 修复极简定案：删 quote/difflib，detail 描述即引导）
+- **拍板**："R1 本来就有摘要（detail），多余机制全删，R1 信息当引导给大模型告诉它只修这里"
+- **删除**：R1 prompt 的 `quote` 字段（输出要求/示例/纠错重试）、issue `source_text`、finalize 聚合打印 `|引:` 标记、web_ui source_text 提取与 quotes_map、`_fuzzy_locate`（difflib 模糊定位）、`_build_window_prompt`（窗口输入）——difflib 全项目零残留
+- **R1 修复 = 引导式局部改写**：problem 含"推理审核" → `_build_guided_prompt`（完整正文 + R1 detail 问题描述，writer 自行定位问题句、只改那里、其余逐字保留）→ `_validate_guided`（三行保留 + 输出与原文确有差异）
+- 校验只防"未改写空转"与"三行丢失"——不再用 diff/相似度（用户明确不需要）；writer 是配置的大模型，detail 描述足以定位，重检兜底全文润色风险
+- 三检 pledge 的 source_text 路径（_full_repair → src_map，b3 前已有）不受影响，保留
+
+## [3.0.0b6] - 2026-08-16
+### 重构（R1 窗口修复 v3：窗口输入，杜绝 LLM 全文润色）
+- **b5 缺陷**：给 writer 完整正文 + "只改问题句"指令 → 大模型易顺手全文润色，靠"变化块占比"校验拦截是"先放任再拦截"，且"相似度"字样引起向量模型误解（实际是 Python 标准库 difflib 字符比对，非 embedding）
+- **窗口输入**：`_fuzzy_locate`（精确 find 优先 → difflib 滑动窗口模糊匹配，容忍 R1 摘录出入；句子边界对齐防拼接残句）→ **LLM 只见问题句 ±40 字窗口**（`_build_window_prompt`，输出仅窗口片段）→ 拼回原文件——窗口外天然不可能被改动，无需事后校验
+- **多问题句**：逐个 quote 循环（定位→窗口改写→拼接，累积），未定位/未改写进 notes；全部失败返回失败
+- **删除**：`_build_guided_prompt`（完整正文引导）、`_validate_local`（变化块占比）——均不再需要
+- 说明：difflib = Python 标准库最长公共子序列比对，零模型零依赖，与向量模型/bge 完全无关（bge 已全项目清零）
+
+## [3.0.0b5] - 2026-08-16
+### 重构（R1 句子级修复：quote 从"精确钥匙"降级为"引导线索"）
+- **根因**：R1（1.5B）的 quote 摘录不可靠——prompt 正文预览中段省略（每段只给前 15 行 + 后 8 行），问题句在省略区时 quote 是编的；1.5B 也无法保证"逐字复制"。b3/b4 的 `_locate_windows` 精确检索 + 多级匹配 + missed 报告本质上在跟不可靠输入搏斗
+- **方案 C（拍板）**：R1 机制不变（sub 定位 + 问题描述 + quote 尽力摘录），quote 降级为**引导线索**——`rewrite_segment` 收到 quotes 直接发 `_build_guided_prompt`（完整正文 + 问题说明 + quote 线索"可能与正文有细微出入，以正文实际内容为准"），**由 writer 大模型在完整正文中自行定位问题句并局部改写**
+- **删除多余机制**：`_locate_windows`（精确检索）、`_build_window_prompt`（窗口契约）、`_validate_window`（窗口外子序列校验）全删；quote 不再做 find 硬钥匙
+- **校验换锚**：`_validate_local` = 三行保留 + **变化块占比 ≤25%**（difflib opcodes replace/delete 块长度/原文长度）——不依赖 quote 精确性，整段重写（97%）必拒、局部改（9%）通过；多问题句适度多改（15%）通过
+- R1 prompt quote 措辞：去掉"必须逐字复制"（1.5B 做不到的约束会硬编）→ "尽力摘录即可，仅作修复引导"
+
+## [3.0.0b4] - 2026-08-16
+### 修复（R1 窗口修复的过度修复回潮 + 定位健壮性）
+- **quote 定位失败不再静默整段重构**：b3 的 `if windows:` 之外，R1 问题句全部定位失败会掉进整段重构（过度修复回潮）→ 改为明确失败返回（列出未定位问题句，提示人工核对或跳过），绝不整段重写
+- **多级匹配**：`_locate_windows` 三级定位（原样 → 剥引号 `“”"'` → 剥标点 `…。，！？；：、`）——R1（1.5B）摘录 quote 与正文的引号/标点出入可容错命中；返回 (windows, missed) 双值
+- **部分定位失败**：修成功的问题句窗口照修，missed 附加 note（重检时 R1 仍报该句可再修）；missed 同时进窗口 prompt 的[未定位问题句]块，让 LLM 若能找到一并修正
+- run 收尾：ok=True 且带 note 时附加到 result（此前 note 被吞）
+
+## [3.0.0b3] - 2026-08-16
+### 新增（R1 句子级窗口修复 + 逻辑检查子结构定位 + 修复顺序）
+- **R1 推理审核句子级定位**：prompt 输出加 `quote` 字段（问题句原文逐字摘录，整章性填 null；输出要求+示例+纠错重试 prompt 同步）→ issue 带 `source_text` → finalize_chapter 聚合打印附 `|引:xxx` 标记走 stdout 链路 → `_parse_hint_issues` 提取回 `source_text`（问题描述剥离干净）
+- **修复引擎窗口修复模式**（`repair_type="reason"` 场景）：`rewrite_segment` 加 `quotes` 参数，正文中定位问题句 ±40 字窗口 → 窗口修复契约 prompt（只改问题句、窗口外逐字保留）→ `_validate_window` 强校验（三行保留 + 窗口外正文子序列顺序逐字保留 + 相似度 ≥60%）；quote 定位失败自动回退整段重构保底；多问题句同段一次修复（多窗口并列）
+- **逻辑检查子结构定位**：`generate_report` 结构化从 detail 提取 `S\d+\.txt`（`_check_*` 内部本已带 fname 前缀）→ issue 落子结构级可勾选整段重构；无定位（如 timeline 全局倒序）落章级仅查看
+- **修复顺序环节优先级**：`files_hit` 从 `sorted()` 字典序改为环节排序——4维 问题=0 最前、格式/逻辑=1、推理审核=2 最后（聚合打印把全部 HARD 放 SOFT 前导致 R1 HARD 反而在前，必须显式按环节排）——弹窗勾选天然"4维 先修、R1 后修"，符合分阶段修复
+- apply 聚合 `quotes_map`（{file: [问题句...]}）传入修复引擎；三检 pledge 的 source_text 路径（_full_repair → src_map）互不干扰
+
+## [3.0.0b2] - 2026-08-16
+### 修复（4维 SOFT 问题丢失根因链）
+- **bridge 过滤漏 `[SOFT]`**：`novel_bridge` 章检/三检 issues 提取只收 `[HARD]`/`[FAIL]` 行 → 所有 SOFT 问题（4维 SOFT/R1 SOFT/格式 SOFT/逻辑 SOFT）从未写入 `hint.issues`，弹窗靠 preview 从 `output` 补 4维，output 截断（stdout[-3000:]）即丢（L01 案例）→ 过滤加 `[SOFT]`
+- **4维 issue 缺子结构定位**：`check_4dim` 的 issue `file` 是 `"S01 → S02"`（无 .txt）→ 聚合打印后 `_parse_hint_issues` 匹配不到 `S\d+\.txt` 落章级不可修复 → 改为 `file=前段 S0X.txt`（与 output 补 4维 路径一致，position 保留"后段开头"定位语义）
+- **problem 剥离正则**：`\[\w+\]` 匹配不了 `[S01.txt]`（`.` 不在 `\w`）→ 问题描述残留 `.txt]` 前缀 → 改 `\[[^\]]*\]` 兼容
+- **HARD 拦截语义收紧（issues 含 SOFT 后的连带）**：novel_writer 章检 `_has_hard`、重检通过判定、三轮回 pending 判定全部改为"存在 `[HARD]`/`[FAIL]` 行"——SOFT 残留不拦截、不无限循环；state_manager `repair_pending` 只由 HARD/FAIL 行或三检 full_items 触发（全 SOFT 章不弹窗）；repair/apply 收尾 `_repaired` 置位改 HARD 判定（重检只剩 SOFT 不死等）
+- 效果：有 HARD 的章，弹窗修复面板现在完整显示 4维 SOFT 问题（可勾选整段重构），不再依赖 output 截断后残留
+
+## [3.0.0b1] - 2026-08-16
+### 修复
+- **逻辑检查正确归位**：`logic_check` 从"无条件跑"纳入 4维 回退链——4维 3B 判定成功（`_4dim_ok`）时跳过；3B 不可用/异常时与规则连通性（`check_continuity`）共同作为规则回退（4维 的规则版替代），异常仍报 HARD 阻断
+- **删除跨章承诺检查**（历史遗留，全文三检承诺已完整替代）：`novel_continuity.cross_chapter` 函数、`finalize_chapter` 调用块与 `chapters_dir` 死变量、CLI `cross-chapter` 分支、`cross_chapter_check` 写入全部移除；`_extract_keywords` 保留（`fidelity_check` L1 词面复用）；质检 UI 4维 悬浮提示同步为"回退规则连通性+逻辑检查"
+- 命名不做改动（novel_style_check.py / style_check / style_check_notes 保持现状，避免链式引用风险）
+
+## [3.0.0b0] - 2026-08-16
+### 架构重构（major：门禁体系废除 + 模型架构 3→2 模型）
+- **门禁体系废除**：`require_gate` 为死代码（无任何调用方）、gate_state.json 只写不读；三检放行改为"修复弹窗处理状态"驱动（`_full_repair` 全部处理完即放行），`_eval_full_gate` 删除
+- **章内/全文统一存储**：三检修复项从 novel_state `_full_repair` 迁入 session `_repair_hints[chapter].full_items`（与章检 issues 同层）——repair_pending 一套判定、apply/skip 一套逻辑；修复 finalize-novel 写 novel_state vs get_progress 读 session 的存储断链（novel_writer 同步桥接）
+- **模型架构定型**：向量模型 bge 全项目移除（章检语义检查 + 实体提取器归并相似度档），系统模型 = R1（推理审核）+ 3B（4维判定/实体提取/忠实度复核/结尾收束）
+- **章检重构**：连通性/语义规则版 → 3B 一次判 4 维（时间衔接/情绪匹配/话题过渡/角色承接，逐维独立判定+独立 reason）+ 角色注册表（name+aliases）全文检索上下文注入；4维不可用回退规则连通性；语义检查（bge）整链路删除
+
+### 新增
+- **全文三检全 LLM 化**：①大纲忠实度（L1 词面全量筛 → 覆盖率<0.6 可疑段 3B 复核"正文是否支持 summary"，支持提升 PASS/不支持给理由）②全文承诺（3B 按正文提取 flag（sub+source_text 规则定位）→ writer 配置驱动推理判已兑现/未兑现/悬停+依据 → 关键词回退；替代旧 cross_chapter 章尾/章头关键词检查）③结尾收束（末章末段 → 3B 判封闭/开放/悬停三型 + 特征词回退）
+- **三检修复弹窗复用**：fidelity/pledge/ending 类型化重构（`novel_repair_engine` 加 repair_type/source_text → [修复目标] 指令变体）；pledge 减法 = LLM 重构移除悬置承诺+平滑衔接
+- **三检当场重检**：勾选修复 = 承担成本——重构成功后当场重跑对应检查（fidelity 重跑 fidelity_check / pledge 重跑 extract+check / ending 重跑 verify_ending），通过才移除修复项，全清空才标记通过（无"下次 finalize-novel"）
+- **修复弹窗显式裁决**：全部跳过（`_repaired=True` 不再弹）替代"关闭"；勾选=要修、未勾选=接受问题立即标记通过
+- **包环境探测安装**：`novel/model_env_check.py`——setup.bat 启动阶段探测 transformers/torch（可选 accelerate），缺失自动 pip install（阿里云镜像），防"UI 下载了模型但缺运行包跑不了"
+- **质检 UI 重构**：章内检测/全文检测分组 + 点位标注 + 慢速提示；全文三检单独打钩（full_fidelity/full_pledge/full_ending）；格式校验独立开关（format，修复挂错 semantic 字段的空开关）
+
+### 修复
+- 修复引擎选错项目（glob 取第一个项目）→ 从 session outline `_novel.state_path` 定位当前项目
+- 修复引擎 chapter_dir 少章级子目录（chapters/ 根 vs chapters/<章>/）→ "文件不存在"全失败
+- 修复失败无条件置 `_repaired=True`（面板永不重弹）→ 有失败保持可重试
+- 章检输出格式与修复解析不匹配（语义检查缩进行/段间标记无 .txt）→ 兼容解析 + 问题清单（只列有问题子结构 + 带问题）+ T0/T1 划分（T0 自动修不进勾选）
+- `repair/preview` + `repair/status` 路由挂错 POST 表（前端 GET → 404 → 修复面板被隐藏）
+- 修复面板按钮不可见 → 改模态框（居中 + 滚动区外物理固定按钮 + 点遮罩不关闭）
+- 章级重规划 title 污染（`S05《xxx》`）→ s_key 明确沿用 + prompt 去诱导（目标子结构编号仅供定位、禁止写入 title）
+- 重规划在途三按钮（开始生成/重新规划/保存范例并生成）未禁用 → `_markActionButtonsBusy` 统一禁用（文案不变）
+- 4维判定 prompt 中略标记误导 3B（把省略当自然承接）→ 移除，改独立【后段结尾节选】字段
+- setup.bat 闪退（UTF-8 中文注释被 GBK cmd 乱码解析 + LF 行尾）→ 全 ASCII + CRLF 重写
+- 修复模型文案写死"35b" → "写作模型"（配置驱动）
+
+### 移除
+- `novel_semantic_check.py`（bge 语义检查，死代码）整文件删除
+- 实体提取器 bge 归并（`_load_bge`/`_cosine`/`MERGE_SIM_THRESHOLD`/第三档相似度）——归并降级精确名+子串
+- `_eval_full_gate`、gate_state.json 的 fidelity/ending_verify 写入、`NOVEL_SKIP_SEMANTIC`、质检 UI "语义bge" 状态/安装项
+
 ## [2.4.0b0] - 2026-08-16
 ### 新增（重规划全链路 UI 反馈与竞态防护，2.3.29b0 之后）
 - **重规划在途反馈**：子结构/章级/整篇重规划进行中——行内"重规划中..."、章卡片/底部三按钮（开始生成/重新规划/保存范例并生成）视觉禁用（文案不变）、防重复发起

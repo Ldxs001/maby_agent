@@ -447,7 +447,7 @@ def write_sub(state_path, chapter, sub_key, target_dir):
 
     # ── 自动完结检测：本章所有子结构全部 completed → 自动 finalize-chapter ──
     # Web 智能体场景：章检由 novel_writer 统一控制（受配置开关），write-sub 不隐式触发
-    # （否则每次写完一章的最后一段都会加载 bge/R1 跑六检，线程卡死）。NOVEL_SKIP_AUTOFINALIZE=1 时跳过。
+    # （否则每次写完一章的最后一段都会加载模型跑六检，线程卡死）。NOVEL_SKIP_AUTOFINALIZE=1 时跳过。
     if os.environ.get("NOVEL_SKIP_AUTOFINALIZE") != "1":
         report_dir = str(Path(state_path).parent / "reports")
         _auto_finalize_if_done(state_path, chapter, str(chapter_dir), report_dir)
@@ -485,59 +485,53 @@ def _auto_finalize_if_done(state_path, chapter, chapter_dir, report_dir):
 
 
 def finalize_chapter(state_path, chapter, chapter_dir, report_dir):
-    """一键完结：章内连通性 → 跨章承诺链 → 风格校验 → 逻辑检查 → 阻断循环 → 门禁"""
+    """一键完结：章内4维判定（3B，规则回退连通性+逻辑）→ 格式校验 → 推理审核 → 阻断循环 → 门禁"""
     import importlib
     sys.path.insert(0, str(SCRIPTS_DIR))
-    from novel_continuity import check_continuity, cross_chapter
+    from novel_continuity import check_continuity
     from novel_style_check import check_chapter as style_check
     from novel_pipeline_gate import pass_gate
-
-    chapters_dir = str(Path(chapter_dir).parent)
 
     all_issues = []
 
     print(f"\n{'='*50}")
     print(f"[完结] {chapter}: 章内连续性检查...")
-    all_issues += check_continuity(chapter_dir, chapter, state_path)
-
-    print(f"\n---")
-    print(f"[完结] {chapter}: 跨章承诺链检查...")
-    all_issues += cross_chapter(state_path, chapters_dir)
-
-    print(f"\n---")
-    print(f"[完结] {chapter}: 风格校验...")
-    all_issues += style_check(chapter_dir, chapter, state_path)
-
-    print(f"\n---")
-    print(f"[完结] {chapter}: 逻辑检查...")
-    sys.path.insert(0, str(SCRIPTS_DIR))
+    # 4维 3B 判定（时间衔接/情绪匹配/话题过渡/角色承接，一次调用）优先；
+    # 3B 不可用 → 规则回退链：连通性（时间词/角色 bigram）+ 逻辑检查（人物行为/时间线/概述匹配）
+    _4dim_ok = False
     try:
-        from novel_logic_check import generate_report as logic_check
-        report_path = Path(report_dir) / f"logic_{chapter}.md"
-        logic_issues = logic_check(chapter_dir, state_path, str(report_path))
-        all_issues += logic_issues
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from novel_4dim_check import check_4dim
+        _4dim_issues = check_4dim(state_path, chapter, chapter_dir)
+        if _4dim_issues is not None:
+            _4dim_ok = True
+            all_issues += _4dim_issues
+            print("  [INFO] 4维模型判定已启用（连通性/逻辑规则版跳过，回退链保留）")
     except Exception as e:
-        print(f"[HOOK-BLOCK] 逻辑检查异常: {e}")
-        print(f"  这是一个硬性问题 — 修复后重新运行 finalize-chapter")
-        all_issues.append({
-            "file": chapter, "problem": f"逻辑检查执行失败: {e}",
-            "position": "logic_check()", "severity": "HARD",
-            "suggestion": "检查 novel_state.json 和 chapter 文件完整性后重试"
-        })
-
-    # ── 第5步: 语义检查（有模型则执行，无模型跳过；NOVEL_SKIP_SEMANTIC=1 时跳过） ──
-    print(f"\n---")
-    print(f"[完结] {chapter}: 语义检查...")
-    if os.environ.get("NOVEL_SKIP_SEMANTIC") == "1":
-        print("  [INFO] 语义检查已被用户开关关闭（配置面板）")
-    else:
+        print(f"  [INFO] 4维判定异常，回退规则连通性+逻辑检查: {e}")
+    if not _4dim_ok:
+        # 4维 3B 不可用 → 规则回退链：连通性 + 逻辑检查（4维 的规则版替代）
+        all_issues += check_continuity(chapter_dir, chapter, state_path)
         try:
-            sys.path.insert(0, str(SCRIPTS_DIR))
-            from novel_semantic_check import check_semantic
-            semantic_issues = check_semantic(state_path, chapter, chapter_dir)
-            all_issues += semantic_issues
+            from novel_logic_check import generate_report as logic_check
+            report_path = Path(report_dir) / f"logic_{chapter}.md"
+            logic_issues = logic_check(chapter_dir, state_path, str(report_path))
+            all_issues += logic_issues
         except Exception as e:
-            print(f"  [INFO] 语义检查跳过（非阻断）: {e}")
+            print(f"[HOOK-BLOCK] 逻辑检查异常: {e}")
+            print(f"  这是一个硬性问题 — 修复后重新运行 finalize-chapter")
+            all_issues.append({
+                "file": chapter, "problem": f"逻辑检查执行失败: {e}",
+                "position": "logic_check()", "severity": "HARD",
+                "suggestion": "检查 novel_state.json 和 chapter 文件完整性后重试"
+            })
+
+    print(f"\n---")
+    print(f"[完结] {chapter}: 格式校验...")
+    if os.environ.get("NOVEL_SKIP_FORMAT") == "1":
+        print("  [INFO] 格式校验已被用户开关关闭（配置面板）")
+    else:
+        all_issues += style_check(chapter_dir, chapter, state_path)
 
     # ── 第6步: 推理审核（可选，CPU 可跑，DeepSeek-R1-Distill-Qwen-1.5B；NOVEL_SKIP_REASON=1 时跳过） ──
     print(f"\n---")
@@ -715,12 +709,15 @@ def _generate_behavior_summary(state_path: str, chapter: str, chapters_dir: str)
 
 def fidelity_check(state_path, chapters_dir):
     """
-    大纲忠实度检查：逐章对比 overview 与实际内容（通用版，无硬编码）
-    关键词从 novel_state.json 的 characters/technical_notes/chapters 动态提取。
+    大纲忠实度检查（子结构级）：L1 词面全量筛 → 可疑段送 3B 复核 → 聚合章级。
+
+    - L1：每子结构 summary 关键词 vs 该段正文关键词 → 覆盖率（毫秒级，无模型）
+    - 3B 复核：覆盖率 < 0.6 的可疑段，3B 判"正文是否支持 summary"；
+      3B 支持 → 提升一级（消除同义改写误报）；3B 不支持 → 保持原级 + 追加 3B 理由
+    - 3B 不可用 → 全走 L1 词面（现行为）
     """
-    import importlib
-    sys.path.insert(0, str(SCRIPTS_DIR))
-    # 复用 continuity 中的动态关键词提取
+    import sys as _sys
+    _sys.path.insert(0, str(SCRIPTS_DIR))
     from novel_continuity import _extract_keywords as _ek
 
     sp = Path(state_path)
@@ -728,152 +725,258 @@ def fidelity_check(state_path, chapters_dir):
     chapters = data.get("chapters", [])
 
     import re
-    # 动态提取关键词
     kw_set = _ek(data)
     kw_list = sorted(kw_set, key=len, reverse=True)
     if not kw_list:
         print("[fidelity] 无可用关键词，使用概述词")
-        # 回退：从各章概述中提取2-4字滑动窗口关键词
         for ch in chapters:
             text = re.sub(r'[^\u4e00-\u9fff]', '', ch.get("overview", ""))
             for wlen in range(4, 1, -1):
                 for i in range(len(text) - wlen + 1):
-                    kw_list.append(text[i:i+wlen])
+                    kw_list.append(text[i:i + wlen])
         kw_list = list(set(kw_list))
-
     keyword_re = re.compile('|'.join(re.escape(p) for p in kw_list))
 
-    report = []
-    report.append("# 大纲忠实度报告\n")
-    report.append("## 全文检查\n")
-    report.append("| 章节 | 概述 | 实际字数 | 关键词覆盖率 | 等级 |")
-    report.append("|------|------|---------|-------------|------|")
+    # 3B 复核器（懒加载；不可用 → None，全走词面）
+    _model = None
+    _tok = None
 
-    pass_count = 0
-    info_count = 0
-    warn_count = 0
-    error_count = 0
+    def _fid_judge(summary, content):
+        nonlocal _model, _tok
+        try:
+            if _model is None:
+                sys.path.insert(0, str(SCRIPTS_DIR))
+                from novel_4dim_check import _load_model as _lm
+                loaded = _lm()
+                if loaded is None:
+                    return None
+                _model, _tok = loaded
+            from novel_4dim_check import fidelity_judge
+            return fidelity_judge(_model, _tok, summary, content)
+        except Exception:
+            return None
+
+    report = ["# 大纲忠实度报告（子结构级）\n", "## 全文检查\n",
+              "| 章节 | 子结构 | 词面覆盖率 | 3B复核 | 等级 |\n",
+              "|------|--------|-----------|--------|------|\n"]
+    pass_count = info_count = warn_count = error_count = 0
     total_chars = 0
+    fail_items = []  # 未通过项（chapter/sub/problem），供修复弹窗
 
     for ch in chapters:
         ch_id = ch["id"]
         if ch.get("status") != "completed":
-            report.append(f"| {ch_id} | - | - | - | [WAIT] 未完成 |")
+            report.append(f"| {ch_id} | - | - | - | [WAIT] 未完成 |\n")
             warn_count += 1
             continue
 
-        overview = ch.get("overview", "")
-        # 读取该章节所有子结构文件
+        subs = ch.get("sub_structures") or {}
         ch_dir = Path(chapters_dir) / ch_id
-        actual_text = ""
-        if ch_dir.exists():
-            for sf in sorted(ch_dir.glob("S*.txt")):
-                content = sf.read_text(encoding="utf-8-sig").strip()
-                # 跳过标题行和末行标记
-                lines = [l for l in content.split("\n") if l.strip() and not re.match(rf'{ch_id}S\d+', l.strip())]
-                # 跳过子结构标题行（L## · S##《...》）
-                lines = [l for l in lines if not re.match(r'L\d+ · S\d+《', l.strip())]
-                actual_text += "".join(lines)
+        ch_pass = ch_info = ch_warn = ch_error = 0
 
-        word_count = ch.get("word_count", 0)
-        total_chars += word_count
+        for sk in sorted(subs.keys()):
+            sv = subs[sk]
+            if not isinstance(sv, dict) or sv.get("status") != "completed":
+                continue
+            summary = sv.get("summary", "")
+            fpath = ch_dir / f"{sk}.txt"
+            if not fpath.exists():
+                report.append(f"| {ch_id} | {sk} | - | - | [ERROR] 正文缺失 |\n")
+                ch_error += 1
+                continue
+            content = fpath.read_text(encoding="utf-8-sig")
+            lines = [l for l in content.split("\n") if l.strip()
+                     and not re.match(rf'{ch_id}S\d+', l.strip())
+                     and not re.match(r'L\d+ · S\d+《', l.strip())]
+            actual_text = "".join(lines)
+            total_chars += len(actual_text)
 
-        if not actual_text:
-            level = "ERROR"
-            detail = "未找到实际内容"
-            error_count += 1
-        else:
-            # 提取 overview 中的关键词和概述中的话题词
-            overview_kws = set(keyword_re.findall(overview))
-            actual_kws = set(keyword_re.findall(actual_text))
-            if not overview_kws:
-                coverage = 1.0  # 概述没有可提取的关键词，跳过
+            # L1 词面覆盖率（summary 关键词 vs 段正文）
+            s_kws = set(keyword_re.findall(summary))
+            a_kws = set(keyword_re.findall(actual_text))
+            if not s_kws:
+                coverage = 1.0
             else:
-                matched = overview_kws & actual_kws
-                coverage = len(matched) / len(overview_kws)
+                coverage = len(s_kws & a_kws) / len(s_kws)
 
+            level, detail = None, ""
             if coverage >= 0.6:
-                level = "PASS"
-                detail = f"覆盖 {len(matched)}/{len(overview_kws)}"
-                pass_count += 1
+                level, detail = "PASS", f"覆盖 {len(s_kws & a_kws)}/{len(s_kws)}"
             elif coverage >= 0.3:
-                level = "INFO"
-                detail = f"部分覆盖 {len(matched)}/{len(overview_kws)}"
-                info_count += 1
+                level, detail = "INFO", f"部分覆盖 {len(s_kws & a_kws)}/{len(s_kws)}"
             elif coverage > 0:
-                level = "WARN"
-                detail = f"低覆盖 {len(matched)}/{len(overview_kws)}"
-                warn_count += 1
+                level, detail = "WARN", f"低覆盖 {len(s_kws & a_kws)}/{len(s_kws)}"
             else:
-                level = "ERROR"
-                detail = "无主题词匹配"
-                error_count += 1
+                level, detail = "ERROR", "无主题词匹配"
 
-        report.append(f"| {ch_id} | {overview[:40]}... | {word_count}字 | {detail} | {level} |")
+            # 3B 复核：仅可疑段（覆盖率 < 0.6）
+            fid_extra = ""
+            if coverage < 0.6:
+                r = _fid_judge(summary, actual_text)
+                if r is not None:
+                    ok, reason = r
+                    if ok:
+                        if level != "PASS":
+                            level, detail = "PASS", "3B复核支持（词面低但语义支持）"
+                        fid_extra = "3B✅"
+                    else:
+                        fid_extra = f"3B❌ {reason[:60]}"
 
-    report.append(f"\n## 统计")
-    report.append(f"| 等级 | 数量 |")
-    report.append(f"|------|------|")
-    report.append(f"| [OK] PASS | {pass_count} |")
-    report.append(f"| ℹ️ INFO | {info_count} |")
-    report.append(f"| [WARN] WARN | {warn_count} |")
-    report.append(f"| [FAIL] ERROR | {error_count} |")
-    report.append(f"| **总字数** | **{total_chars}字** |")
+            report.append(f"| {ch_id} | {sk} | {coverage:.2f} | {fid_extra or '-'} | {level} |\n")
+            if level == "PASS":
+                ch_pass += 1
+            elif level == "INFO":
+                ch_info += 1
+            elif level == "WARN":
+                ch_warn += 1
+            else:
+                ch_error += 1
 
-    report_text = "\n".join(report)
+        pass_count += ch_pass
+        info_count += ch_info
+        warn_count += ch_warn
+        error_count += ch_error
+
+    report.append("\n## 统计\n")
+    report.append("| 等级 | 数量 |\n")
+    report.append("|------|------|\n")
+    report.append(f"| [OK] PASS | {pass_count} |\n")
+    report.append(f"| INFO | {info_count} |\n")
+    report.append(f"| [WARN] WARN | {warn_count} |\n")
+    report.append(f"| [FAIL] ERROR | {error_count} |\n")
+    report.append(f"| **总字数** | **{total_chars}字** |\n")
+
+    report_text = "".join(report)
     print(report_text)
 
-    # 写入报告
     report_dir = Path(state_path).parent / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / "fidelity_report.md"
     report_path.write_text(report_text, encoding="utf-8")
     print(f"\n[报告已写入] {report_path}")
 
-    return pass_count, info_count, warn_count, error_count
+    return pass_count, info_count, warn_count, error_count, fail_items
 
 
 def finalize_novel(state_path, chapters_dir):
-    """全文完结：全线跨章检查 → 大纲忠实度 → 结尾验证 → 门禁"""
+    """全文完结：全文承诺 → 大纲忠实度 → 结尾验证 → 三检修复项（三检独立开关，环境变量控制）
+
+    无独立门禁——三检问题写入 novel_state._full_repair，由 novel_writer 同步进
+    session._repair_hints[chapter].full_items（与章检 issues 同层统一），弹窗裁决
+    （勾选修复当场重检 / 全部跳过），处理完毕即放行。
+    """
     import sys as _sys
     _sys.path.insert(0, str(SCRIPTS_DIR))
-    from novel_continuity import cross_chapter
-    from novel_pipeline_gate import pass_gate, load_gates, save_gates
-    from novel_fidelity import verify_ending
 
-    print(f"{'='*50}")
-    print(f"[全文完结] 开始全线跨章承诺链检查...")
-    issues = cross_chapter(state_path, chapters_dir)
+    # 三检开关（finalize_novel_full 通过 env_extra 传入；默认全开）
+    chk_pledge = os.environ.get("NOVEL_CHK_PLEDGE", "1") != "0"
+    chk_fid = os.environ.get("NOVEL_CHK_FIDELITY", "1") != "0"
+    chk_ending = os.environ.get("NOVEL_CHK_ENDING", "1") != "0"
+
+    # ── 全文承诺（flag 提取 + 推理；旧 cross_chapter 关键词检查废弃） ──
+    issues = []
+    if chk_pledge:
+        print(f"{'='*50}")
+        print(f"[全文完结] 开始全文承诺检查（3B 提取 flag → writer 模型推理兑现）...")
+        try:
+            from novel_pledge_check import extract_pledges, check_pledges
+            if extract_pledges(state_path, chapters_dir):
+                issues += check_pledges(state_path, chapters_dir)
+            else:
+                print("  [INFO] 3B 不可用，跳过全文承诺检查")
+        except Exception as e:
+            print(f"  [INFO] 全文承诺检查异常: {e}")
+    else:
+        print(f"[全文完结] 全文承诺检查已关闭（跳过）")
     total_gaps = len(issues)
 
-    print(f"\n{'='*50}")
-    print(f"[全文完结] 开始大纲忠实度检查...")
-    p, i, w, e = fidelity_check(state_path, chapters_dir)
+    # ── 大纲忠实度（L1 词面全量筛 + 可疑段 3B 复核） ──
+    p = i = w = e = 0
+    fid_fails = []
+    if chk_fid:
+        print(f"\n{'='*50}")
+        print(f"[全文完结] 开始大纲忠实度检查...")
+        p, i, w, e, fid_fails = fidelity_check(state_path, chapters_dir)
+    else:
+        print(f"\n[全文完结] 大纲忠实度检查已关闭（跳过）")
 
     # 🔴 结尾收束验证
-    print(f"\n{'='*50}")
-    print(f"[全文完结] 开始结尾收束验证...")
-    project_dir = str(Path(state_path).parent)  # state_path 是 project_dir/data/novel_state.json
-    ending_result = verify_ending(project_dir)
+    ending_result = {"pass": True, "details": []}
+    if chk_ending:
+        print(f"\n{'='*50}")
+        print(f"[全文完结] 开始结尾收束验证...")
+        from novel_fidelity import verify_ending
+        project_dir = str(Path(state_path).parent)  # state_path 是 project_dir/data/novel_state.json
+        ending_result = verify_ending(project_dir)
+    else:
+        print(f"\n[全文完结] 结尾收束验证已关闭（跳过）")
+
+    # ── 三检修复项写入 state._full_repair（供修复弹窗复用） ──
+    full_repair = {}
+    try:
+        # 忠实度失败项 → fidelity 修复项
+        for it in fid_fails:
+            ch = it.get("chapter", "")
+            full_repair.setdefault(ch, {"items": [], "_repaired": False})
+            full_repair[ch]["items"].append({
+                "type": "fidelity", "sub": it.get("sub", ""),
+                "problem": it.get("problem", ""), "source_text": "",
+            })
+        # 承诺未兑现/悬停 → pledge 修复项（flag 定位 sub/source_text）
+        for it in issues:
+            full_repair.setdefault(it.get("file", ""), {"items": [], "_repaired": False})
+            full_repair[it.get("file", "")]["items"].append({
+                "type": "pledge",
+                "sub": it.get("sub", ""),
+                "problem": it.get("problem", ""),
+                "source_text": it.get("source_text", ""),
+            })
+        # 收束失败 → ending 修复项（末章末段）
+        if not ending_result.get("pass", False):
+            last_ch = None
+            last_sub = None
+            try:
+                _d = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
+                completed = [c for c in _d.get("chapters", []) if c.get("status") == "completed"]
+                if completed:
+                    last_ch = completed[-1]["id"]
+                    cd = Path(chapters_dir) / last_ch
+                    subs = sorted(cd.glob("S*.txt")) if cd.is_dir() else []
+                    if subs:
+                        last_sub = subs[-1].stem
+            except Exception:
+                pass
+            full_repair.setdefault(last_ch or "L01", {"items": [], "_repaired": False})
+            full_repair[last_ch or "L01"]["items"].append({
+                "type": "ending", "sub": last_sub or "",
+                "problem": "结尾收束验证未通过", "source_text": "",
+            })
+        sp_full = Path(state_path)
+        if sp_full.is_file():
+            _d = json.loads(sp_full.read_text(encoding="utf-8-sig"))
+            _d["_full_repair"] = full_repair
+            sp_full.write_text(json.dumps(_d, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[全文完结] 三检修复项已写入 _full_repair（{sum(len(v['items']) for v in full_repair.values())} 项）")
+    except Exception as fe:
+        print(f"  [INFO] 三检修复项写入异常: {fe}")
 
     print(f"\n{'='*50}")
-    print(f"[全文完结] 门禁: fidelity + ending_verify")
-    gates = load_gates(state_path)
-    if e > 0:
-        print(f"[HOOK-BLOCK] 有 {e} 个 ERROR 级别偏差，fidelity 门禁未通过")
-        print(f"  请手动修正后重新运行 finalize-novel")
-    elif not ending_result.get("pass", False):
-        print(f"[HOOK-BLOCK] 结尾收束验证未通过")
-        for d in ending_result.get("details", []):
-            if not d.get("pass"):
-                print(f"  [FAIL] {d.get('name', '?')}: {d.get('reason', '?')}")
-        print(f"  请手动修正后重新运行 finalize-novel")
+    print(f"[全文完结] 三检结果: fidelity ERROR={e} / ending={'FAIL' if not ending_result.get('pass', False) else 'OK'}")
+    if e > 0 or not ending_result.get("pass", False):
+        # 无独立门禁——问题已写入 _full_repair（novel_writer 同步进 session._repair_hints 弹窗），
+        # 弹窗裁决（勾选修复当场重检 / 全部跳过）处理完毕即放行
+        print(f"[HOOK-BLOCK] 存在三检问题，修复项已写入 _full_repair（章级 full_items）")
+        print(f"  在修复弹窗中处理（勾选修复当场重检 / 全部跳过），处理完毕自动放行")
+        if e > 0:
+            for it in fid_fails:
+                print(f"  [ERROR] {it.get('chapter')} {it.get('sub')}: {it.get('problem', '')[:60]}")
+        if not ending_result.get("pass", False):
+            for d in ending_result.get("details", []):
+                if not d.get("pass"):
+                    print(f"  [FAIL] {d.get('name', '?')}: {d.get('reason', '?')}")
     else:
-        gates["fidelity"] = "PASS"
-        gates["ending_verify"] = "PASS"
-        save_gates(state_path, gates)
-        print(f"[全文完结] fidelity [OK] PASS")
-        print(f"[全文完结] ending_verify [OK] PASS")
+        print(f"[全文完结] fidelity [OK] 全部通过")
+        print(f"[全文完结] ending_verify [OK] 通过")
         print(f"[全文完结] 全部完成！")
 
 

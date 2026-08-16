@@ -79,7 +79,7 @@ def check_chapter(chapter_dir, chapter, state_path):
             })
 
     # 输出报告
-    print(f"[风格报告] {chapter}")
+    print(f"[格式报告] {chapter}")
     if not result:
         print(f"  [OK] 无问题")
         print(f"  - 检查文件数: {len(files)}")
@@ -100,7 +100,7 @@ def check_chapter(chapter_dir, chapter, state_path):
                 break
         sp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"[风格校验] {chapter} 完成 ({len(result)} 个问题)")
+    print(f"[格式校验] {chapter} 完成 ({len(result)} 个问题)")
     return result
 
 if __name__ == "__main__":
