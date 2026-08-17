@@ -1,8 +1,8 @@
 # Structured Writer — 结构化写作智能体
 
-> 模板驱动的大纲规划 + 串行写作引擎。基于 LLM 的结构化长文写作系统，支持两级 RAG 增强、事实自检、引用自动格式化、交互式大纲控制、快速范例复用、两级局部重规划。
+> 模板驱动的大纲规划 + 串行写作引擎。基于 LLM 的结构化长文写作系统，支持两级 RAG 增强、事实自检、引用自动格式化、交互式大纲控制、快速范例复用、两级局部重规划，以及**小说模式**（章级规划→写作→章检→修复→全文三检）。
 >
-> 版本：1.9.0b0 | 作者：[username-redacted] | 许可证：Apache 2.0
+> 版本：3.1.0b5 | 作者：wUwproject | 许可证：Apache 2.0
 
 ---
 
@@ -19,6 +19,7 @@
 - [九、写作控制与输出](#九写作控制与输出)
 - [十、会话管理](#十会话管理)
 - [十一、常见问题](#十一常见问题)
+- [十二、小说模式（NOVEL MODE）](#十二小说模式novel-mode)
 - [协议](#协议)
 
 ---
@@ -40,17 +41,21 @@ Structured Writer 是一个**本地运行**的结构化长文写作工具。你�
 
 | 依赖 | 说明 | 获取方式 |
 |------|------|---------|
-| **Python** | 3.10 及以上 | python.org |
-| **LLM 推理服务** | LM Studio 或 Ollama，二选一，本机运行 | LM Studio / Ollama 官网 |
+| **Python** | 任意版本（3.10+ 推荐） | python.org |
+| **transformers / torch** | 实体/行为提取（Qwen2.5-3B CPU）+ 判定回退（3B/1.5B），setup.bat 自动探测安装 | pip（阿里云镜像） |
+| **LM Studio**（写作/规划必需） | 写作/规划 35B + 判定 8B/7B 统一走 LM Studio（lms load → GPU → HTTP localhost:1234） | LM Studio 官网 |
+| **Ollama**（可选替代） | 写作/规划可改走 Ollama API（判定统一管理禁用） | Ollama 官网 |
 | **RAG 智能体**（可选但强烈推荐） | rag-assistant **v2.2.10 及以上**，提供知识库检索能力 | 见下方两种安装方式 |
+
+> **后端说明（v3.1.0b1 起）**：llama.cpp 直挂后端已废弃。写作/规划统一走 **LM Studio**（lms load → GPU → HTTP 1234）；判定模型（章检 4维 8B / 推理 R1 7B）在勾选「统一管理」时也走 LM Studio GPU，否则回退 transformers 3B/1.5B；实体/行为提取**永远**用 transformers Qwen2.5-3B CPU。
 
 ### 获取 RAG 智能体
 
 | 渠道 | 名称 | 说明 |
 |------|------|------|
 | **PyPI** | `rag-assistant-ldxs` | `pip install rag-assistant-ldxs`，安装后运行 `python main.py --no-web --api-port 8767` |
-| **GitHub** | `[username-redacted]/workbuddy-skills` 仓库 → `agent/rag-assistant` 目录 | 下载后运行 `python main.py --no-web --api-port 8767` |
-| **Gitee** | `[username-redacted]/workbuddy-skills` 仓库 → `agent/rag-assistant` 目录 | 同上（国内访问更快） |
+| **GitHub** | `Ldxs001/workbuddy-skills` 仓库 → `agent/rag-assistant` 目录 | 下载后运行 `python main.py --no-web --api-port 8767` |
+| **Gitee** | `wUwproject/workbuddy-skills` 仓库 → `agent/rag-assistant` 目录 | 同上（国内访问更快） |
 
 > **版本要求**：必须 **2.2.10 及以上**。Structured Writer 依赖 rag-assistant 的 `/api/kb/query` 外部接口（端口 8767），低版本缺少文档元数据回填能力，引用功能无法工作。
 >
@@ -158,7 +163,7 @@ python main.py --api-port 8777 --no-web   # 仅对外 API（--no-web 需自行�
 
 | 操作 | 说明 |
 |------|------|
-| **切换模板** | 下拉选择，内置 8 套：日常写作 / 学术论文 / 正式公文 / 新闻报道 / 技术报告 / 通用公文 / 论文综述 / 自定义 |
+| **切换模板** | 下拉选择，内置 9 套：日常写作 / 学术论文 / 正式公文 / 新闻报道 / 技术报告 / 通用公文 / 论文综述 / 自定义 / **小说**（小说模式，题材/篇幅锁定） |
 | **编辑模板** | 直接修改表格字段（见「模板编辑指南」） |
 | **另存为** | 基于当前模板创建副本 |
 | **删除** | 仅自定义模板可删（内置模板只读） |
@@ -394,6 +399,51 @@ A：默认监听 0.0.0.0:8770，局域网可直接访问。公网访问建议配
 
 ---
 
+## 十二、小说模式（NOVEL MODE）
+
+选择「小说」模板（题材/篇幅为锁定字段）后进入小说模式——独立一条线，与通用写作线隔离：
+
+### 流程总览
+
+```
+场景配置（人物/时代/地点/冲突）→ 章数组（短3-6/中8-10/长11-15）→ 因果链验证
+    ↓
+逐章循环：
+  ├─ 章内子结构规划（S01-S05，tone/emotions/writing_prompt≥50 硬校验，确认面板门控）
+  ├─ 逐段写作（上下文注入：角色表/人格/实体关系网/时间线/情绪基调/上章行为轨迹）
+  ├─ 章检（4维 8B + 格式 + 逻辑 + 推理 R1）
+  │   ├─ HARD/FAIL → 修复弹窗（T0 自动修 / T1 写作模型重构 / 跳过=通过）
+  │   └─ 通过 → 标章 done → 下一章
+    ↓
+全书所有章 done → 全文三检：大纲忠实度 + 全文承诺 + 结尾收束
+    ↓
+三检问题 → 修复弹窗（勾选修复当场重检 / 全部跳过）→ 处理完放行
+```
+
+### 章检与全文三检
+
+| 检测 | 内容 | 模型 |
+|------|------|------|
+| **章检（每章）** | 4维（时间衔接/情绪匹配/话题过渡/角色承接）+ 格式校验 + 逻辑检查 + 推理审核（对话匹配/行为一致） | 4维 8B（LM Studio/transformers）/ R1 7B |
+| **全文三检（全书完）** | 大纲忠实度（词面全量筛 + 3B 复核）/ 全文承诺（flag 提取 + writer 推理兑现）/ 结尾收束（封闭/开放/悬停） | 3B + writer |
+
+- 触发点：全文三检只在**全书所有章 done 之后**触发一次（"if 规划 else 全文三检"）
+- 修复弹窗：勾选 = 用写作模型重构（保持文风）；不勾选/全部跳过 = 立即标记通过（跳过=通过）
+
+### 小说质检配置（配置 Tab）
+
+- 「章内检测」：4维（3B/8B）/ 格式 / 推理R1（各自独立开关）+ 自动修复 + 修复轮次
+- 「全文检测」：大纲忠实度 / 全文承诺（慢）/ 结尾收束
+- 「统一管理」勾选：判定 8B/7B 走 LM Studio GPU（仅 planner/writer 都是 LM Studio 时可勾）
+- 「检测模型」：一键检测/安装缺失模型（8B/7B 自动下载到 LM Studio 模型库并 import）
+
+### 小说项目数据
+
+- 项目目录：`data/novel/projects/{project_id}/`（`data/novel_state.json` + `chapters/<章>/*.txt`）
+- 章级 md 实时落盘（`chapters/<章>.md`），整本由手动「拼合」生成
+
+---
+
 ## 协议
 
-Apache 2.0 © [username-redacted]
+Apache 2.0 © wUwproject
