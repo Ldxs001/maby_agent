@@ -643,6 +643,14 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
                             return None
                         time.sleep(2)
                         _hint = _reload_repair_hint(state_mgr, chapter_id)
+                    # 用户跳过（b31 修复）：跳过 = 通过——不再重检、不重置 _repaired
+                    # （旧代码跳过后立即重检，重检仍有 HARD → 显式重置 _repaired=False → 又弹，
+                    #   代码不尊重用户的"跳过=通过"决定）
+                    _hint = _reload_repair_hint(state_mgr, chapter_id)
+                    if (_hint or {}).get("_repair_result") and (_hint or {}).get("_repair_result", {}).get("skipped"):
+                        state_mgr.set_status_text(f"{chapter_id} 已跳过修复（视为通过），进入下一章")
+                        _fc_final = {"ok": True, "issues": []}
+                        break
                     # 修复完成 → 重检全六检（聚合重检：修复后全跑）
                     state_mgr.set_status_text(f"重检: {chapter_id}（修复后第 {_round} 轮全六检）")
                     fc2 = novel_bridge.finalize_novel_chapter(state_path, chapter_id, checks=_checks)
@@ -692,36 +700,45 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
     article_md = article_md.strip()
 
     # ── 全文三检（fidelity + 收束 + 完结；开关控制） ──
-    state_mgr.set_status_text("全文质检中（忠实度+结尾收束）…")
-    try:
-        fn = novel_bridge.finalize_novel_full(state_path, checks=_checks)
-        # 三检修复项同步进 session._repair_hints（统一存储：与章检 issues 同层同判定）
-        # finalize-novel 子进程只拿 state_path，写 novel_state._full_repair；这里桥接进 session
+    # 触发守卫（用户语义）：全文三检只在"最后一章章检通过修复完、后续不再有任何规划"时触发——
+    # 判定 = outline 里所有章都 done（pending/planning/in_progress/confirmed 任一存在 = 还有规划/写作，
+    # 全文未写完不检全文，避免把 ending 收束等全书级问题挂到未完成章上）。
+    _all_done = all((s.get("status") == "done") for s in outline.get("sections", []))
+    if not _all_done:
+        _not_done = [s.get("id") for s in outline.get("sections", []) if s.get("status") != "done"]
+        print(f"[全文三检] 全书未写完（仍有章未 done: {_not_done}），跳过全文三检——待后续规划写作完成、全部章检通过后才会触发")
+        fn = None
+    else:
         try:
-            _d = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
-            _fr = _d.get("_full_repair") or {}
-            if _fr:
-                _hints = state_mgr._state.get("_repair_hints") or {}
-                for _ch, _v in _fr.items():
-                    _items = _v.get("items") or []
-                    if not _items:
-                        continue
-                    _h = _hints.get(_ch) or {}
-                    _h["full_items"] = _items
-                    _h.setdefault("_repaired", False)
-                    _hints[_ch] = _h
-                state_mgr._state["_repair_hints"] = _hints
-                state_mgr.save()
-        except Exception as _e:
-            _logger.error(f"三检修复项同步 session 异常: {_e}")
-        if fn.get("issues"):
-            article_md += "\n\n---\n\n## 质检报告（HARD/FAIL 问题）\n\n" + "\n".join(f"- {i}" for i in fn["issues"][:20])
-        elif fn.get("output"):
-            ok_lines = [ln for ln in (fn.get("output") or "").split("\n") if "[OK]" in ln or "通过" in ln]
-            if ok_lines:
-                article_md += "\n\n---\n\n## 质检报告\n\n" + "\n".join(f"- {ln.strip()}" for ln in ok_lines[:10])
-    except Exception as e:
-        _logger.error(f"finalize-novel 异常: {e}")
+            state_mgr.set_status_text("全文质检中（忠实度+结尾收束）…")
+            fn = novel_bridge.finalize_novel_full(state_path, checks=_checks)
+            # 三检修复项同步进 session._repair_hints（统一存储：与章检 issues 同层同判定）
+            # finalize-novel 子进程只拿 state_path，写 novel_state._full_repair；这里桥接进 session
+            try:
+                _d = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
+                _fr = _d.get("_full_repair") or {}
+                if _fr:
+                    _hints = state_mgr._state.get("_repair_hints") or {}
+                    for _ch, _v in _fr.items():
+                        _items = _v.get("items") or []
+                        if not _items:
+                            continue
+                        _h = _hints.get(_ch) or {}
+                        _h["full_items"] = _items
+                        _h.setdefault("_repaired", False)
+                        _hints[_ch] = _h
+                    state_mgr._state["_repair_hints"] = _hints
+                    state_mgr.save()
+            except Exception as _e:
+                _logger.error(f"三检修复项同步 session 异常: {_e}")
+            if fn is not None and fn.get("issues"):
+                article_md += "\n\n---\n\n## 质检报告（HARD/FAIL 问题）\n\n" + "\n".join(f"- {i}" for i in fn["issues"][:20])
+            elif fn is not None and fn.get("output"):
+                ok_lines = [ln for ln in (fn.get("output") or "").split("\n") if "[OK]" in ln or "通过" in ln]
+                if ok_lines:
+                    article_md += "\n\n---\n\n## 质检报告\n\n" + "\n".join(f"- {ln.strip()}" for ln in ok_lines[:10])
+        except Exception as e:
+            _logger.error(f"finalize-novel 异常: {e}")
 
     # ── 输出目录（章级 md 已在写作中落盘到 chapters/；整本 md 由用户手动「拼合」生成） ──
     # 不自动拼合整本——长篇跨天写作，已完成章通过树状输出随时可读；需要完整版时手动拼合。

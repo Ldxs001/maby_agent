@@ -42,15 +42,15 @@ DIM_SUGGEST = {
     "char_ok": "检查角色进出是否合理，补充退场/承接交代",
 }
 
-PROMPT_TPL = """你是小说章内连贯性审核员。基于给定信息，判断【当前相邻两段】的四个维度。
-【关键要求】每个维度必须独立判断、独立理由——一个维度的判断和理由不得影响或引用其他维度；通过的维度理由写"通过"或简短说明，不通过的写该维度自己的具体问题。
+PROMPT_TPL = """你是小说章内连贯性审核员。基于【共享上下文】（下方全部输入，为各维度各自摘取的合并），判断【当前相邻两段】的四个维度。
+【关键要求】下方所有输入为共享上下文——判断任一维度时可参考任意部分（含其他维度摘取的内容，如角色上下文里的段落、规划情绪、前段尾/后段头等）；四个维度的判定提示词相互独立（各按各的标准判），但上下文全程共享，不得因"某段内容属于另一维度摘取"而忽略它。通过的维度理由写"通过"或简短说明，不通过的写该维度自己的具体问题。
 
 四个维度：
-1. 时间衔接：前段尾到后段头的时间推进是否自然（无跳变/无矛盾/无倒序）
+1. 时间衔接：前段尾到后段头的时间推进是否有叙事目的（闪回/蒙太奇/时间跳跃=文学手法，允许；无叙事目的的时间断裂或前后事实矛盾=不通过）
 2. 情绪匹配：后段情绪基调是否符合规划情绪「{emotion}」（允许同义表达，如"专注"可用"凝神/目不转睛"）
-3. 话题过渡：两段话题衔接是否自然连贯
+3. 话题过渡：两段话题转折是否服务剧情推进（起承转合/视角切换/话题自然演化=正常叙事，允许；与剧情无关的游离、丢失前文关键线索=不通过）
 4. 角色承接：结合【本章角色出现上下文】，判断前段出现的角色在后段的进出是否合理
-   （自然退场/场景切换=合理；异常消失/状态断裂/情绪不一致=不合理）
+   （自然退场/场景切换/情绪转变=合理；无交代的异常消失/状态断裂=不合理）
 
 只输出一个 JSON 对象，不要解释、不要 markdown 围栏：
 {{"time_ok": true/false, "time_reason": "仅时间维度的理由",
@@ -58,25 +58,60 @@ PROMPT_TPL = """你是小说章内连贯性审核员。基于给定信息，判�
   "topic_ok": true/false, "topic_reason": "仅话题维度的理由",
   "char_ok": true/false, "char_reason": "仅角色维度的理由"}}
 
-【前段结尾】
+【共享上下文·前段结尾】（时间/话题维度摘取）
 {prev_tail}
 
-【后段开头】
+【共享上下文·后段开头】（时间/话题/情绪维度摘取）
 {curr_head}
 
-【后段结尾节选】
+【共享上下文·后段结尾节选】（情绪维度摘取）
 {curr_end}
 
-【后段规划情绪】{emotion}
+【共享上下文·后段规划情绪】（情绪维度摘取）{emotion}
 
-【本章角色出现上下文】（括号内为子结构段标识，……内为出现位置附近原文）
+【共享上下文·本章角色出现上下文】（角色维度摘取：名字+代称全文检索，括号内为子结构段标识，……内为出现位置附近原文）
 {char_ctx}"""
 
 
-def _load_model():
-    """懒加载 Qwen2.5-3B（复用提取器加载缓存）；失败返回 None。"""
+def _load_config() -> dict:
+    """读项目根 config.json 的 novel_checks（与 config_manager 同源）；失败返回空。"""
     try:
-        sys.path.insert(0, str(SCRIPTS_DIR))
+        import json as _json
+        # __file__ = structured_writer/novel/novel_4dim_check.py → 项目根 = 上三级
+        cfg_path = Path(__file__).resolve().parent.parent.parent / "config.json"
+        if cfg_path.is_file():
+            d = _json.loads(cfg_path.read_text(encoding="utf-8"))
+            return d.get("novel_checks", {}) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _load_model():
+    """懒加载判定模型：lmstudio 后端（8B/7B 走 LM Studio GPU，lms load）或 transformers 后端（3B）。
+
+    返回统一句柄（transformers: (model, tokenizer)；lmstudio: make_lms_handle 闭包）；
+    失败返回 None。不设模块级缓存——判定模型"测完即卸"（用户铁律：8B 测完彻底卸载再加载 7B，
+    显存错峰；卸载由 release() 识别句柄后 lms unload）。
+    """
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        from model_backend import judge_backend, judge_gguf_paths, make_lms_handle
+        cfg = _load_config()
+        backend = judge_backend(cfg)
+        if backend == "lmstudio":
+            keys = judge_gguf_paths(cfg)
+            key = keys.get("4dim") or keys.get("r1") or ""
+            if not key:
+                print("[4维判定] LM Studio 模型库无判定模型（需下载 Qwen3-8B Q4_K_M），回退规则")
+                return None
+            print(f"[4维判定] 后端: LM Studio（{key}）")
+            # 窗口固定 16384（lms load -c；覆盖 4维 prompt ~3K + 输出，R1 ~13K）——LM Studio 默认窗口不保证够
+            return make_lms_handle(key, ctx=cfg.get("judge_n_ctx") or 16384)
+    except Exception as e:
+        print(f"[4维判定] lmstudio 后端异常（回退 transformers）: {e}")
+    # transformers 后端（3B，现状）
+    try:
         from novel_timeline_extractor import _load_extract_model
         loaded = _load_extract_model()
         if loaded is None:
@@ -164,20 +199,14 @@ def _dim_reason(obj: dict, dim: str) -> str:
     return str(r).strip()[:100]
 
 
-def _judge(model, tok, prompt: str) -> dict | None:
-    """单次调用判 5 维（贪心解码，与提取器一致）。"""
-    import torch
-    chatml = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-    inputs = tok(chatml, return_tensors="pt")
-    with torch.no_grad():
-        out = model.generate(
-            inputs["input_ids"],
-            max_new_tokens=512,
-            do_sample=False,
-            temperature=0.2,
-            pad_token_id=tok.eos_token_id,
-        )
-    raw = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+def _judge(handle, prompt: str) -> dict | None:
+    """单次调用判 5 维（统一生成接口，双后端）。"""
+    from model_backend import generate
+    # LM Studio 后端（Qwen3-8B）：Qwen3 默认思考模式会吞掉大量输出 token——
+    # 判定要的是直接 JSON，注入 /no_think 关思考（transformers 3B 无思考概念，不注入）
+    if not isinstance(handle, tuple):
+        prompt = "/no_think\n" + prompt
+    raw = generate(handle, prompt, max_tokens=1024, temperature=0.2)
     return _parse_json(raw)
 
 
@@ -192,26 +221,19 @@ FIDELITY_PROMPT = """你是小说大纲忠实度判定器。判断【正文】�
 {content}"""
 
 
-def fidelity_judge(model, tok, summary: str, content: str) -> tuple | None:
-    """3B 判"正文是否支持子结构 summary"。返回 (bool, reason)；不可解析返回 None。
+def fidelity_judge(handle, summary: str, content: str) -> tuple | None:
+    """3B/8B 判"正文是否支持子结构 summary"。返回 (bool, reason)；不可解析返回 None。
 
     正文过长时截取前 1000 字（忠实度看"承诺是否兑现"，主体信息集中在前段）。
+    LM Studio 后端（8B）同样注入 /no_think 关思考。
     """
     if len(content) > 1000:
         content = content[:1000] + "\n……（后略）……"
     prompt = FIDELITY_PROMPT.format(summary=summary[:300], content=content)
-    chatml = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-    import torch
-    inputs = tok(chatml, return_tensors="pt")
-    with torch.no_grad():
-        out = model.generate(
-            inputs["input_ids"],
-            max_new_tokens=256,
-            do_sample=False,
-            temperature=0.2,
-            pad_token_id=tok.eos_token_id,
-        )
-    raw = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    if not isinstance(handle, tuple):
+        prompt = "/no_think\n" + prompt
+    from model_backend import generate
+    raw = generate(handle, prompt, max_tokens=1024, temperature=0.2)
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
         return None
@@ -234,7 +256,7 @@ def check_4dim(state_path: str, chapter: str, chapter_dir) -> list | None:
     loaded = _load_model()
     if loaded is None:
         return None
-    model, tok = loaded
+    handle = loaded
 
     if not Path(state_path).is_file():
         return None
@@ -261,7 +283,7 @@ def check_4dim(state_path: str, chapter: str, chapter_dir) -> list | None:
         curr_full = _strip_title(files[i].read_text(encoding="utf-8-sig"))
         emotion = tones.get(curr_stem) or "（未规划）"
 
-        prev_tail = prev_full[-300:]
+        prev_tail = prev_full[-300:]  # 时间/话题维度取前段尾部局部接缝（每维各自摘取：时间/话题=局部，情绪=规划对照，角色=全文上下文）
         curr_head = curr_full[:300]
         curr_end = curr_full[-200:]
         prompt = PROMPT_TPL.format(
@@ -271,7 +293,7 @@ def check_4dim(state_path: str, chapter: str, chapter_dir) -> list | None:
             emotion=emotion,
             char_ctx=char_ctx,
         )
-        obj = _judge(model, tok, prompt)
+        obj = _judge(handle, prompt)
         if obj is None:
             print(f"[4维判定] {prev_stem}→{curr_stem} 输出不可解析，跳过该对")
             continue

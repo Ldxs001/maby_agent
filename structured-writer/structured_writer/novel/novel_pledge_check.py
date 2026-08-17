@@ -214,6 +214,7 @@ def _create_writer_client():
         model=wm.get("model", ""),
         max_tokens=wm.get("max_tokens", 4096),
         temperature=wm.get("temperature", 0.7),
+        # n_ctx 不传：LLMClient 按 max_tokens 自动推导（同一设置）
     )
 
 

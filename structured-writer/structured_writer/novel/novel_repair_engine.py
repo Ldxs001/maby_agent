@@ -7,6 +7,7 @@ v0.3 设计：
 - T1 内容问题 → 35b 整段重构（P2 实现）
 - 双份备份（正文 + state 快照）+ 回滚
 """
+import gc
 import json
 import os
 import re
@@ -128,26 +129,61 @@ def rollback_round(chapter_dir: str, round_no: int, state_path: str) -> list:
 
 # ── T1 整段重构（P2） ──
 
+_REPAIR_CLIENT = None
+_REPAIR_CLIENT_KEY = None  # 配置指纹：配置变了才重建（一次修复循环内多段复用同一模型，避免每段重载爆内存）
+
+
 def _create_repair_client(config_mgr=None):
-    """配置驱动：修复模型 = config writer_model，timeout/max_tokens 全继承。"""
+    """配置驱动：修复模型 = config writer_model（按后端分槽 profile），timeout/max_tokens 全继承。模块级复用。"""
+    global _REPAIR_CLIENT, _REPAIR_CLIENT_KEY
     from ..llm_client import LLMClient
+    from .model_backend import _model_profile
     if config_mgr is not None:
-        wm = config_mgr.get("writer_model", {}) or {}
+        wm_cfg = config_mgr.get("writer_model", {}) or {}
     else:
         # 无 config_mgr（CLI）→ 读 config.json
         try:
             cfg = json.loads(Path(__file__).resolve().parent.parent.parent.joinpath("config.json").read_text(encoding="utf-8"))
-            wm = cfg.get("writer_model", {}) or {}
+            wm_cfg = cfg.get("writer_model", {}) or {}
         except Exception:
-            wm = {}
-    return LLMClient(
-        backend=wm.get("backend", "lmstudio"),
+            wm_cfg = {}
+    backend = (wm_cfg or {}).get("backend", "lmstudio")
+    wm = _model_profile(wm_cfg)
+    key = (backend, wm.get("base_url"), wm.get("model"), wm.get("max_tokens"), wm.get("temperature"))
+    if _REPAIR_CLIENT is not None and _REPAIR_CLIENT_KEY == key:
+        return _REPAIR_CLIENT
+    _REPAIR_CLIENT = LLMClient(
+        backend=backend,
         base_url=wm.get("base_url", "http://localhost:1234"),
         timeout=wm.get("timeout", 300),
         model=wm.get("model", ""),
         max_tokens=wm.get("max_tokens", 8192),
         temperature=wm.get("temperature", 0.7),
+        # share=True（b28 修正）：修复复用共享实例——规划/写作/修复同一模型只加载一次
+        # （用户铁律：跳过修复→规划→弹修复→点修复 不重复加载）。
+        # 僵尸根因是 close 与共享表冲突，不是共享本身——修复不主动 close（见 _release_repair_client）。
+        # n_ctx 不传：LLMClient 按 max_tokens 自动推导（同一设置）
     )
+    _REPAIR_CLIENT_KEY = key
+    return _REPAIR_CLIENT
+
+
+def _release_repair_client() -> None:
+    """修复结束释放修复 client 的强引用——不 close 共享实例！
+
+    b28 修正（用户实测"跳过修复→规划→弹修复→点修复 内存不足"）：
+    修复复用共享实例（share=True）后，**绝不能 close**——close 会杀掉规划/写作正在用的 35B，
+    且 close 后共享表弱引用仍指向已释放底层 ctx 的僵尸实例 → 下次复用 segfault（b24 崩溃根因）。
+    正确语义：只释放本 client 引用，35B 由弱引用表自然管理——
+    还有其他持有者（规划/写作在跑）→ 继续复用；全部回收 → 自动卸载（b20"整章完成后卸载"）。
+    """
+    global _REPAIR_CLIENT, _REPAIR_CLIENT_KEY
+    if _REPAIR_CLIENT is not None:
+        _REPAIR_CLIENT._llama = None
+        _REPAIR_CLIENT = None
+        _REPAIR_CLIENT_KEY = None
+        gc.collect()
+        print("[repair] 修复 client 已释放（35B 由共享表管理：有其他任务则复用，无则自动卸载）")
 
 
 def _build_rewrite_prompt(original: str, title_line: str, alias_line: str, tail_marker: str,
@@ -248,6 +284,7 @@ def rewrite_segment(chapter_dir: str, file_name: str, chapter: str, plan: dict,
         prompt = _build_guided_prompt(body, title_line, alias_line, tail_marker, problems)
         client = _create_repair_client(config_mgr)
         call_timeout = int(getattr(client, "timeout", None) or 300) + timeout_extra
+        print(f"[repair] 正在重构 {file_name}（引导式局部改写）...")
         try:
             r = client.chat_detailed(
                 [{"role": "user", "content": prompt}],
@@ -269,6 +306,7 @@ def rewrite_segment(chapter_dir: str, file_name: str, chapter: str, plan: dict,
                                    plan, prev_tail, next_head, problems,
                                    repair_type=repair_type, source_text=source_text)
     client = _create_repair_client(config_mgr)
+    print(f"[repair] 正在重构 {file_name}（整段重构）...")
     # 超时 = 配置 timeout + 额外余量（thinking 模型重写长文）
     call_timeout = int(getattr(client, "timeout", None) or 300) + timeout_extra
     try:
@@ -353,54 +391,58 @@ def run(state_path: str, chapter_dir: str, chapter: str, issues: list,
     t1_issues = [i for i in issues if _is_t1(i)]
     if not t1_issues:
         report["t1"] = {"fixed": [], "skipped": "无 T1 问题"}
+        _release_repair_client()  # 无 T1 也释放（防模块级单例残留）
         return report
 
-    # 按段聚合
-    seg_map = {}
-    for iss in t1_issues:
-        fname = iss.get("file", "")
-        if fname:
-            seg_map.setdefault(fname, []).append(iss.get("problem", iss.get("desc", "")))
-    if checked_subs is not None:
-        seg_map = {k: v for k, v in seg_map.items() if k in checked_subs}
+    try:
+        # 按段聚合
+        seg_map = {}
+        for iss in t1_issues:
+            fname = iss.get("file", "")
+            if fname:
+                seg_map.setdefault(fname, []).append(iss.get("problem", iss.get("desc", "")))
+        if checked_subs is not None:
+            seg_map = {k: v for k, v in seg_map.items() if k in checked_subs}
 
-    # 三检 source_text 定位（从 state._full_repair 按 chapter+sub 查）
-    src_map = {}
-    if repair_types:
-        try:
-            _d = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
-            for _ch, _frc in (_d.get("_full_repair", {}) or {}).items():
-                for _it in (_frc.get("items") or []):
-                    if _it.get("sub"):
-                        src_map[_it["sub"] + ".txt"] = _it.get("source_text", "")
-        except Exception:
-            pass
+        # 三检 source_text 定位（从 state._full_repair 按 chapter+sub 查）
+        src_map = {}
+        if repair_types:
+            try:
+                _d = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
+                for _ch, _frc in (_d.get("_full_repair", {}) or {}).items():
+                    for _it in (_frc.get("items") or []):
+                        if _it.get("sub"):
+                            src_map[_it["sub"] + ".txt"] = _it.get("source_text", "")
+            except Exception:
+                pass
 
-    results = []
-    syncs = []
-    for fname, probs in seg_map.items():
-        rt = (repair_types or {}).get(fname, "")
-        # R1 推理审核问题（problem 以"推理审核"开头）→ 引导式局部改写（detail 描述引导 writer 只改问题句）
-        guided = any("推理审核" in p for p in probs)
-        r = rewrite_segment(chapter_dir, fname, chapter, _load_plan(state_path, chapter, fname),
-                            _prev_tail(chapter_dir, fname), _next_head(chapter_dir, fname),
-                            probs, config_mgr=config_mgr,
-                            repair_type=rt, source_text=src_map.get(fname, ""),
-                            guided=guided)
-        if r["ok"]:
-            backup_segment(chapter_dir, fname, state_path, 1)
-            _atomic_write(Path(chapter_dir) / fname, r["new_text"])
-            # 重构后同步：实体状态 force 刷新（新正文为准）+ 时间线重扫
-            sync_result = sync_after_rewrite(state_path, chapter_dir, fname)
-            syncs.append({"file": fname, **sync_result})
-            _entry = {"file": fname, "status": "rewritten", "wc": r["wc"]}
-            if r.get("problems"):
-                _entry["note"] = "; ".join(r["problems"])
-            results.append(_entry)
-        else:
-            results.append({"file": fname, "status": "failed", "problems": r["problems"]})
-    report["t1"] = {"results": results, "syncs": syncs}
-    return report
+        results = []
+        syncs = []
+        for fname, probs in seg_map.items():
+            rt = (repair_types or {}).get(fname, "")
+            # R1 推理审核问题（problem 以"推理审核"开头）→ 引导式局部改写（detail 描述引导 writer 只改问题句）
+            guided = any("推理审核" in p for p in probs)
+            r = rewrite_segment(chapter_dir, fname, chapter, _load_plan(state_path, chapter, fname),
+                                _prev_tail(chapter_dir, fname), _next_head(chapter_dir, fname),
+                                probs, config_mgr=config_mgr,
+                                repair_type=rt, source_text=src_map.get(fname, ""),
+                                guided=guided)
+            if r["ok"]:
+                backup_segment(chapter_dir, fname, state_path, 1)
+                _atomic_write(Path(chapter_dir) / fname, r["new_text"])
+                # 重构后同步：实体状态 force 刷新（新正文为准）+ 时间线重扫
+                sync_result = sync_after_rewrite(state_path, chapter_dir, fname)
+                syncs.append({"file": fname, **sync_result})
+                _entry = {"file": fname, "status": "rewritten", "wc": r["wc"]}
+                if r.get("problems"):
+                    _entry["note"] = "; ".join(r["problems"])
+                results.append(_entry)
+            else:
+                results.append({"file": fname, "status": "failed", "problems": r["problems"]})
+        report["t1"] = {"results": results, "syncs": syncs}
+        return report
+    finally:
+        _release_repair_client()  # 修复完成 → 卸载写作模型（35B），显存/内存让给判定模型
 
 
 def _is_t1(issue: dict) -> bool:

@@ -737,22 +737,20 @@ def fidelity_check(state_path, chapters_dir):
         kw_list = list(set(kw_list))
     keyword_re = re.compile('|'.join(re.escape(p) for p in kw_list))
 
-    # 3B 复核器（懒加载；不可用 → None，全走词面）
-    _model = None
-    _tok = None
+    # 判定模型复核器（懒加载统一句柄；不可用 → None，全走词面）
+    _handle = None
 
     def _fid_judge(summary, content):
-        nonlocal _model, _tok
+        nonlocal _handle
         try:
-            if _model is None:
+            if _handle is None:
                 sys.path.insert(0, str(SCRIPTS_DIR))
                 from novel_4dim_check import _load_model as _lm
-                loaded = _lm()
-                if loaded is None:
+                _handle = _lm()
+                if _handle is None:
                     return None
-                _model, _tok = loaded
             from novel_4dim_check import fidelity_judge
-            return fidelity_judge(_model, _tok, summary, content)
+            return fidelity_judge(_handle, summary, content)
         except Exception:
             return None
 

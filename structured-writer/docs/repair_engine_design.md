@@ -1,7 +1,7 @@
 # 六检问题修复系统设计方案（v0.3 定稿）
 
 > 状态：定稿，进入实施
-> 作者：wUwproject
+> 作者：[username-redacted]
 > 日期：2026-08-15
 > 版本：对应 structured-writer 2.3.x 后续迭代
 

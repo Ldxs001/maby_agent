@@ -145,6 +145,7 @@ class ExternalAPIHandler(BaseHTTPRequestHandler):
             model=pm.get("model", ""),
             max_tokens=pm.get("max_tokens", 4096),
             temperature=pm.get("temperature", 0.6),
+            # n_ctx 不传：LLMClient 按 max_tokens 自动推导（同一设置）
         )
 
     def _writer_client(self) -> LLMClient:
@@ -156,6 +157,7 @@ class ExternalAPIHandler(BaseHTTPRequestHandler):
             model=wm.get("model", ""),
             max_tokens=wm.get("max_tokens", 8192),
             temperature=wm.get("temperature", 0.7),
+            # n_ctx 不传：LLMClient 按 max_tokens 自动推导（同一设置）
         )
 
     def _template_names(self) -> list:

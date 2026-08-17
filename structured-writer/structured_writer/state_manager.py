@@ -154,9 +154,17 @@ class StateManager:
         self.save()
 
     def save_repair_hint(self, chapter_id: str, result: dict):
-        """保存章检结果（供前端修复面板读取：T0/T1 分级清单）。"""
+        """保存章检结果（供前端修复面板读取：T0/T1 分级清单）。
+
+        b28 修复：章检（novel_writer 628 的 _checks_result 不含 _repaired）每次覆盖整个 hint，
+        会把"用户已跳过/已标记通过"的 _repaired=True 冲掉 → 跳过后下一子结构写完章检又弹修复。
+        覆盖时保留已有 _repaired（result 显式带 _repaired 时以其为准——重检通过置 True/失败重置 False）。
+        """
         hints = self._state.setdefault("_repair_hints", {})
-        hints[chapter_id] = result
+        old = hints.get(chapter_id) or {}
+        merged = dict(result)
+        merged.setdefault("_repaired", old.get("_repaired", False))
+        hints[chapter_id] = merged
         self.save()
 
     def get_repair_hints(self) -> dict:

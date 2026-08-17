@@ -25,8 +25,6 @@ Reasoning Check - 推理审核引擎 (v3.0)
 import json, sys, re, os
 from pathlib import Path
 
-_LLM = None
-_TOKENIZER = None
 _DEVICE = "cpu"
 
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
@@ -34,11 +32,11 @@ MODEL_CACHE = str(Path.home() / ".cache" / "huggingface" / "hub")
 
 DIMENSIONS = [
     {"key": "causality", "name": "因果合理性", "hard": True,
-     "desc": "事件是否有前文铺垫, 转折是否牵强"},
+     "desc": "事件是否有前文铺垫，转折是否有叙事逻辑（大转折允许，但需有因果呼应）"},
     {"key": "character_consistency", "name": "人物行为一致性", "hard": True,
      "desc": "角色行为是否符合其人格设定"},
     {"key": "emotion_arc", "name": "情绪弧自然度", "hard": False,
-     "desc": "情绪转变是否有递进, 是否突兀"},
+     "desc": "情绪转变是否有铺垫与后文呼应（情绪大起大落是人物弧光，允许；无铺垫无呼应的情绪跳跃=问题）"},
     {"key": "dialogue", "name": "对话匹配度", "hard": False,
      "desc": "对话是否符合角色身份/性格/处境"},
     {"key": "reasoning", "name": "论证可靠性", "hard": False,
@@ -83,13 +81,48 @@ def _download_model():
     return success
 
 
+def _load_config() -> dict:
+    """读项目根 config.json 的 novel_checks（与 config_manager 同源）；失败返回空。"""
+    try:
+        import json as _json
+        # __file__ = structured_writer/novel/novel_reasoning_check.py → 项目根 = 上三级
+        cfg_path = Path(__file__).resolve().parent.parent.parent / "config.json"
+        if cfg_path.is_file():
+            d = _json.loads(cfg_path.read_text(encoding="utf-8"))
+            return d.get("novel_checks", {}) or {}
+    except Exception:
+        pass
+    return {}
+
+
 def _load_model():
-    """懒加载 transformers 模型，只在本地已缓存时加载，永不联网尝试。"""
-    global _LLM, _TOKENIZER, _DEVICE
-    if _LLM is not None:
-        return _LLM, _TOKENIZER
+    """懒加载推理审核模型：lmstudio 后端（7B 走 LM Studio GPU，lms load）或 transformers 后端（1.5B）。
+
+    返回统一句柄（transformers: (model, tokenizer)；lmstudio: make_lms_handle 闭包）；
+    不可用返回 (None, None)。不设模块级缓存——判定模型"测完即卸"（用户铁律：8B/7B 测完
+    彻底卸载再加载后续模型；卸载由 release() 识别句柄后 lms unload）。
+    """
+    llm = None
+    tok = None
     try:
         import os as _os
+        sys.path.insert(0, str(Path(__file__).parent))
+        from model_backend import judge_backend, judge_gguf_paths, make_lms_handle
+        cfg = _load_config()
+        if judge_backend(cfg) == "lmstudio":
+            keys = judge_gguf_paths(cfg)
+            key = keys.get("r1") or keys.get("4dim") or ""
+            if not key:
+                print("[推理审核] LM Studio 模型库无判定模型（需下载 DeepSeek-R1-Distill-Qwen-7B Q4），跳过")
+                return None, None
+            print(f"[推理审核] 后端: LM Studio（{key}）")
+            # 窗口固定 16384（lms load -c；R1 思考链 1-3K + JSON ≈ 13K 覆盖）
+            llm = make_lms_handle(key, ctx=cfg.get("judge_n_ctx") or 16384)
+            return llm, None
+    except Exception as e:
+        print(f"[推理审核] lmstudio 后端异常（回退 transformers）: {e}")
+    # transformers 后端（1.5B，现状）
+    try:
         # 强制 CPU，避免与 LM Studio 抢夺 GPU 显存
         _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
         import torch
@@ -106,7 +139,6 @@ def _load_model():
         default_cache = str(Path.home() / ".cache" / "huggingface" / "hub")
         default_snap = _os.path.join(default_cache, f"models--{MODEL_NAME.replace('/', '--')}", "snapshots")
         try:
-            sys.path.insert(0, str(Path(__file__).parent))
             from _path_utils import MODELS_DIR
             model_cache = str(MODELS_DIR)
         except Exception:
@@ -127,12 +159,11 @@ def _load_model():
             # 没本地模型 → 跳过，绝不联网下载
             print("[推理审核] 跳过：本地无模型缓存，用户需主动安装")
             print(f"[推理审核] 安装命令: HF_ENDPOINT=https://hf-mirror.com python -c \"from transformers import AutoModel; AutoModel.from_pretrained('{MODEL_NAME}', trust_remote_code=True)\"")
-            _LLM, _TOKENIZER = None, None
             return None, None
 
         print(f"[推理审核] 加载模型...")
-        _TOKENIZER = AutoTokenizer.from_pretrained(model_local_path, trust_remote_code=True)
-        _LLM = AutoModelForCausalLM.from_pretrained(
+        tok = AutoTokenizer.from_pretrained(model_local_path, trust_remote_code=True)
+        llm = AutoModelForCausalLM.from_pretrained(
             model_local_path,
             trust_remote_code=True,
             torch_dtype="auto",
@@ -143,14 +174,14 @@ def _load_model():
     except ImportError:
         print("[推理审核] 模型不可用: 未安装 transformers/torch")
         print("[推理审核] 安装: pip install transformers torch -i https://mirrors.aliyun.com/pypi/simple/")
-        _LLM = None
-        _TOKENIZER = None
+        llm = None
+        tok = None
     except Exception as e:
         print(f"[推理审核] 模型加载失败: {e}")
         print("[推理审核] 模型将自动跳过, 不影响现有流程")
-        _LLM = None
-        _TOKENIZER = None
-    return _LLM, _TOKENIZER
+        llm = None
+        tok = None
+    return llm, tok
 
 
 def _strip_think(text: str) -> str:
@@ -334,41 +365,41 @@ def check_reasoning(state_path, chapter, chapter_dir):
 
     model, tokenizer = _load_model()
     if model is None:
-        print("\n  [推理审核] 跳过 (无 DeepSeek-R1-Distill-Qwen-1.5B 模型)")
-        return issues
-
-    print(f"\n{'='*50}")
-    print(f"[推理审核] 开始推理审核 (DeepSeek-R1-Distill-Qwen-1.5B, CPU)...")
-    print(f"{'='*50}")
-
-    prompt = _build_prompt(data, chapter, chapter_dir)
-    if not prompt:
-        print("  [推理审核] 跳过: 无法构建 prompt")
+        print("\n  [推理审核] 跳过 (判定模型不可用：LM Studio 库缺 7B 或 transformers 缺 1.5B)")
         return issues
 
     # ── 生成 + 解析（格式失败 → 打回纠正重试，最多 3 次；避免"格式漂移直接标记失败"导致审核结果不可见）──
-    try:
-        from transformers import pipeline as _pipeline
-        pipe = _pipeline("text-generation", model=model, tokenizer=tokenizer, device=0 if _DEVICE == "cuda" else -1)
-    except Exception as e:
-        print(f"\n  [推理审核] 模型加载异常: {e}")
-        return issues
+    # 统一句柄：lmstudio（make_lms_handle 闭包）→ mb_generate 直出 HTTP；transformers → pipeline
+    from model_backend import generate as mb_generate, judge_backend
+    _is_lms = judge_backend(_load_config()) == "lmstudio"
+    pipe = None
+    if not _is_lms:
+        try:
+            from transformers import pipeline as _pipeline
+            pipe = _pipeline("text-generation", model=model, tokenizer=tokenizer, device=0 if _DEVICE == "cuda" else -1)
+        except Exception as e:
+            print(f"\n  [推理审核] 模型加载异常: {e}")
+            return issues
 
     results = None
     last_raw = ""
+    _R1_MAX_TOKENS = 8192  # R1 是思考模型：思考链 1-3K + JSON 5 维 ≈ 800，4096 偏紧 → 8192 给思考留足
     for attempt in range(1, 4):  # 最多 3 次（第 1 次原始 prompt，第 2-3 次带纠错提示）
         try:
-            output = pipe(
-                prompt,
-                max_new_tokens=4096,
-                temperature=0.6,
-                top_p=0.95,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-            raw_output = output[0]["generated_text"]
-            if raw_output.startswith(prompt):
-                raw_output = raw_output[len(prompt):]
+            if _is_lms:
+                raw_output = mb_generate(model, prompt, max_tokens=_R1_MAX_TOKENS, temperature=0.6)
+            else:
+                output = pipe(
+                    prompt,
+                    max_new_tokens=_R1_MAX_TOKENS,
+                    temperature=0.6,
+                    top_p=0.95,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+                raw_output = output[0]["generated_text"]
+                if raw_output.startswith(prompt):
+                    raw_output = raw_output[len(prompt):]
         except Exception as e:
             print(f"\n  [推理审核] 推理异常(第{attempt}次): {e}")
             if attempt == 3:

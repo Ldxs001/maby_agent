@@ -2,7 +2,7 @@
 
 > 模板驱动的大纲规划 + 串行写作引擎。基于 LLM 的结构化长文写作系统，支持两级 RAG 增强、事实自检、引用自动格式化、交互式大纲控制、快速范例复用、两级局部重规划。
 >
-> 版本：1.9.0b0 | 作者：wUwproject | 许可证：Apache 2.0
+> 版本：1.9.0b0 | 作者：[username-redacted] | 许可证：Apache 2.0
 
 ---
 
@@ -49,8 +49,8 @@ Structured Writer 是一个**本地运行**的结构化长文写作工具。你�
 | 渠道 | 名称 | 说明 |
 |------|------|------|
 | **PyPI** | `rag-assistant-ldxs` | `pip install rag-assistant-ldxs`，安装后运行 `python main.py --no-web --api-port 8767` |
-| **GitHub** | `Ldxs001/workbuddy-skills` 仓库 → `agent/rag-assistant` 目录 | 下载后运行 `python main.py --no-web --api-port 8767` |
-| **Gitee** | `wUwproject/workbuddy-skills` 仓库 → `agent/rag-assistant` 目录 | 同上（国内访问更快） |
+| **GitHub** | `[username-redacted]/workbuddy-skills` 仓库 → `agent/rag-assistant` 目录 | 下载后运行 `python main.py --no-web --api-port 8767` |
+| **Gitee** | `[username-redacted]/workbuddy-skills` 仓库 → `agent/rag-assistant` 目录 | 同上（国内访问更快） |
 
 > **版本要求**：必须 **2.2.10 及以上**。Structured Writer 依赖 rag-assistant 的 `/api/kb/query` 外部接口（端口 8767），低版本缺少文档元数据回填能力，引用功能无法工作。
 >
@@ -396,4 +396,4 @@ A：默认监听 0.0.0.0:8770，局域网可直接访问。公网访问建议配
 
 ## 协议
 
-Apache 2.0 © wUwproject
+Apache 2.0 © [username-redacted]

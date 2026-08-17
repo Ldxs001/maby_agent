@@ -31,7 +31,7 @@ _generation_tasks = {}
 _gen_lock = threading.Lock()
 
 # 修复引擎状态（T1 整段重构后台线程）
-_repair_state = {"done": False, "result": None, "chapter": "", "session_id": ""}
+_repair_states: dict = {}  # session_id → {done, running, result, chapter, session_id}（b25 会话隔离）
 _repair_lock = threading.Lock()
 
 # 小说模型后台安装状态（点击「安装缺失模型」→ 后端自动下载，不弹窗不自装）
@@ -41,10 +41,18 @@ _INSTALL_CMDS = {
     "qwen25": ['python -c "from transformers import AutoModel; AutoModel.from_pretrained(\'Qwen/Qwen2.5-3B-Instruct\', trust_remote_code=True)"'],
 }
 _INSTALL_LABELS = {"r1": "推理R1", "qwen25": "实体抽取Qwen2.5-3B"}
+# LM Studio 判定模型（GGUF，hf-mirror 下载进 LM Studio 模型库 ~/.lmstudio/models/）：
+# 4维 = Qwen3-8B Q4_K_M（5GB）；R1 = DeepSeek-R1-Distill-Qwen-7B Q4（4.4GB）
+_GGUF_MODELS = {
+    "gguf_4dim": {"repo": "Qwen/Qwen3-8B-GGUF", "file": "Qwen3-8B-Q4_K_M.gguf",
+                  "label": "4维判定Qwen3-8B Q4_K_M"},
+    "gguf_r1": {"repo": "unsloth/DeepSeek-R1-Distill-Qwen-7B-GGUF", "file": "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
+                "label": "推理审核R1-Distill-7B Q4_K_M"},
+}
 
 
 def _run_model_install(models: list):
-    """后台下载缺失模型（hf-mirror + transformers），日志写 _install_state。"""
+    """后台下载缺失模型（hf-mirror；transformers 格式或 GGUF），日志写 _install_state。"""
     global _install_state
     log = []
     def _log(msg):
@@ -52,7 +60,48 @@ def _run_model_install(models: list):
         if len(log) > 60:
             log.pop(0)
     for m in models:
-        _log(f"[{_INSTALL_LABELS.get(m, m)}] 开始下载...")
+        _log(f"[{_INSTALL_LABELS.get(m, _GGUF_MODELS.get(m, {}).get('label', m))}] 开始下载...")
+        if m in _GGUF_MODELS:
+            # GGUF：hf_hub_download 拉文件进 LM Studio 模型库（hf-mirror 强制）——
+            # local_dir = 模型库根目录 → 自动落 <publisher>/<repo>/<file>，与 LM Studio 目录结构一致；
+            # 下载后 lms import 注册（LM Studio 未自动扫描时兜底）。
+            # 三保险走镜像：①环境变量强制覆盖（setdefault 遇已有值不生效，会走官方超时）
+            # ②huggingface_hub.constants.ENDPOINT 直接覆盖（库在 import 时缓存，改 env 无效）
+            # ③hf_hub_download 显式 endpoint 参数（旧版库无此参数则 TypeError 兜底）
+            spec = _GGUF_MODELS[m]
+            try:
+                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # 强制，非 setdefault
+                os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+                try:
+                    import huggingface_hub.constants as _hfc
+                    _hfc.ENDPOINT = "https://hf-mirror.com"
+                except Exception:
+                    pass
+                from huggingface_hub import hf_hub_download
+                from .novel import model_backend as mb
+                from .novel import lmstudio_probe
+                # 已存在（LM Studio 库）→ 跳过下载
+                if lmstudio_probe.gguf_exists(spec["repo"], spec["file"]):
+                    _log(f"  已存在: {lmstudio_probe.gguf_expected_path(spec['repo'], spec['file'])}")
+                    continue
+                target_dir = mb.default_gguf_dir()  # = LM Studio 模型库根目录
+                target_dir.mkdir(parents=True, exist_ok=True)
+                _log(f"  repo: {spec['repo']} file: {spec['file']} (hf-mirror → LM Studio 模型库)")
+                try:
+                    path = hf_hub_download(spec["repo"], spec["file"], local_dir=str(target_dir),
+                                           endpoint="https://hf-mirror.com")
+                except TypeError:
+                    path = hf_hub_download(spec["repo"], spec["file"], local_dir=str(target_dir))
+                _log(f"  OK → {path}")
+                # 注册进 LM Studio（幂等；失败不阻断——LM Studio 可能自动扫描到）
+                try:
+                    ok_imp, msg_imp = lmstudio_probe.lms_import(path, spec["repo"], copy=True)
+                    _log(f"  lms import: {'OK' if ok_imp else msg_imp[:120]}")
+                except Exception as e:
+                    _log(f"  lms import 跳过: {e}")
+            except Exception as e:
+                _log(f"  [ERROR] {type(e).__name__}: {e}")
+            continue
         for cmd in _INSTALL_CMDS.get(m, []):
             _log(f"  执行: {cmd[:90]}")
             try:
@@ -119,6 +168,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/config": cls._handle_get_config,
             "/api/llm/test": cls._handle_llm_test,
             "/api/llm/models": cls._handle_llm_models,
+            "/api/llm/window": cls._handle_llm_window,
             "/api/progress": cls._handle_get_progress,
             "/api/result": cls._handle_get_result,
             "/api/sessions": cls._handle_list_sessions,
@@ -251,6 +301,17 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
 
     def _handle_get_config(self):
         cfg = self.config_mgr.get_all()
+        # LM Studio 环境注入 → 前端显示统一管理可用性与模型库状态（llama.cpp 已废弃）
+        try:
+            from .novel import lmstudio_probe
+            p = lmstudio_probe.probe_lmstudio()
+            cfg["lmstudio"] = {"available": bool(p.get("lms_ok")),
+                               "server_ok": bool(p.get("server_ok")),
+                               "models_dir": p.get("models_dir") or "",
+                               "reason": p.get("reason", "")}
+        except Exception:
+            cfg["lmstudio"] = {"available": False, "server_ok": False,
+                               "models_dir": "", "reason": "探测异常"}
         self._json_response({"success": True, "config": cfg})
 
     def _handle_update_config(self):
@@ -268,11 +329,20 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
 
     # ---- LLM 客户端工厂（统一创建，一处改处处生效） ----
 
+    @staticmethod
+    def _model_profile(model_cfg: dict) -> dict:
+        """按后端取配置槽（profiles 分槽结构，用户需求：切后端自动恢复对应落盘配置）。
+
+        实现见 model_backend._model_profile（单一实现，repair engine 共用）。
+        """
+        from .novel.model_backend import _model_profile as _mb_profile
+        return _mb_profile(model_cfg)
+
     @classmethod
     def _create_writer_client(cls):
-        wm = cls.config_mgr.get("writer_model", {})
+        wm = cls._model_profile(cls.config_mgr.get("writer_model", {}))
         return LLMClient(
-            backend=wm.get("backend", "lmstudio"),
+            backend=(cls.config_mgr.get("writer_model", {}) or {}).get("backend", "lmstudio"),
             base_url=wm.get("base_url", "http://localhost:1234"),
             timeout=wm.get("timeout", 300),
             model=wm.get("model", ""),
@@ -282,9 +352,9 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
 
     @classmethod
     def _create_planner_client(cls):
-        pm = cls.config_mgr.get("planner_model", {})
+        pm = cls._model_profile(cls.config_mgr.get("planner_model", {}))
         return LLMClient(
-            backend=pm.get("backend", "lmstudio"),
+            backend=(cls.config_mgr.get("planner_model", {}) or {}).get("backend", "lmstudio"),
             base_url=pm.get("base_url", "http://localhost:1234"),
             timeout=pm.get("timeout", 180),
             model=pm.get("model", ""),
@@ -313,6 +383,11 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         client = LLMClient(backend=backend, base_url=base_url)
         models = client.list_models()
         self._json_response({"success": True, "models": models})
+
+    def _handle_llm_window(self):
+        """窗口信息：llama.cpp 已废弃（LM Studio/Ollama 由服务端管理窗口）→ 恒返回空。"""
+        self._json_response({"success": True, "n_ctx": None, "read_space": None,
+                             "warn": None, "error": None})
 
     # ---- 大纲 API ----
 
@@ -1172,7 +1247,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
     # ---- 小说质检 ----
 
     def _novel_status_data(self):
-        """R1/3B 模型就绪检测（data/models/ 优先，回退 HF 默认缓存）"""
+        """R1/3B 模型就绪检测（data/models/ 优先，回退 HF 默认缓存）+ llama.cpp 后端判定"""
         try:
             from .novel._path_utils import MODELS_DIR
         except Exception:
@@ -1181,6 +1256,24 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         default = {"chapter": True, "format": True, "reason": True, "full": True}
         for k in default:
             cfg.setdefault(k, default[k])
+
+        # LM Studio 后端判定（B = 统一勾选；判定后端 = B → lmstudio 8B/7B，否则 transformers 3B/1.5B）
+        try:
+            from .novel import model_backend as mb
+            from .novel import lmstudio_probe
+            lm_env = lmstudio_probe.probe_lmstudio()
+            judge_backend = mb.judge_backend(cfg)
+            gguf_paths = mb.judge_gguf_paths(cfg) if judge_backend == "lmstudio" else {}
+            try:
+                gguf_dir = str(mb.default_gguf_dir())
+            except Exception:
+                gguf_dir = lm_env.get("models_dir") or ""
+        except Exception:
+            lm_env = {"reason": "探测异常", "server_ok": False, "lms_ok": False,
+                      "models_dir": str(MODELS_DIR / "gguf") if MODELS_DIR else ""}
+            judge_backend = "transformers"
+            gguf_paths = {}
+            gguf_dir = lm_env["models_dir"]
 
         def _has(model_dir):
             try:
@@ -1237,17 +1330,45 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             r1 = _hf_cache("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B").is_dir() if _hf_cache("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B") else False
         if not qwen25:
             qwen25 = _model_ready("Qwen/Qwen2.5-3B-Instruct")
-        return {"r1": r1, "qwen25": qwen25, "dir": str(MODELS_DIR) if MODELS_DIR else "", "config": cfg,
-                "install": dict(_install_state)}
+        # LM Studio 判定模型就绪（8B 4维 / 7B R1）
+        gguf4 = bool(gguf_paths.get("4dim")) if gguf_paths else False
+        gguf7 = bool(gguf_paths.get("r1")) if gguf_paths else False
+        # 写作/规划后端（统一管理只对 LM Studio 后端有意义；ollama 未接入判定联动 → 禁用）
+        try:
+            model_backends = {
+                "planner": (self.config_mgr.get("planner_model", {}) or {}).get("backend", "lmstudio"),
+                "writer": (self.config_mgr.get("writer_model", {}) or {}).get("backend", "lmstudio"),
+            }
+        except Exception:
+            model_backends = {"planner": "lmstudio", "writer": "lmstudio"}
+        return {"r1": r1, "qwen25": qwen25, "dir": str(MODELS_DIR) if MODELS_DIR else "",
+                "config": cfg, "install": dict(_install_state),
+                "model_backends": model_backends,
+                "lmstudio": {"available": lm_env.get("lms_ok", False),
+                             "server_ok": lm_env.get("server_ok", False),
+                             "reason": lm_env.get("reason", "")},
+                "judge_backend": judge_backend,
+                "gguf": {"dir": gguf_dir, "4dim": gguf_paths.get("4dim", ""),
+                         "r1": gguf_paths.get("r1", ""), "4dim_ready": gguf4, "r1_ready": gguf7}}
 
     def _handle_novel_status(self):
         self._json_response({"success": True, **self._novel_status_data()})
 
     def _handle_novel_install(self):
-        """点击「安装缺失模型」→ 后端后台线程自动下载（hf-mirror），不弹窗、不给命令让用户手动装"""
+        """点击「安装缺失模型」→ 后台自动下载（hf-mirror），按判定后端选模型：
+        lmstudio 后端 → 8B+7B GGUF（进 LM Studio 模型库）+ 3B（实体抽取仍需）；transformers 后端 → 1.5B+3B"""
         global _install_state
         st = self._novel_status_data()
-        missing = [k for k in ("r1", "qwen25") if not st.get(k)]
+        if st.get("judge_backend") == "lmstudio":
+            missing = []
+            if not st.get("gguf", {}).get("4dim_ready"):
+                missing.append("gguf_4dim")
+            if not st.get("gguf", {}).get("r1_ready"):
+                missing.append("gguf_r1")
+            if not st.get("qwen25"):
+                missing.append("qwen25")  # 实体抽取/行为提取仍用 3B transformers
+        else:
+            missing = [k for k in ("r1", "qwen25") if not st.get(k)]
         if not missing:
             self._json_response({"success": True, "message": "模型已就绪，无需安装", "started": False, "models": []})
             return
@@ -1257,25 +1378,34 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                                      "message": "安装已在后台进行中（可看状态区进度）",
                                      "started": True, "models": _install_state.get("models", [])})
                 return
+            labels = {**_INSTALL_LABELS, **{k: v["label"] for k, v in _GGUF_MODELS.items()}}
             _install_state = {"running": True, "models": missing,
-                              "log": [f"开始安装: {', '.join(_INSTALL_LABELS.get(m, m) for m in missing)}"],
+                              "log": [f"开始安装: {', '.join(labels.get(m, m) for m in missing)}"],
                               "done": False}
         threading.Thread(target=_run_model_install, args=(missing,), daemon=True).start()
         self._json_response({"success": True,
-                             "message": f"已启动后台下载 {len(missing)} 个模型（{', '.join(_INSTALL_LABELS.get(m, m) for m in missing)}），完成后状态自动更新",
+                             "message": f"已启动后台下载 {len(missing)} 个模型（{', '.join(labels.get(m, m) for m in missing)}），完成后状态自动更新",
                              "started": True, "models": missing})
 
     def _handle_novel_checks(self):
         data = self._read_body()
         cfg = {}
-        for k in ("chapter", "format", "reason", "full", "full_fidelity", "full_pledge", "full_ending", "auto_repair"):
+        for k in ("chapter", "format", "reason", "full", "full_fidelity", "full_pledge", "full_ending", "auto_repair", "unified_management"):
             if k in data:
                 cfg[k] = bool(data.get(k))
+        for k in ("gguf_4dim", "gguf_r1"):
+            if k in data:
+                cfg[k] = str(data.get(k) or "").strip()
         if "repair_rounds" in data:
             try:
                 cfg["repair_rounds"] = max(1, min(5, int(data.get("repair_rounds"))))
             except (ValueError, TypeError):
                 cfg["repair_rounds"] = 3
+        if "judge_n_ctx" in data:
+            try:
+                cfg["judge_n_ctx"] = max(8192, int(data.get("judge_n_ctx")))
+            except (ValueError, TypeError):
+                cfg["judge_n_ctx"] = 16384
         self.config_mgr.set("novel_checks", cfg)
         self._json_response({"success": True})
 
@@ -1488,6 +1618,17 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         if not session_id or not chapter:
             self._json_response({"success": False, "error": "缺少 session_id/chapter"}, 400)
             return
+        # 防重入（b22 崩溃根因 + b24 竞态修复 + b25 会话隔离）：
+        # 状态按 session_id 隔离（_repair_states 字典）——A 会话修复不影响 B 会话的显示/防重入；
+        # run() 只处理请求的 session_id（不会修别的会话）。
+        # 重复 apply（前端重复提交/双击/手动再点）会启动多个 _run 线程并发调用同一 Llama 实例
+        # → llama_cpp 线程不安全 → segfault。检查与置位必须同一锁块（防 TOCTOU 竞态）。
+        st = _repair_states.setdefault(session_id, {"done": False, "running": False, "result": None, "chapter": "", "session_id": session_id})
+        with _repair_lock:
+            if st.get("running"):
+                self._json_response({"success": False, "error": "已有修复任务进行中，请等待完成（或先关闭修复面板）"})
+                return
+            st.update({"done": False, "running": True, "result": None, "chapter": chapter, "session_id": session_id})
         # 三检类型化：full_types 与 checked_subs 一一对应 → {file: type}
         repair_types = None
         if full_types and checked and len(full_types) == len(checked):
@@ -1599,14 +1740,14 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 with _repair_lock:
-                    _repair_state["result"] = rep
-                    _repair_state["done"] = True
+                    _repair_states[session_id]["result"] = rep
+                    _repair_states[session_id]["done"] = True
+                    _repair_states[session_id]["running"] = False
             except Exception as e:
                 with _repair_lock:
-                    _repair_state["result"] = {"error": f"{type(e).__name__}: {e}"}
-                    _repair_state["done"] = True
-        with _repair_lock:
-            _repair_state.update({"done": False, "result": None, "chapter": chapter, "session_id": session_id})
+                    _repair_states[session_id]["result"] = {"error": f"{type(e).__name__}: {e}"}
+                    _repair_states[session_id]["done"] = True
+                    _repair_states[session_id]["running"] = False
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         self._json_response({"success": True, "started": True, "chapter": chapter,
@@ -1798,9 +1939,8 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         sm.load(session_id)
         hints = sm.get_repair_hints()
         if chapter in hints:
-            # 全部跳过：章检阶段清 issues、三检阶段清 full_items（串行时序二选一，统一清两字段一套代码）
+            # 全部跳过 = 通过：统一 _repaired=True + 清 issues/full_items（无单独跳过标识——用户语义"跳过=通过"）
             hints[chapter]["_repaired"] = True
-            hints[chapter]["_skipped_all"] = True
             hints[chapter]["issues"] = []
             hints[chapter]["full_items"] = []
             hints[chapter]["_repair_result"] = {"skipped": True}
@@ -1827,9 +1967,12 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         self._json_response({"success": True, "restored": restored})
 
     def _handle_repair_status(self):
-        """GET /api/novel/repair/status — 修复进度轮询"""
+        """GET /api/novel/repair/status — 修复进度轮询（按 session_id 隔离，b25）"""
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        sid = (params.get("session_id") or [""])[0]
         with _repair_lock:
-            self._json_response({"success": True, "state": dict(_repair_state)})
+            st = _repair_states.get(sid) or {"done": False, "running": False, "result": None, "chapter": "", "session_id": sid}
+            self._json_response({"success": True, "state": dict(st)})
 
     def _handle_novel_replan_sub(self):
         """POST /api/novel/replan_sub — 段级重规划（确认面板内单个子结构）。
@@ -3229,14 +3372,11 @@ body {
           <label style="min-width:auto;white-space:nowrap">超时(s)</label>
           <input type="number" id="planner-timeout" value="180" style="width:100px;flex-shrink:0">
           <label style="min-width:auto;white-space:nowrap">最大Token</label>
-          <input type="number" id="planner-max-tokens" value="4096" style="width:120px;flex-shrink:0">
+          <input type="number" id="planner-max-tokens" value="4096" style="width:120px;flex-shrink:0" title="生成上限（写窗口）">
           <label style="min-width:auto;white-space:nowrap">温度</label>
           <input type="number" id="planner-temperature" value="0.6" min="0" max="1" step="0.05" style="width:70px;flex-shrink:0">
         </div>
-        <div class="form-row" style="font-size:11px;color:var(--text-dim)">
-          <span></span>
-          <span>推理模型建议不低于 4096（默认最低值），长文建议 8192 以上。</span>
-        </div>
+        <div id="planner-window-tip" style="font-size:11px;color:var(--text-dim);margin:2px 0 0 8px;min-height:14px"></div>
       </div>
 
       <div class="config-section">
@@ -3258,14 +3398,11 @@ body {
           <label style="min-width:auto;white-space:nowrap">超时(s)</label>
           <input type="number" id="writer-timeout" value="300" style="width:100px;flex-shrink:0">
           <label style="min-width:auto;white-space:nowrap">最大Token</label>
-          <input type="number" id="writer-max-tokens" value="8192" style="width:120px;flex-shrink:0">
+          <input type="number" id="writer-max-tokens" value="8192" style="width:120px;flex-shrink:0" title="生成上限（写窗口）">
           <label style="min-width:auto;white-space:nowrap">温度</label>
           <input type="number" id="writer-temperature" value="0.7" min="0" max="1" step="0.05" style="width:70px;flex-shrink:0">
         </div>
-        <div class="form-row" style="font-size:11px;color:var(--text-dim)">
-          <span></span>
-          <span>推理模型建议不低于 4096（默认最低值），长文建议 8192 以上。</span>
-        </div>
+        <div id="writer-window-tip" style="font-size:11px;color:var(--text-dim);margin:2px 0 0 8px;min-height:14px"></div>
       </div>
 
       <div class="config-section">
@@ -3403,7 +3540,16 @@ body {
         <div class="form-row">
           <label>操作</label>
           <button class="btn btn-secondary btn-sm" id="novel-install-btn" onclick="installNovelModels()">安装缺失模型</button>
-          <span style="font-size:11px;color:var(--text-dim)">R1 约3.7GB / Qwen2.5-3B 约1.9GB，走镜像源；无模型时小说照写，质检/抽取自动跳过</span>
+          <span style="font-size:11px;color:var(--text-dim)">transformers 方案：R1 约3.7GB / Qwen2.5-3B 约1.9GB；LM Studio 方案（统一勾选）：8B+7B GGUF 约9.4GB（自动下载进 LM Studio 模型库）+ 3B。走镜像源；无模型时自动降级：4维 缺失 → 回退规则连通性+逻辑检查；抽取缺失 → 正则兜底提取；R1 缺失 → 跳过</span>
+        </div>
+        <div class="form-row">
+          <label>判定后端</label>
+          <label style="font-size:12px;cursor:pointer" title="统一管理 = 写作规划与审查判定统一走 LM Studio（lms load 进 GPU，显存错峰共用）：判定模型切换为 8B+7B。勾选 → 8B/7B 走 LM Studio GPU；未勾选 → 判定固定 transformers 3B+1.5B。写作后端为 Ollama 时不适用（Ollama 未接入判定联动）。判定窗口固定 16384（lms load -c，覆盖 4维~3K / R1~13K）"><input type="checkbox" id="novel-chk-unified" onchange="saveNovelChecks()"> 统一管理（LM Studio 判定 8B+7B）</label>
+          <span id="novel-judge-backend" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
+        </div>
+        <div class="form-row" id="novel-gguf-row" style="display:none">
+          <label>GGUF</label>
+          <span id="novel-gguf-status" style="font-size:12px;color:var(--text-dim)"></span>
         </div>
         <div class="form-row">
           <label>章内检测</label>
@@ -3701,30 +3847,141 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // 后端切换触发模型刷新
-  document.getElementById('planner-backend').addEventListener('change', () => refreshModels('planner'));
-  document.getElementById('writer-backend').addEventListener('change', () => refreshModels('writer'));
+  document.getElementById('planner-backend').addEventListener('change', () => onBackendChange('planner'));
+  document.getElementById('writer-backend').addEventListener('change', () => onBackendChange('writer'));
+  // 模型配置自动持久化：地址失焦/模型选择/参数改动即保存
+  ['planner', 'writer'].forEach(p => {
+    document.getElementById(p + '-base-url').addEventListener('change', autoSaveModelConfig);
+    document.getElementById(p + '-model').addEventListener('change', () => {
+      _modelValues[p] = document.getElementById(p + '-model').value;
+      autoSaveModelConfig();
+    });
+    [p + '-timeout', p + '-max-tokens', p + '-temperature'].forEach(id =>
+      document.getElementById(id).addEventListener('change', autoSaveModelConfig));
+    // 最大Token 改动 → 查窗口提示（读写平衡，只提示不强制）
+    document.getElementById(p + '-max-tokens').addEventListener('change', () => checkWindowTip(p));
+    document.getElementById(p + '-backend').addEventListener('change', () => checkWindowTip(p));
+  });
 });
 
+// 窗口提示：llama.cpp 后端已废弃（LM Studio/Ollama 无 n_ctx 直读需求）→ 恒清空
+function checkWindowTip(prefix) {
+  const tipEl = document.getElementById(prefix + '-window-tip');
+  if (tipEl) tipEl.textContent = '';
+}
+
 // ===== 配置操作 =====
+// 模型配置自动持久化：后端/地址/模型/参数改动即保存（不依赖"保存配置"按钮，与 novel_checks 一致）
+// 模型值用内存变量记（_modelValues）——不读 DOM 下拉框：refreshModels 异步重建下拉框时 value 会短暂变空，
+// autoSave 若读 DOM 会存空覆盖（用户实测"选了模型却存成空"的根因）。内存值在恢复/手动选择时同步更新。
+let _modelValues = {planner: '', writer: ''};
+let _modelCfgTimer = null;
+function autoSaveModelConfig() {
+  clearTimeout(_modelCfgTimer);
+  _modelCfgTimer = setTimeout(() => {
+    // 先读现有配置（保留其他后端已落盘的槽），只更新当前后端的槽——切后端配置互不覆盖（用户需求）
+    fetch('/api/config').then(r => r.json()).then(d => {
+      if (!d.success) return null;
+      const c = d.config || {};
+      const readProfile = (p) => ({
+        base_url: document.getElementById(p + '-base-url').value,
+        model: _modelValues[p] || document.getElementById(p + '-model').value,  // 内存值优先（防下拉框重建时读空）
+        timeout: parseInt(document.getElementById(p + '-timeout').value) || 180,
+        max_tokens: parseInt(document.getElementById(p + '-max-tokens').value) || 4096,
+        temperature: parseFloat(document.getElementById(p + '-temperature').value) || 0.7
+      });
+      const merge = (p, cur) => {
+        const backend = document.getElementById(p + '-backend').value;
+        const profiles = Object.assign({}, (cur.profiles || {}));
+        profiles[backend] = readProfile(p);
+        return {backend, profiles};
+      };
+      return fetch('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+        planner_model: merge('planner', c.planner_model || {}),
+        writer_model: merge('writer', c.writer_model || {})
+      })});
+    }).then(r => r ? r.json() : null).then(d => {
+      if (d && d.success) console.log('[auto-save] 模型配置已持久化');
+      else if (d) console.error('[auto-save] 保存失败', d);
+    }).catch(e => console.error('[auto-save] 保存失败', e));
+  }, 600);
+}
+
+// 后端切换引导：llama.cpp 已废弃（下拉仅 LM Studio / Ollama）
+function onBackendChange(prefix) {
+  const backend = document.getElementById(prefix + '-backend').value;
+  const urlEl = document.getElementById(prefix + '-base-url');
+  if (urlEl) {
+    urlEl.placeholder = '';
+    urlEl.title = '';
+  }
+  // 切后端 → 加载该后端落盘的配置槽（用户需求：切回来配置跟着回，各后端互不覆盖）
+  fetch('/api/config').then(r => r.json()).then(d => {
+    if (!d.success) return;
+    const cfg = (d.config || {})[(prefix === 'planner' ? 'planner_model' : 'writer_model')] || {};
+    const prof = (cfg.profiles || {})[backend];
+    if (prof) {
+      // 该后端有落盘槽 → 恢复
+      if (document.getElementById(prefix + '-base-url')) document.getElementById(prefix + '-base-url').value = prof.base_url || '';
+      if (document.getElementById(prefix + '-model')) document.getElementById(prefix + '-model').value = prof.model || '';
+      _modelValues[prefix] = prof.model || '';  // 内存值同步（切后端恢复时先记内存，防 refreshModels 重建期间 autoSave 读空）
+      if (document.getElementById(prefix + '-timeout')) document.getElementById(prefix + '-timeout').value = prof.timeout || 180;
+      if (document.getElementById(prefix + '-max-tokens')) document.getElementById(prefix + '-max-tokens').value = prof.max_tokens || 4096;
+      if (document.getElementById(prefix + '-temperature')) document.getElementById(prefix + '-temperature').value = prof.temperature != null ? prof.temperature : 0.7;
+    } else {
+      // 无该后端槽 → 填该后端默认地址（防止残留上一个后端的地址造成误配）
+      const defUrl = backend === 'ollama' ? 'http://localhost:11434' : 'http://localhost:1234';
+      if (document.getElementById(prefix + '-base-url')) document.getElementById(prefix + '-base-url').value = defUrl;
+    }
+    refreshModels(prefix);
+    autoSaveModelConfig();  // 后端切换即持久化（恢复的槽值原样存回，无副作用）
+  }).catch(() => {
+    // 加载失败 → 填当前后端默认值（防残留上一个后端的值被保存污染槽）
+    if (document.getElementById(prefix + '-base-url')) {
+      document.getElementById(prefix + '-base-url').value = backend === 'ollama' ? 'http://localhost:11434' : 'http://localhost:1234';
+    }
+    refreshModels(prefix);
+    autoSaveModelConfig();
+  });
+}
+
 function loadConfig() {
   fetch('/api/config').then(r => r.json()).then(data => {
     if (!data.success) return;
     const c = data.config;
     const pm = c.planner_model || {};
     const wm = c.writer_model || {};
-    document.getElementById('planner-backend').value = pm.backend || 'lmstudio';
-    document.getElementById('planner-base-url').value = pm.base_url || 'http://localhost:1234';
-    document.getElementById('planner-timeout').value = pm.timeout || 180;
-    document.getElementById('planner-max-tokens').value = pm.max_tokens || 4096;
-    document.getElementById('planner-temperature').value = pm.temperature != null ? pm.temperature : 0.6;
+    // llama.cpp 已废弃：若旧配置仍指向 llama.cpp → 提示回退 LM Studio / Ollama
+    ['planner', 'writer'].forEach(p => {
+      const cur = (p === 'planner' ? pm : wm).backend;
+      if (cur === 'llama.cpp') {
+        const hint = document.getElementById(p + '-base-url');
+        if (hint) hint.title = 'llama.cpp 后端已废弃，请改用 LM Studio / Ollama';
+      }
+    });
+    // 按后端取配置槽（profiles 分槽结构——用户需求：切后端自动恢复对应落盘配置）
+    // 槽缺失 → 用后端默认值（绝不用顶层残留——旧格式迁移后的顶层 base_url 不可靠）
+    const pmBackend = pm.backend || 'lmstudio';
+    const pmHasProf = !!(pm.profiles && Object.keys(pm.profiles).length);
+    const pmProf = pmHasProf ? ((pm.profiles || {})[pmBackend] || {}) : pm;
+    const pmDefUrl = pmBackend === 'ollama' ? 'http://localhost:11434' : 'http://localhost:1234';
+    document.getElementById('planner-backend').value = pmBackend;
+    document.getElementById('planner-base-url').value = pmProf.base_url || pmDefUrl;
+    document.getElementById('planner-timeout').value = pmProf.timeout || 180;
+    document.getElementById('planner-max-tokens').value = pmProf.max_tokens || 4096;
+    document.getElementById('planner-temperature').value = pmProf.temperature != null ? pmProf.temperature : 0.6;
     // 缓存模板数据供只读控制
     window._lastTemplates = c.templates || {};
     window._lastBuiltins = c.builtin_templates || [];
-    document.getElementById('writer-backend').value = wm.backend || 'lmstudio';
-    document.getElementById('writer-base-url').value = wm.base_url || 'http://localhost:1234';
-    document.getElementById('writer-timeout').value = wm.timeout || 300;
-    document.getElementById('writer-max-tokens').value = wm.max_tokens || 8192;
-    document.getElementById('writer-temperature').value = wm.temperature != null ? wm.temperature : 0.7;
+    const wmBackend = wm.backend || 'lmstudio';
+    const wmHasProf = !!(wm.profiles && Object.keys(wm.profiles).length);
+    const wmProf = wmHasProf ? ((wm.profiles || {})[wmBackend] || {}) : wm;
+    const wmDefUrl = wmBackend === 'ollama' ? 'http://localhost:11434' : 'http://localhost:1234';
+    document.getElementById('writer-backend').value = wmBackend;
+    document.getElementById('writer-base-url').value = wmProf.base_url || wmDefUrl;
+    document.getElementById('writer-timeout').value = wmProf.timeout || 300;
+    document.getElementById('writer-max-tokens').value = wmProf.max_tokens || 8192;
+    document.getElementById('writer-temperature').value = wmProf.temperature != null ? wmProf.temperature : 0.7;
     // 加载模板
     const templates = c.templates || {};
     const selectedTemplate = c.selected_template || '日常写作';
@@ -3788,8 +4045,10 @@ function loadConfig() {
     if (c.rag_path) document.getElementById('rag-path').value = c.rag_path;
     if (c.context_review_length) document.getElementById('context-review-length').value = c.context_review_length;
     if (c.fact_check_enabled) document.getElementById('fact-check-enabled').checked = true;
-    refreshModels('planner', pm.model);
-    refreshModels('writer', wm.model);
+    refreshModels('planner', pmProf.model);
+    refreshModels('writer', wmProf.model);
+    _modelValues.planner = pmProf.model || '';
+    _modelValues.writer = wmProf.model || '';
     // 小说质检状态（模型就绪检测 + 开关）
     if (typeof checkNovelModels === 'function') checkNovelModels();
     // 加载完成后渲染对话区的 meta 输入框
@@ -4288,13 +4547,60 @@ async function checkNovelModels() {
     const r = await fetch('/api/novel/status');
     const d = await r.json();
     const parts = [];
-    if (d.r1) parts.push('<span style="color:#2ecc71">推理R1 就绪</span>');
-    else parts.push('<span style="color:#e94560">推理R1 缺失</span>');
-    if (d.qwen25) parts.push('<span style="color:#2ecc71">实体抽取Qwen2.5-3B 就绪</span>');
-    else parts.push('<span style="color:#e94560">实体抽取Qwen2.5-3B 缺失</span>');
+    if (d.judge_backend === 'lmstudio') {
+      const gg = d.gguf || {};
+      parts.push('<span style="color:#2ecc71">判定后端: LM Studio（统一）</span>');
+      parts.push(gg['4dim_ready'] ? '<span style="color:#2ecc71">8B 就绪</span>' : '<span style="color:#e94560">8B 缺失</span>');
+      parts.push(gg['r1_ready'] ? '<span style="color:#2ecc71">7B 就绪</span>' : '<span style="color:#e94560">7B 缺失</span>');
+      parts.push(d.qwen25 ? '<span style="color:#2ecc71">3B(抽取) 就绪</span>' : '<span style="color:#e94560">3B(抽取) 缺失</span>');
+    } else {
+      if (d.r1) parts.push('<span style="color:#2ecc71">推理R1 就绪</span>');
+      else parts.push('<span style="color:#e94560">推理R1 缺失</span>');
+      if (d.qwen25) parts.push('<span style="color:#2ecc71">实体抽取Qwen2.5-3B 就绪</span>');
+      else parts.push('<span style="color:#e94560">实体抽取Qwen2.5-3B 缺失</span>');
+      parts.push('<span style="color:var(--text-dim)">判定后端: transformers</span>');
+    }
+    // LM Studio 环境提示（已装？引擎在跑？）
+    const lm = d.lmstudio || {};
+    if (lm.available && lm.server_ok) parts.push('<span style="color:var(--text-dim)">LM Studio 就绪</span>');
+    else if (lm.available) parts.push('<span style="color:#e67e22">LM Studio 已装但引擎未响应（lms server start）</span>');
+    else parts.push('<span style="color:#e94560">LM Studio 未安装</span>');
     statusEl.innerHTML = parts.join(' | ');
     const dirEl = document.getElementById('novel-model-dir');
     if (dirEl && d.dir) dirEl.value = d.dir;
+    // 判定后端徽标
+    const jbEl = document.getElementById('novel-judge-backend');
+    if (jbEl) {
+      jbEl.textContent = lm.available
+        ? `（LM Studio：${lm.reason || ''}；勾选统一 → 8B+7B 走 GPU，不勾 → 3B+1.5B）`
+        : (lm.reason ? `（${lm.reason} → 固定 3B+1.5B）` : '');
+      jbEl.style.color = lm.available ? 'var(--text-dim)' : '#e67e22';
+    }
+    // 统一管理勾选：LM Studio 存在 且 写作/规划后端都是 LM Studio 时可勾（ollama 未接入判定联动 → 禁用）
+    const unifiedEl = document.getElementById('novel-chk-unified');
+    if (unifiedEl) {
+      const mb = d.model_backends || {};
+      const allLms = (mb.planner === 'lmstudio') && (mb.writer === 'lmstudio');
+      unifiedEl.disabled = !(lm.available && allLms);
+      unifiedEl.checked = !!(d.config && d.config.unified_management);
+      unifiedEl.title = (!lm.available)
+        ? 'LM Studio 未安装，统一管理不可用'
+        : (!allLms ? '写作/规划后端为 Ollama，统一管理（LM Studio 判定）不适用' : unifiedEl.title);
+    }
+    const ggufRow = document.getElementById('novel-gguf-row');
+    const ggufSt = document.getElementById('novel-gguf-status');
+    if (ggufRow && ggufSt) {
+      const unifiedOn = unifiedEl && unifiedEl.checked;
+      if (unifiedOn) {
+        const gg = d.gguf || {};
+        ggufRow.style.display = '';
+        ggufSt.innerHTML = `目录: ${gg.dir || ''}<br>` +
+          (gg['4dim_ready'] ? `✅ 4维 8B: ${gg['4dim']}` : `❌ 4维 8B 缺失（Qwen3-8B Q4_K_M 约5GB，点「安装缺失模型」下载）`) + '<br>' +
+          (gg['r1_ready'] ? `✅ R1 7B: ${gg['r1']}` : `❌ R1 7B 缺失（R1-Distill-Qwen-7B Q4 约4.4GB，点「安装缺失模型」下载）`);
+      } else {
+        ggufRow.style.display = 'none';
+      }
+    }
     if (d.config) {
       novelChecksConfig = d.config;
       const map = {chapter:'novel-chk-chapter', format:'novel-chk-format', reason:'novel-chk-reason', full_fidelity:'novel-chk-fid', full_pledge:'novel-chk-pledge', full_ending:'novel-chk-ending', auto_repair:'novel-chk-autorepair'};
@@ -4345,6 +4651,7 @@ async function installNovelModels() {
 
 async function saveNovelChecks() {
   const roundsEl = document.getElementById('novel-chk-rounds');
+  const unifiedEl = document.getElementById('novel-chk-unified');
   const cfg = {
     chapter: !!document.getElementById('novel-chk-chapter').checked,
     format: !!document.getElementById('novel-chk-format').checked,
@@ -4353,12 +4660,15 @@ async function saveNovelChecks() {
     full_pledge: !!document.getElementById('novel-chk-pledge').checked,
     full_ending: !!document.getElementById('novel-chk-ending').checked,
     auto_repair: !!document.getElementById('novel-chk-autorepair').checked,
+    unified_management: unifiedEl ? !!unifiedEl.checked : false,
     repair_rounds: roundsEl ? (parseInt(roundsEl.value) || 3) : 3
   };
   novelChecksConfig = cfg;
   try {
     await fetch('/api/novel/checks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)});
   } catch(e) { console.error('保存小说质检开关失败', e); }
+  // 勾选统一管理后立即刷新 GGUF 状态行
+  checkNovelModels();
 }
 
 // ===== RAG 状态管理 =====
@@ -4582,38 +4892,27 @@ function refreshModels(prefix, savedValue) {
   sel.disabled = true;
   fetch(`/api/llm/models?backend=${encodeURIComponent(backend)}&base_url=${encodeURIComponent(base_url)}`)
     .then(r => r.json()).then(d => {
-      sel.innerHTML = '<option value="">(请选择)</option>';
-      if (d.success && d.models) {
-        d.models.forEach(m => {
+      const models = (d.success && d.models) || [];
+      if (models.length) {
+        sel.innerHTML = '<option value="">(请选择)</option>';
+        models.forEach(m => {
           const opt = document.createElement('option');
           opt.value = m;
           opt.textContent = m;
           sel.appendChild(opt);
         });
-      }
-      // 用 currentVal（来自 select 或 savedValue）恢复选择
-      const restoreVal = currentVal || savedValue;
-      if (restoreVal) {
-        const exists = Array.from(sel.options).some(o => o.value === restoreVal);
-        if (!exists) {
-          const opt = document.createElement('option');
-          opt.value = restoreVal;
-          opt.textContent = restoreVal + '（已配置）';
-          sel.appendChild(opt);
+        // 只恢复「当前后端返回列表内」的值——跨后端一律不恢复，每个后端各管各的模型，杜绝配置互相污染
+        const restoreVal = currentVal || savedValue;
+        if (restoreVal && Array.from(sel.options).some(o => o.value === restoreVal)) {
+          sel.value = restoreVal;
+          _modelValues[prefix] = restoreVal;  // 内存值同步（防 autoSave 读空）
         }
-        sel.value = restoreVal;
+      } else {
+        sel.innerHTML = '<option value="">(未获取到模型 — 请检查后端服务与地址)</option>';
       }
       sel.disabled = false;
     }).catch(() => {
       sel.innerHTML = '<option value="">(获取失败)</option>';
-      // 获取失败时也尝试恢复保存值
-      if (savedValue) {
-        const opt = document.createElement('option');
-        opt.value = savedValue;
-        opt.textContent = savedValue + '（已配置）';
-        sel.appendChild(opt);
-        sel.value = savedValue;
-      }
       sel.disabled = false;
     });
 }
@@ -6195,6 +6494,8 @@ function showRepairPanel(chapter, fullItems) {
 }
 
 // 拉 preview 渲染修复面板（手动模式首次弹出 + 重检后刷新共用）
+let _repairPv = null;  // 当前修复面板的 preview 数据缓存（HARD/SOFT 过滤重渲染复用）
+
 function renderRepairPreview(chapter) {
   const modal = document.getElementById('novel-repair-modal');
   const panel = document.getElementById('novel-repair-panel');
@@ -6202,42 +6503,67 @@ function renderRepairPreview(chapter) {
   fetch(`/api/novel/repair/preview?session_id=${encodeURIComponent(currentSessionId)}&chapter=${encodeURIComponent(chapter)}`)
     .then(r => r.json()).then(d => {
       if (!d.success || !d.preview) { modal.style.display = 'none'; return; }
-      const pv = d.preview;
-      const t0Lines = (pv.issues || []).filter(l => l.includes('末行') || l.includes('禁用模式'));
-      const t1Lines = (pv.issues || []).filter(l => !l.includes('末行') && !l.includes('禁用模式'));
-      // 按文件聚合 T1
-      const fileMap = {};
-      (pv.files || []).forEach(f => { if (!fileMap[f]) fileMap[f] = {problems: []}; });
-      t1Lines.forEach(l => {
-        const m = l.match(/S\d+\.txt/);
-        const f = m ? m[0] : '';
-        if (f && fileMap[f]) fileMap[f].problems.push(l.replace(/^\[(HARD|SOFT|WARN|FAIL)\]/, '').trim());
-        else if (f) { fileMap[f] = {problems: [l.replace(/^\[(HARD|SOFT|WARN|FAIL)\]/, '').trim()]}; }
-      });
-      const subRows = Object.keys(fileMap).map(f => {
-        const probs = (fileMap[f].problems || []).slice(0, 3).map(p => `<div style="font-size:11px;color:var(--text-dim);margin-left:26px">• ${escapeHtml(p.slice(0, 60))}</div>`).join('');
-        return `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;border-bottom:1px solid var(--border)">
-          <input type="checkbox" class="rp-check" data-file="${f}" checked>
-          <span style="font-size:12px;flex:1">${f.replace('.txt','')}</span>
-        </label>${probs}`;
-      }).join('');
-      const t0Msg = t0Lines.length ? `<div style="font-size:12px;color:#2ecc71;margin:2px 0">⚡ T0 已自动修复：${t0Lines.length} 处格式问题</div>` : '';
-      const chOnlyMsg = (pv.chapter_only && pv.chapter_only.length) ? `<div style="font-size:12px;color:#e94560;margin:6px 0;padding:6px 8px;background:var(--bg-input);border-radius:4px;border-left:3px solid #e94560">⚠️ 章级问题（无法整段重构，需人工处理或全部跳过）：${pv.chapter_only.map(escapeHtml).join('；')}</div>` : '';
-      panel.innerHTML = `<div style="font-size:13px;font-weight:500;margin-bottom:4px">🔧 ${pv.chapter} 六检结果：${pv.ok ? '通过' : (pv.timeout ? '超时' : '需修复')}（HARD/SOFT ${t1Lines.length + (pv.chapter_only ? pv.chapter_only.length : 0)} 条）</div>
-        ${t0Msg}
-        ${chOnlyMsg}
-        <div id="repair-scroll-body" style="flex:1 1 auto;overflow-y:auto;min-height:40px;max-height:calc(80vh - 130px);padding-right:4px">
-          <div style="font-size:12px;color:var(--text-dim);margin:4px 0">选择要修复的子结构（勾掉 = 跳过，写作模型整段重构，字数±15%）</div>
-          ${subRows || '<div style="font-size:12px;color:var(--text-dim)">（无可重构的子结构）</div>'}
-        </div>
-        <div style="display:flex;gap:8px;margin-top:8px;padding-top:6px;border-top:1px solid var(--border);background:var(--bg-card)">
-          <button class="btn btn-sm btn-secondary" onclick="skipAllRepair('${pv.chapter}')" title="确认该章所有检出问题都不修复，标记通过，不再弹出">全部跳过</button>
-          <button class="btn btn-sm btn-primary" onclick="applyRepair('${pv.chapter}')">开始修复</button>
-        </div>
-        <div id="repair-status" style="font-size:12px;color:var(--text-dim);margin-top:6px"></div>`;
+      _repairPv = d.preview;
+      renderRepairBody();
       panel.style.display = 'flex';
       modal.style.display = 'flex';
     }).catch(() => {});
+}
+
+// HARD/SOFT 级别过滤重渲染（完全隐藏未勾选级别的问题子结构）：
+// 只勾 HARD → SOFT 问题行被滤掉 → 全 SOFT 的子结构从列表消失（防错误勾选）
+function renderRepairBody() {
+  const panel = document.getElementById('novel-repair-panel');
+  const pv = _repairPv;
+  if (!panel || !pv) return;
+  const wantHard = document.getElementById('rp-filter-hard') ? document.getElementById('rp-filter-hard').checked : true;
+  const wantSoft = document.getElementById('rp-filter-soft') ? document.getElementById('rp-filter-soft').checked : true;
+  const t0Lines = (pv.issues || []).filter(l => l.includes('末行') || l.includes('禁用模式'));
+  const t1Lines = (pv.issues || []).filter(l => !l.includes('末行') && !l.includes('禁用模式'));
+  // 级别过滤：行内 [HARD]/[SOFT]（preview 格式 `S01.txt: [HARD] problem`）决定归属；未勾选的级别整行滤掉
+  const filtered = t1Lines.filter(l => {
+    const m = l.match(/\[(HARD|SOFT|WARN|FAIL)\]/);
+    const sev = m ? m[1] : '';
+    if (sev === 'HARD' || sev === 'FAIL') return wantHard;
+    if (sev === 'SOFT' || sev === 'WARN') return wantSoft;
+    return true;  // 无级别标记（罕见）→ 保留
+  });
+  // 按文件聚合（只聚合 pv.files 里已有的文件；过滤后无问题的文件不生成条目 → 完全隐藏）
+  const fileMap = {};
+  filtered.forEach(l => {
+    const m = l.match(/S\d+\.txt/);
+    const f = m ? m[0] : '';
+    if (f && (pv.files || []).includes(f)) {
+      if (!fileMap[f]) fileMap[f] = [];
+      fileMap[f].push(l.replace(/^S\d+\.txt:\s*/, '').replace(/^\[(HARD|SOFT|WARN|FAIL)\]\s*/, '').trim());
+    }
+  });
+  const subRows = Object.keys(fileMap).map(f => {
+    const probs = (fileMap[f] || []).slice(0, 3).map(p => `<div style="font-size:11px;color:var(--text-dim);margin-left:26px">• ${escapeHtml(p.slice(0, 60))}</div>`).join('');
+    return `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;border-bottom:1px solid var(--border)">
+      <input type="checkbox" class="rp-check" data-file="${f}" checked>
+      <span style="font-size:12px;flex:1">${f.replace('.txt','')}</span>
+    </label>${probs}`;
+  }).join('');
+  const t0Msg = t0Lines.length ? `<div style="font-size:12px;color:#2ecc71;margin:2px 0">⚡ T0 已自动修复：${t0Lines.length} 处格式问题</div>` : '';
+  const chOnlyMsg = (pv.chapter_only && pv.chapter_only.length) ? `<div style="font-size:12px;color:#e94560;margin:6px 0;padding:6px 8px;background:var(--bg-input);border-radius:4px;border-left:3px solid #e94560">⚠️ 章级问题（无法整段重构，需人工处理或全部跳过）：${pv.chapter_only.map(escapeHtml).join('；')}</div>` : '';
+  panel.innerHTML = `<div style="font-size:13px;font-weight:500;margin-bottom:4px">🔧 ${pv.chapter} 六检结果：${pv.ok ? '通过' : (pv.timeout ? '超时' : '需修复')}（HARD/SOFT ${t1Lines.length + (pv.chapter_only ? pv.chapter_only.length : 0)} 条）</div>
+    <div style="font-size:12px;color:var(--text-dim);margin:4px 0">级别过滤（未勾选级别的问题子结构完全隐藏，防错误勾选）：
+      <label style="cursor:pointer;margin-left:6px"><input type="checkbox" id="rp-filter-hard" ${wantHard ? 'checked' : ''} onchange="renderRepairBody()"> HARD</label>
+      <label style="cursor:pointer;margin-left:10px"><input type="checkbox" id="rp-filter-soft" ${wantSoft ? 'checked' : ''} onchange="renderRepairBody()"> SOFT</label>
+      <span style="margin-left:10px;color:var(--text-dim)">当前显示 ${Object.keys(fileMap).length} 个子结构</span>
+    </div>
+    ${t0Msg}
+    ${chOnlyMsg}
+    <div id="repair-scroll-body" style="flex:1 1 auto;overflow-y:auto;min-height:40px;max-height:calc(80vh - 130px);padding-right:4px">
+      <div style="font-size:12px;color:var(--text-dim);margin:4px 0">选择要修复的子结构（勾掉 = 跳过，写作模型整段重构，字数±15%）</div>
+      ${subRows || '<div style="font-size:12px;color:var(--text-dim)">（当前级别过滤下无可重构的子结构）</div>'}
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px;padding-top:6px;border-top:1px solid var(--border);background:var(--bg-card)">
+      <button class="btn btn-sm btn-secondary" onclick="skipAllRepair('${pv.chapter}')" title="确认该章所有检出问题都不修复，标记通过，不再弹出">全部跳过</button>
+      <button class="btn btn-sm btn-primary" onclick="applyRepair('${pv.chapter}')">开始修复</button>
+    </div>
+    <div id="repair-status" style="font-size:12px;color:var(--text-dim);margin-top:6px"></div>`;
 }
 
 function closeRepairPanel() {
@@ -6301,7 +6627,7 @@ function applyFullRepair(chapter) {
 }
 
 function pollRepairStatus(chapter) {
-  fetch('/api/novel/repair/status').then(r => r.json()).then(d => {
+  fetch(`/api/novel/repair/status?session_id=${encodeURIComponent(currentSessionId)}`).then(r => r.json()).then(d => {
     if (!d.success) return;
     const st = d.state || {};
     if (!st.done) { const el = document.getElementById('repair-status'); if (el) el.textContent = '⏳ 修复中...'; return; }
@@ -6316,15 +6642,21 @@ function pollRepairStatus(chapter) {
     const maxRounds = (novelChecksConfig && novelChecksConfig.repair_rounds) || 3;
     _autoRecheckRound++;
     const base = `修复完成：重写 ${okN} 段${failN ? '，失败 ' + failN + ' 段（已保留原稿）' : ''}`;
+    let statusColor = failN ? '#e94560' : '#2ecc71';
+    let failDetail = '';
+    if (failN) {
+      failDetail = t1.filter(x => x.status === 'failed')
+        .map(x => `${x.file}${x.problems && x.problems.length ? ': ' + x.problems.join(';') : ''}`).join(' | ');
+    }
     if (_repairMode === 'manual') {
       // 手动：重检一次，有问题刷新面板让人再点（无上限）
-      el.textContent = `🔄 ${base}。自动重检中...`;
-      el.style.color = failN ? '#e94560' : '#2ecc71';
+      el.textContent = `🔄 ${base}${failDetail ? '（' + failDetail + '）' : ''}。自动重检中...`;
+      el.style.color = statusColor;
       triggerRecheck(chapter, 0);
     } else {
       // 自动：循环修复到通过或超次数
-      el.textContent = `🔄 ${base}。自动重检中 (${_autoRecheckRound}/${maxRounds})...`;
-      el.style.color = failN ? '#e94560' : '#2ecc71';
+      el.textContent = `🔄 ${base}${failDetail ? '（' + failDetail + '）' : ''}。自动重检中 (${_autoRecheckRound}/${maxRounds})...`;
+      el.style.color = statusColor;
       triggerRecheck(chapter, maxRounds);
     }
   }).catch(() => {});

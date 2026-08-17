@@ -1,7 +1,18 @@
-"""LLM 统一客户端 — 支持 LM Studio / Ollama / OpenAI 兼容 API"""
+"""LLM 统一客户端 — LM Studio / Ollama（OpenAI 兼容 HTTP API）。
+
+llama.cpp 直挂分支（本地 GGUF 加载）已于 2026-08 整体废弃：
+  - 旧内核 llama-cpp-python 0.3.34 对 Qwen3.5/3.6-35B-A3B（新 MoE）无优化，35B 写作仅 8 t/s
+  - LM Studio（lms）用最新 llama.cpp 内核 + GPU 调度，同模型 20+ t/s
+  - 多模型统一管理（35B 写作 → 8B/7B 判定）改由 lms load/unload + HTTP 实现（见 novel/lmstudio_probe.py）
+本文件只保留 HTTP 客户端：chat / chat_detailed / test_connection / list_models。
+"""
 import json
+import os
+import threading
+import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Optional
 
 
@@ -10,6 +21,11 @@ class LLMClientError(Exception):
 
 
 class LLMClient:
+    # 模型列表缓存（key=backend|base_url → (时间戳, [模型])）——LM Studio /v1/models 实测 2 秒，
+    # 切后端/刷新反复查询会卡 UI（用户实测"F5 不加载"根因）；30 秒 TTL 后秒回。
+    _MODELS_CACHE: dict = {}
+    _MODELS_CACHE_TTL = 30.0
+
     def __init__(self, backend="lmstudio", base_url="http://localhost:1234",
                  timeout=180, model="", max_tokens=4096, temperature=0.7):
         self.backend = backend
@@ -18,12 +34,6 @@ class LLMClient:
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
-
-    def _get_api_url(self):
-        if self.backend == "ollama":
-            return f"{self.base_url}/api/chat"
-        else:
-            return f"{self.base_url}/v1/chat/completions"
 
     def _get_api_url(self):
         if self.backend == "ollama":
@@ -149,6 +159,12 @@ class LLMClient:
             return False, f"连接失败：{e}"
 
     def list_models(self) -> list[str]:
+        # 模型列表缓存（30s TTL）：LM Studio /v1/models 实测 2 秒，切后端/刷新反复查会卡 UI。
+        cache_key = f"{self.backend}|{self.base_url}"
+        _now = time.monotonic()
+        _cached = LLMClient._MODELS_CACHE.get(cache_key)
+        if _cached and (_now - _cached[0]) < LLMClient._MODELS_CACHE_TTL:
+            return _cached[1]
         try:
             if self.backend == "ollama":
                 url = f"{self.base_url}/api/tags"
@@ -159,8 +175,10 @@ class LLMClient:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read())
                 if self.backend == "ollama":
-                    return [m["name"] for m in data.get("models", [])]
+                    result = [m["name"] for m in data.get("models", [])]
                 else:
-                    return [m["id"] for m in data.get("data", [])]
+                    result = [m["id"] for m in data.get("data", [])]
         except Exception:
-            return []
+            result = []
+        LLMClient._MODELS_CACHE[cache_key] = (_now, result)
+        return result

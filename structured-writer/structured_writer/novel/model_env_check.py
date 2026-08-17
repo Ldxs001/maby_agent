@@ -16,6 +16,7 @@ R1（DeepSeek-R1-Distill-Qwen-1.5B）与 3B（Qwen2.5-3B-Instruct）实际 impor
 """
 import subprocess
 import sys
+from pathlib import Path
 
 REQUIRED_PACKAGES = ["transformers", "torch"]
 OPTIONAL_PACKAGES = {"accelerate": "accelerate"}
@@ -89,33 +90,58 @@ def install_missing(required_missing, optional_missing, mirror="default"):
     return ok_all
 
 
+def check_lmstudio() -> dict:
+    """LM Studio 环境探测（判定模型 8B/7B 的宿主）：lms 可用性 + server 可达性。
+
+    返回 {"available": bool, "server_ok": bool, "reason": str}。
+    LM Studio 不可用 → 统一管理不可勾，判定模型固定 transformers 3B+1.5B。
+    """
+    try:
+        # 双兼容导入：包方式（python -m 运行）与顶层方式
+        try:
+            from .lmstudio_probe import probe_lmstudio
+        except ImportError:
+            from lmstudio_probe import probe_lmstudio
+        p = probe_lmstudio(force=True)
+        reason = p.get("reason", "")
+        if p.get("lms_ok") and not p.get("server_ok"):
+            reason += "（引擎未响应，需 lms server start）"
+        return {"available": bool(p.get("lms_ok")),
+                "server_ok": bool(p.get("server_ok")), "reason": reason}
+    except Exception as e:
+        return {"available": False, "server_ok": False, "reason": f"探测异常: {e}"}
+
+
 def main():
     check_only = "--check" in sys.argv
     required_missing, optional_missing = check_missing()
+    lm = check_lmstudio()
 
     if not required_missing and not optional_missing:
         print("[env-check] R1/3B packages ready (transformers + torch)")
-        return 0
+    else:
+        if required_missing:
+            print(f"[env-check] missing required: {', '.join(required_missing)} (R1/3B cannot run)")
+        if optional_missing:
+            print(f"[env-check] missing optional: {', '.join(optional_missing)} (not needed for single-GPU small models, skipped)")
+        if check_only:
+            print("[env-check] --check mode: detect only, no install")
+            return 1
+        print("[env-check] auto-installing missing packages (aliyun mirror)...")
+        ok = install_missing(required_missing, optional_missing)
+        # 装完复查必需包
+        required_missing2, _ = check_missing()
+        if required_missing2:
+            print(f"[env-check] still missing: {required_missing2} (install manually)")
+            return 1
 
-    if required_missing:
-        print(f"[env-check] missing required: {', '.join(required_missing)} (R1/3B cannot run)")
-    if optional_missing:
-        print(f"[env-check] missing optional: {', '.join(optional_missing)} (not needed for single-GPU small models, skipped)")
-
-    if check_only:
-        print("[env-check] --check mode: detect only, no install")
-        return 1
-
-    print("[env-check] auto-installing missing packages (aliyun mirror)...")
-    ok = install_missing(required_missing, optional_missing)
-
-    # 装完复查必需包
-    required_missing2, _ = check_missing()
-    if not required_missing2:
-        print("[env-check] required packages installed, R1/3B ready")
-        return 0
-    print(f"[env-check] still missing: {required_missing2} (install manually)")
-    return 1
+    # LM Studio 环境（B 条件的前提——判定模型 8B/7B 的宿主）
+    if lm["available"]:
+        print(f"[env-check] LM Studio: available ({lm['reason']}) — 统一管理勾选可用，判定模型可切换 8B+7B")
+    else:
+        print(f"[env-check] LM Studio: unavailable ({lm['reason']}) — 判定模型固定 transformers 3B+1.5B")
+    print("[env-check] required packages ready")
+    return 0
 
 
 if __name__ == "__main__":
