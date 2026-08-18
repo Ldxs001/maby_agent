@@ -3,6 +3,24 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [3.1.2] - 2026-08-19
+### 修复（整本拼合缺章——用户"五章全写完过了三检，但输出只有 1/2/3/5 缺第四章"）
+- **现象**：《躯体协议》5 章全写完（txt 全齐）、全文三检通过，但输出 `chapters/` 只有 L01/L02/L03/L05.md，**缺 L04.md**——整本拼合/预览缺第四章
+- **根因**：章级 md 由 novel_writer 写作循环内生成（751 行）——L04 章检 HARD 后用户"全部跳过"（skip 接口只标章 status=done + hint，**不生成章级 md**）→ L04 done 但 md 从未写 → 输出缺章（skip 标 done 与 md 生成解耦）
+- **修复**：
+  1. `_handle_repair_skip` 标 done 后，**自动补齐章级 md**（`_ensure_chapter_md`：从项目 chapters/<章>/*.txt 拼，无【别名】/末行编号残留，章标题 + 各子结构）
+  2. 三处整本拼合/预览/texpdf 接口兜底：**md 缺失但项目 txt 存在的章 → 现场拼**（覆盖 skip/中断/其他未生成 md 场景）
+- **验证**：实机补 L04.md（10825 字符，`## 强制收容` + 5 子结构标题全对，无别名/编号残留）；输出目录 5 章齐 ✅
+- bump 3.1.2（不 git-sync，用户指示）
+
+## [3.1.1] - 2026-08-19
+### 修复（"全部跳过总是不标记通过"——用户"两章点全部跳过多少次了还是不通过，守卫一直拦 n2/n4"）
+- **现象**：L02/L04 反复点"全部跳过"，全文三检守卫仍拦 `['n2','n4']`（章 status 一直不是 done）
+- **根因**：skip 接口只标记 hint（_repaired=True + 清 issues/full_items），**章的 status=done 由生成线程（novel_writer）在修复循环 break 后标**——生成线程已退出（修复轮次用完回 pending / 线程结束）后，再点多少次"全部跳过"都**无人标 done** → 章永久 pending → 守卫一直拦
+- **修复**：`_handle_repair_skip` 补"跳过=通过"完整语义——除标记 hint 外，**直接把对应章（_novel.chapter == chapter）的 section status 置 done**（生成线程在跑时幂等，已退出时兜底生效）
+- **验证**：模拟 L02 pending + HARD hint → skip 新逻辑 → L02 status=done → 守卫放行 ✅
+- bump 3.1.1（不 git-sync，用户指示）
+
 ## [3.1.0] - 2026-08-19
 ### 发布（beta 线收敛转正式版——3.1.0b1~b22 全量沉淀）
 - **发布说明**：3.1.0 正式版，beta 线（b1~b22）结束。本节为 beta 线核心变更摘要，逐条细节见对应 b 版本条目。

@@ -842,6 +842,21 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             if ch_dir.is_dir():
                 # 小说目录：整本预览 = 动态合并所有已完成章（按 L## 编号排序）
                 chs = sorted(ch_dir.glob("*.md"))
+                # 兜底：md 缺失但项目 txt 存在的章 → 现场拼（skip 标 done/中断等未生成 md 的场景）
+                try:
+                    _proj = fpath / ".project"
+                    if _proj.is_file():
+                        from pathlib import Path as _P2
+                        _sp = _proj.read_text(encoding="utf-8").strip()
+                        _have = {c.stem for c in chs}
+                        for _c in sorted(_P2(_sp).parent.parent.glob("chapters/*")):
+                            if _c.is_dir() and _c.name not in _have:
+                                _m = self._ensure_chapter_md(_sp, _c.name, str(ch_dir))
+                                if _m and _m not in chs:
+                                    chs.append(_m)
+                        chs.sort()
+                except Exception:
+                    pass
                 if not chs:
                     self._json_response({"success": False, "error": "暂无已完成章节"}, 404)
                     return
@@ -887,6 +902,21 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             self._json_response({"success": False, "error": "非小说目录（无 chapters/）"}, 400)
             return
         chs = sorted(ch_dir.glob("*.md"))
+        # 兜底：md 缺失但项目 txt 存在的章 → 现场拼（skip 标 done/中断等未生成 md 的场景）
+        try:
+            _proj = fpath / ".project"
+            if _proj.is_file():
+                from pathlib import Path as _P2
+                _sp = _proj.read_text(encoding="utf-8").strip()
+                _have = {c.stem for c in chs}
+                for _c in sorted(_P2(_sp).parent.parent.glob("chapters/*")):
+                    if _c.is_dir() and _c.name not in _have:
+                        _m = self._ensure_chapter_md(_sp, _c.name, str(ch_dir))
+                        if _m and _m not in chs:
+                            chs.append(_m)
+                chs.sort()
+        except Exception:
+            pass
         if not chs:
             self._json_response({"success": False, "error": "暂无已完成章节"}, 400)
             return
@@ -975,6 +1005,21 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             if ch_dir.is_dir():
                 # 小说目录：先确保整本（未拼合则动态合并到临时整本 md），再走 md2tex
                 chs = sorted(ch_dir.glob("*.md"))
+                # 兜底：md 缺失但项目 txt 存在的章 → 现场拼（skip 标 done/中断等未生成 md 的场景）
+                try:
+                    _proj = fpath / ".project"
+                    if _proj.is_file():
+                        from pathlib import Path as _P2
+                        _sp = _proj.read_text(encoding="utf-8").strip()
+                        _have = {c.stem for c in chs}
+                        for _c in sorted(_P2(_sp).parent.parent.glob("chapters/*")):
+                            if _c.is_dir() and _c.name not in _have:
+                                _m = self._ensure_chapter_md(_sp, _c.name, str(ch_dir))
+                                if _m and _m not in chs:
+                                    chs.append(_m)
+                        chs.sort()
+                except Exception:
+                    pass
                 if not chs:
                     self._json_response({"success": False, "error": "暂无已完成章节"}, 404)
                     return
@@ -1987,6 +2032,41 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                 print(f"[三检重检] ending 异常（按未通过处理）: {e}")
         return ok_keys
 
+    @staticmethod
+    def _ensure_chapter_md(state_path: str, chapter: str, out_chapters_dir: str):
+        """章级 md 缺失时从项目 chapters/<chapter>/*.txt 现场拼（覆盖 skip 标 done / 中断等
+        未走 novel_writer 写 md 路径的场景——否则输出目录缺章，整本拼合缺内容）。
+
+        返回 md 路径；无 txt / md 已存在 → 返回现有路径或 None。"""
+        import re as _re
+        from pathlib import Path as _P
+        ch_dir = _P(state_path).parent.parent / "chapters" / chapter
+        out_md = _P(out_chapters_dir) / f"{chapter}.md"
+        if not ch_dir.is_dir():
+            return out_md if out_md.exists() else None
+        txts = sorted(ch_dir.glob("S*.txt"))
+        if not txts:
+            return out_md if out_md.exists() else None
+        if out_md.exists() and out_md.stat().st_size > 0:
+            return out_md
+        try:
+            import json as _json
+            _d = _json.loads(_P(state_path).read_text(encoding="utf-8-sig"))
+            title = next((c.get("title", "") for c in _d.get("chapters", []) if c.get("id") == chapter), chapter)
+        except Exception:
+            title = chapter
+        parts = [f"## {title}\n"]
+        for t in txts:
+            lines = t.read_text(encoding="utf-8-sig").rstrip("\n").split("\n")
+            sub_title = lines[0].strip() if lines else t.stem
+            body = "\n".join(l for l in lines[1:] if l.strip() and not l.startswith("【别名】")
+                             and not _re.match(rf'{chapter}S\d+', l.strip())
+                             and not _re.match(r'L\d+ · S\d+《', l.strip()))
+            parts.append(f"### {sub_title}\n\n{body}\n")
+        out_md.parent.mkdir(parents=True, exist_ok=True)
+        out_md.write_text("\n".join(parts), encoding="utf-8")
+        return out_md
+
     def _handle_repair_skip(self):
         """POST /api/novel/repair/skip  {session_id, chapter}
         全部跳过：用户确认该章所有检出问题都不修复 → 标记通过（_repaired=True），不再弹面板。"""
@@ -2004,14 +2084,36 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         sm.load(session_id)
         hints = sm.get_repair_hints()
         if chapter in hints:
-            # 全部跳过 = 通过：统一 _repaired=True + 清 issues/full_items（无单独跳过标识——用户语义"跳过=通过"）
+            # 全部跳过 = 通过：统一 _repaired=True + 清 issues/full_items（用户语义"跳过=通过"）
             hints[chapter]["_repaired"] = True
             hints[chapter]["issues"] = []
             hints[chapter]["full_items"] = []
             hints[chapter]["_repair_result"] = {"skipped": True}
             sm._state["_repair_hints"] = hints
+        # 跳过 = 通过：对应章直接标 done（b21——历史根因：skip 只标记 hint，
+        # 章 status 由生成线程标 done；生成线程已退出（修复轮次用完/线程结束）后，
+        # 用户再点多少次"全部跳过"都无人标 done → 章永久 pending → 全文三检守卫
+        # 一直拦 ['n2','n4']，用户"全部跳过总是不标记通过"）
+        _sec_marked = False
+        for _s in (sm._state.get("outline") or {}).get("sections", []):
+            if ( _s.get("_novel") or {}).get("chapter") == chapter and _s.get("status") != "done":
+                _s["status"] = "done"
+                _sec_marked = True
         sm.save()
-        self._json_response({"success": True, "chapter": chapter})
+        # 补齐章级 md：skip 标 done 不走 novel_writer 写 md 路径——缺 md 则输出目录缺章、
+        # 整本拼合缺内容（用户"五章全写完但输出只有 1/2/3/5，缺第四章"根因）
+        try:
+            from pathlib import Path as _P
+            _of = sm._state.get("output_file") or ""
+            if _of:
+                _op = _P(_of)
+                _proj = _op / ".project"
+                if _proj.is_file():
+                    _sp = _proj.read_text(encoding="utf-8").strip()
+                    self._ensure_chapter_md(_sp, chapter, str(_op / "chapters"))
+        except Exception:
+            pass
+        self._json_response({"success": True, "chapter": chapter, "section_marked_done": _sec_marked})
 
     def _handle_repair_rollback(self):
         """POST /api/novel/repair/rollback  {session_id, chapter, round}"""
