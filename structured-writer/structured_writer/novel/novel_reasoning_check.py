@@ -236,6 +236,20 @@ def _build_prompt(data, chapter, chapter_dir) -> str:
 
     char_setting = "\n".join(char_lines) if char_lines else "(无角色设定)"
 
+    # 文风规则注入：判定前必须知晓题材/叙事约束——设定内合法的表达（如叙述者视角/系统日志/代码块）
+    # 不算文风问题。缺失时审核模型按通用小说标准误判（如"机器腔=问题"）。
+    style = data.get("writing_style") or {}
+    rules = style.get("custom_rules") or ""
+    if rules:
+        style_block = (
+            f"\n[文风规则]\n{rules}\n\n"
+            "[判定约束]\n"
+            "1. 先读[文风规则]再判各维度——规则允许的表达（如叙述者本身的设定视角、系统日志/代码块/警告标记等修辞工具）不属于文风问题。\n"
+            "2. 各维度只判其自身维度（因果/人物一致性/情绪弧/对话匹配/论证可靠），不把文风规则允许的内容当作违规。\n"
+        )
+    else:
+        style_block = ""
+
     sub_lines = []
     for sk in sorted_keys:
         sv = subs[sk]
@@ -276,7 +290,7 @@ def _build_prompt(data, chapter, chapter_dir) -> str:
 
 [角色设定]
 {char_setting}
-
+{style_block}
 [章节概述]
 {ch_info.get('overview', '(无概述)')}
 
@@ -367,9 +381,26 @@ def check_reasoning(state_path, chapter, chapter_dir):
     if model is None:
         print("\n  [推理审核] 跳过 (判定模型不可用：LM Studio 库缺 7B 或 transformers 缺 1.5B)")
         return issues
+    try:
+        return _reasoning_impl(model, tokenizer, data, issues, state_path, chapter, chapter_dir)
+    finally:
+        # 独占串行（默认）：判定模型测完即卸（lms unload），显存让给下一模型（8B/35B）；
+        # 关闭（并行）：驻留不卸——多模型常驻，适合显存充足硬件
+        try:
+            if _load_config().get("exclusive_serial", True):
+                from model_backend import release as _mb_release
+                _mb_release(model)
+        except Exception:
+            pass
 
+
+def _reasoning_impl(model, tokenizer, data, issues, state_path, chapter, chapter_dir):
     # ── 生成 + 解析（格式失败 → 打回纠正重试，最多 3 次；避免"格式漂移直接标记失败"导致审核结果不可见）──
     # 统一句柄：lmstudio（make_lms_handle 闭包）→ mb_generate 直出 HTTP；transformers → pipeline
+    prompt = _build_prompt(data, chapter, chapter_dir)
+    if not prompt:
+        print("  [推理审核] 跳过: 无法构建 prompt")
+        return issues
     from model_backend import generate as mb_generate, judge_backend
     _is_lms = judge_backend(_load_config()) == "lmstudio"
     pipe = None
@@ -387,13 +418,13 @@ def check_reasoning(state_path, chapter, chapter_dir):
     for attempt in range(1, 4):  # 最多 3 次（第 1 次原始 prompt，第 2-3 次带纠错提示）
         try:
             if _is_lms:
-                raw_output = mb_generate(model, prompt, max_tokens=_R1_MAX_TOKENS, temperature=0.6)
+                raw_output = mb_generate(model, prompt, max_tokens=_R1_MAX_TOKENS, temperature=0.2)
             else:
                 output = pipe(
                     prompt,
                     max_new_tokens=_R1_MAX_TOKENS,
-                    temperature=0.6,
-                    top_p=0.95,
+                    temperature=0.2,
+                    top_p=0.9,
                     do_sample=True,
                     pad_token_id=tokenizer.eos_token_id,
                 )
@@ -458,8 +489,21 @@ def check_reasoning(state_path, chapter, chapter_dir):
             result = dim
             dim = ""
         else:
-            result = "SOFT"
+            # 模型可能用自然语言写 result 字段（如"符合设定"）——PASS 语义绝不误报 SOFT 逼用户修复
+            _txt = f"{result_raw} {detail}"
+            if any(w in _txt for w in ("符合", "一致", "正常", "无问题", "通过", "合理", "恰当", "到位", "没有矛盾", "无异常", "无误")):
+                result = "PASS"
+            elif any(w in _txt for w in ("不符合", "不一致", "矛盾", "突兀", "异常", "缺失", "不足", "欠妥", "生硬", "断裂")):
+                result = "SOFT"  # 问题词 → 保守 SOFT（供人工复核）
+            else:
+                result = "SOFT"
         result = result.upper()
+        # 无法评估语义（R1 明确表示该维度无法评估——暂无对话/无内容/无法判断/不适用）
+        # → 跳过，不是问题（b19：R1 会把"无法评估"标成 HARD/SOFT 逼用户处理，同"符合设定"类误报）
+        if any(w in f"{result_raw} {detail}" for w in (
+                "无法评估", "无法判断", "无法确认", "无法核验", "无法验证", "暂无法",
+                "暂无对话", "无对话内容", "没有对话", "对话内容不足", "暂无内容", "无内容可", "不适用")):
+            continue
         if result == "PASS":
             continue
         # sub 定位：模型输出 S01/S02 → 子结构文件（修复面板可勾选重构）；否则章级

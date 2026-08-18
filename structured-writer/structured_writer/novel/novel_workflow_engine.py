@@ -853,6 +853,17 @@ def fidelity_check(state_path, chapters_dir):
     report_path.write_text(report_text, encoding="utf-8")
     print(f"\n[报告已写入] {report_path}")
 
+    # 独占串行（默认）：判定模型测完即卸（lms unload），显存让给下一模型；
+    # 关闭（并行）：驻留不卸——多模型常驻，适合显存充足硬件
+    if _handle is not None:
+        try:
+            from novel_4dim_check import _load_config as _nc_cfg
+            if _nc_cfg().get("exclusive_serial", True):
+                import model_backend as _mb
+                _mb.release(_handle)
+        except Exception:
+            pass
+
     return pass_count, info_count, warn_count, error_count, fail_items
 
 

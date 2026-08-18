@@ -63,21 +63,6 @@ def _load_3b():
         return None
 
 
-def _gen_3b(model, tok, prompt: str) -> str:
-    import torch
-    chatml = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-    inputs = tok(chatml, return_tensors="pt")
-    with torch.no_grad():
-        out = model.generate(
-            inputs["input_ids"],
-            max_new_tokens=300,
-            do_sample=False,
-            temperature=0.2,
-            pad_token_id=tok.eos_token_id,
-        )
-    return tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-
-
 def _parse_json_array(raw: str):
     m = re.search(r"\[.*\]", raw, re.S)
     if not m:
@@ -136,15 +121,23 @@ def _locate_source_text(chapters_dir, ch_id: str, sub: str, text: str) -> str:
 
 
 def extract_pledges(state_path: str, chapters_dir) -> bool:
-    """3B 按章提取 flag 写入 state.pledges。成功 True；3B 不可用 False。"""
+    """flag 提取（统一后端：统一管理勾选 → 8B LM Studio；未勾选 → 3B transformers）写入 state.pledges。
+
+    成功 True；模型不可用 False（跳过 35B 判定）。"""
     sp = Path(state_path)
     if not sp.is_file():
         return False
-    state = json.loads(sp.read_text(encoding="utf-8-sig"))
-    loaded = _load_3b()
-    if loaded is None:
+    try:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from novel_entity_extractor import _load_config, _llm_generate
+    except Exception:
         return False
-    model, tok = loaded
+    state = json.loads(sp.read_text(encoding="utf-8-sig"))
+    # 未勾统一管理 → 3B 必须可用（前置检查，与现状一致）；勾选 → 8B 主路径（_llm_generate 内部失败回退 3B）
+    if not _load_config().get("unified_management", False):
+        loaded = _load_3b()
+        if loaded is None:
+            return False
 
     all_flags = []
     fid = 1
@@ -165,7 +158,7 @@ def extract_pledges(state_path: str, chapters_dir) -> bool:
                 if body:
                     parts.append(f"【{sf.stem}】{body[:400]}")
         chapter_info = "\n".join(parts)[:1600]
-        raw = _gen_3b(model, tok, EXTRACT_PROMPT.format(chapter_info=chapter_info))
+        raw = _llm_generate(EXTRACT_PROMPT.format(chapter_info=chapter_info)) or ""
         arr = _parse_json_array(raw)
         if not arr:
             print(f"[承诺提取] {ch_id}: 无 flag 或解析失败")
@@ -294,14 +287,33 @@ def check_pledges(state_path: str, chapters_dir) -> list:
 
     try:
         client = _create_writer_client()
-        # 调用不覆盖 max_tokens/timeout——完全继承 config writer_model 全套配置
-        resp = client.chat_detailed(
-            [
-                {"role": "system", "content": "你是严谨的小说承诺兑现审核员，输出严格 JSON。"},
-                {"role": "user", "content": JUDGE_PROMPT.format(flags=flags_desc, book_summary=book_summary)},
-            ],
-            temperature=0.2,
-        )
+        # 统一管理：承诺判定用写作模型（35B）装载 → 推理 → 卸载（ollama/非 lmstudio 空跑）
+        # 独占串行开（默认）：用完即卸；关（并行）：驻留不卸。仅在统一管理勾选时生效
+        # （不勾 → 3B/1.5B transformers，无 GPU 模型可串行 → 常驻）
+        _serial_pl = True
+        try:
+            import json as _json
+            from pathlib import Path as _P
+            _cp = _P(__file__).resolve().parent.parent.parent / "config.json"
+            if _cp.is_file():
+                _nc = _json.loads(_cp.read_text(encoding="utf-8")).get("novel_checks") or {}
+                _serial_pl = bool(_nc.get("exclusive_serial", True) and _nc.get("unified_management", False))
+        except Exception:
+            pass
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from model_backend import model_key_from_cfg, lms_session
+        with lms_session(model_key_from_cfg({
+            "backend": getattr(client, "backend", "lmstudio"),
+            "profiles": {}, "model": getattr(client, "model", ""),
+        }), unload_on_exit=_serial_pl):
+            # 调用不覆盖 max_tokens/timeout——完全继承 config writer_model 全套配置
+            resp = client.chat_detailed(
+                [
+                    {"role": "system", "content": "你是严谨的小说承诺兑现审核员，输出严格 JSON。"},
+                    {"role": "user", "content": JUDGE_PROMPT.format(flags=flags_desc, book_summary=book_summary)},
+                ],
+                temperature=0.2,
+            )
     except Exception as e:
         print(f"[全文承诺] 推理 client 不可用（{e}），回退关键词判定")
         return _keyword_fallback(state, flags, chapters_dir)

@@ -257,7 +257,21 @@ def check_4dim(state_path: str, chapter: str, chapter_dir) -> list | None:
     if loaded is None:
         return None
     handle = loaded
+    try:
+        return _check_4dim_impl(handle, state_path, chapter, chapter_dir)
+    finally:
+        # 独占串行（默认）：判定模型测完即卸（lms unload），显存让给下一模型（7B/35B）；
+        # 关闭（并行）：驻留不卸——多模型常驻，适合显存充足硬件
+        try:
+            if _load_config().get("exclusive_serial", True):
+                from model_backend import release as _mb_release
+                _mb_release(handle)
+        except Exception:
+            pass
 
+
+def _check_4dim_impl(handle, state_path: str, chapter: str, chapter_dir) -> list | None:
+    """4维判定主体（handle 统一句柄；异常/不可用 → None 规则回退）。"""
     if not Path(state_path).is_file():
         return None
     state = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))

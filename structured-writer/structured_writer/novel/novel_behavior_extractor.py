@@ -20,9 +20,10 @@ import re
 import sys
 from pathlib import Path
 
-# 复用 entity_extractor 的模型加载（Qwen2.5-3B 懒加载 + data/models 优先）
+# 复用 entity_extractor 的模型加载（Qwen2.5-3B 懒加载 + data/models 优先）与统一生成后端
+# （统一管理勾选 → 8B LM Studio；未勾选 → 3B transformers——流程不变，仍一子结构一次）
 sys.path.insert(0, str(Path(__file__).parent))
-from novel_entity_extractor import _load_extract_model  # noqa: E402
+from novel_entity_extractor import _load_extract_model, _llm_generate  # noqa: E402
 
 # 行为提取 max tokens（行为列表比实体更短，1024 足够）
 BEHAVIOR_MAX_TOKENS = 1024
@@ -37,11 +38,8 @@ ACTION_KWS = ["把", "将", "用", "对", "给", "从", "在", "说", "问", "�
 
 
 def _extract_behavior_llm(content: str, char_names: list) -> dict | None:
-    """Qwen2.5-3B 提取角色行为：{角色名: [行为...]}；失败返回 None。"""
-    loaded = _load_extract_model()
-    if loaded is None:
-        return None
-    model, tokenizer = loaded
+    """提取角色行为：{角色名: [行为...]}；失败返回 None。
+    统一后端：统一管理勾选 → 8B LM Studio；未勾选 → Qwen2.5-3B transformers。"""
     chars = "、".join(char_names) if char_names else "（未知）"
     prompt = (
         "你是小说角色行为提取引擎。从正文中提取每个角色的核心行为（做了什么/说了什么/决定什么），"
@@ -57,21 +55,10 @@ def _extract_behavior_llm(content: str, char_names: list) -> dict | None:
         '{"behaviors": {"林渊": ["启动防火墙", "把芯片交给苏婉"], "苏婉": ["带着芯片离开"]}}\n'
         f"正文：\n{content}"
     )
-    import torch
     last_raw = ""
     for attempt in range(1, 4):
         try:
-            chatml = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-            model_inputs = tokenizer(chatml, return_tensors="pt")
-            with torch.no_grad():
-                gen_out = model.generate(
-                    model_inputs["input_ids"],
-                    max_new_tokens=BEHAVIOR_MAX_TOKENS,
-                    do_sample=False,
-                    temperature=0.2,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            raw = tokenizer.decode(gen_out[0][model_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            raw = _llm_generate(prompt) or ""
             last_raw = raw
             obj = _extract_behavior_json(raw)
             if obj is not None and isinstance(obj.get("behaviors"), dict):

@@ -150,12 +150,15 @@ def _sync_subs_from_state(section: dict, sid: str, ndata: dict) -> list:
     return sub_sections
 
 
-def _write_sub_inline(state_path: str, chapter_id: str, s_key: str, title: str, content: str) -> bool:
+def _write_sub_inline(state_path: str, chapter_id: str, s_key: str, title: str, content: str,
+                      serial_switch: bool = False, writer_key: str = "") -> bool:
     """进程内直接落盘子结构正文（替代 write-sub 子进程）。
 
     Web 服务线程下调子进程写正文存在管道/编码/环境不确定性（真实流程出现过
     写出的 S##.txt 为 0 字节）；进程内写保证「写了必有文件」。
     保留：别名剥离、实体提取、原子写入（tmp + os.replace）、state 字数/状态更新。
+    serial_switch（独占串行 + 统一管理）：提取前卸载写作模型（35B）→ 8B 提取（LM Studio GPU）
+    → 提取完释放 8B → 下一段写段前 ensure_loaded 35B 重载（写段循环已有）。流程不变：仍一子结构一次提取。
     """
     try:
         # 剥离末尾【别名】行（如有），正文清洗
@@ -182,7 +185,15 @@ def _write_sub_inline(state_path: str, chapter_id: str, s_key: str, title: str, 
         if not fp.is_file() or fp.stat().st_size == 0:
             _logger.error(f"落盘回读校验失败 {chapter_id}{s_key}: 文件缺失或 0 字节")
             return False
-        # 实体提取（novel-weaver 能力，进程内执行）
+        # 独占串行 + 统一管理：提取前卸载写作模型（35B）——8B 提取要吃 GPU（35B 驻留时
+        # LM Studio 会把 8B 降级 CPU offload）；不串行/不勾统一管理则 3B 或 8B 常驻，无需切换
+        if serial_switch and writer_key:
+            try:
+                from .model_backend import lmstudio_probe
+                lmstudio_probe.lms_unload(writer_key, timeout=60)
+            except Exception:
+                pass
+        # 实体提取（novel-weaver 能力，进程内执行；后端跟随统一管理：3B transformers / 8B LM Studio）
         try:
             from .novel_entity_extractor import extract
             extract(str(Path(state_path).resolve()), chapter_id, s_key, clean_body)
@@ -200,6 +211,13 @@ def _write_sub_inline(state_path: str, chapter_id: str, s_key: str, title: str, 
             extract_timeline(str(Path(state_path).resolve()), chapter_id, s_key, clean_body)
         except Exception:
             pass
+        # 独占串行：三个提取器全部完成后释放 8B（lms unload），显存让给下一段写作的 35B
+        if serial_switch:
+            try:
+                from .novel_entity_extractor import _release_extract_lms
+                _release_extract_lms()
+            except Exception:
+                pass
         # 更新 state：字数 + 状态（运行时字段，不触发指纹）
         from .novel_state_manager import load_state, save_state
         data = load_state(state_path)
@@ -377,6 +395,24 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
     # 小说质检开关（配置面板「小说质检」区，控制用户权力）
     _checks = ((state_mgr._state or {}).get("config") or {}).get("novel_checks", {}) or {}
 
+    # ── 独占串行调度（两套机制；仅统一管理勾选时生效）──
+    # 生效条件 = exclusive_serial ∧ unified_management：统一管理不勾 → 判定走 transformers 3B/1.5B（CPU），
+    # 没有 8B/7B 抢 GPU——串行卸载加载无意义（35B 卸了纯浪费），整个调度退出，35B 由 web_ui 包管常驻。
+    # 生效时：章级严格卸载加载——写章 35B → 章检前卸载 → 8B/7B 判定（子进程内各自 load/unload）→
+    # 下一章再加载 35B；一次只驻留一个模型，8B/7B 真吃 GPU。规划/写作同模型也严格两步。
+    _serial = bool((_checks or {}).get("exclusive_serial", True)
+                   and (_checks or {}).get("unified_management", False))
+    # 提取切换开关：与 _serial 同值（串行生效时提取才需 35B↔8B 卸载加载；3B 提取 CPU 无需切换）
+    _switch = _serial
+    _writer_key = ""
+    if _serial:
+        try:
+            from .model_backend import model_key_from_cfg
+            _cfg_all = (state_mgr._state or {}).get("config") or {}
+            _writer_key = model_key_from_cfg(_cfg_all.get("writer_model", {}))
+        except Exception:
+            _writer_key = ""
+
     # 加载 novel 项目（角色/文风/章节）
     from .novel_state_manager import load_state
     ndata = load_state(state_path)
@@ -490,6 +526,14 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
                 except Exception:
                     pass
 
+        # 独占串行：写段前幂等加载 35B（LM Studio 重复 load 会生成 :2 副本，必须探测后加载）
+        if _serial and _writer_key:
+            try:
+                from .model_backend import lms_ensure_loaded
+                lms_ensure_loaded(_writer_key, ttl=120)
+            except Exception as _e:
+                _logger.warning(f"[lms-sched] 写作模型装载异常: {_e}")
+
         for j, sub in enumerate(sub_sections, 1):
             if not sub.get("_checked", True):
                 continue  # 确认时取消勾选的段跳过（与通用线一致）
@@ -585,7 +629,8 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
 
             # 写入 novel 项目（进程内直接落盘，替代 write-sub 子进程——写了必有文件；
             # 失败停止整章——该段没写，后续段写了下文断链，等重试整章）
-            if not _write_sub_inline(state_path, chapter_id, sub["_novel"]["s_key"], sub.get("title", ""), content):
+            if not _write_sub_inline(state_path, chapter_id, sub["_novel"]["s_key"], sub.get("title", ""), content,
+                                     serial_switch=_switch, writer_key=_writer_key if _switch else ""):
                 _logger.error(f"落盘失败 {chapter_id}{sub['_novel']['s_key']}")
                 state_mgr.update_section(ssid, {"status": "pending", "actual_word_count": 0})
                 state_mgr.set_status_text(f"写入失败: {chapter_id}{sub['_novel']['s_key']}（本章停止，可重新生成本章）")
@@ -605,6 +650,13 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
             state_mgr.update_section(sid, {"status": "pending"})
             continue
 
+        # 独占串行：章检前卸载写作模型——8B/7B 判定（子进程 lms load）前腾出显存，判定真吃 GPU
+        if _serial and _writer_key:
+            try:
+                from .model_backend import lmstudio_probe
+                lmstudio_probe.lms_unload(_writer_key, timeout=60)
+            except Exception:
+                pass
         # 章检（4维 3B + 格式 + 逻辑 + 推理R1，子进程；失败不阻断主流程；开关控制）
         # 顺序：先检后标 done——finalize 是章级裁判，有 HARD → 拦截等修复，通过后才标 done
         # 判定用 HARD/FAIL 行（issues 现在含 SOFT 非阻断项，供弹窗显示但不拦截）而非 fc.ok——
@@ -643,6 +695,15 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
                             return None
                         time.sleep(2)
                         _hint = _reload_repair_hint(state_mgr, chapter_id)
+                    # 磁盘 hint 同步回内存：skip/apply 写的是磁盘（独立 StateManager 实例），
+                    # 本进程 state_mgr 内存仍是章检旧态——不同步的话，后续标 done 的 save() 会用
+                    # 内存旧态覆盖磁盘（HARD + _repaired=False）→ 前端 repair_pending 又非空又弹，
+                    # 用户需再点一次跳过才不弹（"跳两次"根因，b20 修复）
+                    try:
+                        _hints_mem = state_mgr._state.setdefault("_repair_hints", {})
+                        _hints_mem[chapter_id] = _hint
+                    except Exception:
+                        pass
                     # 用户跳过（b31 修复）：跳过 = 通过——不再重检、不重置 _repaired
                     # （旧代码跳过后立即重检，重检仍有 HARD → 显式重置 _repaired=False → 又弹，
                     #   代码不尊重用户的"跳过=通过"决定）
@@ -694,19 +755,33 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
 
         state_mgr.set_status_text(f"进度: {idx}/{total} 章完成")
 
+    # 独占串行：全书循环结束 → 卸载写作模型（全文三检 8B/7B 前腾显存；异常路径由 ttl=120 兜底自动卸）
+    if _serial and _writer_key:
+        try:
+            from .model_backend import lmstudio_probe
+            lmstudio_probe.lms_unload(_writer_key, timeout=60)
+        except Exception:
+            pass
+
     # ── meta 块 + 全文组装 ──
     meta_block = _render_meta_block(outline, template)
     article_md = f"# {title}\n{meta_block}" + "".join(md_parts)
     article_md = article_md.strip()
 
     # ── 全文三检（fidelity + 收束 + 完结；开关控制） ──
-    # 触发守卫（用户语义）：全文三检只在"最后一章章检通过修复完、后续不再有任何规划"时触发——
-    # 判定 = outline 里所有章都 done（pending/planning/in_progress/confirmed 任一存在 = 还有规划/写作，
-    # 全文未写完不检全文，避免把 ending 收束等全书级问题挂到未完成章上）。
-    _all_done = all((s.get("status") == "done") for s in outline.get("sections", []))
+    # 触发守卫（用户语义）：全文三检只在"章内六检并修复全部通过、后续不再有任何规划"时触发——
+    # 判定 = session outline 后端状态全部 done（章检通过才标 done，state_mgr 维护的真相，非前端请求体副本）
+    #       ∧ 所有章文件真实落盘（文件为真相源，防 session/磁盘分叉）。
+    # 历史教训：
+    #   b7 只按文件真相 → L05 文件齐但章检未通过也放行 → 全文检查跑在章检之前（顺序错）；
+    #   更早 outline 参数 status 是前端过期副本 → 误判"未写完"。
+    _sess_out = ((state_mgr._state or {}).get("outline") or {}).get("sections") or []
+    _sess_done = bool(_sess_out) and all(s.get("status") == "done" for s in _sess_out)
+    _all_done = _sess_done and all(_chapter_files_complete(state_path, s, ndata) for s in _sess_out)
     if not _all_done:
-        _not_done = [s.get("id") for s in outline.get("sections", []) if s.get("status") != "done"]
-        print(f"[全文三检] 全书未写完（仍有章未 done: {_not_done}），跳过全文三检——待后续规划写作完成、全部章检通过后才会触发")
+        _not_done = [s.get("id") for s in _sess_out
+                     if s.get("status") != "done" or not _chapter_files_complete(state_path, s, ndata)]
+        print(f"[全文三检] 全书未写完（仍有章检未通过或文件不全: {_not_done}），跳过全文三检——待全部章内六检通过后才会触发")
         fn = None
     else:
         try:

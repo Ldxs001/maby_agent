@@ -22,9 +22,10 @@ import re
 import sys
 from pathlib import Path
 
-# 复用 entity_extractor 的模型加载（Qwen2.5-3B 懒加载 + data/models 优先）
+# 复用 entity_extractor 的模型加载（Qwen2.5-3B 懒加载 + data/models 优先）与统一生成后端
+# （统一管理勾选 → 8B LM Studio；未勾选 → 3B transformers——流程不变，仍一子结构一次）
 sys.path.insert(0, str(Path(__file__).parent))
-from novel_entity_extractor import _load_extract_model  # noqa: E402
+from novel_entity_extractor import _load_extract_model, _llm_generate  # noqa: E402
 
 TIMELINE_MAX_TOKENS = 1024
 
@@ -85,11 +86,8 @@ def _resolve_day(time_point: str, base_day: int) -> int | None:
 
 
 def _extract_timeline_llm(content: str, prev_timeline: list) -> list | None:
-    """Qwen2.5-3B 提取时间事件列表；失败返回 None。"""
-    loaded = _load_extract_model()
-    if loaded is None:
-        return None
-    model, tokenizer = loaded
+    """提取时间事件列表；失败返回 None。
+    统一后端：统一管理勾选 → 8B LM Studio；未勾选 → Qwen2.5-3B transformers。"""
     prev_summary = ""
     if prev_timeline:
         prev_summary = "；".join(
@@ -109,21 +107,10 @@ def _extract_timeline_llm(content: str, prev_timeline: list) -> list | None:
         '[{"time_point": "次日清晨", "event": "苏婉带着芯片离开实验楼"}]\n'
         f"正文：\n{content}"
     )
-    import torch
     last_raw = ""
     for attempt in range(1, 4):
         try:
-            chatml = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-            model_inputs = tokenizer(chatml, return_tensors="pt")
-            with torch.no_grad():
-                gen_out = model.generate(
-                    model_inputs["input_ids"],
-                    max_new_tokens=TIMELINE_MAX_TOKENS,
-                    do_sample=False,
-                    temperature=0.2,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            raw = tokenizer.decode(gen_out[0][model_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            raw = _llm_generate(prompt) or ""
             last_raw = raw
             obj = _extract_timeline_json(raw)
             if obj is not None:

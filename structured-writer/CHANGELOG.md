@@ -3,12 +3,180 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [3.1.0] - 2026-08-19
+### 发布（beta 线收敛转正式版——3.1.0b1~b22 全量沉淀）
+- **发布说明**：3.1.0 正式版，beta 线（b1~b22）结束。本节为 beta 线核心变更摘要，逐条细节见对应 b 版本条目。
+- **架构主线**：
+  - llama.cpp 直挂后端整体废弃 → LM Studio 统一管理（llama.cpp 写作 8 t/s vs LM Studio 20+ t/s，两代推理内核代差）；模型配置按后端分槽、切后端自动恢复
+  - 判定模型共享（`_SHARED_LLAMA`）弱引用化——35B 写作/规划常驻共享，判定模型（8B/7B）测完即卸；修复引擎独立实例 + apply 防重入竞态
+  - 串行调度序列定稿：卸载 → 加载 → 执行 → 卸载；统一管理装载/卸载调度点 + ending 收尾判定 8B
+- **判定体系**：
+  - 推理审核注入 `writing_style.custom_rules`（[文风规则] 块）——题材感知判定，消除"设定内合法表达被通用标准误判"导致的修复空转（b21）
+  - 推理审核采样参数回归判定温区 0.2（0.6 创造模式 → 0.2 判定模式）——判定任务稳定化，HARD 稳定归零（b22）
+- **流程语义**：
+  - 跳过 = 通过统一语义；章检"全部跳过"弹窗修复；修复状态会话隔离；修复静默失败 + 无过程反馈补齐
+  - 三检修复项静默丢弃、全文三检守卫顺序、pledge flag 提取统一 8B 后端、3B 遗留加载等修复
+- **验证**：L04 端到端推理审核 0 HARD 稳定（两次 0+0 / 0+1 SOFT）；8B/7B 就位后全链路实机验证通过
+- bump 3.1.0（不 git-sync）
+
+## [3.1.0b22] - 2026-08-19
+### 修复（推理审核采样参数回归判定温区——0.6 创造模式→0.2 判定模式）
+- **现象**：推理审核两次独立运行结果波动（1 HARD+1 SOFT / 0+0）——判定任务输出不稳定
+- **根因**：`novel_reasoning_check.py` 推理审核用 `temperature=0.6, top_p=0.95`——创造模式采样用于判定任务，波动被放大；全套判定任务（4维 0.2 / fidelity 0.2 / pledge 0.2 / 实体提取 0.2）唯独推理审核是 0.6
+- **修复**：推理审核采样参数 0.6→**0.2**、top_p 0.95→0.9（与全系统判定任务惯例一致；非 0.0 贪心，保留轻微多样性避免边界判定固化）
+- **决策确认**：温度选 0.2（非 0.1）——与全系统判定任务一致且避免贪心焊死边界；pledge 继承 writer 配置路径（`_create_writer_client` 构造时 `wm.get("temperature", 0.7)`）实际被调用处 `temperature=0.2` 硬覆盖，生效值 0.2，无继承问题；HARD/SOFT 均弹窗由人工决定是否修复，无需改动 UI 行为
+- **验证**：降温度后端到端跑 L04 推理审核两次：0+0 / 0+1（SOFT）——HARD 稳定归零（b21 已消除机器腔误判，b22 使结论稳定）；SOFT 波动（S05 人物行为一致性）属边界判定正常现象且不阻断
+- bump 3.1.0b22（不 git-sync）
+
+## [3.1.0b21] - 2026-08-19
+### 修复（推理审核未注入文风规则——设定内合法表达被误判为问题，修复空转）
+- **现象**：科幻题材（叙述者 = 植入式 LLM）L04 反复报 S03/S04/S05 推理审核问题；修复后验证通过但重检仍报
+- **根因**：`writing_style.custom_rules`（明确"允许代码/协议块、系统警告标记作为修辞工具"）**未注入推理审核 prompt**——审核模型（R1）按通用小说标准判定，把设定内合法的机器腔（概率链/CPU 负载/系统日志）判为"对话用词超出角色设定"；且修复 prompt（novel_repair_engine 372 行）"禁止任何 meta 表述"与 custom_rules 冲突，修复器无所适从 → 修复无效 → 重检仍报 → 循环
+- **修复**：
+  - A. `novel_reasoning_check._build_prompt` 注入 `writing_style.custom_rules` 为 [文风规则] 块，加判定约束（先读文风规则再判各维度；规则允许的表述不属于违规）——审核器知晓题材边界
+  - B. `novel_repair_engine._build_guided_prompt` 372 行"禁止任何 meta 表述"改为"除文风规则允许的表述外禁止"——修复器与审核器读同源规则，消除冲突
+- **明确不改**：4 维检查（novel_4dim_check）不注入——只做章内连贯性（时间/情绪/话题/角色），无文风维度，机器腔不影响衔接判定
+- **验证**：注入后端到端跑 L04 推理审核：0 HARD + 0 SOFT（改前反复报 S03/S04/S05）；两次独立运行存在模型判定波动（1 HARD+1 SOFT / 0+0），但机器腔类误判已消除
+- bump 3.1.0b21（不 git-sync）
+
+## [3.1.0b20] - 2026-08-18
+### 修复（章检"全部跳过"弹两次——点击跳过后仍再次弹出，需二次跳过才停止）
+- **现象**：章检 HARD 弹窗 → 点"全部跳过" → 又弹一次 → 再点才不弹
+- **根因**：内存/磁盘不同步——skip 接口用独立 StateManager 实例写**磁盘**（_repaired=True + issues 清空 + skipped），但 novel_writer 的 state_mgr 是**内存对象**，内存 _repair_hints 仍是章检旧态（HARD + _repaired=False）；skip 后 novel_writer 轮询读到磁盘 _repaired → break → 标章 done 时 `state_mgr.save()` **用内存旧态覆盖磁盘**（HARD 复活 + _repaired=False）→ 前端 repair_pending 又非空又弹 → 再 skip（此时章已 done 不再覆盖）才停
+- **修复**：novel_writer 修复循环轮询到 `_repaired=True` 后，**先把磁盘 hint 同步回 state_mgr 内存**（`_hints_mem[chapter_id] = _hint`），后续 save() 保留 skip/apply 状态
+- **验证**：模拟——修复前 save 覆盖回 `_repaired=False + issues=[HARD]` → 又弹；修复后磁盘保留 `_repaired=True + issues=[]` → 不再弹 ✅
+- bump 3.1.0b20（不 git-sync）
+
+## [3.1.0b19] - 2026-08-18
+### 修复（推理审核"无法评估"误报——无对话段落被标 HARD"无法评估"）
+- **现象**：UI 章级问题显示 `HARD: 推理审核 - 对话匹配度: 暂无对话内容，无法评估`——R1 明确表示"无法评估"（该段无对话）却标 HARD 强制人工处理，与"符合设定"类误报同源
+- **根因**：R1 输出 result="HARD"（标准值）+ detail="暂无对话内容，无法评估"——解析直接按 HARD 收集；"无法评估"语义（≠问题）无兜底
+- **修复**：解析循环加**无法评估语义跳过**（无论 result 是 HARD/SOFT，detail/result 含 无法评估/无法判断/无法确认/无法核验/无法验证/暂无法/暂无对话/无对话内容/没有对话/对话内容不足/暂无内容/无内容可/不适用 → continue 不收集）
+- **验证**：案例"HARD 暂无对话内容，无法评估"→ 跳过 ✅；"该段无对话，无法评估匹配度"→ 跳过 ✅；真问题"事件无前文铺垫，转折突兀"→ 保留 HARD ✅；PASS → 跳过 ✅
+- bump 3.1.0b19（不 git-sync）
+
+## [3.1.0b18] - 2026-08-18
+### 修复（3B 遗留加载不做功——3B 在 8B 前被加载且不参与生成）
+- **现象**：unified 勾选下提取一直走 8B（每段后 `已卸载判定模型: qwen3-8b`），但服务启动后第一次提取时 3B（transformers）也被加载（`Loading weights 434/434` + `抽取模型已加载 (Qwen2.5-3B, CPU)`），加载后从不使用、常驻内存
+- **根因**：b9 改 `_extract_llm` 接入 `_llm_generate` 统一后端时，**只删了 `model, tokenizer = loaded`，残留了开头的 `loaded = _load_extract_model()` 前置检查**——每次提取先加载 3B（_EXTRACT_PIPE 单例常驻），然后 `_llm_generate` 走 8B 干活 → 3B 加载后不做功
+- **修复**：删除 `_extract_llm` 开头的 `loaded = _load_extract_model(); if loaded is None: return None`（模型加载统一归 `_llm_generate`）；behavior/timeline 已确认无残留（仅 import，不加载）
+- **验证**：实机复现（unified=True 真实提取）——修复前打印 3B 加载（Loading weights），修复后**无 3B 加载**，仅 8B 提取（总结新增关系）✅；临时文件已清理
+- bump 3.1.0b18（不 git-sync）
+
+## [3.1.0b17] - 2026-08-18
+### 修复（UI 文案残留"统一管理 + 3B"——统一管理路径下文案仍提示 3B）
+- **背景**：b9-b11 后统一管理（8B/7B LM Studio）下判定+提取全走 8B/7B（章内提取/pledge flag/4dim/reasoning/fidelity/ending），**3B 只在未勾选统一管理（transformers 3B/1.5B）时使用**——但 UI 文案仍残留"LM Studio 方案 + 3B"
+- **修复**：①安装缺失模型说明「LM Studio 方案（统一勾选）：8B+7B GGUF 约9.4GB + 3B」→「…判定+提取全走 8B/7B，无需 3B」；②模型状态 JS：统一管理分支删除「3B(抽取) 就绪/缺失」显示 → 改为「提取: 8B（统一管理下无需 3B）」；未勾选分支（transformers）的 R1/3B 状态保留（该模式仍需 3B）
+- **验证**：残留 "+ 3B"（统一方案）False；JS 无 "3B(抽取)"；含 "提取: 8B" ✅
+- bump 3.1.0b17（不 git-sync）
+
+## [3.1.0b16] - 2026-08-18
+### 修复（修复提示词缺写作分类上下文——修复 prompt 未携带写作时的分类约束）
+- **背景**："内部时钟/帧率/磨砂玻璃"是小说正常叙事（第一人称 AI 视角），问题句是"概率链显示…符合 INTJ 原型理性规划特征"（分析腔）。写作时 NOVEL_SYSTEM_PROMPT 有分类约束（视角强制最高优先级/show don't tell/对话符合身份），novel_context_loader 输出 ★★★ 分级上下文（角色/人格/情绪/命题框）——但**修复 prompt 从未复用**
+- **根因**：_build_guided_prompt / _build_rewrite_prompt 只有 [子结构规划]（title/summary/emotions/word_count）+ R1 detail 问题描述——**无视角强制、无角色人格、无 show don't tell、无命题框** → 35B 重构无文风锚点自由发挥 → 分析腔
+- **修复**：rewrite_segment 加载该段写作上下文（novel_context_loader._load_context_captured，与写作同源）注入两个修复 prompt 的 [写作上下文] 段（★★★ 分级约束/角色/情绪/视角强制/命题框）；rewrite_segment 加 state_path 参数（reng.run 传入）；guided 与整段重构均遵守原文分类
+- **验证**：真实项目 L05/S02 上下文加载 6385 字符（含 ★★★ 分级说明），guided prompt 含 [写作上下文] ✅
+- bump 3.1.0b16（不 git-sync）
+
+## [3.1.0b15] - 2026-08-18
+### 修复（修复提示词引导出"分析腔"正文——修复结果出现"符合 INTJ 原型理性规划特征"式分析表述）
+- **现象**：勾选修复后 35B 重构输出"概率链显示，张维医生的行为模式符合 INTJ 原型中的理性规划特征…内部时钟与外部世界物理时间存在微小不同步…帧率丢失"——分析/评论/旁白腔，不是小说叙事
+- **根因**：修复 prompt（guided 引导式局部改写 + 整段重构）把 R1 审核的 detail（问题描述）直接喂给 35B——detail 若含 PASS 语义（如"符合设定"，b14 前的误报）或分析性语言，35B 无从定位问题句 → 为了改而改 → 凭空插入分析词、把 meta 语言写进正文
+- **修复**：`_build_guided_prompt` + `_build_rewrite_prompt` 双加硬约束——①文风硬约束：禁止任何分析/评论/旁白式 meta 表述（"概率链显示""符合某原型特征""内部时钟与物理时间不同步"等），一律动作/对话/场景呈现，叙述者视角不得跳成"分析报告"口吻；②PASS 语义保护：问题描述本身是"符合设定/一致/正常"等 PASS 语义或无法定位具体问题句 → 原样保留正文，不要为了改而改
+- **非串行逻辑确认未动**：sync_after_rewrite 从 reng.run 挪到 web_ui with 外，非串行时 with 不卸载 35B（驻留），sync 时机与原行为一致；report["t1"]["results"] 结构保留（web_ui 唯一读点）
+- bump 3.1.0b15（不 git-sync）
+
+## [3.1.0b14] - 2026-08-18
+### 修复（串行明确步骤：重构后同步 8B 提取挪出 35B 窗口 + 推理审核 PASS 语义误报 SOFT）
+- **① 重构后同步（sync_after_rewrite）在 35B 窗口内跑 8B 提取（修复后 35B 未卸载即加载 8B——应先卸载再加载，串行步骤明确）**
+  - 原：reng.run 内重构段后立即 `sync_after_rewrite`（8B 实体提取）——但此时修复线程 35B 仍驻留（lms_session 窗口内）→ 8B 被 CPU offload
+  - 修：`sync_after_rewrite` 从 reng.run 内移除（report["t1"] 去 syncs），挪到 web_ui 修复线程 `lms_session(35B)` **退出后**执行——串行明确步骤：35B 卸载 → 8B 提取真 GPU
+- **② 推理审核"符合设定"误报 SOFT（S02 符合设定却作为 SOFT 显示并强制修复）**
+  - 原：模型 result 字段用自然语言（如"符合设定"）时，解析走 else 兜底 → 一律 SOFT → 通过项被收集并强制修复
+  - 修：else 分支先判 PASS 语义词（符合/一致/正常/无问题/通过/合理/恰当/到位/没有矛盾/无异常/无误）→ PASS 不收集；问题词（不符合/不一致/矛盾/突兀/异常/缺失/不足/欠妥/生硬/断裂）→ SOFT 保守收集；均无 → SOFT
+  - 验证：`result='符合设定'` → PASS 不收集 ✅；标准 PASS → 不收集 ✅；真问题"情绪转变略显突兀" → SOFT ✅
+- bump 3.1.0b14（不 git-sync）
+
+## [3.1.0b13] - 2026-08-18
+### 修复（三检修复项被静默丢弃——勾选修复后 35B 装载未生成即卸载，宣称完成）
+- **现象**：勾选三检修复项（ending 等）→ 点修复 → 35B 装载 → **零生成** → 卸载 → "修复完成"。正文根本没改
+- **根因**：`_handle_repair_apply` 的 `structured` 只从**章检 issues**（hint.issues）构建；三检修复项（`hint.full_items`，fidelity/pledge/ending）**从未并入** → reng.run 的 seg_map 从 structured 构建 → 三检项永远进不了 seg_map → 无 T1 重构 → 35B 白装 → 重检 `_recheck_full_items` 重跑 verify_ending 碰运气通过（正文未改）→ full_items 清空标记完成
+- **修复**：`_handle_repair_apply` 把 `full_items` 并入 structured（`file=sub.txt` + problem，severity=HARD）——三检项进入 seg_map → 35B 真重构对应子结构（repair_type=ending/fidelity/pledge 类型化修复目标）；重构后重检逻辑不变（通过才移除）
+- **验证**：模拟三检阶段（章检 issues 空 + full_items 含 ending/S05）→ 合并后 structured 非空 → seg_map 命中 `{"S05.txt": ["结尾收束验证未通过"]}` → 35B 将真重构 ✅（修复前 seg_map 为空 = 零生成）
+- bump 3.1.0b13（不 git-sync）
+
+## [3.1.0b12] - 2026-08-18
+### 修复（全文三检守卫顺序错误——章内六检并修复通过之后才做全文检查，顺序不对）
+- **现象**：L05 章内 6 检在全文检查**之后**才执行——流程反了（应为：章内六检并修复通过 → 无规划任务 → 全文检查）
+- **根因**：b7 修复守卫时只按"文件真相"（_chapter_files_complete）放行——L05 正文文件已落盘（S01-S05 非空）但**章检（6检）未通过/未跑**，守卫照样放行全文检查
+- **修复**：守卫改为双条件——`session outline 后端状态全部 done（章检通过才标 done，state_mgr 维护的真相，非前端请求体副本）∧ 所有章文件真实落盘`。既防前端过期副本误判（b7 动机保留），又防"文件齐但章检未过"提前触发（本次根因）
+- **验证**（真实项目）：全 done+文件全齐 → 触发 ✅；L05 文件齐但章检未过 → 不触发 ✅；全 planning（前端过期）→ 不触发 ✅
+- bump 3.1.0b12（不 git-sync）
+
+## [3.1.0b11] - 2026-08-18
+### 修复（pledge flag 提取遗漏接入统一 8B 后端——flag 提取未随统一管理切到 8B）
+- **现象**：b9 只改了三个小说提取器（entity/behavior/timeline），pledge 的 `extract_pledges` 仍走独立的 `_load_3b`/`_gen_3b`（transformers 3B ChatML 直挂）——统一管理下全文三检的承诺 flag 提取仍是 3B，漏网
+- **修复**：extract_pledges 生成处改调 `_llm_generate`（统一后端：unified 勾选 → 8B LM Studio 句柄缓存；不勾 → 3B transformers）；前置检查改为"未勾统一管理时 3B 必须可用"（勾选时 8B 主路径，失败内部回退 3B）；删除死代码 `_gen_3b`（唯一调用点已替换）
+- **验证**：临时开 unified → 8B 正确提取 flag（"潜入实验室查明真相"林渊 / "找到芯片"苏婉，含 sub 定位）→ 数组解析成功 → 8B 释放（lms unload）✅；config 已还原
+- **至此统一管理下全部提取/判定点已无 3B 遗漏**：章内提取（entity/behavior/timeline）+ pledge flag 提取 + 4dim 判定 + reasoning 审核 + fidelity + ending 全走 LM Studio（串行时严格卸载加载）
+- bump 3.1.0b11（不 git-sync）
+
+## [3.1.0b10] - 2026-08-18
+### 修复（独占串行依赖统一管理——未开启统一管理时走 3B/1.5B，独占串行不生效）
+- **现象**：exclusive_serial 此前是独立开关——统一管理不勾（判定 transformers 3B/1.5B，无 8B/7B GPU 模型）时串行开关仍驱动 35B 卸载加载，属无效调度（35B 卸了纯浪费，下章又 load 15s）
+- **修复**：串行生效条件 = `exclusive_serial ∧ unified_management`（四象限：unified=True+serial=True → 串行；unified=True+serial=False → 并行常驻；unified=False → 串行无效，35B 由 web_ui 包管常驻）
+- **接入点**：web_ui 规划/写作/修复三处 `_serial_*` 改 `serial ∧ unified`（不勾时写作改回 lms_session 包整本常驻）；novel_writer 章级调度 `_serial = serial ∧ unified`（提取切换 `_switch` 同值）；pledge `_serial_pl` 同改
+- **UI**：独占串行 checkbox 跟随统一管理——统一管理不勾 → 串行禁用（disabled）+ 强制取消勾选；save/初始化双处联动；后端判定 release 无需改（unified 不勾走 transformers 分支，release 为 del+gc 无害）
+- 验证：四象限生效矩阵全过（unified×serial → 生效布尔）
+- bump 3.1.0b10（不 git-sync）
+
+## [3.1.0b9] - 2026-08-18
+### 新增（提取 3B → 8B，流程不变——仅换后端，仍每子结构写完后立即做）
+- **背景**：b8 曾误将提取设想为"挪到章级窗口"；纠正——提取仍是每子结构写完后立即做，只是后端从 transformers 3B 换成 LM Studio 8B；串行时在 S01 写完卸载 35B → 加载 8B 提取 → 卸载 8B → 加载 35B 继续写 S02
+- **提取器统一生成后端（novel_entity_extractor._llm_generate）**：统一管理勾选（unified_management）→ LM Studio 8B（make_lms_handle 4dim key + lms_generate，GPU/部分 GPU；8B 句柄模块级缓存）；未勾选 → transformers Qwen2.5-3B（CPU，现状，ChatML 逻辑保留）。三个提取器（entity/behavior/timeline）生成处全部改调 `_llm_generate`，prompt 构造/纠错重试/正则兜底逻辑不变
+- **串行切换（novel_writer._write_sub_inline）**：serial_switch（=独占串行 ∧ 统一管理勾选）时——提取前卸载写作模型（35B）→ 三个提取器（8B）→ 完成后 `_release_extract_lms()` 释放 8B → 下一段写段前 ensure_loaded 35B 重载（写段循环已有）。**流程完全不变：仍一子结构写完后一次提取**
+- **并行模式**：提取直接调 8B（模型常驻，LM Studio 自行调度 GPU/部分 GPU），与 3B 时代调用方式一致，只是后端不同——无需卸载加载
+- **UI**：取消独占串行时显示提醒"⚠️ 关闭独占串行：建议将 max concurrency 设置为 ≥2（多模型常驻可并行推理）"（仅此时提醒，串行模式一次一模型无并发；toast 不可用时用内联 span）
+- 验证：临时开 unified_management + exclusive_serial → 8B 正确提取实体（林渊/苏婉 character + 推开门/启动防火墙关系）→ JSON 解析成功 → _release_extract_lms 正常卸载；config.json 已还原
+- bump 3.1.0b9（不 git-sync）
+
+## [3.1.0b8] - 2026-08-18
+### 新增（独占串行两套卸载加载机制——35B 常驻致 8B/7B 被 CPU offload 的根因修复）
+- **背景**：实测 35B 权重 22GB 只放 7.6GB 进 GPU（部分 offload，空闲即占满）；35B 驻留时 8B/7B 加载显存仅 +326MiB/+279MiB → 被 LM Studio 降级全量 CPU（8B ~6 t/s、7B ~9 t/s，GPU 利用率 0-17%）——"8B 很好/7B 一闪而过"的真因
+- **exclusive_serial 开关（novel_checks，默认 True）**：两套机制
+  - 开（独占串行，默认）：一次只驻留一个模型——写章 35B → 章检前卸载 → 8B 判定（真 GPU）→ 卸载 → 7B → 卸载 → 下一章再加载。规划/写作同模型也严格两步（规划线程退出即卸，写作首段幂等重载）
+  - 关（并行）：只加载不卸载（模型常驻），适合显存充足硬件；UI 提醒"关闭本功能请先确认硬件足够"
+- **lms_ensure_loaded 幂等加载**（model_backend）：先 lms_ps 探测再 load——LM Studio 重复 load 同模型会生成 `:2` 副本双倍占显存（实测 qwen3-8b:2），串行调度必须防
+- **lms_session 加 unload_on_exit**：True=退出即卸（串行）；False=退出驻留（并行）；make_lms_handle 也走幂等加载
+- **调度接入点**：web_ui 规划/写作/修复三处 lms_session 按开关传 unload_on_exit（串行开时写作不包整本——novel_writer 内部章级调度）；novel_writer 循环写段前 ensure_loaded 35B、章检前 unload 35B、循环尾卸载兜底（异常由 ttl=120 兜底）；判定模块（4dim/reasoning/fidelity/ending）release 按开关（关时驻留不卸）；pledge 包裹按开关
+- **UI**：统一管理旁新增「独占串行（一次一模型，用完即卸）」checkbox，title 含硬件提醒；旧配置无该字段 → 默认勾选
+- 验证：幂等加载（二次调用 already-loaded、无 :2 副本）、串行态退出即卸、并行态退出驻留、默认 True 全通过
+- bump 3.1.0b8（不 git-sync）
+
+## [3.1.0b7] - 2026-08-18
+### 修复（全文三检守卫误判"未写完"——outline 过期副本与磁盘真相脱钩）
+- **现象**：正文 5 章全部写完（L01-L05 段文件全齐、session n1-n5 全 done），真实写作流程却打 `[全文三检] 全书未写完（仍有章未 done: ['n5']）` 跳过三检
+- **根因**：novel_writer.py 全文三检守卫读"调用方传入 outline 参数"的 section status；web_ui 生成请求的 outline 直接来自前端请求体（web_ui.py 还会把请求体 outline 覆盖回写 session）——前端缓存过期副本时 status 与磁盘真相脱钩 → 误判
+- **修复**：守卫改为 `_chapter_files_complete(state_path, s, ndata)` 文件为真相源（与循环内续写恢复逻辑同构），outline status 不再参与判定；日志文案改"仍有章文件不全"
+- **验证**：实测把 session outline 5 章 status 全部故意置为 planning（模拟前端过期）→ 旧守卫跳过，新守卫判定文件全齐 → 正确触发三检
+- bump 3.1.0b7（不 git-sync）
+
+## [3.1.0b6] - 2026-08-18
+### 新增（统一管理装载/卸载调度点 + ending 收尾判定 8B——调度序列定稿）
+- **调度基础设施（model_backend）**：新增 `lms_session(model_key, ctx, ttl=120)` 上下文管理器（进入 lms load --gpu max --ttl，退出 lms unload）+ `model_key_from_cfg(model_cfg)` 配置取 key；`make_lms_handle` 默认 ttl=120 兜底自动卸
+- **web_ui 三处 LLM 调用点包裹 lms_session**：规划（planner_model）、写作（writer_model）、修复（writer_model）——每次请求装载对应模型、用完即卸，35B 不再 TTL 1h 常驻
+- **判定模型卸载**：check_4dim（novel_4dim_check）/ check_reasoning（novel_reasoning_check）主体 try/finally `release()`（lms unload 识别句柄卸载）；fidelity_check 返回前 release。8B/7B 判定用完即卸，杜绝 35B+8B+7B 叠抢 8GB 显存
+- **pledge 全文承诺判定**：writer client 调用包裹 lms_session（writer_model）
+- **ending 收尾判定 8B（novel_fidelity）**：`_classify_ending_llm` 双后端——judge_backend==lmstudio → `make_lms_handle(8b)` LM Studio GPU；否则回退 Qwen2.5-3B（CPU）；source 文案同步更新
+- **实机生效**：真实写作流程日志 `[lms-sched] 卸载: qwen/qwen3.5-35b-a3b` 确认调度点在生产链路运行（写完即卸）
+- bump 3.1.0b6（不 git-sync）
+
 ## [3.1.0b5] - 2026-08-18
-### 验证确认（8B/7B 就位后全链路实机验证——用户"确认 7B 进行了推理审核 / 8B 关思考"）
+### 验证确认（8B/7B 就位后全链路实机验证——确认 7B 跑推理审核、8B 关思考）
 - **8B/7B 就位**：现有 GGUF（data/models/gguf 旧 llama.cpp 遗留）移入 LM Studio 模型库 → 自动识别裸名 key（qwen3-8b / deepseek-r1-distill-qwen-7b），无需 lms import
 - **7B 推理审核实机验证**：novel_reasoning_check 走 LM Studio 后端，加载 deepseek-r1-distill-qwen-7b → 审核"太阳落下但钟显八点"段落 → 正确输出 `{"ok": false, "issues": ["矛盾的时间信息"]}` → JSON 解析成功 → lms unload。非空跑/非回退/非跳过
 - **8B 关思考实机验证**：Qwen3-8B 带 `/no_think` → content 直接输出（`'2'`）；不带 → 思考链进 reasoning_content（LM Studio 分离字段）→ 判定 JSON 永不被思考链污染；`_judge` 注入逻辑不变
-- **结论**：b4 后无新增代码改动，纯验证闭环；bump 3.1.0b5（不 git-sync，用户指示）
+- **结论**：b4 后无新增代码改动，纯验证闭环；bump 3.1.0b5（不 git-sync）
 
 ## [3.1.0b4] - 2026-08-18
 ### 修复（lms ls 裸名 key 过滤 bug——本地移入的 8B/7B 识别不了）
@@ -19,23 +187,23 @@
 - 验证：judge_model_keys → {4dim: qwen3-8b, r1: deepseek-r1-distill-qwen-7b}，ensure_judge_models ok=True；**8B 实机链路**（lms load 5GB 全 GPU → HTTP 生成 → lms unload）通过；bump 3.1.0b4（不 git-sync）
 
 ## [3.1.0b3] - 2026-08-18
-### 简化（判定窗口 UI 移除 + ollama 场景禁用统一管理——用户"窗口还需要吗 / ollama那边压根没做"）
-- **用户两点**：①判定窗口输入框是否还需要 ②写作后端是 ollama 时统一管理不该显示/应禁用
+### 简化（判定窗口 UI 移除 + ollama 场景禁用统一管理——判定窗口无必要、ollama 侧无实现）
+- **两点**：①判定窗口输入框是否还需要 ②写作后端是 ollama 时统一管理不该显示/应禁用
 - **判定窗口判断**：输入框可以删，但窗口参数本身不能丢——LM Studio 默认窗口不保证够 R1（prompt+思考链+JSON ≈13K），lms load 必须显式 `-c`。实现：删前端「判定窗口」输入框与说明，窗口固定 16384（4维/R1 的 make_lms_handle 传 `cfg.judge_n_ctx or 16384`；后端 judge_n_ctx 解析保留兼容旧配置）
 - **ollama 禁用统一管理**：_novel_status_data 新增 model_backends（planner/writer 的 backend）；前端 unifiedEl.disabled = !(LM Studio 存在 && planner/writer 都是 lmstudio)，禁用时 title 提示"写作/规划后端为 Ollama，统一管理不适用"
-- 验证：py_compile 全绿；novel-chk-nctx 无残留；bump 3.1.0b3（不 git-sync，用户指示）
+- 验证：py_compile 全绿；novel-chk-nctx 无残留；bump 3.1.0b3（不 git-sync）
 
 ## [3.1.0b2] - 2026-08-18
-### 清理（setup.bat 去掉 py 3.11 优先——用户"bat也不用装llama了，不需要CUDA了，不用限制py版本了"）
-- **用户确认**：llama-cpp-python/CUDA/Python 版本限定全部移除后，setup.bat 的 `py -3.11 优先` 是唯一残留的历史偏好（llama-cpp-python wheel 区间遗留），不再有任何意义
+### 清理（setup.bat 去掉 py 3.11 优先——bat 不再装 llama/CUDA，无需限制 py 版本）
+- **确认**：llama-cpp-python/CUDA/Python 版本限定全部移除后，setup.bat 的 `py -3.11 优先` 是唯一残留的历史偏好（llama-cpp-python wheel 区间遗留），不再有任何意义
 - **实现**：setup.bat 删除 `py -3.11` 探测段，直接用系统默认 python（`set PYCMD=python`）；注释更新（仅需 transformers/torch，任意版本）
-- 验证：bat 语法检查；3B/1.5B 与 LM Studio 链路不受影响（env_check 用 sys.executable 自检）；bump 3.1.0b2（不 git-sync，用户指示）
+- 验证：bat 语法检查；3B/1.5B 与 LM Studio 链路不受影响（env_check 用 sys.executable 自检）；bump 3.1.0b2（不 git-sync）
 
 ## [3.1.0b1] - 2026-08-17
-### 重构（llama.cpp 直挂后端整体废弃 → LM Studio 统一管理——用户"写作 8 t/s vs LM Studio 20+ t/s"）
-- **用户现象**：llama.cpp 后端（llama-cpp-python 0.3.34 本地直挂）35B 写作仅 8 t/s，LM Studio 同模型 20+ t/s，差距巨大
-- **根因实锤**：llama-cpp-python 官方 PyPI 最高 0.3.35（2025 年初内核，已停更）——旧内核对 Qwen3.5/3.6-35B-A3B（新 MoE）无专家并行/CUDA MoE kernel 优化，9 层 partial offload 后 55 层（含全部专家）在 CPU 串行 → 8 t/s 是物理极限；LM Studio 用最新 llama.cpp master → 20+ t/s。上下文窗口非主因（KV 预分配，窗口只影响内存/prefill 不影响 decode t/s）
-- **架构决策（用户定稿）**：llama.cpp 直挂整体废弃；写作/规划 35B + 判定 8B/7B 统一走 LM Studio（lms load → GPU → HTTP localhost:1234）；统一管理勾选 → 8B/7B 走 LM Studio GPU，不勾 → transformers 3B+1.5B；实体/行为提取永远 transformers Qwen2.5-3B CPU
+### 重构（llama.cpp 直挂后端整体废弃 → LM Studio 统一管理——llama.cpp 写作 8 t/s vs LM Studio 20+ t/s）
+- **现象**：llama.cpp 后端（llama-cpp-python 0.3.34 本地直挂）35B 写作仅 8 t/s，LM Studio 同模型 20+ t/s，差距巨大
+- **根因确认**：llama-cpp-python 官方 PyPI 最高 0.3.35（2025 年初内核，已停更）——旧内核对 Qwen3.5/3.6-35B-A3B（新 MoE）无专家并行/CUDA MoE kernel 优化，9 层 partial offload 后 55 层（含全部专家）在 CPU 串行 → 8 t/s 是物理极限；LM Studio 用最新 llama.cpp master → 20+ t/s。上下文窗口非主因（KV 预分配，窗口只影响内存/prefill 不影响 decode t/s）
+- **架构决策（定稿）**：llama.cpp 直挂整体废弃；写作/规划 35B + 判定 8B/7B 统一走 LM Studio（lms load → GPU → HTTP localhost:1234）；统一管理勾选 → 8B/7B 走 LM Studio GPU，不勾 → transformers 3B+1.5B；实体/行为提取永远 transformers Qwen2.5-3B CPU
 - **实现**：
   - 新增 `novel/lmstudio_probe.py`——LM Studio 环境探查（lms.exe 定位、settings.json downloadsFolder 模型根目录、server 可达性）+ lms load/unload/ps/import/server start 封装 + GGUF 下载目标映射（hf_hub_download local_dir=模型库根 → 自动落 `<publisher>/<repo>/<file>`，与 LM Studio 目录结构一致）
   - `model_backend.py`：judge_backend 从 `A∧B→llama.cpp` 改为 `B→lmstudio`（A=Python 3.10~3.11 条件消失）；删 load_llama/_estimate_gpu_layers/_gguf_*/弱引用共享；新增 judge_model_keys（lms ls 解析 8B/7B key）、lms_generate（HTTP 生成）、make_lms_handle（可调用句柄，带 _lms_model_key 标记）、ensure_judge_models（缺失检测）；release 识别 lms 句柄 → lms unload（测完即卸）
@@ -43,55 +211,55 @@
   - `web_ui.py`：后端下拉移除 llama.cpp 选项；统一管理勾选条件改为 LM Studio 存在；「安装缺失模型」GGUF 下载目标改为 LM Studio 模型库（缺失自动下载 + lms import 注册，不依赖本机已有）；状态注入改 lmstudio probe
   - `model_env_check.py`：check_llamacpp → check_lmstudio；`setup.bat`：删除 llama-cpp-python 安装段（不再限定 Python 3.10~3.11）
   - `config.json`：planner/writer 移除 llama.cpp profile，顶层对齐 lmstudio（qwen/qwen3.6-35b-a3b）
-- 验证：全项目 py_compile 全绿；lmstudio_probe 探查全通（lms_exe/models_dir/server_ok）；judge_backend 路由（勾选→lmstudio/不勾→transformers）；缺失场景（库无 8B/7B → 明确提示下载 + 回退 transformers 3B 实测加载 OK）；完整链路实测（make_lms_handle 1B → lms load → HTTP 生成"我是AI助手。" → release lms unload）；/api/config 与 /api/novel/status 集成验证通过；bump 3.1.0b1（不 git-sync，用户指示）
+- 验证：全项目 py_compile 全绿；lmstudio_probe 探查全通（lms_exe/models_dir/server_ok）；judge_backend 路由（勾选→lmstudio/不勾→transformers）；缺失场景（库无 8B/7B → 明确提示下载 + 回退 transformers 3B 实测加载 OK）；完整链路实测（make_lms_handle 1B → lms load → HTTP 生成"我是AI助手。" → release lms unload）；/api/config 与 /api/novel/status 集成验证通过；bump 3.1.0b1（不 git-sync）
 
 ## [3.0.0b41] - 2026-08-17
-### 优化（模型列表缓存——用户"F5 不加载/切后端模型加载慢"）
-- **用户实测**：切后端/刷新时模型下拉框加载慢或失败（LM Studio API 实测 2.07s）；F5 时 LM Studio 未就绪 → 获取失败
+### 优化（模型列表缓存——F5 不触发加载/切后端模型加载慢）
+- **实测**：切后端/刷新时模型下拉框加载慢或失败（LM Studio API 实测 2.07s）；F5 时 LM Studio 未就绪 → 获取失败
 - **验证结论**：恢复逻辑本身正确（完整列表模拟：lmstudio→qwen/qwen3.5-35b-a3b 恢复 OK；llama.cpp→Qwen3.5-35B-A3B GGUF 恢复 OK；两模型都在各自列表里）
 - **实现**：LLMClient.list_models 加 30 秒 TTL 缓存（key=backend|base_url）——LM Studio /v1/models 2 秒 → 第二次秒回；llama.cpp rglob 扫描也缓存
 - 验证：单测首次 2.00s 调 API、第二次 0.000s 命中缓存、API 只调 1 次；py_compile 全绿；bump 3.0.0b41
 
 ## [3.0.0b40] - 2026-08-17
-### 修复（模型存空根因——用户"选了就一定有，切了那个也没有"）
-- **用户现象**：选了模型（LM Studio/llama.cpp），切后端再切回来模型不恢复——config 里 model 存成了空
+### 修复（模型存空根因——选中即应有值，切换后端后丢失）
+- **现象**：选了模型（LM Studio/llama.cpp），切后端再切回来模型不恢复——config 里 model 存成了空
 - **根因（存空机制）**：onBackendChange 填好 model → 调 refreshModels（异步重建下拉框为"加载中"，value 变空）→ 立即调 autoSaveModelConfig（600ms 后读 DOM 表单）——模型列表未加载完时下拉框 value='' → 保存空 model → 覆盖刚填的 → config 槽 model 变空 → 下次切回没得恢复
-- **修复**：内存变量 `_modelValues = {planner, writer}` 记录当前模型值——autoSave 的 model 读内存值（不读正在重建的 DOM）；四个同步点：loadConfig 恢复、onBackendChange 填值、refreshModels 恢复成功、用户手动选模型（change）
+- **修复**：内存变量 `_modelValues = {planner, writer}` 记录当前模型值——autoSave 的 model 读内存值（不读正在重建的 DOM）；四个同步点：loadConfig 恢复、onBackendChange 填值、refreshModels 恢复成功、手动选模型（change）
 - 验证：py_compile 全绿 + node --check JS 语法通过；bump 3.0.0b40
 
 ## [3.0.0b39] - 2026-08-17
-### 修复（模型不跟着恢复——用户"选择的模型为啥也不跟着，每次都重新选择"）
-- **用户现象**：切换后端/重启后，模型下拉框不恢复已选模型，每次重新选择
+### 修复（模型不跟着恢复——切换后端/重启后已选模型丢失，需重新选择）
+- **现象**：切换后端/重启后，模型下拉框不恢复已选模型，每次重新选择
 - **根因**：b38 清掉 config 顶层残留后，loadConfig 调 `refreshModels('planner', pm.model)` 传的是顶层 `pm.model`（现在 undefined）——正确值在 `profiles[backend].model`（pmProf.model）；savedValue=undefined → refreshModels 恢复逻辑匹配不到 → 下拉框不恢复
 - **修复**：loadConfig 传参改为 `pmProf.model` / `wmProf.model`（当前后端槽的 model）
 - 验证：模拟链路——顶层 None vs 槽内 35B GGUF，修复后传槽值恢复 ✓；py_compile 全绿；bump 3.0.0b39
 
 ## [3.0.0b38] - 2026-08-17
-### 修复（b37 分槽数据污染——用户"切了乱，规划写作逻辑不一致"）
-- **用户实测乱象**：切 LM Studio 再切回 llama.cpp 配置不跟着变、模型不跟着、规划写作不一致
-- **根因实锤（config.json 污染）**：①writer_model.profiles[llama.cpp] 被写成 base_url=http://localhost:1234（LM Studio API 地址）+ model 空——onBackendChange 加载失败时表单残留上一个后端值，autoSave 把错值存进新槽 ②loadConfig 槽缺失回退 `|| pm` 读到顶层残留旧字段（base_url=C:\...\model）③顶层旧字段残留干扰
+### 修复（b37 分槽数据污染——切换后配置错乱，规划/写作逻辑不一致）
+- **切换乱象**：切 LM Studio 再切回 llama.cpp 配置不跟着变、模型不跟着、规划写作不一致
+- **根因确认（config.json 污染）**：①writer_model.profiles[llama.cpp] 被写成 base_url=http://localhost:1234（LM Studio API 地址）+ model 空——onBackendChange 加载失败时表单残留上一个后端值，autoSave 把错值存进新槽 ②loadConfig 槽缺失回退 `|| pm` 读到顶层残留旧字段（base_url=C:\...\model）③顶层旧字段残留干扰
 - **修复**：①loadConfig 槽缺失 → 用后端默认值（绝不读顶层残留；profiles 存在时顶层作废）②onBackendChange fetch 失败 → 也填当前后端默认（防残留值保存污染）③清理 config.json 污染（writer 两个槽恢复正确值，清顶层残留）
 - **清理后配置**：planner/writer × lmstudio/llama.cpp 四槽全正确（lmstudio→1234+qwen；llama.cpp→本地路径+35B GGUF）
 - 验证：_model_profile 读取四槽正确；py_compile 全绿；bump 3.0.0b38
 
 ## [3.0.0b37] - 2026-08-17
-### 新增（模型配置按后端分槽——用户"切回 lmstudio 结果没回 api，落盘的配置得跟回来"）
-- **用户需求**：每个后端（LM Studio/llama.cpp/Ollama）一套独立配置，切后端自动恢复对应落盘配置——LM Studio→http://localhost:1234、llama.cpp→本地 GGUF 路径、切回 LM Studio→自动恢复 1234
+### 新增（模型配置按后端分槽——切回 lmstudio 后配置未恢复，落盘配置应随后端切换）
+- **需求**：每个后端（LM Studio/llama.cpp/Ollama）一套独立配置，切后端自动恢复对应落盘配置——LM Studio→http://localhost:1234、llama.cpp→本地 GGUF 路径、切回 LM Studio→自动恢复 1234
 - **根因**：planner_model/writer_model 是扁平结构 {backend, base_url, ...}——切后端不改 base_url（onBackendChange 只改 placeholder/title），切回 LM Studio 时 base_url 还是上次 llama.cpp 的本地路径
 - **实现（profiles 分槽）**：`{backend, profiles: {lmstudio: {...}, ollama: {...}, llama.cpp: {...}}}`——①后端读取辅助 `_model_profile()`（model_backend 单一实现，web_ui._create_writer_client/_create_planner_client/repair engine 共用；旧格式无 profiles 兼容）②前端 autoSaveModelConfig 保存时先 GET 合并（只更新当前后端槽，保留其他后端槽）③onBackendChange 切后端时异步加载该后端槽填表单（无槽则填默认 LM Studio 1234/Ollama 11434，防残留）④loadConfig 按 backend 取槽
 - 验证：_model_profile 7 场景单测全过（各后端槽切换/旧格式兼容/无槽空/空配置）；py_compile 全绿；bump 3.0.0b37
 
 ## [3.0.0b36] - 2026-08-17
-### 优化（offload_kqv=False——用户两次质疑："同样预分配为什么 LM Studio 不慢"）
-- **用户质疑链**：①n_ctx 大为什么慢（attention 只按实际序列算，不按 n_ctx）②同样预分配 KV，LM Studio 为什么不慢
-- **真根因（用户全程对）**：llama-cpp-python 默认 `offload_kqv=True`——KV cache 预分配在显存（GPU 层 KV 占显存 2.3GB@262144）→ 8GB 显存被 KV 挤占 → 权重只能 offload 10 层；**LM Studio 的 KV 放共享内存**（截图共享 GPU 内存 31.6GB = 同款策略效果）→ 显存几乎全给权重
+### 优化（offload_kqv=False——同样预分配 KV，LM Studio 不慢的根因）
+- **质疑链**：①n_ctx 大为什么慢（attention 只按实际序列算，不按 n_ctx）②同样预分配 KV，LM Studio 为什么不慢
+- **真根因**：llama-cpp-python 默认 `offload_kqv=True`——KV cache 预分配在显存（GPU 层 KV 占显存 2.3GB@262144）→ 8GB 显存被 KV 挤占 → 权重只能 offload 10 层；**LM Studio 的 KV 放共享内存**（截图共享 GPU 内存 31.6GB = 同款策略效果）→ 显存几乎全给权重
 - **实现**：llm_client.py + model_backend.py 两处 Llama(...) 加 `offload_kqv=False`（KV 全放 CPU 内存）+ `_estimate_gpu_layers` 加 offload_kqv 参数（False 时 KV 不占显存，只按权重算）
 - **实测（真实 GGUF + mock 显存 8188）**：offload_kqv=True → 10 层 GPU；False → 14 层 GPU（CPU 30→26 层）——**14 层 = 8GB 显存权重物理上限**，预期提速 10-15%（9.4 → ~11 t/s）
 - **天花板定论**：8GB 显存物理放不下 35B——26 层 CPU 是硬限制，offload_kqv 只是把 KV 让给权重；质变需换 14B 模型或更大显存
 - 验证：py_compile 全绿；真实 GGUF 层数对比 10→14；bump 3.0.0b36
 
 ## [3.0.0b35] - 2026-08-17
-### 优化（t/s 实时显示——用户"写小说几小时，等生成完成才看到是闹呢"）
+### 优化（t/s 实时显示——长时生成需实时观测，而非等生成完成才见）
 - **需求**：生成过程中实时看到速度（b34 只在生成完成后打印，长任务等于看不到）
 - **实现**：_llama_generate 改流式（create_chat_completion stream=True）——逐 token 迭代累计 content/token 数，每 2 秒 `
 ` 原地刷新 `[llama] 模型名 生成中: N tokens, X t/s`；完成打印最终统计；返回结构与 stream=False 一致（content+finish_reason，截断续写逻辑无感知）
@@ -99,114 +267,114 @@
 - 验证：mock 流式 20 tokens/1.0s → 20.0 t/s 实时+完成双打印；chat/chat_detailed 兼容；py_compile 全绿；bump 3.0.0b35
 
 ## [3.0.0b34] - 2026-08-17
-### 新增（llama.cpp 推理速度观测——用户"我没地方看推理速度"；用户实测"生成速率没显示"）
-- **需求**：llama-cpp-python 无 UI 显示 t/s——用户无法判断 b33 参数是否生效/推理是否正常
-- **第一次实现踩坑（实测打脸）**：读 `create_chat_completion` 返回的 usage 字段——**0.3.34 源码实测无 usage 字段**（mock 测试编造了 usage 才通过）→ 真实环境 `r.get('usage')` 为 None → 异常被静默吞 → 什么都不打印（用户"没显示"）
+### 新增（llama.cpp 推理速度观测——无推理速度查看入口，生成速率不显示）
+- **需求**：llama-cpp-python 无 UI 显示 t/s——无法判断 b33 参数是否生效/推理是否正常
+- **第一次实现缺陷（实测不符）**：读 `create_chat_completion` 返回的 usage 字段——**0.3.34 源码实测无 usage 字段**（mock 测试编造了 usage 才通过）→ 真实环境 `r.get('usage')` 为 None → 异常被静默吞 → 什么都不打印（生成速率未显示）
 - **修正**：改用 `llm.tokenize(输出文本, add_bos=False)` 自数 completion_tokens（prompt 侧无 apply_chat_template 拿不到准确值，去掉）；打印 `[llama] 模型名: 生成 M tokens, 用时 Xs, Y t/s`
 - **教训**：mock 测试不能编造 API 返回——必须先查真实返回结构再写代码
 - 验证：无 usage 字段场景 tokenize 自数打印正常（11 tokens/0.5s → 22 t/s）；两条调用链正常；py_compile 全绿；bump 3.0.0b34
 
 ## [3.0.0b33] - 2026-08-17
-### 优化（llama.cpp 推理参数——用户对比 LM Studio 同硬件更快，截图反证窗口/offload 归因错误）
-- **用户反证**：LM Studio 截图——上下文 96000（不是小窗口）、GPU 卸载设 40（同 8GB 显存）、Unified KV Cache 开、Context Checkpoints 32、评估批处理 768/512、CPU 线程 10——"快"不是 offload 层数差
-- **查证**：llama-cpp-python 0.3.35 只有版本号 bump（chore）；主分支 llama_cpp.py 源码无任何 checkpoint 绑定（LlamaContextCheckpoint/checkpoint/ckpt 全无）——Context Checkpoints 在 Python 绑定中不存在，**非版本问题，设计上没实现**（用户骂醒：别画大饼"等升级"）
+### 优化（llama.cpp 推理参数——LM Studio 同硬件更快，截图反证窗口/offload 归因错误）
+- **反证**：LM Studio 截图——上下文 96000（不是小窗口）、GPU 卸载设 40（同 8GB 显存）、Unified KV Cache 开、Context Checkpoints 32、评估批处理 768/512、CPU 线程 10——"快"不是 offload 层数差
+- **查证**：llama-cpp-python 0.3.35 只有版本号 bump（chore）；主分支 llama_cpp.py 源码无任何 checkpoint 绑定（LlamaContextCheckpoint/checkpoint/ckpt 全无）——Context Checkpoints 在 Python 绑定中不存在，**非版本问题，设计上未实现**（依赖升级不现实）
 - **根因**：代码 Llama 实例化只传 flash_attn/type_k/type_v——n_threads（CPU 层多核并行）、n_batch（prefill 批量）、use_mlock（20GB 权重防换页）全用默认 → 35B 31/40 层在 CPU 上没吃满多核
 - **实现**：①LLMClient._llama_n_threads()——wmic 物理核数探测（AMD 7845HX 12C24T → 12）②llm_client.py + model_backend.py 两处 Llama(...) 加 n_threads=12/n_threads_batch=12/n_batch=1024/n_ubatch=512/use_mlock=True
 - 验证：物理核数探测=12；mock Llama 捕获参数全生效；py_compile 全绿；bump 3.0.0b33
 - **遗留**：Context Checkpoints 做不了（llama-cpp-python 无此 API）——已划掉不画饼
 
 ## [3.0.0b32] - 2026-08-17
-### 修复（全文三检触发守卫——用户"全文三检要全文写完才触发，if规划else全文三检"）
-- **用户语义**：全文三检只在最后一章章检通过修复完、后续不再有任何规划时触发——if 规划 else 全文三检
-- **根因实锤**：generate_novel_article 主循环结束后【无条件】执行 finalize_novel_full——全书未写完（有章 pending/章检没过）也跑全文三检 → verify_ending 兜底把 ending 收束问题挂到 L01 → 弹窗显示"L01 全文质检（三检修复项）"——章检项与三检项并存，违背"同一章不会同时有"的设计
+### 修复（全文三检触发守卫——全文写完才触发，if 规划 else 全文三检）
+- **语义**：全文三检只在最后一章章检通过修复完、后续不再有任何规划时触发——if 规划 else 全文三检
+- **根因确认**：generate_novel_article 主循环结束后【无条件】执行 finalize_novel_full——全书未写完（有章 pending/章检没过）也跑全文三检 → verify_ending 兜底把 ending 收束问题挂到 L01 → 弹窗显示"L01 全文质检（三检修复项）"——章检项与三检项并存，违背"同一章不会同时有"的设计
 - **修法**：全文三检前加守卫 `all(section.status == 'done')`——任一章未 done（pending/planning/in_progress/confirmed）= 还有规划/写作 → 跳过全文三检（打印原因）；全部 done（最后一章章检通过修复完）才触发；fn=None 时质检报告段跳过
 - **触发点定论**：全文三检的唯一点位 = 全书所有章 done 之后（后续不再有规划）
 - 验证：守卫逻辑 6 场景单测全过（全书done触发/L01 pending跳过/部分done跳过/planning跳过/confirmed跳过）；py_compile 全绿；bump 3.0.0b32
 
 ## [3.0.0b31] - 2026-08-17
-### 修复（跳过=通过：跳过后不再重检重置——用户"跳过是上一章检测的覆盖，怎么回事"）
-- **用户流程**：规划章内子结构→写作→检测→通过→规划下一章子结构——跳过=通过，不该再弹
-- **根因实锤（b29 也没覆盖）**：跳过（_repaired=True）后，novel_writer 646-665 **立即重检 L01**——重检仍有 HARD（跳过≠修复，正文没改问题当然还在）→ 663-665 显式 `_repaired=False` 重置 → save_repair_hint → 轮询又弹。b29 的 setdefault 保留只对"result 没带 _repaired"生效，665 是显式 False，挡不住
-- **修复**：修复循环轮询到 `_repaired=True` 后，检查 `_repair_result.skipped`（skip 已写）——**用户跳过 → 不再重检、不重置，直接通过进入下一章**（_fc_final 置通过）；修复完成（非跳过）→ 照旧重检
+### 修复（跳过=通过：跳过后不再重检重置——跳过语义与上一章检测覆盖冲突）
+- **流程**：规划章内子结构→写作→检测→通过→规划下一章子结构——跳过=通过，不该再弹
+- **根因确认（b29 也没覆盖）**：跳过（_repaired=True）后，novel_writer 646-665 **立即重检 L01**——重检仍有 HARD（跳过≠修复，正文没改问题当然还在）→ 663-665 显式 `_repaired=False` 重置 → save_repair_hint → 轮询又弹。b29 的 setdefault 保留只对"result 没带 _repaired"生效，665 是显式 False，挡不住
+- **修复**：修复循环轮询到 `_repaired=True` 后，检查 `_repair_result.skipped`（skip 已写）——**跳过 → 不再重检、不重置，直接通过进入下一章**（_fc_final 置通过）；修复完成（非跳过）→ 照旧重检
 - 验证：py_compile 全绿；bump 3.0.0b31
 
 ## [3.0.0b30] - 2026-08-17
-### 清理（删除冗余"跳过"标识——用户"跳过或没有勾选等同于通过，为什么弄个跳过单独标识"）
-- **用户语义定稿**：跳过 / 未勾选 = 通过——统一一个"通过"语义，不要单独的跳过标识
-- **实锤**：`_skipped_all` 只有 `_handle_repair_skip` 一处写入，**没有任何读取**——纯冗余；skip 已设 `_repaired=True` + 清 issues/full_items（这就是"通过"语义）
+### 清理（删除冗余跳过标识——跳过/未勾选均等同于通过，无需独立标识）
+- **语义定稿**：跳过 / 未勾选 = 通过——统一一个"通过"语义，不要单独的跳过标识
+- **确认**：`_skipped_all` 只有 `_handle_repair_skip` 一处写入，**没有任何读取**——纯冗余；skip 已设 `_repaired=True` + 清 issues/full_items（这就是"通过"语义）
 - **清理**：删除 `_skipped_all`（skip 统一走 `_repaired=True` + 清 issues/full_items）
 - **保留（有实际用途）**：`_skipped_subs`（未勾选段记录——重检时过滤未勾选段问题）；`_repaired`（弹窗核心判定）
 - **语义统一**：跳过 = `_repaired=True`（通过）；未勾选 = 从 issues 移除（通过）——弹窗只认 `_repaired` / issues 空
 - 验证：py_compile 全绿；`_skipped_all` 全局清零；bump 3.0.0b30
 
 ## [3.0.0b29] - 2026-08-17
-### 修复（跳过修复后又被弹窗——用户"跳过了没记录 True/ok，规划完又弹修复"）
-- **用户流程实锤**：跳过所有修复 → 自动规划下一子结构 → 规划完又弹修复窗口 → 被迫点修复 → 重加载模型 → 链路错乱
-- **根因实锤**：`StateManager.save_repair_hint` 用 `hints[chapter_id] = result` **整个覆盖**——章检（novel_writer 628 的 `_checks_result`）**不含 `_repaired`** → 覆盖时把"用户已跳过"的 `_repaired=True` 冲掉 → `get_progress` 的 `repair_pending` 判定（`if not hint.get("_repaired")`）→ **又弹**
+### 修复（跳过修复后又被弹窗——跳过未记录 True/ok，规划后重弹修复）
+- **流程确认**：跳过所有修复 → 自动规划下一子结构 → 规划完又弹修复窗口 → 被迫点修复 → 重加载模型 → 链路错乱
+- **根因确认**：`StateManager.save_repair_hint` 用 `hints[chapter_id] = result` **整个覆盖**——章检（novel_writer 628 的 `_checks_result`）**不含 `_repaired`** → 覆盖时把"已跳过"的 `_repaired=True` 冲掉 → `get_progress` 的 `repair_pending` 判定（`if not hint.get("_repaired")`）→ **又弹**
 - **修复**：`save_repair_hint` 覆盖时**保留已有 `_repaired`**（`merged.setdefault("_repaired", old...)`）——result 显式带 `_repaired` 时以其为准（重检通过置 True / 重检仍 HARD 重置 False，656/665 行为不变）；无旧值默认 False（正常弹窗）
 - 验证：3 场景单测全过（跳过后章检保留 True 不再弹 / 显式 False 生效重置 / 无旧值默认 False）；py_compile 全绿；bump 3.0.0b29
 
 ## [3.0.0b28] - 2026-08-17
-### 修复（修复复用共享实例——用户实测"跳过修复→规划→弹修复→点修复 内存不足"）
-- **用户流程实锤**：跳过修复 → 规划下一子结构（35B 加载进共享表）→ 规划完弹修复窗口 → 点修复 → **b24 的 share=False 让修复独立加载第二份 35B** → 内存两份 35B → 窗口兜底 8192 → 修复失败（内存不足）
+### 修复（修复复用共享实例——跳过修复→规划→弹修复→点修复 内存不足）
+- **流程确认**：跳过修复 → 规划下一子结构（35B 加载进共享表）→ 规划完弹修复窗口 → 点修复 → **b24 的 share=False 让修复独立加载第二份 35B** → 内存两份 35B → 窗口兜底 8192 → 修复失败（内存不足）
 - **b24 修错方向**：当时"共享之后崩溃"的僵尸根因是 `_release_repair_client` 的**强制 close**（close 后共享表弱引用仍指向已释放底层 ctx 的实例 → 复用 segfault）——**正确解法是去掉 close，不是让修复独立**
-- **修复**：`_create_repair_client` 恢复 share=True（复用共享——规划/写作/修复同一模型只加载一次，用户 b20 核心诉求）；`_release_repair_client` **去掉 close**（只释放 client 引用——有其他持有者则复用，全部回收则弱引用自动卸载，僵尸无来源）
+- **修复**：`_create_repair_client` 恢复 share=True（复用共享——规划/写作/修复同一模型只加载一次，b20 核心诉求）；`_release_repair_client` **去掉 close**（只释放 client 引用——有其他持有者则复用，全部回收则弱引用自动卸载，僵尸无来源）
 - **完整闭环（验证）**：规划(加载) → 弹修复 → 点修复(复用) → 修复完成(不 close) → 继续规划/写作(复用) → 全部结束(自动卸载)——**全程一份 35B**
 - 验证：5 场景单测全过（规划→修复→写作只加载1次 / 同实例 / 修复释放不影响 / 全部回收自动卸载 / 无僵尸重新加载）；py_compile 全绿；bump 3.0.0b28
 
 ## [3.0.0b27] - 2026-08-17
-### 修复（修复静默失败 + 无过程反馈——用户"就光让了？不执行修复？"）
-- **用户现象**：日志只有"加载成功（n_ctx=8192）→ 修复完成卸载"，没看到修复结果；GPU 跑着但不知道在干嘛；对比 LM Studio 无此问题
-- **根因实锤（静默失败）**：n_ctx=8192 是**内存不足的动态窗口兜底值**（内存可容纳 ≤0 → 8192）；修复 max_tokens 继承 writer 的 81920 **远超 8192 窗口** → llama_cpp 报 "Requested tokens exceed context window" → rewrite 失败 → 只显示"加载→卸载"，**没有修复结果可见**（UI 也不显示失败原因）
+### 修复（修复静默失败 + 无过程反馈——仅提示未执行修复）
+- **现象**：日志只有"加载成功（n_ctx=8192）→ 修复完成卸载"，没看到修复结果；GPU 跑着但不知道在干嘛；对比 LM Studio 无此问题
+- **根因确认（静默失败）**：n_ctx=8192 是**内存不足的动态窗口兜底值**（内存可容纳 ≤0 → 8192）；修复 max_tokens 继承 writer 的 81920 **远超 8192 窗口** → llama_cpp 报 "Requested tokens exceed context window" → rewrite 失败 → 只显示"加载→卸载"，**没有修复结果可见**（UI 也不显示失败原因）
 - **修复（三层）**：
   1. **超窗降级**：LLMClient 加 `_llama_max_tokens()`——llama.cpp 分支 max_tokens 自动 min(n_ctx−1024, 最小 256)——n_ctx=8192 时输出上限降到 7168，修复能跑而不是直接报错
-  2. **过程日志**：rewrite_segment 打印"正在重构 S02（窗口 N）..."——用户知道 GPU 在干嘛；加载时 n_ctx<16384 打警告"内存不足窗口仅 N"
+  2. **过程日志**：rewrite_segment 打印"正在重构 S02（窗口 N）..."——可观测 GPU 状态；加载时 n_ctx<16384 打警告"内存不足窗口仅 N"
   3. **UI 失败原因**：pollRepairStatus 显示 failed 段的原因（problems）——"失败 N 段（文件: 原因）"红色显示
 - 验证：超窗降级 3 场景单测过（8192→7168 / 262144 保持 / 未知保持）；三文件 py_compile 全绿；bump 3.0.0b27
 
 ## [3.0.0b26] - 2026-08-17
-### 修复（修复状态会话隔离——用户"A 点修复 B 也显示/也修"）
-- **用户现象**：在会话 A 点击修复，B 会话的修复面板也显示修复状态/进行中——"好几个会话一起跑"的错觉 + 多次加载模型
-- **根因实锤**：`_repair_state` 是**模块级全局单例**——所有 session 的修复状态/防重入共用一份；前端 `pollRepairStatus` 调 `/api/novel/repair/status` 不带 session_id → 返回全局状态 → **任何 session 的页面都显示同一修复**；防重入也全局互锁（A 修复时 B 被拒/或状态串）
-- **说明**：run() 本身只修请求的 session_id（不会真的修 B）——用户看到的"B 也修"是全局状态显示误导；两条 [llama] 是"A 修复 + 之前 B 的操作"各自加载
+### 修复（修复状态会话隔离——A 会话点修复，B 会话也显示/执行）
+- **现象**：在会话 A 点击修复，B 会话的修复面板也显示修复状态/进行中——"好几个会话一起跑"的错觉 + 多次加载模型
+- **根因确认**：`_repair_state` 是**模块级全局单例**——所有 session 的修复状态/防重入共用一份；前端 `pollRepairStatus` 调 `/api/novel/repair/status` 不带 session_id → 返回全局状态 → **任何 session 的页面都显示同一修复**；防重入也全局互锁（A 修复时 B 被拒/或状态串）
+- **说明**：run() 本身只修请求的 session_id（不会真的修 B）——界面显示"B 也修"是全局状态误导；两条 [llama] 是"A 修复 + 之前 B 的操作"各自加载
 - **修复（会话隔离）**：`_repair_state` → `_repair_states: dict`（key=session_id）；apply 防重入/置位按 session；`_run` 完成按 session 写；status 接口读 query `session_id` 返回对应 state；前端 `pollRepairStatus` fetch 带 `?session_id=`（currentSessionId）
 - 验证：py_compile 全绿；`_repair_state` 全局引用清零；bump 3.0.0b26
 
 ## [3.0.0b25] - 2026-08-17
-### 修复（apply 防重入竞态——用户"就点了一次却加载两个"）
-- **用户现象**：点一次"开始修复"却出现两条 `[llama] 加载成功`（n_ctx 251447 / 250240 不同 = 两个时刻）——run() 内只有一处 client 调用（单例复用），两条 = 两个 `_run` 线程
+### 修复（apply 防重入竞态——单击触发双加载）
+- **现象**：点一次"开始修复"却出现两条 `[llama] 加载成功`（n_ctx 251447 / 250240 不同 = 两个时刻）——run() 内只有一处 client 调用（单例复用），两条 = 两个 `_run` 线程
 - **根因（竞态窗口）**：b22 防重入的"检查 `running`"与"置位 `running=True`"是两个**分离的锁块**——两次 apply（前端重复提交/双击）在"检查通过 → 置位"之间并发时**双双放行** → 两个 `_run` 线程 → 两条 35B 加载（且并发调用 Llama 实例 = 崩溃风险）
 - **修复**：检查与置位合并到**同一锁块**（原子化）——第二次 apply 必被拒（无论何时到达）
 - 验证：py_compile 全绿；bump 3.0.0b25
 
 ## [3.0.0b24] - 2026-08-17
-### 修复（修复引擎独立实例——用户定位"共享之后出现的崩溃"）
-- **用户两条线索**：①"就是在共享之后出现的"——崩溃与共享机制强相关②"你自己走的路径和给我代码写得不一样"——我 curl 单次测试不触发复用，用户连续操作触发
-- **根因实锤（僵尸实例复用）**：`_release_repair_client` 显式 `llm.close()` 释放了 35B 底层 ctx，但**共享表 `_SHARED_LLAMA` 的弱引用还在**——实例对象未死（底层已死）。下次任何操作（修复/写作）`_llama_instance` 命中该僵尸实例 → 调用已释放的 ctx → **segfault → 无输出崩溃**。共享表是**跨 session 全局**的——我测试 close 的僵尸实例，用户任何 session 都可能命中
-- **为什么我测试不崩**：curl 单次 apply → close → 测试结束，没再触发复用；用户连续操作（修完再修/修完写作）→ 命中僵尸 → 崩
-- **修复**：`LLMClient` 加 `share` 参数（默认 True）——`share=False` 时**不查共享表、不写共享表**；修复引擎 `_create_repair_client` 传 `share=False`（独立加载/close，僵尸无来源）；共享仍服务于规划/写作（用户 b20 定的范围）；`_release_repair_client` 简化（独立实例 close 安全，不再需要判空逻辑）
+### 修复（修复引擎独立实例——崩溃出现在共享机制引入之后）
+- **两条线索**：①崩溃与共享机制强相关（共享引入后出现）②curl 单次测试不触发复用、连续操作才触发
+- **根因确认（僵尸实例复用）**：`_release_repair_client` 显式 `llm.close()` 释放了 35B 底层 ctx，但**共享表 `_SHARED_LLAMA` 的弱引用还在**——实例对象未死（底层已死）。下次任何操作（修复/写作）`_llama_instance` 命中该僵尸实例 → 调用已释放的 ctx → **segfault → 无输出崩溃**。共享表是**跨 session 全局**的——我测试 close 的僵尸实例，任何 session 都可能命中
+- **为什么我测试不崩**：curl 单次 apply → close → 测试结束，没再触发复用；连续操作（修完再修/修完写作）→ 命中僵尸 → 崩
+- **修复**：`LLMClient` 加 `share` 参数（默认 True）——`share=False` 时**不查共享表、不写共享表**；修复引擎 `_create_repair_client` 传 `share=False`（独立加载/close，僵尸无来源）；共享仍服务于规划/写作（b20 定的范围）；`_release_repair_client` 简化（独立实例 close 安全，不再需要判空逻辑）
 - 验证：share=False 单测 7 项全过（修复独立加载不复用 / 不进共享表 / close 只关自己的 / 写作复用正常实例 / 连续多次修复无僵尸）；py_compile 全绿；bump 3.0.0b24
 
 ## [3.0.0b23] - 2026-08-17
-### 回滚（b21 修复窗口限制——用户指令"崩溃之后改的瞎搞，改回来"）
-- **用户指令**：崩溃后改的"显存/动态层数"相关改动改回来——崩溃真因是并发（b22 防重入已修），窗口限制是错误方向
-- **用户判断正确**：用户环境 b20 日志 `n_gpu_layers=9` → 9 层 + 262144 窗口显存 = 4.5GB 权重 + ~1.5GB KV ≈ 6GB < 8GB，**根本不崩显存**——b21 窗口限制（n_ctx=16384）对用户环境是多余的
+### 回滚（b21 修复窗口限制——回滚崩溃后改动的显存/动态层数相关修改）
+- **指令**：崩溃后改的"显存/动态层数"相关改动改回来——崩溃真因是并发（b22 防重入已修），窗口限制是错误方向
+- **判断正确**：当前环境 b20 日志 `n_gpu_layers=9` → 9 层 + 262144 窗口显存 = 4.5GB 权重 + ~1.5GB KV ≈ 6GB < 8GB，**根本不崩显存**——b21 窗口限制（n_ctx=16384）对当前环境是多余的
 - **回滚**：`_create_repair_client()` 恢复继承 writer 配置（max_tokens 原值、n_ctx 自动推导），删 b21 的 max_tokens cap + n_ctx 固定
 - **保留**：b22 防重入（`running` 标志，并发崩溃真因修复）、b21 `_release_repair_client` 显式 close（防假卸载）
 - 验证：py_compile 全绿；bump 3.0.0b23；服务器重启
 
 ## [3.0.0b22] - 2026-08-17
-### 修复（修复 apply 防重入——用户骂醒"查代码，不是内存/KV"）
-- **用户定位**："压根不是爆内存包缓存，查代码！！"——同一 b21 代码我（curl 单次 apply）执行不崩、用户（浏览器 UI）执行崩溃 → 差异在请求并发
-- **根因实锤（代码级）**：`_handle_repair_apply` 的 `_repair_lock` 只保护 `_repair_state` 写入（1733），**run() 后台线程执行完全在锁外**——重复 apply（前端重复提交/手动再点"开始修复"）会启动**多个 `_run` 线程并发跑 `run()`**，而修复 client 是模块级单例 `_REPAIR_CLIENT`（同一 Llama 实例）→ **llama_cpp 线程不安全 → 并发调用同一实例 → segfault → 无输出崩溃**（无 WER、无 traceback、cmd 直接关闭——与用户观察完全吻合）
+### 修复（修复 apply 防重入——根因在代码级并发，非内存/KV）
+- **定位**：根因不在内存/KV 而在代码级——同一 b21 代码 curl 单次 apply 执行不崩、浏览器 UI 执行崩溃 → 差异在请求并发
+- **根因确认（代码级）**：`_handle_repair_apply` 的 `_repair_lock` 只保护 `_repair_state` 写入（1733），**run() 后台线程执行完全在锁外**——重复 apply（前端重复提交/手动再点"开始修复"）会启动**多个 `_run` 线程并发跑 `run()`**，而修复 client 是模块级单例 `_REPAIR_CLIENT`（同一 Llama 实例）→ **llama_cpp 线程不安全 → 并发调用同一实例 → segfault → 无输出崩溃**（无 WER、无 traceback、cmd 直接关闭——与观察到的现象完全吻合）
 - **为什么我 curl 不崩**：单次 apply → 单线程 → 无并发
 - **修复**：`_handle_repair_apply` 开头加防重入——`with _repair_lock` 检查 `_repair_state["done"]`，修复进行中（done=False）→ 拒绝新 apply（返回"已有修复任务进行中"）
 - 验证：py_compile 全绿；bump 3.0.0b22；服务器重启生效
 
 ## [3.0.0b21] - 2026-08-17
-### 修复（修复引擎 35B 不释放 + OOM 崩溃——用户实测抓包）
-- **用户现象链**：①日志"加载成功→复用→卸载"三连但修复秒级完成，S02 没被改②"卸载"打印但 GPU 还在跑③cmd 直接崩溃退出
-- **实锤**：
+### 修复（修复引擎 35B 不释放 + OOM 崩溃——实测抓包）
+- **现象链**：①日志"加载成功→复用→卸载"三连但修复秒级完成，S02 没被改②"卸载"打印但 GPU 还在跑③cmd 直接崩溃退出
+- **确认**：
   1. **假卸载**：`_release_repair_client()` 只置 None + gc——llama_cpp Llama 实例的 `__del__` 依赖 `close()`，引用循环/异常路径下 close 不执行 → 35B 永不释放（实测 python 进程 22.4GB 内存 + 6.5GB 显存残留，直到崩溃后进程退出才释放）
   2. **OOM 崩溃**：修复加载 35B 时 n_ctx 推导到模型原生 262144 → 生成时 KV cache 膨胀 10-30GB（q8_0 ~80KB/token）+ 权重 20GB + 3B 常驻 6GB → 66GB 机器被击穿 → python 被系统杀（b11 同款病根：KV cache 是内存爆放大器）
 - **修复**：
@@ -215,9 +383,9 @@
 - 验证：window_info 显式 n_ctx=16384 生效（read_space=8192）；Llama.close 方法确认存在；py_compile 全绿；服务器重启（日志落盘，便于后续排查）
 
 ## [3.0.0b20] - 2026-08-17
-### 修复（35B 也不常驻——用户纠正"强引用常驻是错的，只需解决同模型不二次加载"）
-- **用户纠正**："为了让 8B/7B 正确用到 GPU，整章完成后应卸载规划/写作模型 → 加载 8B → 4维 → 卸载 → 加载 7B → R1 → 卸载 → 修复时再加载写作模型；写作和规划模型是强引用常驻？我们只要解决规划和写作是同一个模型不二次加载的问题"
-- **实锤**：我 b17-b19 保留的 LLMClient 强引用（35B 常驻）是错的——8GB 显存被 35B 占着，8B/7B 判定模型无法正确用上 GPU；35B 常驻还叠加判定模型内存压力
+### 修复（35B 也不常驻——强引用常驻是错误方向，只需解决同模型不二次加载）
+- **纠正**：整章完成后应卸载规划/写作模型 → 加载 8B 做 4维 → 卸载 → 加载 7B 做 R1 → 卸载 → 修复时再加载写作模型；写作/规划模型不常驻，只需解决同模型不二次加载
+- **确认**：我 b17-b19 保留的 LLMClient 强引用（35B 常驻）是错的——8GB 显存被 35B 占着，8B/7B 判定模型无法正确用上 GPU；35B 常驻还叠加判定模型内存压力
 - **执行链**：批量/章级入口（web_ui 2278 等）函数内创建 writer+planner client 全程复用，函数结束回收——正是"章内常驻、章后卸载"的天然边界
 - **修复**：
   1. `LLMClient._SHARED_LLAMA` 改 **weakref.WeakValueDictionary**——章内规划/写作交替持 client 句柄 → 同一 35B 复用不二次加载；任务结束 client 回收 → 35B 自动卸载（显存让给 8B/7B）
@@ -226,39 +394,39 @@
 - 验证：LLMClient 弱引用单测 5 项全过（规划+写作同模型复用 / client 回收自动卸载 / 下一任务重新加载 / 修复循环内复用 / 修复结束卸载）；_release_repair_client 释放+幂等验证过；四文件 py_compile 全绿；服务器已重启
 
 ## [3.0.0b19] - 2026-08-17
-### 修复（b18 判定模型共享改弱引用——用户追问"测完卸载会不会有影响"）
-- **用户问题**："8B测完了要彻底卸载然后加载7B，完了要彻底卸载，然后加载规划写作之类的模型，虽然缓存了但好像用不上，如果只是冗余就没事，不会造成其他问题吧"
-- **实锤**：**不是冗余，是真问题**——b18 的共享表是**强引用**，8B/7B 加载后常驻进程无法卸载，与"测完彻底卸载"直接冲突（8B~5GB+7B~4GB 堆积，等 35B 20GB+KV 30GB 加载时逼近 63GB 上限，之前实测爆过）
-- **执行链实锤**：`finalize_chapter` 每章调用 `check_4dim`(8B) → `check_reasoning`(7B) 交替，章内串行"测完即卸"——共享缓存对判定模型确实"用不上"（每次都是新加载），用户判断正确
+### 修复（b18 判定模型共享改弱引用——测完卸载是否有影响）
+- **问题**：判定模型测完是否需彻底卸载再加载下一个（8B→7B→规划/写作）；共享缓存对判定模型看似用不上——若仅为冗余无影响，但需确认不引发其他问题
+- **确认**：**不是冗余，是真问题**——b18 的共享表是**强引用**，8B/7B 加载后常驻进程无法卸载，与"测完彻底卸载"直接冲突（8B~5GB+7B~4GB 堆积，等 35B 20GB+KV 30GB 加载时逼近 63GB 上限，之前实测爆过）
+- **执行链确认**：`finalize_chapter` 每章调用 `check_4dim`(8B) → `check_reasoning`(7B) 交替，章内串行"测完即卸"——共享缓存对判定模型确实"用不上"（每次都是新加载），判断正确
 - **修复**：
   1. `model_backend._SHARED_LLAMA` 改 **weakref.WeakValueDictionary**——有强引用才共享（35B 写作/规划 client 持句柄 → 常驻复用），无强引用自动卸载（判定模型局部句柄消失 → 弱引用失效 → 真释放）
   2. 删 `novel_4dim_check._4DIM_HANDLE` global 缓存（b18 加的强引用元凶）——回到"每章加载即卸"
   3. 删 `novel_reasoning_check._LLM/_TOKENIZER` global 缓存（b11 遗留，7B 从不卸载）——同样"测完即卸"
-- **保留**：LLMClient._SHARED_LLAMA（35B）强引用——写作/规划常驻共享是设计目标，用户未要求卸载 35B
+- **保留**：LLMClient._SHARED_LLAMA（35B）强引用——写作/规划常驻共享是设计目标，未要求卸载 35B
 - 验证：弱引用单测 7 项全过（测完即卸表内自动移除 / 下次重新加载 / 持句柄复用 / 双句柄释放表空 / 释放后 get None）；残留引用检查干净；三文件 py_compile 全绿；服务器已重启
 
 ## [3.0.0b18] - 2026-08-17
-### 新增（判定模型共享——用户论点："判定模型更是如此"）
-- **用户论点**：审核判定模型更需要共享——章内审核多次调用反复加载；且判定模型只有固定 8B/7B/3B 三个角色、分阶段执行（4维→fidelity→R1）、judge_n_ctx 统一 → **永远不会有"各开各"的情况，纯共享场景**
-- **现状实锤**：4维 `_load_model` 无缓存 → 每章六检都重新加载 8B（38s+，一本书 N 章 = N 次）；R1 有模块级缓存（`_LLM` global）、fidelity/提取 3B 有缓存（`_EXTRACT_PIPE` global）——8B 是唯一漏网
+### 新增（判定模型共享——判定模型场景更适用）
+- **论点**：审核判定模型更需要共享——章内审核多次调用反复加载；且判定模型只有固定 8B/7B/3B 三个角色、分阶段执行（4维→fidelity→R1）、judge_n_ctx 统一 → **永远不会有"各开各"的情况，纯共享场景**
+- **现状确认**：4维 `_load_model` 无缓存 → 每章六检都重新加载 8B（38s+，一本书 N 章 = N 次）；R1 有模块级缓存（`_LLM` global）、fidelity/提取 3B 有缓存（`_EXTRACT_PIPE` global）——8B 是唯一漏网
 - **实现**：
   1. `model_backend.load_llama` 加进程级共享表 `_SHARED_LLAMA: {规范化path → (Llama实例, n_ctx)}` + threading.Lock——同 path 复用（打印 `复用共享实例`），不同 path 独立；n_ctx 需求更大（判定场景被 clamp 到 16384 后不可能发生）→ 独立加载不覆盖首实例
   2. `novel_4dim_check._load_model` 加模块级缓存 `_4DIM_HANDLE`（与 R1 同款模式）——消除每章重复 judge_backend/路径解析/日志噪音
-- **关键印证**：load_llama 判定模型 n_ctx 硬 clamp `min(n_ctx, 16384)` → 任何 n_ctx 需求（65536/4096）都归一 16384 → 共享表永远命中——**用户"判定模型永不各开各"的论点是代码语义层面的证明，不是巧合**
+- **关键印证**：load_llama 判定模型 n_ctx 硬 clamp `min(n_ctx, 16384)` → 任何 n_ctx 需求（65536/4096）都归一 16384 → 共享表永远命中——**"判定模型永不各开各"的论点是代码语义层面的证明，不是巧合**
 - 验证：单测 11 项全过（同 path 只实例化 1 次 / 不同 path 独立 / 第 3 次复用 / 65536 需求 clamp 后复用 / 4096 复用 / 连续 5 次调用仍 1 实例 / 4维 第二次调用走缓存不重载）；py_compile 全绿；服务器已重启
 
 ## [3.0.0b17] - 2026-08-17
-### 新增（llama.cpp 实例进程级共享——用户设计）
-- **用户现象**：`[llama] 加载成功` 日志出现两次，n_gpu_layers=9 和 1——同一 35B 被加载两份
+### 新增（llama.cpp 实例进程级共享）
+- **现象**：`[llama] 加载成功` 日志出现两次，n_gpu_layers=9 和 1——同一 35B 被加载两份
 - **根因**：`planner_model` 与 `writer_model` 都配了同一 GGUF 且都是 llama.cpp → `_create_planner_client` / `_create_writer_client` 两个独立 LLMClient 各缓存各的实例（`self._llama` 实例级）→ 20GB 模型驻留两份（修复引擎 `_REPAIR_CLIENT` 也读 writer 配置，跑 llama 时第三份）；n_gpu_layers 不同是因为 `_estimate_gpu_layers` 按当前可用显存实时估算，第二次加载时第一个实例已占显存 → 只剩 1 层
-- **用户铁律**：相同模型可以只加载一次；**不同模型必须分开加载**
+- **铁律**：相同模型可以只加载一次；**不同模型必须分开加载**
 - **实现**：`LLMClient` 类级共享表 `_SHARED_LLAMA: {规范化模型路径 → (Llama 实例, n_ctx)}` + `threading.Lock` 双重保护；`_llama_instance` 先查共享表——命中且需求 n_ctx ≤ 共享实例 → 复用（打印 `[llama] 复用共享实例`）；需求更大（罕见，显式配置大窗口）→ 独立加载且不覆盖首实例；未命中 → 正常加载并写表。不同模型路径 → 天然独立实例
 - 验证：单测 11 场景全过（同模型两 client 只实例化 1 次且同实例 / 不同模型分开 / 第三 client 复用 / 需求更小复用、更大独立且不覆盖首实例 / 后续大需求独立）；py_compile 全绿；服务器已重启
 
 ## [3.0.0b16] - 2026-08-17
-### 修复（修复面板 HARD/SOFT 过滤的 3 个 bug——用户实测抓包）
-- **用户现象 1**：勾选框点击后视觉状态不消失（取消勾选后仍显示打勾）
-- **用户现象 2**：HARD/SOFT 像互斥开关——点 SOFT 后所有子结构下的问题全消失，但子结构本身不消失且全部打√；点 HARD 又"恢复最初"
+### 修复（修复面板 HARD/SOFT 过滤的 3 个 bug——实测抓包）
+- **现象 1**：勾选框点击后视觉状态不消失（取消勾选后仍显示打勾）
+- **现象 2**：HARD/SOFT 像互斥开关——点 SOFT 后所有子结构下的问题全消失，但子结构本身不消失且全部打√；点 HARD 又"恢复最初"
 - **根因**：
   1. `renderRepairBody` 重建 `panel.innerHTML` 时 HARD/SOFT 勾选框 `checked` 硬编码 true → 每次 onchange 重渲染后视觉永远恢复打勾（现象 1）
   2. `(pv.files || []).forEach(...)` 无条件初始化所有子结构 → 级别过滤后无问题的子结构仍显示且带 √，违反"完全隐藏"设计（现象 2 前半）
@@ -267,8 +435,8 @@
 - 验证：node 单测 11 场景全过（全 SOFT 只勾 HARD → 0 子结构显示占位；混合只勾 HARD → 无 HARD 的子结构隐藏；T0 末行行不参与聚合）；真实 preview 数据（22 issues）验证——只勾 HARD 仅显示 S02、其余 3 个全隐藏；py_compile 全绿；服务器已重启
 
 ## [3.0.0b15] - 2026-08-17
-### 新增（修复面板 HARD/SOFT 级别过滤——用户设计）
-- **用户需求**：修复面板只有子结构勾选不够——需 HARD/SOFT 级别勾选。都勾 = 现状（所有检出作为子结构备选）；只勾一个 = 过滤掉未勾选级别的问题，**未勾选级别的问题子结构完全隐藏**（防错误勾选：全 SOFT 子结构在只修 HARD 时直接消失）
+### 新增（修复面板 HARD/SOFT 级别过滤）
+- **需求**：修复面板只有子结构勾选不够——需 HARD/SOFT 级别勾选。都勾 = 现状（所有检出作为子结构备选）；只勾一个 = 过滤掉未勾选级别的问题，**未勾选级别的问题子结构完全隐藏**（防错误勾选：全 SOFT 子结构在只修 HARD 时直接消失）
 - **现状确认**：子结构勾选已生效（前端 rp-check → applyRepair checked_subs → 修复引擎 `seg_map = {k: v for k, v in seg_map.items() if k in checked_subs}` 只重构勾选文件）
 - **实现**：`renderRepairPreview` 拆分出 `renderRepairBody()`（preview 数据缓存 `_repairPv`，级别过滤重渲染复用）；面板加 HARD/SOFT 两个 checkbox（默认勾，onchange 重渲染）；过滤规则 `[HARD]`/`[FAIL]` 归 HARD、`[SOFT]`/`[WARN]` 归 SOFT，未勾选级别整行滤掉 → 全隐藏该级别子结构；显示当前子结构数
 - **坑**：前端正则初版用 `^\[(HARD|...)\]`（锚定行首），但 preview 实际格式是 `S01.txt: [HARD] problem`（severity 在文件名后）——非锚定 `\[(HARD|...)\]` 才对；单测用错格式（凭空加缩进）误报逻辑错，用真实格式验证全对
@@ -276,7 +444,7 @@
 
 ## [3.0.0b14] - 2026-08-17
 ### 修复（n_gpu_layers=-1 触发 VMM 慢路径——加载 200s+ 的元凶）
-- **用户抓包**：实测 35B 加载 269s/211s（"加载 5 分钟"），追问根因
+- **实测**：实测 35B 加载 269s/211s（"加载 5 分钟"），追问根因
 - **根因**：`n_gpu_layers=-1`（全 GPU）在放不下的模型（35B 19.7GB > 8GB 显存）上**不会 OOM 失败**——llama.cpp 0.3.34 用 VMM（虚拟内存管理）把权重硬映射进显存，放不下的溢出到系统内存 → 加载 200s+ 且溢出层实际仍 CPU 算。项目代码 `layers_try=[-1]` 第一个就试 -1 → 35B 必中慢路径
 - **顺带发现**：估算层数=0 的场景（显存被 LM Studio 占满）→ 35B 纯 CPU 跑 → 这是"GPU 完全不占用"的真因（nvidia-smi 91% 是 LM Studio 自己在跑写作）
 - **修复**：llm_client `_llama_instance` + model_backend `load_llama`——模型放得下全 GPU（估算层数 ≥ 总层数）才试 -1；放不下 → 跳过 -1 直接用估算层数；估算失败 → 纯 CPU
@@ -284,7 +452,7 @@
 
 ## [3.0.0b13] - 2026-08-17
 ### 修复（GPU 层数估算计入 KV cache + KV 量化 flash_attn 路径）
-- **背景**：用户观察"CPU 满载、GPU 12% 出力不足"——partial offload 串行（GPU 层算完等 CPU 层）是架构固有；但 `_estimate_gpu_layers` 只留 1GB KV 预算，实际 n_ctx=262K 时 KV cache 占显存 6.8GB（实测 1B 全 GPU：n_ctx 1024→8192 显存差 516MB ≫ 理论 56MB——KV 在显存实锤）→ 层数估算虚高
+- **背景**：观测到"CPU 满载、GPU 12% 出力不足"——partial offload 串行（GPU 层算完等 CPU 层）是架构固有；但 `_estimate_gpu_layers` 只留 1GB KV 预算，实际 n_ctx=262K 时 KV cache 占显存 6.8GB（实测 1B 全 GPU：n_ctx 1024→8192 显存差 516MB ≫ 理论 56MB——KV 在显存确认）→ 层数估算虚高
 - **C 修复**：`_estimate_gpu_layers(model_path, n_ctx=0)` 两处（llm_client + model_backend）——KV cache 显存按层比例分摊计入（`n_ctx × KV每token / 总层数`）；n_ctx=0 兼容旧调用；调用点传 n_ctx
 - **B 修复（关键发现：flash_attn 路径支持 KV 量化）**：默认 attention 路径 type_k=8（Q8_0）报 `SET_ROWS 无法在 CUDA buffer 运行`（0.3.34 CUDA 后端限制）；但 **`flash_attn=True` 绕开该限制，Q8_0 KV 量化完全可用**——实测 1B 全 GPU：fp16 KV +2141MB vs flash+Q8_0 +1729MB，**省 412MB**；部分 offload（12 层 GPU）+ flash + Q8_0 加载成功、推理正常
 - **落地**：两处 Llama 加载（llm_client `_llama_instance` + model_backend `load_llama`）加 `flash_attn=True, type_k=8, type_v=8`；C 估算 KV 系数 0.5（q8_0 减半）。效果：35B n_ctx=262K → 7 层（fp16 虚高不计）→ **9 层（q8_0 减半后回升）**
@@ -293,7 +461,7 @@
 
 ## [3.0.0b12] - 2026-08-17
 ### 新增（窗口 = 内存动态 + 判定模型 max_tokens 定稿）
-- **规划/写作模型窗口（用户定稿规矩）**：`n_ctx = min(模型原生窗口, 内存可容纳窗口)`——内存可容纳 = (可用物理内存 × 0.8 − 模型权重) ÷ KV每token（安全系数 0.8 用户拍板）；读 = n_ctx − max_tokens。**用"可用内存"做基数**（物理总内存算 35B 会得出 384K > 原生 262K，min 后等于没限制——正是要防的"莽原生"）；内存紧张时窗口自动缩小（模拟 28GB 可用 → 35B n_ctx=35K 防爆）
+- **规划/写作模型窗口（定稿规矩）**：`n_ctx = min(模型原生窗口, 内存可容纳窗口)`——内存可容纳 = (可用物理内存 × 0.8 − 模型权重) ÷ KV每token（安全系数 0.8 拍板）；读 = n_ctx − max_tokens。**用"可用内存"做基数**（物理总内存算 35B 会得出 384K > 原生 262K，min 后等于没限制——正是要防的"莽原生"）；内存紧张时窗口自动缩小（模拟 28GB 可用 → 35B n_ctx=35K 防爆）
 - **KV 每 token 实算**：GGUF 元数据 `2 × 层数 × KV头 × head_dim × 2字节(fp16)`（35B → 80KB/token，与实测 256K≈35GB 吻合）；元数据一次性读入缓存（35B 19.7GB 文件首次 9.6s，缓存后 0s）
 - **判定模型 max_tokens 定稿**：4维判定 512→**1024**；忠实度复核 256→**1024**（llama 后端也用 8B，3B 只做提取）；R1 推理审核 4096→**8192**（R1 思考链 1-3K + JSON 5 维，4096 偏紧）；judge_n_ctx 固定 16384 不动态
 - **Qwen3-8B 关思考**：llama.cpp 后端（Qwen3 默认思考模式会吞输出 token）4维/fidelity 判定注入 `/no_think`——transformers 3B 无思考概念不注入
@@ -303,7 +471,7 @@
 ## [3.0.0b11] - 2026-08-17
 ### 新增（判定模型双后端：llama.cpp / transformers，配置驱动）
 - **背景**：Qwen2.5-3B 判不了"叙事目的/起承转合"抽象标准（实测 22→8 条仍伪问题为主）；换 Qwen3-8B 但 Python 3.14 装不了 llama-cpp-python（无预编译 wheel），3.11 可装——催生双后端
-- **路由矩阵（用户定稿）**：A = Python 3.10~3.11 存在（llama.cpp 选项出现的唯一条件）；B = 用户勾选"统一管理"（仅 A 真时可勾选，写作规划与审查判定统一走 llama.cpp）；**审核判定后端 = A ∧ B → llama.cpp（4维: Qwen3-8B Q4_K_M 5GB / R1: DeepSeek-R1-Distill-Qwen-7B Q4 4.4GB），否则 transformers（3B + 1.5B）**
+- **路由矩阵（定稿）**：A = Python 3.10~3.11 存在（llama.cpp 选项出现的唯一条件）；B = 用户勾选"统一管理"（仅 A 真时可勾选，写作规划与审查判定统一走 llama.cpp）；**审核判定后端 = A ∧ B → llama.cpp（4维: Qwen3-8B Q4_K_M 5GB / R1: DeepSeek-R1-Distill-Qwen-7B Q4 4.4GB），否则 transformers（3B + 1.5B）**
 - **model_backend.py（新）**：`detect_llamacpp()`（版本区间+import）、`judge_backend(cfg)`（A∧B 路由）、`list_gguf_models()`（目录扫描）、`load_llama()`（n_gpu_layers=-1 + OOM 降层回退 CPU）、`release()`（del+gc 按需释放——llama.cpp 无运行时自动卸载，显存错峰靠代码管理）、`generate()`（双后端统一生成接口：transformers 句柄=(model,tokenizer) chatml 解码；llama 句柄=Llama 原始补全）
 - **4维/R1 改造**：`_load_model` 先判后端（llama → GGUF 路径；transformers → 现状 3B/1.5B）；`_judge`/`fidelity_judge`/R1 生成全走 `model_backend.generate`；R1 的 pipeline 仅 transformers 后端用，llama 后端直出（Qwen 系认识 chatml）
 - **setup.bat**：py launcher 探测 3.11→3.10（通用，不特例任何环境）→ PYCMD + 幂等装 llama-cpp-python（aliyun 镜像，失败仅 WARN 回退方案 1）
@@ -324,7 +492,7 @@
   - 新增 `onBackendChange(prefix)`：后端切换时设置地址栏 placeholder/title 引导 + 刷新模型列表
 - 验证：`/api/llm/models?backend=llama.cpp&base_url=http://localhost:1234` → `[]`（空，前端显示引导提示不再恢复旧值）
 ### 新增（模型配置"选择即持久化"）
-- **问题**：模型区（后端/地址/模型/参数）改动必须点"保存配置"按钮才写盘——用户切 llama.cpp 配完没点保存，刷新即丢（config 里 planner/writer 仍是 lmstudio + qwen3.5），与 novel_checks 勾选自动保存不一致
+- **问题**：模型区（后端/地址/模型/参数）改动必须点"保存配置"按钮才写盘——切换 llama.cpp 配完未点保存，刷新即丢（config 里 planner/writer 仍是 lmstudio + qwen3.5），与 novel_checks 勾选自动保存不一致
 - **修法**：新增 `autoSaveModelConfig()`（600ms 防抖）——后端 select change（并入 onBackendChange）、地址 change、模型 select change、超时/max_tokens/温度 change 全部自动 POST /api/config，选择即持久化
 - 验证：POST planner/writer = llama.cpp + 本地路径 + GGUF 模型 → config.json 实写成功（backend/base_url/model 全持久化）
 ### 修复（GGUF 下载走 huggingface.co 官方超时 10060）
@@ -334,10 +502,10 @@
 
 ## [3.0.0b10] - 2026-08-17
 ### 修复（章内检测 prompt 哲学：内容一致 → 叙事目的/起承转合）
-- **用户批评**：检测"完全脱离大纲路线发展"，L01 22 条里 21 条是"前后波动"伪问题——4维/R1 的 prompt 用的是"内容一致"哲学（前后平滑/连贯/自然），但文章需要起伏转折，那才叫文章
+- **问题**：检测"完全脱离大纲路线发展"，L01 22 条里 21 条是"前后波动"伪问题——4维/R1 的 prompt 用的是"内容一致"哲学（前后平滑/连贯/自然），但文章需要起伏转折，那才叫文章
 - **只改 prompt 措辞，判定逻辑/结构/流程全不动**（4维 仍 4 布尔维度、R1 仍 5 维 PASS/HARD/SOFT、SOFT 仍进修复面板、回退链不变）
 - **4维（novel_4dim_check.py PROMPT_TPL）**：
-  - **上下文共享 + 判定提示词分隔（用户原始设计还原）**：删掉"每个维度必须独立判断、独立理由，不得影响或引用其他维度"（该句把共享上下文分割成各维各看各的）——改为"下方所有输入为共享上下文（各维度各自摘取的合并），判断任一维度时可参考任意部分（含其他维度摘取的内容）；判定提示词相互独立，但上下文全程共享"。摘取五块（前段尾300/后段头300/后段尾200/规划情绪/角色名字+代称全文上下文）**一字不动**，仅输入标签标注"共享上下文·XX维度摘取"明确各块来源
+  - **上下文共享 + 判定提示词分隔（原始设计还原）**：删掉"每个维度必须独立判断、独立理由，不得影响或引用其他维度"（该句把共享上下文分割成各维各看各的）——改为"下方所有输入为共享上下文（各维度各自摘取的合并），判断任一维度时可参考任意部分（含其他维度摘取的内容）；判定提示词相互独立，但上下文全程共享"。摘取五块（前段尾300/后段头300/后段尾200/规划情绪/角色名字+代称全文上下文）**一字不动**，仅输入标签标注"共享上下文·XX维度摘取"明确各块来源
   - 时间衔接：`无跳变/无矛盾/无倒序` → "时间推进是否有叙事目的（闪回/蒙太奇/跳跃=文学手法允许；无叙事目的的时间断裂或前后事实矛盾=不通过）"
   - 话题过渡：`衔接是否自然连贯` → "话题转折是否服务剧情推进（起承转合/视角切换=正常叙事允许；与剧情无关的游离、丢失前文关键线索=不通过）"
   - 角色承接：删 `情绪不一致=不合理`，保留"自然退场/场景切换/情绪转变=合理；无交代的异常消失=不合理"
@@ -349,8 +517,8 @@
 
 ## [3.0.0b9] - 2026-08-16
 ### 修复（手动/自动模式行为拆分）
-- **b8 缺陷**：手动模式也被套进"自动重检循环"（有问题自动继续 apply + 轮次上限）——违背用户定义
-- **手动模式（无上限，全凭人）**：允许中途点"全部跳过"；点"开始修复" → 修复 → 自动重检一次 → **有问题 → 界面不关，`renderRepairPreview` 刷新为本次问题与勾选**（用户再勾选/跳过/继续点）；无问题 → 关闭界面走下一章。**无重试上限**
+- **b8 缺陷**：手动模式也被套进"自动重检循环"（有问题自动继续 apply + 轮次上限）——违背定义
+- **手动模式（无上限，全凭人）**：允许中途点"全部跳过"；点"开始修复" → 修复 → 自动重检一次 → **有问题 → 界面不关，`renderRepairPreview` 刷新为本次问题与勾选**（再勾选/跳过/继续点）；无问题 → 关闭界面走下一章。**无重试上限**
 - **自动模式（有上限）**：修复 → 重检 → 有问题继续自动全量修复 → 重检 → ... 直到通过或超 `repair_rounds`（默认 3）次
 - **实现**：模块级 `_repairMode`（manual/auto）——自动分支（auto_repair 配置）设 auto，applyRepair/applyFullRepair 设 manual；`triggerRecheck` 按模式分支：manual → 刷新面板，auto → 循环 apply + 轮次判定
 - 渲染抽取：showRepairPanel 的 preview 渲染抽成 `renderRepairPreview(chapter)`（首次弹出 + 手动重检刷新共用）
@@ -359,8 +527,8 @@
 ### 修复（修复面板：删"关闭"文案 + 修复完自动重检循环）
 - **删"关闭"按钮文案**：原成功消息"可点「关闭」后查看，或重新完结章节重检"——用户没有"关闭"按钮（点击外部不关闭），文案自相矛盾；改为"🔄 修复完成：重写 X 段。自动重检中 (N/M)..."
 - **修复完自动重检**：`pollRepairStatus` 拿到 done → 触发 `triggerRecheck`：拉 preview → 有问题 & 未超轮次（默认 3 次，配置 `novel_checks.repair_rounds`）→ 继续 apply → 继续 poll；preview 无问题 → 关闭 modal + 提示"全通过"；超轮次仍有 → 保留 modal 让用户人工处理/全部跳过
-- **统一手动/自动模式**：手动模式也走自动重检循环（用户原话"修复完了不自动重检？"）；配置 auto_repair 仅决定"是否弹面板"（自动模式不弹），不影响自动重检循环
-- **防误触发**：triggerRecheck 检查 modal 未关闭 且 `_repairPanelChapter === chapter`——用户中途点"全部跳过"后不会触发"通过"误判
+- **统一手动/自动模式**：手动模式也走自动重检循环（修复完未自动重检的问题）；配置 auto_repair 仅决定"是否弹面板"（自动模式不弹），不影响自动重检循环
+- **防误触发**：triggerRecheck 检查 modal 未关闭 且 `_repairPanelChapter === chapter`——中途点"全部跳过"后不会触发"通过"误判
 - 轮次计数器模块级 `_autoRecheckRound`，新弹窗重置，超轮次/通过/失败时重置
 
 ## [3.0.0b7] - 2026-08-16
@@ -368,7 +536,7 @@
 - **拍板**："R1 本来就有摘要（detail），多余机制全删，R1 信息当引导给大模型告诉它只修这里"
 - **删除**：R1 prompt 的 `quote` 字段（输出要求/示例/纠错重试）、issue `source_text`、finalize 聚合打印 `|引:` 标记、web_ui source_text 提取与 quotes_map、`_fuzzy_locate`（difflib 模糊定位）、`_build_window_prompt`（窗口输入）——difflib 全项目零残留
 - **R1 修复 = 引导式局部改写**：problem 含"推理审核" → `_build_guided_prompt`（完整正文 + R1 detail 问题描述，writer 自行定位问题句、只改那里、其余逐字保留）→ `_validate_guided`（三行保留 + 输出与原文确有差异）
-- 校验只防"未改写空转"与"三行丢失"——不再用 diff/相似度（用户明确不需要）；writer 是配置的大模型，detail 描述足以定位，重检兜底全文润色风险
+- 校验只防"未改写空转"与"三行丢失"——不再用 diff/相似度（明确不需要）；writer 是配置的大模型，detail 描述足以定位，重检兜底全文润色风险
 - 三检 pledge 的 source_text 路径（_full_repair → src_map，b3 前已有）不受影响，保留
 
 ## [3.0.0b6] - 2026-08-16
@@ -483,7 +651,7 @@
 ### 修复（CLI 写入路径改真原子写，2.3.26b0 之后）
 - **背景**：CLI 路径 `validate_and_write_body`（novel_atomic_writer）是两段式写入——`open(fp,"w")` 写正文 + `open(fp,"a")` 追加末行标记。中断在两步之间 → 文件缺末行标记 → 章检报"末行缺失" HARD
 - **修复**：改为真原子写——组装完整内容（标题/空行/正文/别名/末行一次成型）→ 写 tmp → fsync → `os.replace`，与 `_write_sub_inline` 完全一致；中断只留 .tmp 残留，目标文件要么旧完整版要么新完整版
-- **CLI 保留**（用户明确：有直接调用场景），逻辑与 web 写段统一
+- **CLI 保留**（存在直接调用场景），逻辑与 web 写段统一
 - 验证：CLI 落盘结构 标题/正文/别名/末行 一次成型 ✅；中断残留 tmp 不影响目标文件 ✅
 - 版本 2.3.26b0 → 2.3.27b0
 ### 修复（续写重复重写已写章，2.3.25b0 之后）
@@ -577,7 +745,7 @@
 - **推理审核格式漂移根因修复**（novel_reasoning_check.py）：
   - 根因：prompt 只有一行格式说明、无示例 → R1-1.5B 输出 result 字段填中文/填反（"通过"/"合理"），后端 3 个兜底穷举填错姿势（376/378/382 行）把正面判断猜成 SOFT → 每次审核产生 5 个"通过型 SOFT"噪音
   - 治本：prompt 增加 **few-shot 完整输出示例**（5 维 JSON 数组，含 PASS/SOFT/HARD 三态）→ 模型一次输出正确格式（实测 5/5 漂移 → 一次通过）
-  - 治标改治本：解析失败不再直接标记"审核失败"（用户看不到审核结果）——**打回纠正重试最多 3 次**（把原始输出+错误说明喂回要求重新输出），3 次仍失败才标记「推理审核失败」SOFT（人工可见）
+  - 治标改治本：解析失败不再直接标记"审核失败"（审核结果不可见）——**打回纠正重试最多 3 次**（把原始输出+错误说明喂回要求重新输出），3 次仍失败才标记「推理审核失败」SOFT（人工可见）
   - 解析逻辑抽为 `_parse_reasoning_results()` 独立函数
 - 实测：L02 一次通过，输出 1 HARD（对话匹配度，真问题）+ 1 SOFT（人物行为一致性，模型有意判定），无格式噪音
 
@@ -628,7 +796,7 @@
 
 ## [2.3.8b0] - 2026-08-15
 ### 修复（2.3.7b0 之后）
-- **模型安装改自动下载（去弹窗）**：点击「安装缺失模型」→ 后端后台线程执行 hf-mirror 下载（bge/R1/Qwen2.5-3B 缺失自动装），不再 `alert()` 弹命令让用户手动装；前端内联显示安装进度 + 3s 轮询，模型就绪状态自动变色（用户铁律：不弹消息框）
+- **模型安装改自动下载（去弹窗）**：点击「安装缺失模型」→ 后端后台线程执行 hf-mirror 下载（bge/R1/Qwen2.5-3B 缺失自动装），不再 `alert()` 弹命令手动安装；前端内联显示安装进度 + 3s 轮询，模型就绪状态自动变色（铁律：不弹消息框）
 
 ## [2.3.7b0] - 2026-08-15
 ### 修复（2.3.6b0 之后）
@@ -650,7 +818,7 @@
 
 ## [2.3.4b0] - 2026-08-15
 ### 修复（2.3.3b0 之后）
-- **删除输出文章去掉 confirm 弹窗**：deleteOutput 目录文章删除时，在内联二级确认（✕→确认?/取消）之外还套了浏览器 `confirm()` 弹窗 = 双重确认。移除弹窗，只保留内联二级确认（用户铁律：不弹消息框）
+- **删除输出文章去掉 confirm 弹窗**：deleteOutput 目录文章删除时，在内联二级确认（✕→确认?/取消）之外还套了浏览器 `confirm()` 弹窗 = 双重确认。移除弹窗，只保留内联二级确认（铁律：不弹消息框）
 
 ## [2.3.3b0] - 2026-08-15
 ### 修复（2.3.2b0 之后）
@@ -1047,7 +1215,7 @@
 - **section["show_label"] 无 fallback**：从模板直读 `section["show_label"]`，LLM 输出的节不包含该字段 → planner _normalize_outline 传播 show_label 到所有 section
 - **gen-template 验收逻辑过松**：`result.get("meta") is not None` 通过 `[]`（空数组非 None）→ 改为 `if result.get("meta") or result.get("content")`（truthiness 判断）
 - **saveConfig/confirmSaveAs 表格索引错位**：meta 行 querySelectorAll 返回 3 个元素但代码读 inputs[3]；content 行预期 5 个元素实际 4 个（button 非 input/select）
-- **planner JSON 示例硬编码用户名**：示例值改为通用占位符
+- **planner JSON 示例硬编码真实姓名**：示例值改为通用占位符
 
 ### 新增
 - **style_hint 注入**：`_build_context_section_prompt` 加 `style_hint` 参数，将模板 `style` 注入每节 prompt 作为"写作风格要求"

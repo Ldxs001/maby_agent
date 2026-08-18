@@ -114,6 +114,79 @@ def _load_extract_model():
     return _EXTRACT_PIPE
 
 
+# ── 统一提取生成后端（3B transformers ↔ 8B LM Studio，流程不变：仍一子结构一次） ──
+
+_EXTRACT_LMS_HANDLE = None  # 统一管理勾选时的 8B 句柄（模块级缓存；串行模式提取完由调用方 release）
+
+
+def _load_config() -> dict:
+    """读 config.json 的 novel_checks（unified_management / exclusive_serial）；失败返回空。"""
+    try:
+        import json as _json
+        cfg_path = Path(__file__).resolve().parent.parent.parent / "config.json"
+        if cfg_path.is_file():
+            d = _json.loads(cfg_path.read_text(encoding="utf-8"))
+            return d.get("novel_checks", {}) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _llm_generate(prompt: str) -> str | None:
+    """提取生成统一后端（调用方流程不变，仍是每子结构写完后一次提取）：
+    - 统一管理勾选（novel_checks.unified_management）→ LM Studio 8B（HTTP，GPU/部分 GPU；
+      串行开时由 _release_extract_lms 测完即卸，关时驻留由 LM Studio 调度）
+    - 未勾选 → transformers Qwen2.5-3B（CPU，现状）
+    返回原始文本；模型不可用/失败返回 None（调用方正则兜底）。"""
+    cfg = _load_config()
+    if cfg.get("unified_management", False):
+        global _EXTRACT_LMS_HANDLE
+        try:
+            if _EXTRACT_LMS_HANDLE is None:
+                from model_backend import judge_gguf_paths, make_lms_handle
+                keys = judge_gguf_paths(cfg) or {}
+                key = keys.get("4dim") or ""
+                if key:
+                    _EXTRACT_LMS_HANDLE = make_lms_handle(key, ctx=16384)
+            if _EXTRACT_LMS_HANDLE is not None:
+                from model_backend import generate as _mb_gen
+                return _mb_gen(_EXTRACT_LMS_HANDLE, prompt, max_tokens=EXTRACT_MAX_TOKENS, temperature=0.2) or None
+        except Exception as e:
+            print(f"[extract] LM Studio 8B 提取失败（回退 3B）: {e}")
+            _EXTRACT_LMS_HANDLE = None
+    # transformers Qwen2.5-3B（CPU，现状；不勾统一管理或 8B 失败时）
+    loaded = _load_extract_model()
+    if loaded is None:
+        return None
+    model, tokenizer = loaded
+    import torch
+    chatml = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    model_inputs = tokenizer(chatml, return_tensors="pt")
+    with torch.no_grad():
+        gen_out = model.generate(
+            model_inputs["input_ids"],
+            max_new_tokens=EXTRACT_MAX_TOKENS,
+            do_sample=False,
+            temperature=0.2,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    return tokenizer.decode(gen_out[0][model_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+
+def _release_extract_lms() -> None:
+    """串行模式：三个提取器全部完成后释放 8B 句柄（lms unload），显存让给 35B 继续写作。
+
+    并行模式（exclusive_serial=False）不调用——8B 驻留，LM Studio 自行调度。"""
+    global _EXTRACT_LMS_HANDLE
+    if _EXTRACT_LMS_HANDLE is not None:
+        try:
+            from model_backend import release as _mb_rel
+            _mb_rel(_EXTRACT_LMS_HANDLE)
+        except Exception:
+            pass
+        _EXTRACT_LMS_HANDLE = None
+
+
 # ── 清洗 / 注册 ──
 
 def _sanitize_legacy(entities: list) -> list:
@@ -218,14 +291,13 @@ def _extract_json(text: str) -> dict | None:
 
 
 def _extract_llm(content: str, char_hint: str) -> dict | None:
-    """Qwen2.5-3B 抽取 {entities, relations, status_changes}；失败返回 None。
+    """抽取 {entities, relations, status_changes}；失败返回 None。
+    统一后端：统一管理勾选 → 8B LM Studio；未勾选 → Qwen2.5-3B transformers——
+    模型加载统一在 _llm_generate 内部（b18：删除残留的 _load_extract_model 前置检查——
+    unified 下每次提取先加载 3B 常驻内存却从不做功，8B 才真正干活）。
 
     v2.3.22b0：few-shot 示例（治本）+ 打回重试最多 3 次（偶发格式漂移兜底）+ WARN 打印原始输出。
     """
-    loaded = _load_extract_model()
-    if loaded is None:
-        return None
-    model, tokenizer = loaded
     prompt = (
         "你是小说实体关系抽取引擎。从正文中抽取有意义的实体和关系，只输出一个 JSON 对象，"
         "不要任何解释、不要思考过程、不要 markdown 围栏。\n"
@@ -247,20 +319,8 @@ def _extract_llm(content: str, char_hint: str) -> dict | None:
     last_raw = ""
     for attempt in range(1, 4):  # 最多 3 次（第 1 次原始 prompt，第 2-3 次带纠错提示）
         try:
-            # 走 ChatML（Qwen2 系标准格式） + model.generate：
-            # 不用 pipeline（generation_config 混传导致 max_length=20 生效/BPE 后处理清空输出，实测空输出 288s）
-            # 不用 apply_chat_template（本地 Qwen2.5-3B-Instruct 的 tokenizer.chat_template 缺失）
-            chatml = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-            model_inputs = tokenizer(chatml, return_tensors="pt")
-            with torch.no_grad():
-                gen_out = model.generate(
-                    model_inputs["input_ids"],
-                    max_new_tokens=EXTRACT_MAX_TOKENS,
-                    do_sample=False,
-                    temperature=0.2,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            raw = tokenizer.decode(gen_out[0][model_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            # 统一生成后端：统一管理勾选 → 8B LM Studio；未勾选 → 3B transformers（ChatML 内部处理）
+            raw = _llm_generate(prompt) or ""
             last_raw = raw
             result = _extract_json(raw)
             if result is not None:

@@ -23,6 +23,7 @@ import json
 import sys
 import urllib.request
 import urllib.error
+from contextlib import contextmanager
 from pathlib import Path
 
 # 双兼容导入：包方式（web_ui 内）与顶层方式（4dim/reasoning 的 sys.path + from model_backend）
@@ -184,6 +185,68 @@ def lms_generate(model_key: str, prompt: str, max_tokens: int = 512,
     return ""
 
 
+# ── 模型装载/卸载调度（统一管理：一次一个模型，阶段级切换） ──────────
+
+def model_key_from_cfg(model_cfg: dict | None, backend: str = "lmstudio") -> str:
+    """从规划/写作模型配置取 LM Studio key：profiles[backend].model > 顶层 model。
+
+    非 lmstudio 后端（ollama 等）→ 返回 ""（不参与 lms 调度）。
+    """
+    model_cfg = model_cfg or {}
+    if (model_cfg.get("backend") or "lmstudio") != "lmstudio":
+        return ""
+    prof = (model_cfg.get("profiles") or {}).get(backend) or {}
+    return str(prof.get("model") or model_cfg.get("model") or "").strip()
+
+
+def lms_ensure_loaded(model_key: str, ctx: int | None = None, ttl: int | None = 120) -> tuple[bool, str]:
+    """幂等加载：已加载则跳过，未加载才 lms load。
+
+    LM Studio 重复 lms load 同一模型会生成副本（qwen3-8b:2）双倍占显存/内存——
+    串行调度（写章/修复循环）必须走幂等入口，先 lms_ps 探测再决定。
+    """
+    if not model_key:
+        return True, "empty-key"
+    try:
+        ok, out = lmstudio_probe.lms_ps(timeout=30)
+        if ok and model_key in out:
+            return True, "already-loaded"
+    except Exception:
+        pass
+    return lmstudio_probe.lms_load(model_key, gpu="max", ctx=ctx, ttl=ttl)
+
+
+@contextmanager
+def lms_session(model_key: str, ctx: int | None = None, ttl: int | None = 120,
+                unload_on_exit: bool = True):
+    """模型装载 → 使用 → （可选）卸载（阶段级调度；异常也卸载）。
+
+    两套机制（novel_checks.exclusive_serial 开关）：
+      - 独占串行（默认 True）：unload_on_exit=True → 用完立即 lms unload，一次只驻留一个模型，
+        显存永远够下一个模型加载（防 8B/7B 叠加被 CPU offload）。
+      - 并行（False）：unload_on_exit=False → 只加载不卸载（模型常驻），适合显存充足的硬件
+        （多模型随时可并行推理）。
+    装载用 lms_ensure_loaded 幂等（防 :2 副本）。model_key 为空 → 空跑。
+    """
+    if not model_key:
+        yield
+        return
+    ok, msg = lms_ensure_loaded(model_key, ctx=ctx, ttl=ttl)
+    if not ok:
+        print(f"[lms-sched] 装载失败 {model_key}: {msg[:120]}（继续，HTTP 调用自会报错/回退）")
+        yield
+        return
+    print(f"[lms-sched] 装载: {model_key}")
+    try:
+        yield
+    finally:
+        if unload_on_exit:
+            lmstudio_probe.lms_unload(model_key, timeout=60)
+            print(f"[lms-sched] 卸载: {model_key}")
+        else:
+            print(f"[lms-sched] 驻留（并行模式，不卸载）: {model_key}")
+
+
 def make_lms_handle(model_key: str, ctx: int | None = None, ttl: int | None = 120):
     """LM Studio 生成句柄（可调用，兼容 generate() 统一调用面）。
 
@@ -192,7 +255,7 @@ def make_lms_handle(model_key: str, ctx: int | None = None, ttl: int | None = 12
     """
     if not model_key:
         return None
-    ok, msg = lmstudio_probe.lms_load(model_key, gpu="max", ctx=ctx, ttl=ttl)
+    ok, msg = lms_ensure_loaded(model_key, ctx=ctx, ttl=ttl)
     if not ok:
         print(f"[lmstudio] lms load 失败（{model_key}）: {msg[:120]}")
         return None

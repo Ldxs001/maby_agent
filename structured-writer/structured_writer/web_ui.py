@@ -432,14 +432,21 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         client = self._create_planner_client()
 
         try:
-            # 兼容旧调用：如果有 meta/content 字段就走新方式
-            if isinstance(template, dict) and (template.get("meta") is not None or template.get("content") is not None):
-                outline = plan_outline(topic, template=template, user_meta=user_meta, llm_client=client, plan_hints=plan_hints)
-            elif isinstance(template, dict) and (template.get("meta") or template.get("content") or template.get("structure")):
-                outline = plan_outline(topic, template=template, user_meta=user_meta, llm_client=client, plan_hints=plan_hints)
-            else:
-                style = template if isinstance(template, str) else ""
-                outline = plan_outline(topic, template=style or prompt, llm_client=client)
+            # 统一管理：规划模型装载 → 规划 → 卸载（一次一个模型；ollama/非 lmstudio 空跑）
+            # 独占串行开（默认）：规划完即卸载（规划/写作同模型也严格两步）；关：加载常驻不卸
+            _nc_plan = self.config_mgr.get("novel_checks", {}) or {}
+            # 独占串行只在统一管理勾选时生效（不勾 → 3B/1.5B transformers，无 GPU 模型可串行）
+            _serial_plan = bool(_nc_plan.get("exclusive_serial", True) and _nc_plan.get("unified_management", False))
+            from .novel.model_backend import model_key_from_cfg, lms_session
+            with lms_session(model_key_from_cfg(self.config_mgr.get("planner_model", {})), unload_on_exit=_serial_plan):
+                # 兼容旧调用：如果有 meta/content 字段就走新方式
+                if isinstance(template, dict) and (template.get("meta") is not None or template.get("content") is not None):
+                    outline = plan_outline(topic, template=template, user_meta=user_meta, llm_client=client, plan_hints=plan_hints)
+                elif isinstance(template, dict) and (template.get("meta") or template.get("content") or template.get("structure")):
+                    outline = plan_outline(topic, template=template, user_meta=user_meta, llm_client=client, plan_hints=plan_hints)
+                else:
+                    style = template if isinstance(template, str) else ""
+                    outline = plan_outline(topic, template=style or prompt, llm_client=client)
         except (ValueError, LLMClientError) as e:
             self._json_response({"success": False, "error": str(e)}, 500)
             return
@@ -636,20 +643,46 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                 def _stop_check():
                     with _stop_lock:
                         return _stop_flags.get(sid)
-                md_content, output_path = generate_article(
-                    outline=outline,
-                    user_orders=orders,
-                    rag_options=rag_opt,
-                    llm_client=llm_cli,
-                    state_mgr=local_sm,
-                    rag_client=rag_client,
-                    aux_knowledge=aux_kn,
-                    fact_check_enabled=fc_enabled,
-                    context_review_length=ctx_len,
-                    stop_check=_stop_check,
-                    template=tmpl,
-                    citation_config=cit_cfg
-                )
+                # 统一管理：写作模型装载 → 写全文 → 卸载（ollama/非 lmstudio 空跑）
+                # 独占串行开（默认）：不在此包 35B——novel_writer 内部章级调度（写章加载→章检前卸载→8B/7B 判定）
+                # 关（并行）：加载常驻不卸载，整本写作期间模型保持可用
+                _nc_write = self.config_mgr.get("novel_checks", {}) or {}
+                # 独占串行只在统一管理勾选时生效（不勾 → 判定 transformers，无 GPU 竞争 → 35B 常驻）
+                _serial_write = bool(_nc_write.get("exclusive_serial", True) and _nc_write.get("unified_management", False))
+                from .novel.model_backend import model_key_from_cfg
+                _wkey = model_key_from_cfg(self.config_mgr.get("writer_model", {}))
+                if _serial_write:
+                    md_content, output_path = generate_article(
+                        outline=outline,
+                        user_orders=orders,
+                        rag_options=rag_opt,
+                        llm_client=llm_cli,
+                        state_mgr=local_sm,
+                        rag_client=rag_client,
+                        aux_knowledge=aux_kn,
+                        fact_check_enabled=fc_enabled,
+                        context_review_length=ctx_len,
+                        stop_check=_stop_check,
+                        template=tmpl,
+                        citation_config=cit_cfg
+                    )
+                else:
+                    from .novel.model_backend import lms_session
+                    with lms_session(_wkey, unload_on_exit=False):
+                        md_content, output_path = generate_article(
+                            outline=outline,
+                            user_orders=orders,
+                            rag_options=rag_opt,
+                            llm_client=llm_cli,
+                            state_mgr=local_sm,
+                            rag_client=rag_client,
+                            aux_knowledge=aux_kn,
+                            fact_check_enabled=fc_enabled,
+                            context_review_length=ctx_len,
+                            stop_check=_stop_check,
+                            template=tmpl,
+                            citation_config=cit_cfg
+                        )
                 result["success"] = True
                 result["output_file"] = output_path
                 result["content"] = md_content[:8000] + ("...(截断) 完整文件见" + output_path if len(md_content) > 8000 else "")
@@ -1390,7 +1423,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
     def _handle_novel_checks(self):
         data = self._read_body()
         cfg = {}
-        for k in ("chapter", "format", "reason", "full", "full_fidelity", "full_pledge", "full_ending", "auto_repair", "unified_management"):
+        for k in ("chapter", "format", "reason", "full", "full_fidelity", "full_pledge", "full_ending", "auto_repair", "unified_management", "exclusive_serial"):
             if k in data:
                 cfg[k] = bool(data.get(k))
         for k in ("gguf_4dim", "gguf_r1"):
@@ -1644,6 +1677,19 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         hints = sm.get_repair_hints()
         hint = hints.get(chapter, {}) or {}
         structured = self._parse_hint_issues(hint.get("issues") or [], hint.get("output", ""))
+        # 三检修复项（full_items）并入 issues——历史 bug：reng.run 只消费章检 issues，
+        # 三检项（fidelity/pledge/ending）被静默丢弃 → 勾选三检修复 → 35B 装载 → seg_map 空 →
+        # 一个 token 不吐就卸载 → 重检 verify_ending 碰运气通过，正文根本没改（用户实锤"修的啥"）
+        full_items = hint.get("full_items") or []
+        for it in full_items:
+            if not it.get("sub"):
+                continue
+            structured.append({
+                "file": str(it["sub"]) + ".txt",
+                "problem": str(it.get("problem") or "三检问题"),
+                "desc": str(it.get("problem") or "三检问题"),
+                "severity": "HARD",
+            })
         if not structured:
             self._json_response({"success": False, "error": "该章无可用检查输出"}, 400)
             return
@@ -1651,9 +1697,28 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         # 后台线程执行（T1 重构慢）
         def _run():
             try:
-                rep = reng.run(state_path, chapter_dir, chapter, structured,
-                               mode=mode, config_mgr=self.config_mgr,
-                               checked_subs=checked, repair_types=repair_types)
+                # 统一管理：修复用写作模型装载 → 修复 → 卸载（ollama/非 lmstudio 空跑）
+                # 独占串行开（默认）：修复完即卸载；关（并行）：加载常驻不卸
+                _nc_rep = self.config_mgr.get("novel_checks", {}) or {}
+                # 独占串行只在统一管理勾选时生效（不勾 → 3B/1.5B，无 GPU 模型可串行）
+                _serial_rep = bool(_nc_rep.get("exclusive_serial", True) and _nc_rep.get("unified_management", False))
+                from .novel.model_backend import model_key_from_cfg, lms_session
+                with lms_session(model_key_from_cfg(self.config_mgr.get("writer_model", {})), unload_on_exit=_serial_rep):
+                    rep = reng.run(state_path, chapter_dir, chapter, structured,
+                                   mode=mode, config_mgr=self.config_mgr,
+                                   checked_subs=checked, repair_types=repair_types)
+                # 串行明确步骤：35B 已卸载（with 退出）→ 重构段实体/时间线同步（8B 提取真 GPU——
+                # 若在 35B 驻留窗口内跑，8B 会被 LM Studio CPU offload）
+                try:
+                    from .novel.novel_repair_engine import sync_after_rewrite as _sync_rewrite
+                    for _x in (rep.get("t1") or {}).get("results") or []:
+                        if _x.get("status") == "rewritten" and _x.get("file"):
+                            try:
+                                _sync_rewrite(state_path, chapter_dir, _x["file"])
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 # 标记该章修复结果（含三检当场重检）——done 在重检完成后才置 True，
                 # 前端轮询在重检期间持续显示"修复中"（用户勾选即默认承担重检成本）
                 try:
@@ -3540,11 +3605,13 @@ body {
         <div class="form-row">
           <label>操作</label>
           <button class="btn btn-secondary btn-sm" id="novel-install-btn" onclick="installNovelModels()">安装缺失模型</button>
-          <span style="font-size:11px;color:var(--text-dim)">transformers 方案：R1 约3.7GB / Qwen2.5-3B 约1.9GB；LM Studio 方案（统一勾选）：8B+7B GGUF 约9.4GB（自动下载进 LM Studio 模型库）+ 3B。走镜像源；无模型时自动降级：4维 缺失 → 回退规则连通性+逻辑检查；抽取缺失 → 正则兜底提取；R1 缺失 → 跳过</span>
+          <span style="font-size:11px;color:var(--text-dim)">transformers 方案：R1 约3.7GB / Qwen2.5-3B 约1.9GB；LM Studio 方案（统一勾选）：8B+7B GGUF 约9.4GB（自动下载进 LM Studio 模型库；判定+提取全走 8B/7B，无需 3B）。走镜像源；无模型时自动降级：4维 缺失 → 回退规则连通性+逻辑检查；抽取缺失 → 正则兜底提取；R1 缺失 → 跳过</span>
         </div>
         <div class="form-row">
           <label>判定后端</label>
           <label style="font-size:12px;cursor:pointer" title="统一管理 = 写作规划与审查判定统一走 LM Studio（lms load 进 GPU，显存错峰共用）：判定模型切换为 8B+7B。勾选 → 8B/7B 走 LM Studio GPU；未勾选 → 判定固定 transformers 3B+1.5B。写作后端为 Ollama 时不适用（Ollama 未接入判定联动）。判定窗口固定 16384（lms load -c，覆盖 4维~3K / R1~13K）"><input type="checkbox" id="novel-chk-unified" onchange="saveNovelChecks()"> 统一管理（LM Studio 判定 8B+7B）</label>
+          <label style="font-size:12px;cursor:pointer;margin-left:10px" title="独占串行 = 一次只驻留一个模型，用完即卸载（写作 35B → 章检前卸载 → 8B 判定 → 卸载 → 7B 审核 → 卸载 → 下一章写作再加载）。保证 8B/7B 判定真正吃到 GPU（实测：35B 常驻时 8B/7B 会被 LM Studio 降级到 CPU，慢 5-8 倍）。⚠️ 关闭本功能请先确认硬件足够——关闭后模型加载常驻不卸载，多模型同时驻留需大显存/大内存"><input type="checkbox" id="novel-chk-serial" onchange="saveNovelChecks()"> 独占串行（一次一模型，用完即卸）</label>
+          <span id="novel-serial-warn" style="display:none;color:#e67e22;font-size:11px;margin-left:8px">⚠️ 关闭独占串行：建议将 max concurrency 设置为 ≥2（多模型常驻可并行推理）</span>
           <span id="novel-judge-backend" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
         </div>
         <div class="form-row" id="novel-gguf-row" style="display:none">
@@ -4552,7 +4619,7 @@ async function checkNovelModels() {
       parts.push('<span style="color:#2ecc71">判定后端: LM Studio（统一）</span>');
       parts.push(gg['4dim_ready'] ? '<span style="color:#2ecc71">8B 就绪</span>' : '<span style="color:#e94560">8B 缺失</span>');
       parts.push(gg['r1_ready'] ? '<span style="color:#2ecc71">7B 就绪</span>' : '<span style="color:#e94560">7B 缺失</span>');
-      parts.push(d.qwen25 ? '<span style="color:#2ecc71">3B(抽取) 就绪</span>' : '<span style="color:#e94560">3B(抽取) 缺失</span>');
+      parts.push('<span style="color:var(--text-dim)">提取: 8B（统一管理下无需 3B）</span>');
     } else {
       if (d.r1) parts.push('<span style="color:#2ecc71">推理R1 就绪</span>');
       else parts.push('<span style="color:#e94560">推理R1 缺失</span>');
@@ -4610,6 +4677,17 @@ async function checkNovelModels() {
         const v = d.config[k] !== undefined ? d.config[k] : d.config.full;
         if (el && v !== undefined) el.checked = !!v;
       });
+      // 独占串行：默认开（True）；旧配置无此字段 → 按默认 True 勾选
+      const serialEl = document.getElementById('novel-chk-serial');
+      if (serialEl) serialEl.checked = d.config.exclusive_serial !== undefined ? !!d.config.exclusive_serial : true;
+      // 独占串行依赖统一管理：统一管理不勾 → 串行禁用（3B/1.5B 无 GPU 模型可串行）
+      if (serialEl && unifiedEl) {
+        serialEl.disabled = !unifiedEl.checked;
+        if (!unifiedEl.checked) serialEl.checked = false;
+      }
+      // 关闭独占串行 → 显示 max concurrency 提醒（仅此时提醒，串行模式无并发）
+      const serialWarn = document.getElementById('novel-serial-warn');
+      if (serialWarn && serialEl) serialWarn.style.display = serialEl.checked ? 'none' : '';
       const roundsEl = document.getElementById('novel-chk-rounds');
       if (roundsEl && d.config.repair_rounds) roundsEl.value = d.config.repair_rounds;
     }
@@ -4652,6 +4730,13 @@ async function installNovelModels() {
 async function saveNovelChecks() {
   const roundsEl = document.getElementById('novel-chk-rounds');
   const unifiedEl = document.getElementById('novel-chk-unified');
+  const serialEl = document.getElementById('novel-chk-serial');
+  // 独占串行依赖统一管理：统一管理不勾 → 串行禁用且不生效（3B/1.5B 无 GPU 模型可串行）
+  const unifiedOn = unifiedEl ? !!unifiedEl.checked : false;
+  if (serialEl) {
+    serialEl.disabled = !unifiedOn;
+    if (!unifiedOn) serialEl.checked = false;
+  }
   const cfg = {
     chapter: !!document.getElementById('novel-chk-chapter').checked,
     format: !!document.getElementById('novel-chk-format').checked,
@@ -4660,10 +4745,14 @@ async function saveNovelChecks() {
     full_pledge: !!document.getElementById('novel-chk-pledge').checked,
     full_ending: !!document.getElementById('novel-chk-ending').checked,
     auto_repair: !!document.getElementById('novel-chk-autorepair').checked,
-    unified_management: unifiedEl ? !!unifiedEl.checked : false,
+    unified_management: unifiedOn,
+    exclusive_serial: serialEl ? (unifiedOn && serialEl.checked) : false,
     repair_rounds: roundsEl ? (parseInt(roundsEl.value) || 3) : 3
   };
   novelChecksConfig = cfg;
+  // 关闭独占串行 → 显示 max concurrency 提醒（仅此时；串行模式一次一模型无并发）
+  const serialWarn = document.getElementById('novel-serial-warn');
+  if (serialWarn) serialWarn.style.display = cfg.exclusive_serial ? 'none' : '';
   try {
     await fetch('/api/novel/checks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)});
   } catch(e) { console.error('保存小说质检开关失败', e); }

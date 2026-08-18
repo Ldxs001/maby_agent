@@ -188,22 +188,25 @@ def _release_repair_client() -> None:
 
 def _build_rewrite_prompt(original: str, title_line: str, alias_line: str, tail_marker: str,
                           plan: dict, prev_tail: str, next_head: str, problems: list,
-                          repair_type: str = "", source_text: str = "") -> str:
+                          repair_type: str = "", source_text: str = "",
+                          writing_ctx: str = "") -> str:
     """整段重构契约 prompt（v0.3 设计 4.1 节）。repair_type 支持三检类型化修复：
-    fidelity（正文兑现概述承诺）/ pledge（移除悬置承诺+平滑衔接）/ ending（收尾类型符合规划）。"""
+    fidelity（正文兑现概述承诺）/ pledge（移除悬置承诺+平滑衔接）/ ending（收尾类型符合规划）。
+    writing_ctx：该段写作上下文（角色/人格/情绪/视角强制/命题框）——重构必须遵守原文分类约束。"""
     original_wc = len(original)
     lo, hi = int(original_wc * 0.85), int(original_wc * 1.15)
     prob_lines = "\n".join(f"- {p}" for p in problems)
     emo = plan.get("emotions") or []
     emo_str = ", ".join(str(e) for e in emo) if emo else "（无）"
     repair_goal = _repair_goal_block(repair_type, plan, source_text)
+    ctx_block = f"\n[写作上下文]（与写作时同源的分类约束，重构必须遵守）\n{writing_ctx}\n" if writing_ctx else ""
     return f"""你是小说重写编辑。根据问题清单重写下面的子结构正文，只输出重写后的正文，不要任何解释、思考或 markdown 围栏。
 
 [保留格式]
 - 首行标题必须原样保留: {title_line}
 - 末行编号必须原样保留: {tail_marker}
 - 别名行必须原样保留: {alias_line}
-
+{ctx_block}
 [字数约束]
 - 原文 {original_wc} 字，重写后需在 {lo}-{hi} 字（±15%）
 
@@ -223,6 +226,10 @@ def _build_rewrite_prompt(original: str, title_line: str, alias_line: str, tail_
 {prob_lines}
 
 [修复目标]{repair_goal}
+
+[文风硬约束]
+- 严格保持小说叙事文体：禁止任何分析/评论/旁白式 meta 表述（如"概率链显示""行为模式符合某原型特征""内部时钟与外部物理时间不同步"等），一律通过动作、对话、场景呈现；叙述者视角不得跳成"分析报告"口吻
+- 若问题描述本身含 PASS 语义（"符合设定""一致""正常"等）或无法定位具体句子，仅做最小改动或原样保留正文（不要为了改而改、不要凭空插入分析词）
 
 [原文]
 {original}
@@ -264,9 +271,11 @@ def _validate_rewrite(new_text: str, title_line: str, alias_line: str, tail_mark
 def rewrite_segment(chapter_dir: str, file_name: str, chapter: str, plan: dict,
                     prev_tail: str, next_head: str, problems: list,
                     config_mgr=None, timeout_extra=180,
-                    repair_type: str = "", source_text: str = "", guided: bool = False) -> dict:
+                    repair_type: str = "", source_text: str = "", guided: bool = False,
+                    state_path: str = "") -> dict:
     """T1: 整段重构单个子结构；guided=True（R1 推理审核）→ 完整正文 + 问题描述引导局部改写。
-    返回 {ok, new_text, problems, wc}。"""
+    返回 {ok, new_text, problems, wc}。state_path 非空时加载该段写作上下文注入 prompt
+    （角色/人格/情绪/视角强制/命题框——修复必须遵守原文分类约束，否则 35B 无文风锚点自由发挥）。"""
     f = Path(chapter_dir) / file_name
     if not f.exists():
         return {"ok": False, "problems": [f"文件不存在: {file_name}"]}
@@ -278,10 +287,19 @@ def rewrite_segment(chapter_dir: str, file_name: str, chapter: str, plan: dict,
     body = "\n".join(l for l in lines[1:] if l.strip() and not l.startswith("【别名】")
                      and not SUFFIX_RE.match(l.strip()))
 
+    # 写作上下文（分类约束）——与写作时同源（novel_context_loader）
+    writing_ctx = ""
+    if state_path:
+        try:
+            from novel_context_loader import _load_context_captured
+            writing_ctx = _load_context_captured(state_path, chapter, Path(file_name).stem) or ""
+        except Exception:
+            writing_ctx = ""
+
     # 引导式局部改写（R1 推理审核）：R1 的 detail 问题描述本身就是引导——
     # writer 拿到完整正文 + 描述，自行定位问题句并只改那里，其余逐字保留
     if guided:
-        prompt = _build_guided_prompt(body, title_line, alias_line, tail_marker, problems)
+        prompt = _build_guided_prompt(body, title_line, alias_line, tail_marker, problems, writing_ctx)
         client = _create_repair_client(config_mgr)
         call_timeout = int(getattr(client, "timeout", None) or 300) + timeout_extra
         print(f"[repair] 正在重构 {file_name}（引导式局部改写）...")
@@ -304,7 +322,8 @@ def rewrite_segment(chapter_dir: str, file_name: str, chapter: str, plan: dict,
 
     prompt = _build_rewrite_prompt(body, title_line, alias_line, tail_marker,
                                    plan, prev_tail, next_head, problems,
-                                   repair_type=repair_type, source_text=source_text)
+                                   repair_type=repair_type, source_text=source_text,
+                                   writing_ctx=writing_ctx)
     client = _create_repair_client(config_mgr)
     print(f"[repair] 正在重构 {file_name}（整段重构）...")
     # 超时 = 配置 timeout + 额外余量（thinking 模型重写长文）
@@ -330,23 +349,28 @@ def rewrite_segment(chapter_dir: str, file_name: str, chapter: str, plan: dict,
 
 
 def _build_guided_prompt(body: str, title_line: str, alias_line: str, tail_marker: str,
-                         problems: list) -> str:
+                         problems: list, writing_ctx: str = "") -> str:
     """引导式局部改写契约：完整正文 + R1 的问题描述（detail 本身就是引导），
-    writer 自行定位问题句并只改那里，其余正文逐字保留。"""
+    writer 自行定位问题句并只改那里，其余正文逐字保留。
+    writing_ctx：该段写作上下文（角色/人格/情绪/视角强制/命题框）——修复必须遵守原文分类约束，
+    否则 35B 无文风锚点自由发挥（历史上把 R1 detail 当正文写、输出"概率链…INTJ 原型"分析腔）。"""
     prob_lines = "\n".join(f"- {p}" for p in problems)
+    ctx_block = f"\n[写作上下文]（与写作时同源的分类约束，重构必须遵守）\n{writing_ctx}\n" if writing_ctx else ""
     return f"""你是小说局部改写编辑。以下正文存在审核发现的问题，只改写与问题描述直接相关的句子，其余正文必须逐字保留（不得增删改任何其他字符）。
 
 [保留格式]
 - 首行标题必须原样保留: {title_line}
 - 末行编号必须原样保留: {tail_marker}
 - 别名行必须原样保留: {alias_line}
-
+{ctx_block}
 [问题说明]（审核模型判定——问题就出在以下描述指出的句子/行为上，请在[正文]中定位并仅改写该处）
 {prob_lines}
 
 [改写要求]
 - 仅修改问题描述直接指出的句子，其余正文逐字保留（不得增删改）
 - 修正后符合角色设定/身份处境/推理逻辑，保持文风与字数
+- 严格保持小说叙事文体：除[写作上下文]中文风规则明确允许的表述（如叙述者本身设定视角下的系统日志/代码块/警告标记等修辞工具）外，禁止无设定依据的分析/评论/旁白式 meta 表述（如"概率链显示""行为模式符合某原型特征""内部时钟与物理时间不同步""数据解析帧率"等），一律通过动作、对话、场景呈现；叙述者视角不得跳成"分析报告"口吻——判定以[写作上下文]的文风规则为准，规则允许的不算违规
+- 若问题描述本身是 PASS 语义（"符合设定""一致""正常""无问题"等）或无法定位具体问题句 → 原样保留正文，不要为了改而改（审核模型判定为符合时无需任何修改）
 - 输出完整正文（含保留格式三行），不要任何解释
 
 [正文]
@@ -417,7 +441,6 @@ def run(state_path: str, chapter_dir: str, chapter: str, issues: list,
                 pass
 
         results = []
-        syncs = []
         for fname, probs in seg_map.items():
             rt = (repair_types or {}).get(fname, "")
             # R1 推理审核问题（problem 以"推理审核"开头）→ 引导式局部改写（detail 描述引导 writer 只改问题句）
@@ -426,20 +449,20 @@ def run(state_path: str, chapter_dir: str, chapter: str, issues: list,
                                 _prev_tail(chapter_dir, fname), _next_head(chapter_dir, fname),
                                 probs, config_mgr=config_mgr,
                                 repair_type=rt, source_text=src_map.get(fname, ""),
-                                guided=guided)
+                                guided=guided, state_path=state_path)
             if r["ok"]:
                 backup_segment(chapter_dir, fname, state_path, 1)
                 _atomic_write(Path(chapter_dir) / fname, r["new_text"])
-                # 重构后同步：实体状态 force 刷新（新正文为准）+ 时间线重扫
-                sync_result = sync_after_rewrite(state_path, chapter_dir, fname)
-                syncs.append({"file": fname, **sync_result})
+                # 重构后同步（实体状态 force 刷新 + 时间线重扫）不在本函数内执行——
+                # 挪到 web_ui 修复线程 35B 卸载之后（串行明确步骤：先卸 35B，再上 8B 提取，
+                # 否则 35B 驻留时 8B 提取被 CPU offload）。web_ui 按 results 的 rewritten 段补 sync。
                 _entry = {"file": fname, "status": "rewritten", "wc": r["wc"]}
                 if r.get("problems"):
                     _entry["note"] = "; ".join(r["problems"])
                 results.append(_entry)
             else:
                 results.append({"file": fname, "status": "failed", "problems": r["problems"]})
-        report["t1"] = {"results": results, "syncs": syncs}
+        report["t1"] = {"results": results}
         return report
     finally:
         _release_repair_client()  # 修复完成 → 卸载写作模型（35B），显存/内存让给判定模型

@@ -53,24 +53,28 @@ def _classify_ending_rules(content: str) -> str | None:
     return best
 
 
+def _load_config() -> dict:
+    """读项目根 config.json 的 novel_checks（与 4dim 同源）；失败返回空。"""
+    try:
+        cfg_path = os.path.join(os.path.dirname(SCRIPTS_DIR), "..", "config.json")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d.get("novel_checks", {}) or {}
+    except Exception:
+        pass
+    return {}
+
+
 def _classify_ending_llm(content: str) -> tuple | None:
-    """Qwen2.5-3B（本地 CPU，复用实体提取器加载）判结尾属于哪种收尾类型。
+    """收尾类型判定：统一管理勾选 → 8B（LM Studio GPU，/no_think 直出）；否则 Qwen2.5-3B（CPU）。
 
     返回 (ending_type, reason)；模型不可用/输出不可解析返回 None（触发特征词回退）。
-    输入取最后 3 段（段落级，不按字符硬截）；3B 无 think，max_new_tokens=1024 足够。
-    （1.5B 实测判收尾类型不可靠——封闭式判成悬停式，改用 3B。）
+    输入取最后 3 段（段落级，不按字符硬截）。（1.5B 实测判收尾类型不可靠，故 3B/8B。）
     """
-    try:
-        sys.path.insert(0, SCRIPTS_DIR)
-        from novel_entity_extractor import _load_extract_model
-        pipe = _load_extract_model()
-        if pipe is None:
-            return None
-        model, tok = pipe
-        # 取最后 3 段（段落级切分，保留完整信息）
-        paras = [p.strip() for p in content.split("\n") if p.strip()]
-        ending_text = "\n".join(paras[-3:]) if len(paras) >= 3 else content
-        prompt = f"""你是小说收尾类型判定器。判断下面的【结尾段落】属于哪种收尾类型。
+    paras = [p.strip() for p in content.split("\n") if p.strip()]
+    ending_text = "\n".join(paras[-3:]) if len(paras) >= 3 else content
+    prompt = f"""你是小说收尾类型判定器。判断下面的【结尾段落】属于哪种收尾类型。
 
 【收尾类型判据】
 - 封闭式：主要冲突全部解决，无遗留悬念，有明确结束感（所有线闭合、角色获得安定、"从此以后"式收束）
@@ -81,6 +85,34 @@ def _classify_ending_llm(content: str) -> tuple | None:
 {ending_text}
 
 请只输出：封闭式 / 开放式 / 悬停式（三选一）+ 一句话理由。"""
+    try:
+        sys.path.insert(0, SCRIPTS_DIR)
+        from model_backend import judge_backend, judge_gguf_paths, make_lms_handle
+        from model_backend import generate as mb_generate, release as mb_release
+        if judge_backend(_load_config()) == "lmstudio":
+            keys = judge_gguf_paths(_load_config())
+            key = keys.get("4dim") or keys.get("r1") or ""
+            if key:
+                h = make_lms_handle(key, ctx=16384)
+                if h:
+                    try:
+                        resp = mb_generate(h, "/no_think\n" + prompt, max_tokens=1024, temperature=0.2)
+                        for t in ENDING_TYPES:
+                            if t in resp:
+                                after = resp.split(t, 1)[1]
+                                reason = after.strip().split("\n")[0].strip(" ：:，,。")[:60]
+                                return (t, reason or "（无理由）")
+                    finally:
+                        # 独占串行（默认）：用完即卸；关闭（并行）：驻留不卸
+                        if _load_config().get("exclusive_serial", True):
+                            mb_release(h)
+                    return None
+        # transformers 3B（现状，CPU）
+        from novel_entity_extractor import _load_extract_model
+        pipe = _load_extract_model()
+        if pipe is None:
+            return None
+        model, tok = pipe
         inputs = tok(prompt, return_tensors="pt").to(model.device)
         with __import__("torch").no_grad():
             out = model.generate(**inputs, max_new_tokens=1024, do_sample=False)
@@ -93,7 +125,7 @@ def _classify_ending_llm(content: str) -> tuple | None:
                 return (t, reason or "（无理由）")
         return None
     except Exception as e:
-        print(f"[收尾判定] 3B 判定失败（回退特征词）: {e}")
+        print(f"[收尾判定] 判定失败（回退特征词）: {e}")
         return None
 
 
@@ -105,11 +137,11 @@ def _model_ending_verdict(content: str, planned_type: str) -> dict | None:
     """
     actual = _classify_ending_llm(content)
     if actual is None:
-        # 1.5B 不可用 → 特征词回退
+        # 模型不可用 → 特征词回退
         actual = _classify_ending_rules(content)
         source = "特征词"
     else:
-        source = "1.5B"
+        source = "模型"
     if actual is None:
         return None  # 特征词也无法判定 → 原规则细查
 
