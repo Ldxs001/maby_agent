@@ -1,0 +1,8 @@
+==================================================
+  Structured Writer · 结构化写作智能体
+  版本: 3.0.0b25
+==================================================
+
+[Structured Writer] 服务启动: http://0.0.0.0:8770
+[Structured Writer] 配置面板: http://localhost:8770 (配置Tab)
+[Structured Writer] 写作界面: http://localhost:8770 (对话Tab)
