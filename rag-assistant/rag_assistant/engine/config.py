@@ -33,6 +33,11 @@ DEFAULT_CONFIG = {
     },
     "router": {
         "enabled": True,
+        "classify_threshold": 0.3,
+        "top_n": 1,
+        # fallback 子节点为 0.5.0 弃用 cross-encoder 出库路由后的历史残留：
+        # - min_score_threshold：FallbackRouter 阈值，消费方为死代码，UI 入口已移除
+        # - signature_auto_rebuild：仍被 knowledge_base_manager.py 读取，保留
         "fallback": {
             "enabled": True,
             "model_path": "",

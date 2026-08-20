@@ -2063,12 +2063,16 @@ input:disabled + .toggle-slider {{ background: #ddd; cursor: not-allowed; }}
           <span style="font-size:11px;color:#c92a2a;{"display:inline" if not has_emb else "display:none"};">请先下载嵌入模型</span>
         </div>
         <div style="font-size:12px;color:#888;margin-bottom:6px;">用户提问时路由到对应知识库检索（始终用嵌入模型，精排开时签名路由，关时关键词路由）</div>
-        <div style="display:flex;align-items:center;gap:8px;">
-          <label style="font-size:12px;color:#888;white-space:nowrap;">出库最低分
-            <input type="number" value="{fb_cfg.get('min_score_threshold', 0.3)}" min="0" max="1" step="0.05" onchange="updateConfig('router','fallback_threshold',parseFloat(this.value))" style="width:60px;padding:4px 6px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <label style="font-size:12px;color:#888;white-space:nowrap;">路由阈值
+            <input type="number" value="{router_cfg.get('classify_threshold', 0.3)}" min="0" max="1" step="0.05" onchange="updateConfig('router','classify_threshold',parseFloat(this.value))" style="width:60px;padding:4px 6px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
           </label>
+          <label style="font-size:12px;color:#888;white-space:nowrap;">候选KB数
+            <input type="number" value="{router_cfg.get('top_n', 1)}" min="1" max="10" step="1" onchange="updateConfig('router','top_n',Math.min(10,Math.max(1,parseInt(this.value)||1)))" style="width:60px;padding:4px 6px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
+          </label>
+
         </div>
-        <div style="font-size:11px;color:#aaa;margin-top:4px;">精排开→嵌入模型×签名　精排关→嵌入模型×关键词</div>
+        <div style="font-size:11px;color:#aaa;margin-top:4px;">精排开→嵌入模型×签名　精排关→嵌入模型×关键词　候选KB数>1→多KB并查（跨域问题用）</div>
       </div>
     </div>
     </div>

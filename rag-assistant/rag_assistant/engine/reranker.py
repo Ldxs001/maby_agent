@@ -357,6 +357,12 @@ if __name__ == "__main__":
         parser.print_help()
 
 
+# ── 死代码 ──────────────────────────────────────────
+# FallbackRouter 原用于出库路由（cross-encoder 对 query×KB签名 打分选最佳 KB）。
+# 0.5.0 因 reranker 多语言混合场景得分不稳定甚至全负，出库路由改用嵌入余弦，
+# 本类降级为签名生成用；0.7.0 从 router.py 迁入 reranker.py 后无任何调用方。
+# 配置 router.fallback.min_score_threshold 是本类的阈值，UI 入口已移除。
+# 保留供未来可能恢复 cross-encoder 路由时参考。详见 CHANGELOG [0.5.0]。
 class FallbackRouter:
     """语义回退路由（从 router.py 迁入，精排模块的一部分）
     

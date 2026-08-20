@@ -329,7 +329,7 @@ def build_context(docs):
 
 
 def retrieve_context(question, kb_name="default", k=None, score_threshold=None, embeddings=None,
-                     use_router=True, use_reranker=True, include_header=False):
+                     use_router=True, use_reranker=True, include_header=False, top_n=None):
     """
     纯检索接口：只检索和构建 context，不调用 LLM。
 
@@ -344,7 +344,7 @@ def retrieve_context(question, kb_name="default", k=None, score_threshold=None, 
     # ==================== 路由阶段 ====================
     if use_router and cfg.get("router", {}).get("enabled", True):
         from router import route_query
-        routing = route_query(question)
+        routing = route_query(question, top_n=top_n)
         kb_names = routing["kb_names"]
         routing_method = routing["method"]
     else:

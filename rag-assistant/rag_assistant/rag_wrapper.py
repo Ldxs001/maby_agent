@@ -49,6 +49,7 @@ class RAGWrapper:
                 k=kwargs.get("k", 5),
                 score_threshold=kwargs.get("score_threshold", 0.0),
                 include_header=include_header,
+                top_n=kwargs.get("top_n"),
             )
             context = result.get("context", "")
             docs = result.get("source_docs", result.get("documents", []))

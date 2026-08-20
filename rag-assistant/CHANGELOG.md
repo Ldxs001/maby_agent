@@ -3,6 +3,23 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`__init__.py` 唯一源）。
 
+## [2.3.0] - 2026-08-20
+### 新增（top-N 多 KB 路由 + 死代码清理）
+> 本次更新使用 **CodeArts + GLM-5.2** 协同完成。
+
+- **top-N 多 KB 路由**：`route_query()` 从 top-1（只取最高分 KB）改为 top-N（收集所有过阈值 KB → 按分数降序取前 N 个），激活 `retrieve_context` 中预留的多 KB 并查循环。跨域问题（如"量子物理与音乐的关系"）不再漏召回次相关 KB。三层防护：UI 限 1-10 → 代码夹 `[1,10]` → 运行时限实际过阈值 KB 数。默认 `top_n=1` 保持兼容，单域问题不受影响
+- **外部 API `POST /api/kb/query` 支持 `top_n` 参数**：单次查询临时指定查几个 KB，不改全局配置。调用链 `external_api → rag_wrapper → retrieve_context → route_query` 4 处签名透传，外部传参优先于配置
+- **Web UI 出库路由区新增"路由阈值"和"候选KB数"输入框**：`router.classify_threshold`（主路由 KB 分数下限）和 `router.top_n`（候选 KB 数量上限）可直接在配置页编辑
+- **`config.py` router 默认配置新增 `classify_threshold: 0.3` 和 `top_n: 1`**：原靠代码 `.get(..., 默认值)` 兜底，现显式写入配置
+
+### 变更
+- **移除"出库最低分"UI 输入框**：该字段 `router.fallback.min_score_threshold` 的消费方 `FallbackRouter`（reranker.py:360）为 0.5.0 弃用的死代码，UI 入口能改但改了无效果。移除输入框避免误导
+- **`reranker.py` `FallbackRouter` 类加死代码注释**：标注 0.5.0 弃用原因（reranker 多语言混合场景得分不稳定甚至全负）、0.7.0 迁入后无调用方、保留供未来参考
+- **`config.py` `router.fallback` 子节点加注释**：标注 `min_score_threshold` 为死配置、`signature_auto_rebuild` 仍被 `knowledge_base_manager.py` 读取保留
+- bump 2.3.0（不 git-sync，用户指示）
+
+---
+
 ## [2.2.14] - 2026-08-09
 ### 修复
 - **作者行探测重写：短单元链替代"短词,短词"正则**。旧作者名正则 `[\u4e00-\u9fff]{2,4},[\u4e00-\u9fff]{2,4}` 因 `re.search` 部分匹配，把正文"词，词"并列短语全部误判为作者行（实测综述文档 146 块命中 102 块，95 块误判）。新逻辑按逗号切分为单元，要求"连续 ≥3 个去空白后 ≤6 字且含汉字的短单元链"，纯编号（1、2、1,2、2+）视为中性不计数，英文/公式/符号单元断链（避免英文库误判）。实测全库命中从 136 → 36（-74%），综述文档 102 → 9，英文库仅 -5，真作者行与期刊头保留

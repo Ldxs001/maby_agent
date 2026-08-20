@@ -48,7 +48,7 @@ def broadcast_route(question: str, kb_names: list[str]) -> list[str]:
 
 # ==================== 主路由入口 ====================
 
-def route_query(question: str) -> dict:
+def route_query(question: str, top_n: int = None) -> dict:
     from knowledge_base_manager import list_knowledge_bases
     cfg = load_config()
     router_cfg = cfg.get("router", {})
@@ -56,13 +56,16 @@ def route_query(question: str) -> dict:
         from rag_core import get_embeddings
         import numpy as np
         classify_threshold = router_cfg.get("classify_threshold", 0.3)
+        # top-N 多 KB 路由 + 三层防护：外部传参优先 → 配置夹 [1,10] → 运行时限实际 KB 数
+        cfg_top_n = router_cfg.get("top_n", 1)
+        top_n = max(1, min(int(top_n if top_n is not None else cfg_top_n), 10))
         try:
             emb = get_embeddings()
             qv = np.array(emb.embed_query(question))
             # 有签名 → 嵌入 × 签名
             sigs = list_kb_signatures()
             if sigs:
-                best_kb, best_score = None, classify_threshold
+                scored = []
                 for kb_name, sig_info in sigs.items():
                     if not isinstance(sig_info, dict):
                         continue
@@ -82,27 +85,29 @@ def route_query(question: str) -> dict:
                     else:
                         sv = np.array(emb.embed_query(sig_text.replace(" · ", " ")[:512]))
                         sim = float(np.dot(qv, sv) / (np.linalg.norm(qv) * np.linalg.norm(sv)))
-                    if sim > best_score:
-                        best_score = sim
-                        best_kb = kb_name
-                if best_kb:
-                    return {"kb_names": [best_kb], "method": "embedding_signature", "kb_scores": {best_kb: best_score}}
+                    if sim >= classify_threshold:
+                        scored.append((kb_name, sim))
+                if scored:
+                    scored.sort(key=lambda x: -x[1])
+                    selected = scored[:min(top_n, len(scored))]
+                    return {"kb_names": [k for k, _ in selected], "method": "embedding_signature", "kb_scores": dict(selected)}
             # 无签名或签名不匹配 → 嵌入 × 关键词
             from knowledge_base_manager import _load_rules
             rules = _load_rules()
             if rules:
-                best_kb, best_score = None, classify_threshold
+                scored = []
                 for kb_name, rule_obj in rules.items():
                     kws = rule_obj.get("keywords", [])
                     if not kws:
                         continue
                     kv = np.array(emb.embed_query(" ".join(kws)))
                     sim = float(np.dot(qv, kv) / (np.linalg.norm(qv) * np.linalg.norm(kv)))
-                    if sim > best_score:
-                        best_score = sim
-                        best_kb = kb_name
-                if best_kb:
-                    return {"kb_names": [best_kb], "method": "embedding_keyword", "kb_scores": {best_kb: best_score}}
+                    if sim >= classify_threshold:
+                        scored.append((kb_name, sim))
+                if scored:
+                    scored.sort(key=lambda x: -x[1])
+                    selected = scored[:min(top_n, len(scored))]
+                    return {"kb_names": [k for k, _ in selected], "method": "embedding_keyword", "kb_scores": dict(selected)}
         except Exception:
             pass
     else:

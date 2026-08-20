@@ -621,6 +621,7 @@ class ExternalAPIHandler(BaseHTTPRequestHandler):
         query = body.get("query", "")
         kb = body.get("kb", "")        # 空=自动路由
         top_k = body.get("top_k", 5)
+        top_n = body.get("top_n")      # None=用配置默认值
         score_threshold = body.get("score_threshold")
         include_header = body.get("include_header", False)
 
@@ -639,6 +640,7 @@ class ExternalAPIHandler(BaseHTTPRequestHandler):
                 k=top_k,
                 score_threshold=score_threshold,
                 include_header=include_header,
+                top_n=top_n,
             )
             resp = {
                 "context": result.get("context", ""),
