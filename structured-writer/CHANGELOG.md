@@ -3,6 +3,24 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [3.1.7] - 2026-08-20
+### 重构（配置推动点位统一——09b「配置推动的穷举一致性」范式驱动）
+> 本次更新使用 **CodeArts + GLM-5.2** 协同完成。方法论体系 Cogito Scribo（09b 配置推动的穷举一致性：统一点位→有限枚举→偏差一致）驱动，识别"应统一却分散、各自干各自"的规则点位，统一到单一配置源，消除偏差不一致。
+
+- **新建统一配置源 `novel/nover_config.py`**：小说线散落在各文件的常量统一收拢——LENGTH_TARGETS / LENGTH_LABELS / LENGTH_CHAPTERS / KEY_UPSCALE / JUDGE_TEMPERATURE / JUDGE_MAX_TOKENS / REPAIR_WORD_TOLERANCE / DEFAULT_NOVEL_STYLE
+- **C4 通用线关键词放大倍数**：`planner.py` / `writer.py` 各自硬编码 `*1.5` → 统一引用 `KEY_UPSCALE=1.5`（planner 建 f-string，writer import）
+- **C6 小说线篇幅标签**：`novel_workflow_engine.py` / `novel_state_manager.py` / `novel_context_loader.py` 三份本地 LENGTH_LABELS 定义 → 统一 import nover_config
+- **C7 小说线章节数范围**：long 统一为 11-20 章；**去掉 `if i>15: break` 硬截断**（连警告都不要，只靠提示词约束）；LENGTH_RANGES → LENGTH_CHAPTERS
+- **C8 小说线判定温度**：5 文件（reasoning_check / entity_extractor / pledge_check / fidelity / 4dim_check）各自 `temperature=0.2` → 统一 `JUDGE_TEMPERATURE`
+- **C8b 小说线判定 max_tokens**：2 文件（fidelity / 4dim_check）各自 `max_tokens=1024` → 统一 `JUDGE_MAX_TOKENS`
+- **C9 小说线关键词放大倍数**：`novel_writer.py` `*1.5` → `*KEY_UPSCALE`；`novel_bridge.py` prompt f-string 引用
+- **C10 篇幅描述动态生成**：`config_manager.py` 篇幅 desc 从 LENGTH_TARGETS 动态生成，不再手写硬编码
+- **C11 修复波动容差**：`novel_bridge.py` / `novel_context_loader.py` / `novel_workflow_engine.py` 各自 `*1.15` → `*(1+REPAIR_WORD_TOLERANCE)`（0.15）
+- **C12 前后端字数兜底统一**：`web_ui.py` 后端兜底 `1500` → `LENGTH_TARGETS["medium"][0]`；前端 JS `1000` → `1500`
+- **default_prompt 同步路径切断**：`web_ui.py:4331` 删 `data.default_prompt = style || ...`——保存模板不再覆盖顶层 default_prompt（此前选小说模板保存会把 default_prompt 污染成小说文风，但小说线根本不用它）；`config.json` default_prompt 恢复通用文风。default_prompt 固定为通用线兜底，不被保存动作覆盖
+- **小说线文风兜底 DEFAULT_NOVEL_STYLE**：`novel_bridge.py:118` `template.get("style","")` 空时不再空漂移 → 用 `DEFAULT_NOVEL_STYLE` 兜底（文风六字段模板 + 创作铁律：show don't tell / 对话符合角色 / 禁止元文本 / 禁止第三人称插入）。泛化后 161 字符，去掉科幻特有项（代码/协议块/系统警告标记）。与 default_prompt 逻辑一致：都是代码推动固定兜底，不被用户保存覆盖
+- bump 3.1.7（不 git-sync，用户指示）
+
 ## [3.1.6] - 2026-08-19
 ### 修复（子结构规划失败静默跳章——前置章缺失无感知）
 - **根因**：novel_writer 主循环规划子结构异常时 `continue` 直接跳过该章进入下一章——用户调整模型期间规划调用失败 → 章回 pending 但无任何提示，后续章照常规划/写作，出现"L03 没规划、L04 照写"的跳章缺章（全文三检守卫靠 status 拦，但用户侧缺明确反馈）

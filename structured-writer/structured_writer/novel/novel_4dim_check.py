@@ -26,6 +26,8 @@ import sys
 import re
 from pathlib import Path
 
+from nover_config import JUDGE_TEMPERATURE, JUDGE_MAX_TOKENS
+
 SCRIPTS_DIR = Path(__file__).parent
 
 DIM_LABELS = {
@@ -206,7 +208,7 @@ def _judge(handle, prompt: str) -> dict | None:
     # 判定要的是直接 JSON，注入 /no_think 关思考（transformers 3B 无思考概念，不注入）
     if not isinstance(handle, tuple):
         prompt = "/no_think\n" + prompt
-    raw = generate(handle, prompt, max_tokens=1024, temperature=0.2)
+    raw = generate(handle, prompt, max_tokens=JUDGE_MAX_TOKENS, temperature=JUDGE_TEMPERATURE)
     return _parse_json(raw)
 
 
@@ -233,7 +235,7 @@ def fidelity_judge(handle, summary: str, content: str) -> tuple | None:
     if not isinstance(handle, tuple):
         prompt = "/no_think\n" + prompt
     from model_backend import generate
-    raw = generate(handle, prompt, max_tokens=1024, temperature=0.2)
+    raw = generate(handle, prompt, max_tokens=JUDGE_MAX_TOKENS, temperature=JUDGE_TEMPERATURE)
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
         return None

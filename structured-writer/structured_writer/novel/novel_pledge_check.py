@@ -18,6 +18,8 @@ import re
 import sys
 from pathlib import Path
 
+from nover_config import JUDGE_TEMPERATURE
+
 SCRIPTS_DIR = Path(__file__).parent
 
 EXTRACT_PROMPT = """你是小说承诺提取器。从【本章内容】中提取"角色做出的决定/计划/承诺"——即**尚未兑现的意图事件**。
@@ -312,7 +314,7 @@ def check_pledges(state_path: str, chapters_dir) -> list:
                     {"role": "system", "content": "你是严谨的小说承诺兑现审核员，输出严格 JSON。"},
                     {"role": "user", "content": JUDGE_PROMPT.format(flags=flags_desc, book_summary=book_summary)},
                 ],
-                temperature=0.2,
+                temperature=JUDGE_TEMPERATURE,
             )
     except Exception as e:
         print(f"[全文承诺] 推理 client 不可用（{e}），回退关键词判定")

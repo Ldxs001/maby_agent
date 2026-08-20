@@ -19,6 +19,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from .nover_config import KEY_UPSCALE
+
 from ..llm_client import LLMClientError
 from ..state_manager import SESSIONS_DIR
 from . import novel_bridge
@@ -576,7 +578,7 @@ def generate_novel_article(outline, user_orders, rag_options, llm_client,
             ctx = novel_bridge.build_writing_context(state_path, chapter_id, sub["_novel"]["s_key"])
             word_target = int(sub.get("word_count") or 0) or _sub_word_target(ndata)
             if sub.get("is_key") or section.get("is_key"):
-                word_target = int(word_target * 1.5)  # 重点段/重点章：字数上浮 50%（对齐通用线 is_key 语义）
+                word_target = int(word_target * KEY_UPSCALE)  # 重点段/重点章：字数上浮（对齐通用线 is_key 语义）
             rag_ctx = sub_rag_ctxs.get(ssid) or chapter_rag_ctx
             # 用户指定辅助知识（与通用线 writer.py 同语义：text=使用指令，files=文字/表格资料）
             aux_text = _build_sub_aux(aux_knowledge, ssid)

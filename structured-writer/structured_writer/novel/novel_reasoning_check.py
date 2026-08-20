@@ -25,6 +25,8 @@ Reasoning Check - 推理审核引擎 (v3.0)
 import json, sys, re, os
 from pathlib import Path
 
+from nover_config import JUDGE_TEMPERATURE
+
 _DEVICE = "cpu"
 
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
@@ -418,12 +420,12 @@ def _reasoning_impl(model, tokenizer, data, issues, state_path, chapter, chapter
     for attempt in range(1, 4):  # 最多 3 次（第 1 次原始 prompt，第 2-3 次带纠错提示）
         try:
             if _is_lms:
-                raw_output = mb_generate(model, prompt, max_tokens=_R1_MAX_TOKENS, temperature=0.2)
+                raw_output = mb_generate(model, prompt, max_tokens=_R1_MAX_TOKENS, temperature=JUDGE_TEMPERATURE)
             else:
                 output = pipe(
                     prompt,
                     max_new_tokens=_R1_MAX_TOKENS,
-                    temperature=0.2,
+                    temperature=JUDGE_TEMPERATURE,
                     top_p=0.9,
                     do_sample=True,
                     pad_token_id=tokenizer.eos_token_id,

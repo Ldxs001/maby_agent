@@ -5,6 +5,8 @@ import copy
 from typing import Optional
 from .llm_client import LLMClient, LLMClientError
 
+KEY_UPSCALE = 1.5
+
 
 def _build_planner_prompt(meta: list, content: list, user_meta: dict,
                           plan_hints: str = "") -> str:
@@ -80,7 +82,7 @@ def _build_planner_prompt(meta: list, content: list, user_meta: dict,
         parts.append('- type="section"：默认拆 2-4 个子结构，用户明确指定数量时按用户要求')
         parts.append('- 每子结构默认 200-800 字，用户指定则按用户要求')
         parts.append("")
-        parts.append("- is_key: true = 该节为重点节，写作字数可上浮 50%；false = 普通节")
+        parts.append(f"- is_key: true = 该节为重点节，写作字数可上浮 {int((KEY_UPSCALE - 1) * 100)}%；false = 普通节")
 
         parts.append("【硬性要求】所有内容树字段**必须全部**在 sections 数组中输出，一条对应一个 sections 元素。")
         parts.append(f"内容树字段清单（共 {len(content)} 个，不准少）：{', '.join(cf['name'] for cf in content)}")

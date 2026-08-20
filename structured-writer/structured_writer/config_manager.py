@@ -34,6 +34,17 @@ DEFAULT_CONFIG = {
     "max_sessions": 20,
 }
 
+from .novel.nover_config import LENGTH_TARGETS as _LENGTH_TARGETS
+
+_LENGTH_DESC = "、".join(
+    f"{lbl}{lo}-{hi}"
+    for lbl, (lo, hi) in [
+        ("短篇", _LENGTH_TARGETS["short"]),
+        ("中篇", _LENGTH_TARGETS["medium"]),
+        ("长篇", _LENGTH_TARGETS["long"]),
+    ]
+)
+
 # ── 内置模板（代码级只读，永不写入文件） ──
 
 DEFAULT_TEMPLATES = {
@@ -105,7 +116,7 @@ DEFAULT_TEMPLATES = {
         "meta": [
             {"name": "标题", "show_label": False, "desc": "小说标题", "source": "auto"},
             {"name": "题材", "show_label": False, "desc": "科幻/武侠/悬疑/都市/奇幻/历史等，必须填写", "source": "user"},
-            {"name": "篇幅", "show_label": False, "desc": "短篇/中篇/长篇——决定每子结构字数目标（短篇1000-1500、中篇1500-2000、长篇2000-4000）", "source": "user"},
+            {"name": "篇幅", "show_label": False, "desc": f"短篇/中篇/长篇——决定每子结构字数目标（{_LENGTH_DESC}）", "source": "user"},
             {"name": "叙事视角", "show_label": False, "desc": "第一人称/第三人称有限/第三人称全知/第二人称，留空由AI按题材推断", "source": "auto"},
             {"name": "署名", "show_label": True, "desc": "作者署名", "source": "user"}
         ],

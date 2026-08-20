@@ -40,8 +40,7 @@ DATA_STATE = DATA_DIR / "novel_state.json"   # 占位（实际用 _chapters_dir 
 DATA_CHAPTERS = DATA_DIR / "chapters"        # 占位
 DATA_REPORTS = DATA_DIR / "reports"          # 占位
 
-LENGTH_RANGES = {"short": (3, 6), "medium": (8, 10), "long": (11, 99)}
-LENGTH_LABELS = {"short": "短篇", "medium": "中篇", "long": "长篇"}
+from nover_config import LENGTH_LABELS, LENGTH_CHAPTERS, REPAIR_WORD_TOLERANCE
 
 def _chapters_dir(state_path):
     """从 state_path 推导项目 chapters 目录: projects/<name>/chapters/"""
@@ -428,7 +427,7 @@ def write_sub(state_path, chapter, sub_key, target_dir):
         if word_count < lo:
             print(f"  [WARN] 字数 {word_count} < 下限 {lo}，建议补充至 {lo}-{hi} 字")
         elif word_count > check_hi:
-            print(f"  [INFO] 字数 {word_count} > 上限+15%({check_hi})，注意篇幅控制")
+            print(f"  [INFO] 字数 {word_count} > 上限+{int(REPAIR_WORD_TOLERANCE*100)}%({check_hi})，注意篇幅控制")
         else:
             print(f"  [OK] 字数 {word_count} 在 {lo}-{check_hi} 范围内")
     else:
@@ -1023,7 +1022,7 @@ def next_step(state_path):
 
     # 篇幅检查（不阻断，仅提示）
     if length:
-        lo, hi = LENGTH_RANGES.get(length, (0, 99))
+        lo, hi = LENGTH_CHAPTERS.get(length, (0, 99))
         actual = len(chapters)
         if actual > 0 and (actual < lo or actual > hi):
             print(f"  ⚠️ 当前 {actual} 章, 篇幅 {length} 建议 {lo}-{hi} 章")

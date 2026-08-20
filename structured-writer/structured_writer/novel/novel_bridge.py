@@ -13,18 +13,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .nover_config import (
+    LENGTH_TARGETS,
+    LENGTH_CHAPTERS,
+    KEY_UPSCALE,
+    REPAIR_WORD_TOLERANCE,
+    DEFAULT_NOVEL_STYLE,
+)
+
 SCRIPTS_DIR = Path(__file__).parent
 
 # 因果链验证：概述必需因果动词（与 novel-weaver novel_causality_check.py 同源）
 CAUSAL_VERBS = ["因为", "所以", "导致", "发现", "决定", "开始", "被迫", "意识到"]
 ENDING_TYPES = ("封闭式", "开放式", "悬停式")
-
-# 篇幅 → 每子结构字数目标（三阶段同源，plan-chapter 注入 word_count_target）
-LENGTH_TARGETS = {
-    "short": (1000, 1500),
-    "medium": (1500, 2000),
-    "long": (2000, 4000),
-}
 
 
 def is_novel_template(template) -> bool:
@@ -115,7 +116,7 @@ def generate_scene_config(topic, user_meta, template, llm_client) -> dict:
     """步骤1：场景配置（人物/时代/地点/风土人情/核心冲突）"""
     genre = (user_meta or {}).get("题材", "") or "未指定"
     pov = (user_meta or {}).get("叙事视角", "") or "未指定"
-    style = (template or {}).get("style", "")[:600]
+    style = ((template or {}).get("style", "") or DEFAULT_NOVEL_STYLE)[:600]
     sys_prompt = """你是小说设定规划师。根据主题生成场景配置 JSON。
 【输出规则】只输出 JSON，禁止任何其他文字，禁止 markdown 代码块，直接以 { 开头。
 【JSON 格式】
@@ -156,13 +157,22 @@ def generate_scene_config(topic, user_meta, template, llm_client) -> dict:
 def generate_chapters(setting, topic, length, llm_client) -> list:
     """步骤2：一级大纲（章数组 L01-L15）。LLM 同时提炼小说标题（短标题）。"""
     length_key = _length_key(length)
+    _upscale_pct = int((KEY_UPSCALE - 1) * 100)
+    _ch_ranges = "、".join(
+        f"{lbl}{lo}-{hi}章"
+        for lbl, (lo, hi) in [
+            ("短篇", LENGTH_CHAPTERS["short"]),
+            ("中篇", LENGTH_CHAPTERS["medium"]),
+            ("长篇", LENGTH_CHAPTERS["long"]),
+        ]
+    )
     sys_prompt = """你是小说大纲规划师。根据场景配置生成章节大纲。
 【输出规则】只输出 JSON，禁止任何其他文字。格式：
 {"title": "小说标题", "chapters": [{"id": "L01", "title": "章标题", "overview": "概述", "is_key": false}]}
 【title】为整本小说的短标题（≤12字，精炼有记忆点，贴合主题与题材，不抄用户原文）。
 【概述要求】≥12 有效字符，必须含因果动词（因为/所以/导致/发现/决定/开始/被迫/意识到），描述"谁做了什么事导致什么"。
-【is_key】true = 重点章（转折/高潮/冲突爆发/关键揭秘的章），写作字数可上浮 50%；false = 普通章。每本 2-4 个重点章，标在 overview 因果最强、矛盾最烈的章上。
-【章节数】按篇幅：短篇3-6章、中篇8-10章、长篇11-15章。
+【is_key】true = 重点章（转折/高潮/冲突爆发/关键揭秘的章），写作字数可上浮 __UP__%；false = 普通章。每本 2-4 个重点章，标在 overview 因果最强、矛盾最烈的章上。
+【章节数】按篇幅：__CH__。
 【因果递进】章与章之间必须环环相扣：L01→L02→... 前一章结果为后一章起因。
 【末章】最后一章 overview 末尾标注【收尾类型: 封闭式】或【收尾类型: 开放式】或【收尾类型: 悬停式】三选一。
 【完整示例】（照着这个结构填）：
@@ -171,7 +181,7 @@ def generate_chapters(setting, topic, length, llm_client) -> list:
   {"id": "L01", "title": "深夜警报", "overview": "义体修理工林铁生在维修AI核心时发现异常脉冲，决定暗中调查", "is_key": false},
   {"id": "L02", "title": "导师的警告", "overview": "调查惊动导师三浦，被迫停止调查但已留下线索", "is_key": true},
   {"id": "L03", "title": "终局", "overview": "真相揭露导致系统崩溃，林铁生选择直面AI本体【收尾类型: 开放式】", "is_key": true}
-]}"""
+]}""".replace("__UP__", str(_upscale_pct)).replace("__CH__", _ch_ranges)
     user_msg = (
         f"主题：{topic}\n篇幅：{length}\n"
         f"场景配置：\n{json.dumps(setting, ensure_ascii=False, indent=2)}\n请生成章节大纲 JSON（含 title 与 chapters）。"
@@ -185,8 +195,7 @@ def generate_chapters(setting, topic, length, llm_client) -> list:
     chapters = obj.get("chapters") or []
     out = []
     for i, c in enumerate(chapters, 1):
-        if i > 15:
-            break
+
         out.append({
             "id": str(c.get("id") or f"L{i:02d}"),
             "title": str(c.get("title") or f"第{i}章"),
@@ -905,7 +914,7 @@ def replan_novel_sub(state_path, chapter_id, s_key, hints, llm_client,
         "title": str(obj.get("title", old.get("title", ""))),
         "summary": str(obj.get("summary", old.get("summary", ""))),
         "tone": str(obj.get("tone", old.get("tone", ""))),
-        "word_count_target": old.get("word_count_target") or {"min": lo, "max": hi, "check_max": int(hi * 1.15)},
+        "word_count_target": old.get("word_count_target") or {"min": lo, "max": hi, "check_max": int(hi * (1 + REPAIR_WORD_TOLERANCE))},
         "word_count": old.get("word_count", 0),
         "status": old.get("status", "pending"),
         "writing_prompt": wp,

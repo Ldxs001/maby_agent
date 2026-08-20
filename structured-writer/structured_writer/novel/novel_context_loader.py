@@ -6,6 +6,8 @@ Context Loader — 上下文加载器
 import json, sys
 from pathlib import Path
 
+from nover_config import LENGTH_LABELS, REPAIR_WORD_TOLERANCE
+
 # ── 情绪强度映射表 ──
 INTENSITY_LABELS = [
     (0.0, 0.2, "微弱"),
@@ -169,13 +171,13 @@ def load_context(state_path, chapter, sub_key):
             prev_lines = prev_text[-3:] if len(prev_text) >= 3 else prev_text
 
     # ── [硬性] 字数约束（从子结构 word_count_target 读取，无需硬编码）──
-    LENGTH_LABELS = {"short": "短篇", "medium": "中篇", "long": "长篇"}
+
     length = data.get("meta", {}).get("length", "")
     length_label = LENGTH_LABELS.get(length, length)
     sub_target = subs[sub_key].get("word_count_target", {})
     word_count_note = ""
     if sub_target and sub_target.get("min") and sub_target.get("max"):
-        lo, hi, check_hi = sub_target["min"], sub_target["max"], sub_target.get("check_max", int(sub_target["max"] * 1.15))
+        lo, hi, check_hi = sub_target["min"], sub_target["max"], sub_target.get("check_max", int(sub_target["max"] * (1 + REPAIR_WORD_TOLERANCE)))
         word_count_note = f"  篇幅: {length_label}\n  每子结构字数范围: {lo}-{hi}（校验上浮至 {check_hi}）"
     else:
         word_count_note = f"  篇幅: {length_label}（未设定字数目标，请运行 plan-chapter 更新）"

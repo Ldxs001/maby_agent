@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Optional
 
 from .config_manager import ConfigManager, BUILTIN_TEMPLATE_NAMES
+from .novel.nover_config import LENGTH_TARGETS
 from .llm_client import LLMClient, LLMClientError
 from .state_manager import StateManager
 from .planner import plan_outline, generate_template, replan_section, adapt_outline
@@ -2231,7 +2232,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             sub.update({
                 "title": new_entry.get("title", sub.get("title", "")),
                 "summary": new_entry.get("summary", sub.get("summary", "")),
-                "word_count": (new_entry.get("word_count_target") or {}).get("max", sub.get("word_count", 1500)),
+                "word_count": (new_entry.get("word_count_target") or {}).get("max", sub.get("word_count", LENGTH_TARGETS["medium"][0])),
                 "status": "pending",
                 "actual_word_count": 0,
             })
@@ -2876,7 +2877,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                 target.update({
                     "title": new_entry.get("title", target.get("title", "")),
                     "summary": new_entry.get("summary", target.get("summary", "")),
-                    "word_count": (new_entry.get("word_count_target") or {}).get("max", target.get("word_count", 1500)),
+                    "word_count": (new_entry.get("word_count_target") or {}).get("max", target.get("word_count", LENGTH_TARGETS["medium"][0])),
                     "status": "pending",
                     "actual_word_count": 0,
                 })
@@ -4327,7 +4328,7 @@ function saveConfig() {
           }
         });
         data.templates = tmplObj;
-      data.default_prompt = style || (tmplObj[selTmpl] && tmplObj[selTmpl].style) || '';
+
 
     fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) })
       .then(r => r.json()).then(d => {
@@ -6534,7 +6535,7 @@ function startProgressPolling(sid) {
                     <input type="checkbox" class="nc-check" data-id="${ss.id}" ${ss._checked === false ? '' : 'checked'} title="取消勾选 = 跳过该段">
                     <select class="nc-order" data-id="${ss.id}" style="width:52px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" title="调整该段在写作中的顺序">${subOpts}</select>
                     <span style="flex:1;min-width:100px;font-size:12px">${ss.title}</span>
-                    <input type="number" class="nc-words" data-id="${ss.id}" value="${ss.word_count || 1000}" style="width:58px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" min="100" max="5000" title="字数目标"><span style="font-size:11px;color:var(--text-dim)">字</span>
+                    <input type="number" class="nc-words" data-id="${ss.id}" value="${ss.word_count || 1500}" style="width:58px;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" min="100" max="5000" title="字数目标"><span style="font-size:11px;color:var(--text-dim)">字</span>
                     <label style="font-size:11px;color:var(--sc-key);cursor:pointer"><input type="checkbox" class="nc-key" data-id="${ss.id}" ${ss.is_key ? 'checked' : ''}> ⭐重点</label>
                     <button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openAuxModal('${ss.id}')" title="辅助知识">+辅助</button>
                     <button class="btn btn-sm btn-secondary nc-replan-btn" style="font-size:10px;padding:2px 6px;${rowBusy ? 'display:none' : ''}" onclick="openReplanModal('novel_sub','${ss.id}')" title="只重新规划这一个子结构">重规划</button>

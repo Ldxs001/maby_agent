@@ -10,7 +10,7 @@ from typing import Optional
 from .llm_client import LLMClient, LLMClientError
 from .state_manager import StateManager, OUTPUTS_DIR, SESSIONS_DIR
 from .citation_validator import post_process as citation_post_process
-from .planner import _strip_word_desc
+from .planner import _strip_word_desc, KEY_UPSCALE
 from . import aux_parser
 
 
@@ -95,7 +95,7 @@ def _build_context_section_prompt(
     if word_count > 0:
         wn = f"字数要求：约 {word_count} 字"
         if is_key:
-            wn += "（重点节，可上浮 50%）"
+            wn += f"（重点节，可上浮 {int((KEY_UPSCALE - 1) * 100)}%）"
         sec_reqs.append(wn)
     else:
         sec_reqs.append("字数不限：根据写作要点自由发挥，该节必须输出有效内容，不得留空")

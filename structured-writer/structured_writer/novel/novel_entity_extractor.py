@@ -33,6 +33,8 @@ v2.3.7b0 架构（替代纯正则版）：
 import json
 import os
 import re
+
+from nover_config import JUDGE_TEMPERATURE
 import sys
 from pathlib import Path
 
@@ -150,7 +152,7 @@ def _llm_generate(prompt: str) -> str | None:
                     _EXTRACT_LMS_HANDLE = make_lms_handle(key, ctx=16384)
             if _EXTRACT_LMS_HANDLE is not None:
                 from model_backend import generate as _mb_gen
-                return _mb_gen(_EXTRACT_LMS_HANDLE, prompt, max_tokens=EXTRACT_MAX_TOKENS, temperature=0.2) or None
+                return _mb_gen(_EXTRACT_LMS_HANDLE, prompt, max_tokens=EXTRACT_MAX_TOKENS, temperature=JUDGE_TEMPERATURE) or None
         except Exception as e:
             print(f"[extract] LM Studio 8B 提取失败（回退 3B）: {e}")
             _EXTRACT_LMS_HANDLE = None
@@ -167,7 +169,7 @@ def _llm_generate(prompt: str) -> str | None:
             model_inputs["input_ids"],
             max_new_tokens=EXTRACT_MAX_TOKENS,
             do_sample=False,
-            temperature=0.2,
+            temperature=JUDGE_TEMPERATURE,
             pad_token_id=tokenizer.eos_token_id,
         )
     return tokenizer.decode(gen_out[0][model_inputs["input_ids"].shape[1]:], skip_special_tokens=True)

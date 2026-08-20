@@ -19,6 +19,8 @@ import sys
 import json
 import re
 
+from nover_config import JUDGE_TEMPERATURE, JUDGE_MAX_TOKENS
+
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # — 收尾验证关键词库 —
@@ -96,7 +98,7 @@ def _classify_ending_llm(content: str) -> tuple | None:
                 h = make_lms_handle(key, ctx=16384)
                 if h:
                     try:
-                        resp = mb_generate(h, "/no_think\n" + prompt, max_tokens=1024, temperature=0.2)
+                        resp = mb_generate(h, "/no_think\n" + prompt, max_tokens=JUDGE_MAX_TOKENS, temperature=JUDGE_TEMPERATURE)
                         for t in ENDING_TYPES:
                             if t in resp:
                                 after = resp.split(t, 1)[1]

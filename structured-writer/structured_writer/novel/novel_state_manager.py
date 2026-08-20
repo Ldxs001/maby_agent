@@ -14,6 +14,7 @@ from datetime import datetime
 
 # 路径集中管理
 from _path_utils import DATA_DIR
+from nover_config import LENGTH_LABELS, LENGTH_CHAPTERS
 
 # ── 核心规划字段保护 ──
 # 这些字段一旦写入即不可修改（仅 status/word_count 等运行字段可变更）
@@ -376,8 +377,6 @@ def set_signature(path, enabled, text=""):
     if not enabled_bool:
         print(f"[署名] 已关闭，LLM 不得在正文中写入任何署名/代名内容（atomic_writer 代码级阻断）")
 
-LENGTH_RANGES = {"short": (3, 6), "medium": (8, 10), "long": (11, 99)}
-LENGTH_LABELS = {"short": "短篇(3-6章)", "medium": "中篇(8-10章)", "long": "长篇(11章+)"}
 
 def init_project(name, project_name, length="medium", num_chapters=None):
     """
@@ -395,15 +394,15 @@ def init_project(name, project_name, length="medium", num_chapters=None):
     if p.exists():
         print(f"[HOOK-BLOCK] {p} 已存在，禁止重复初始化")
         sys.exit(1)
-    if length not in LENGTH_RANGES:
+    if length not in LENGTH_CHAPTERS:
         print(f"[HOOK-BLOCK] 无效篇幅: {length}，可选: short/medium/long")
         sys.exit(1)
     if num_chapters is None:
-        lo, hi = LENGTH_RANGES[length]
+        lo, hi = LENGTH_CHAPTERS[length]
         num_chapters = (lo + hi) // 2
     else:
         num_chapters = int(num_chapters)
-        lo, hi = LENGTH_RANGES[length]
+        lo, hi = LENGTH_CHAPTERS[length]
         if num_chapters < lo or num_chapters > hi:
             print(f"[HOOK-BLOCK] {LENGTH_LABELS[length]} 章数应在 {lo}-{hi} 之间，收到 {num_chapters}")
             sys.exit(1)
@@ -525,7 +524,7 @@ if __name__ == "__main__":
     elif cmd == "set-length":
         length = sys.argv[3]
         data = load_state(sp)
-        if length not in LENGTH_RANGES:
+        if length not in LENGTH_CHAPTERS:
             print(f"[HOOK-BLOCK] 无效篇幅: {length}，可选: short/medium/long")
             sys.exit(1)
         data.setdefault("meta", {})["length"] = length
