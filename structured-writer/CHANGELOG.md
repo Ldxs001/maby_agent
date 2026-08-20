@@ -3,6 +3,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [3.1.8] - 2026-08-20
+### 重构（C5 通用线字数默认值统一——09b 配置推动的穷举一致性）
+> 本次更新使用 **CodeArts + GLM-5.2** 协同完成。
+
+- **统一源**：`planner.py` 顶部加 `SUB_WORDS_MIN=200` / `SUB_WORDS_MAX=800` / `SUB_WORDS_DEFAULT=500`（范围中点）
+- **去掉 400**：子结构默认字数 400 → `SUB_WORDS_DEFAULT`=500（200-800 范围中点，语义更清晰：无偏好时的中位默认）
+- **planner.py**：13 处硬编码替换——4 处 prompt 文本 f-string 引用常量 + 9 处代码默认值（setdefault/get 兜底）
+- **writer.py**：import 3 常量 + 3 处替换（section 兜底→SUB_WORDS_MAX，sub 兜底→SUB_WORDS_DEFAULT）
+- **web_ui.py**：前端子结构输入框 `400→500`；叶子节 `800` 保持（= SUB_WORDS_MAX，前端 JS 无法 import Python 常量，值与后端统一）
+- **不影响用户覆盖**：plan_hints（重新规划输入）和 desc 字段字数仍优先于默认值，统一的是"用户没说时的代码兜底"
+- bump 3.1.8（不 git-sync，用户指示）
+
 ## [3.1.7] - 2026-08-20
 ### 重构（配置推动点位统一——09b「配置推动的穷举一致性」范式驱动）
 > 本次更新使用 **CodeArts + GLM-5.2** 协同完成。方法论体系 Cogito Scribo（09b 配置推动的穷举一致性：统一点位→有限枚举→偏差一致）驱动，识别"应统一却分散、各自干各自"的规则点位，统一到单一配置源，消除偏差不一致。

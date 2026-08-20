@@ -5530,7 +5530,7 @@ function buildOutlineHTML(outline, readOnly) {
             ${readOnly
               ? `<span style="font-size:13px;flex:1;color:var(--text-dim)">${ss.title}</span>`
               : `<input class="sub-title-input" data-sid="${ss.id}" value="${escapeAttr(ss.title)}" onchange="onTitleChange(this)" style="flex:1;min-width:90px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px 4px;font-size:12px">`}
-            ${readOnly ? '' : `<input type="number" class="sub-words" value="${ss.word_count || 400}" style="width:58px;font-size:11px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" min="100" max="2000" onchange="onSubWordChange(this, '${ss.id}', '${s.id}')"><span style="font-size:11px;color:var(--text-dim)">字</span>`}
+            ${readOnly ? '' : `<input type="number" class="sub-words" value="${ss.word_count || 500}" style="width:58px;font-size:11px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);padding:2px" min="100" max="2000" onchange="onSubWordChange(this, '${ss.id}', '${s.id}')"><span style="font-size:11px;color:var(--text-dim)">字</span>`}
             ${readOnly ? `<span style="font-size:11px;color:var(--text-dim)">${ss.word_count || ''}字</span>` : ''}
             ${ss.status === 'done' ? '<span style="font-size:11px;color:var(--green)">✓</span>' : ''}
             ${readOnly ? '' : `<button class="btn btn-sm btn-secondary" style="font-size:10px;padding:2px 6px" onclick="openAuxModal('${ss.id}')" title="辅助知识">+</button>`}

@@ -7,6 +7,10 @@ from .llm_client import LLMClient, LLMClientError
 
 KEY_UPSCALE = 1.5
 
+SUB_WORDS_MIN = 200
+SUB_WORDS_MAX = 800
+SUB_WORDS_DEFAULT = (SUB_WORDS_MIN + SUB_WORDS_MAX) // 2
+
 
 def _build_planner_prompt(meta: list, content: list, user_meta: dict,
                           plan_hints: str = "") -> str:
@@ -27,7 +31,7 @@ def _build_planner_prompt(meta: list, content: list, user_meta: dict,
         "",
         "【优先级规则】",
         "- 用户明确指定的结构要求（章节数、子结构数、字数等）优先于默认值",
-        "- 2-4 个子结构、200-800 字/子结构 这些只是默认值，用户说了就不遵守",
+        f"- 2-4 个子结构、{SUB_WORDS_MIN}-{SUB_WORDS_MAX} 字/子结构 这些只是默认值，用户说了就不遵守",
         "- 每个内容树字段的 desc 字段中可能包含字数要求（如200-300字），以此为准设置 word_count",
         "",
         "【层级边界规则】",
@@ -80,7 +84,7 @@ def _build_planner_prompt(meta: list, content: list, user_meta: dict,
         parts.append("类型规则：")
         parts.append('- type="leaf"：无子结构 sub_sections=[]，直接写全部内容')
         parts.append('- type="section"：默认拆 2-4 个子结构，用户明确指定数量时按用户要求')
-        parts.append('- 每子结构默认 200-800 字，用户指定则按用户要求')
+        parts.append(f'- 每子结构默认 {SUB_WORDS_MIN}-{SUB_WORDS_MAX} 字，用户指定则按用户要求')
         parts.append("")
         parts.append(f"- is_key: true = 该节为重点节，写作字数可上浮 {int((KEY_UPSCALE - 1) * 100)}%；false = 普通节")
 
@@ -97,7 +101,7 @@ def _build_planner_prompt(meta: list, content: list, user_meta: dict,
         '  "sections": [',
         '    {"title": "关键词", "sub_sections": [], "type": "leaf", "is_key": false},',
         '    {"title": "摘要", "sub_sections": [], "type": "leaf", "is_key": false},',
-        '    {"title": "引言", "sub_sections": [{"title":"子1","summary":"要点","word_count":400}], "type": "section", "is_key": true},',
+        '    {"title": "引言", "sub_sections": [{"title":"子1","summary":"要点","word_count":500}], "type": "section", "is_key": true},',
         '  ]',
         '}',
         "",
@@ -234,7 +238,7 @@ def _normalize_outline(outline: dict, content_fields: list) -> dict:
             s["id"] = f"s{i+1}"
         s.setdefault("subtitle", "")
         s.setdefault("summary", "")
-        s.setdefault("word_count", 800)
+        s.setdefault("word_count", SUB_WORDS_MAX)
         s.setdefault("is_key", False)
         s.setdefault("status", "pending")
         s.setdefault("actual_word_count", 0)
@@ -272,7 +276,7 @@ def _normalize_outline(outline: dict, content_fields: list) -> dict:
                 "id": f"{s['id']}_1",
                 "title": s.get("subtitle") or s["title"],
                 "summary": s.get("summary", ""),
-                "word_count": s.get("word_count", 800),
+                "word_count": s.get("word_count", SUB_WORDS_MAX),
             }]
             s["sub_sections"] = subs
 
@@ -280,14 +284,14 @@ def _normalize_outline(outline: dict, content_fields: list) -> dict:
             if "id" not in ss:
                 ss["id"] = f"{s['id']}_{j+1}"
             ss.setdefault("summary", "")
-            ss.setdefault("word_count", max(200, s.get("word_count", 800) // max(len(subs), 1)))
+            ss.setdefault("word_count", max(SUB_WORDS_MIN, s.get("word_count", SUB_WORDS_MAX) // max(len(subs), 1)))
             ss.setdefault("status", "pending")
             ss.setdefault("actual_word_count", 0)
             ss.setdefault("_checked", True)
             ss.setdefault("aux_knowledge", None)
 
         if not subs:
-            s.setdefault("word_count", 800)
+            s.setdefault("word_count", SUB_WORDS_MAX)
         else:
             s["word_count"] = sum(ss["word_count"] for ss in subs)
 
@@ -485,7 +489,7 @@ def replan_section(topic: str, hints: str, llm_client: LLMClient,
             "summary": target.get("summary", ""),
             "sub_sections": [
                 {"title": ss.get("title", ""), "summary": ss.get("summary", ""),
-                 "word_count": ss.get("word_count", 400)}
+                 "word_count": ss.get("word_count", SUB_WORDS_DEFAULT)}
                 for ss in target.get("sub_sections", [])
             ],
         }, ensure_ascii=False, indent=2))
@@ -494,11 +498,11 @@ def replan_section(topic: str, hints: str, llm_client: LLMClient,
         parts.append('{')
         parts.append('  "title": "新章节标题（可沿用原标题，也可按用户要求调整）",')
         parts.append('  "sub_sections": [')
-        parts.append('    {"title": "子结构1", "summary": "写作要点", "word_count": 400},')
-        parts.append('    {"title": "子结构2", "summary": "写作要点", "word_count": 400}')
+        parts.append('    {"title": "子结构1", "summary": "写作要点", "word_count": 500},')
+        parts.append('    {"title": "子结构2", "summary": "写作要点", "word_count": 500}')
         parts.append('  ]')
         parts.append('}')
-        parts.append("子结构 2-4 个、每子结构 200-800 字是默认值，用户明确要求时按用户要求。")
+        parts.append(f"子结构 2-4 个、每子结构 {SUB_WORDS_MIN}-{SUB_WORDS_MAX} 字是默认值，用户明确要求时按用户要求。")
     else:
         parts.append("【任务】对该子结构重新规划方向和内容：输出新的子结构标题、要点、字数。")
         if parent_section:
@@ -507,16 +511,16 @@ def replan_section(topic: str, hints: str, llm_client: LLMClient,
         parts.append(json.dumps({
             "title": target.get("title", ""),
             "summary": target.get("summary", ""),
-            "word_count": target.get("word_count", 400),
+            "word_count": target.get("word_count", SUB_WORDS_DEFAULT),
         }, ensure_ascii=False, indent=2))
         parts.append("")
         parts.append("【JSON 格式】")
         parts.append('{')
         parts.append('  "title": "新子结构标题",')
         parts.append('  "summary": "写作要点",')
-        parts.append('  "word_count": 400')
+        parts.append('  "word_count": 500')
         parts.append('}')
-        parts.append("字数默认 200-800，用户明确要求时按用户要求。")
+        parts.append(f"字数默认 {SUB_WORDS_MIN}-{SUB_WORDS_MAX}，用户明确要求时按用户要求。")
 
     parts.append("")
     parts.append("【后果】如果输出包含 JSON 以外的任何文字，系统将无法解析，整个流程会失败。")
@@ -562,7 +566,7 @@ def replan_section(topic: str, hints: str, llm_client: LLMClient,
                 "id": f"{target.get('id', 's')}_{j+1}",
                 "title": str(ss.get("title", "")).strip() or f"子结构{j+1}",
                 "summary": str(ss.get("summary", "")).strip(),
-                "word_count": int(ss.get("word_count") or 400),
+                "word_count": int(ss.get("word_count") or SUB_WORDS_DEFAULT),
                 "status": "pending",
                 "actual_word_count": 0,
                 "_checked": True,
@@ -573,7 +577,7 @@ def replan_section(topic: str, hints: str, llm_client: LLMClient,
                 "id": f"{target.get('id', 's')}_1",
                 "title": target.get("title", "正文"),
                 "summary": target.get("summary", ""),
-                "word_count": target.get("word_count", 800),
+                "word_count": target.get("word_count", SUB_WORDS_MAX),
                 "status": "pending",
                 "actual_word_count": 0,
                 "_checked": True,
@@ -600,7 +604,7 @@ def replan_section(topic: str, hints: str, llm_client: LLMClient,
             "id": target.get("id", ""),
             "title": str(result.get("title", "")).strip() or target.get("title", ""),
             "summary": str(result.get("summary", "")).strip() or target.get("summary", ""),
-            "word_count": int(result.get("word_count") or target.get("word_count", 400)),
+            "word_count": int(result.get("word_count") or target.get("word_count", SUB_WORDS_DEFAULT)),
             "status": "pending",
             "actual_word_count": 0,
             "_checked": True,

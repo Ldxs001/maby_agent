@@ -10,7 +10,7 @@ from typing import Optional
 from .llm_client import LLMClient, LLMClientError
 from .state_manager import StateManager, OUTPUTS_DIR, SESSIONS_DIR
 from .citation_validator import post_process as citation_post_process
-from .planner import _strip_word_desc, KEY_UPSCALE
+from .planner import _strip_word_desc, KEY_UPSCALE, SUB_WORDS_MIN, SUB_WORDS_MAX, SUB_WORDS_DEFAULT
 from . import aux_parser
 
 
@@ -232,7 +232,7 @@ def generate_article(
                 "id": f"{sid}_1",
                 "title": section.get("subtitle") or section["title"],
                 "summary": section.get("summary", ""),
-                "word_count": section.get("word_count", 800),
+                "word_count": section.get("word_count", SUB_WORDS_MAX),
             }]
 
         # ── 两级 RAG 查询 ──
@@ -307,7 +307,7 @@ def generate_article(
                 section_title=section["title"],
                 section_subtitle=section.get("subtitle", ""),
                 section_summary=section.get("summary", ""),
-                word_count=section.get("word_count", 800),
+                word_count=section.get("word_count", SUB_WORDS_MAX),
                 is_key=section.get("is_key", False),
                 context_buffer=(context_buffer or "") if section.get("_logical_order") == 2 else (context_buffer[-context_review_length:] if context_buffer and context_review_length else (context_buffer or "")),
                 rag_context=section_rag_context,
@@ -428,7 +428,7 @@ def generate_article(
                 section_title=sub["title"],
                 section_subtitle="",
                 section_summary=sub.get("summary", ""),
-                word_count=sub.get("word_count", 400),
+                word_count=sub.get("word_count", SUB_WORDS_DEFAULT),
                 is_key=section.get("is_key", False),
                 context_buffer=ctx_buffer,
                 rag_context=combined_rag,
