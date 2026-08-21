@@ -3,6 +3,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`__init__.py` 唯一源）。
 
+## [2.4.1] - 2026-08-21
+### 变更（版本号重发）
+- **2.4.0 的 wheel 文件名在 PyPI 已上传后被删除，文件名永久锁定（PyPI file-name-reuse 规则：`Deleted files cannot be re-uploaded`）**——同版本号同类型无法重传，故 bump 至 2.4.1 重发（代码内容与 2.4.0 完全一致，仅版本号变更）
+- bump 2.4.1
+
+---
+
 ## [2.4.0] - 2026-08-21
 ### 新增（PDF 引擎迁移 pypdf → pypdfium2 + 乱码检测）
 > 本次更新使用 **CodeArts + GLM-5.2** 协同完成。
