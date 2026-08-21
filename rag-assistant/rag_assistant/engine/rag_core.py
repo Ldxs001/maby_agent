@@ -16,6 +16,18 @@ from config import load_config
 from utils import KB_DIR, MODELS_DIR, find_model_dirs
 
 
+# ── 信号 4：中文常用字表（~200 高频汉字，覆盖正常中文 70%+ 字符） ──
+_COMMON_CJK = set(
+    "的一是不了在有人我他这中大为上以个到说们时们要就你会对那和也子道得没出"
+    "而想能天见只么下生把还多去过用她里说后去做来把就好走小如们都然自家什"
+    "把好心又问比些太起看十全老进着而才你已经可前所被最从现因让此其样第与"
+    "但并信关步制数期次品由各共名代何力当加外本立解正意者明理法化使体水公"
+    "叫合等员电放件求任利位业形目经面话或两嘛呢吧啊哦嗯呀谁哪每很非即则便"
+    "若且虽故所然不过还就只些太起看十全老进着而才你已经可前所被最从现因让"
+    "此其样第与但并信关步制数期次品由各共名代何力当加外本立解正意者明理"
+)
+
+
 # ── 头部块标记（is_header） ──
 
 def _looks_like_header(text: str) -> bool:
@@ -569,33 +581,81 @@ def import_documents_to_kb(file_path, kb_name="default", embeddings=None, splitt
     try:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
-            from pypdf import PdfReader
-            reader = PdfReader(file_path)
-            docs = []
-            for i, page in enumerate(reader.pages):
-                text = page.extract_text() or ""
-                docs.append(Document(
-                    page_content=text,
-                    metadata={"source": os.path.basename(file_path), "page": i + 1}
-                ))
-            # 扫描版 PDF 自动回退 OCR
-            total_chars = sum(len(d.page_content) for d in docs)
-            # 无文本层（0 字符或极少字符）→ 直接 OCR，与文件名无关
-            if total_chars < 50:
-                print(f"  [OCR fallback] 提取文本仅 {total_chars} 字符，走 OCR")
-                total_chars = 0  # 强制走 OCR 回退
-            # 中文文件名 + CJK 占比过低 → 编码乱码，触发 OCR
-            fname = os.path.basename(file_path)
-            has_chinese_filename = bool(re.search(r'[\u4e00-\u9fff]', fname))
-            if total_chars >= 50 and has_chinese_filename:
-                all_text = "".join(d.page_content for d in docs)
-                total_chars = len(all_text)
-                cjk = sum(1 for c in all_text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
-                cjk_ratio = cjk / max(total_chars, 1)
-                if cjk_ratio < 0.10 and total_chars > 100:
-                    print(f"  [OCR fallback] 中文文件名但 CJK 占比 {cjk_ratio:.1%}，触发 OCR")
-                    total_chars = 0  # 强制走 OCR 回退
-            if total_chars < 50:
+            import pypdfium2 as pdfium
+
+            # 步骤 1：二进制读取判断 PDF 类型（首位）
+            with open(file_path, 'rb') as f:
+                raw = f.read()
+            has_font = b'/Font' in raw
+            has_image = b'/Image' in raw or b'/XObject' in raw
+
+            need_ocr = False
+
+            if not has_font:
+                print(f"  [PDF] 无文本层（无 /Font），走 OCR")
+                need_ocr = True
+            elif has_image:
+                # 混合版：统计无文本页占比
+                pdf = pdfium.PdfDocument(file_path)
+                total_pages = len(pdf)
+                no_text_pages = 0
+                for i in range(total_pages):
+                    page = pdf[i]
+                    tp = page.get_textpage()
+                    text = tp.get_text_range()
+                    tp.close()
+                    page.close()
+                    if len(text.strip()) < 50:
+                        no_text_pages += 1
+                pdf.close()
+                image_ratio = no_text_pages / max(total_pages, 1)
+                if image_ratio > 0.5:
+                    print(f"  [PDF] 混合版，无文本页占比 {image_ratio:.0%} > 50%，走 OCR")
+                    need_ocr = True
+
+            if not need_ocr:
+                # 步骤 2：pypdfium2 提取全部页文本
+                pdf = pdfium.PdfDocument(file_path)
+                docs = []
+                for i in range(len(pdf)):
+                    page = pdf[i]
+                    tp = page.get_textpage()
+                    text = tp.get_text_range()
+                    tp.close()
+                    page.close()
+                    docs.append(Document(
+                        page_content=text,
+                        metadata={"source": os.path.basename(file_path), "page": i + 1}
+                    ))
+                pdf.close()
+
+                # 步骤 3：信号 2+4 逐页质量检测（提取后、切分前）
+                garbled_pages = 0
+                total_pages = len(docs)
+                for doc in docs:
+                    text = doc.page_content
+                    if not text or len(text) < 50:
+                        continue
+                    # 信号 2：英文词间距丢失（max_run > 30）
+                    alpha = sum(1 for c in text if c.isalpha() and ord(c) < 128) / len(text)
+                    max_run = max((len(m) for m in re.findall(r'[a-zA-Z]+', text)), default=0)
+                    if alpha > 0.5 and max_run > 30:
+                        garbled_pages += 1
+                        continue
+                    # 信号 4：中文常用字覆盖率 < 50%
+                    cjk_chars = [c for c in text if '\u4e00' <= c <= '\u9fff']
+                    if len(cjk_chars) > 10:
+                        common_hit = sum(1 for c in cjk_chars if c in _COMMON_CJK) / len(cjk_chars)
+                        if common_hit < 0.5:
+                            garbled_pages += 1
+
+                garbled_ratio = garbled_pages / max(total_pages, 1)
+                if garbled_ratio > 0.1:
+                    print(f"  [PDF] 乱码页占比 {garbled_ratio:.0%} > 10%，走 OCR")
+                    need_ocr = True
+
+            if need_ocr:
+                # 步骤 4：OCR 回退（pdf2image + easyocr）
                 try:
                     from pdf2image import convert_from_path
                     import numpy as np
@@ -612,7 +672,7 @@ def import_documents_to_kb(file_path, kb_name="default", embeddings=None, splitt
                         metadata={"source": os.path.basename(file_path), "ocr": True}
                     )]
                 except Exception as ocr_err:
-                    raise RuntimeError(f"PDF 无文本且 OCR 失败: {ocr_err}")
+                    raise RuntimeError(f"PDF OCR 失败: {ocr_err}")
         else:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()

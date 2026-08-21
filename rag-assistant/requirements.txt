@@ -16,6 +16,7 @@ numpy>=1.24
 # 需要时手动安装: pip install llama-cpp-python (需 CMake + VS Build Tools)
 
 # ── 输入源 ───────────────────────────────────
+
 easyocr>=1.7        # OCR（扫描版 PDF）
 
 # ── Web 与工具 ─────────────────────────────

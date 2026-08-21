@@ -25,7 +25,7 @@ CONFIG_SCHEMA = {
         "enable_pdf":     {"type": "bool", "default": False, "label": "PDF 支持"},
         "enable_ocr":     {"type": "bool", "default": False, "label": "OCR 支持"},
         "enable_html2md": {"type": "bool", "default": False, "label": "HTML→Markdown"},
-        "pdf_backend":    {"type": "enum", "default": "pypdf", "options": ["pypdf", "pdfplumber"], "label": "PDF 引擎"},
+        "pdf_backend":    {"type": "enum", "default": "pypdfium2", "options": ["pypdfium2"], "label": "PDF 引擎"},
     },
     "embedding": {
         "model_path": {"type": "string", "default": "BAAI/bge-small-zh-v1.5", "label": "嵌入模型"},

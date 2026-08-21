@@ -75,21 +75,16 @@ def run_import(file_path, kb=None, json_output=False, auto_classify=False):
         # PDF 文件需要用解析器提取文本，不能当 UTF-8 文本读
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
-            from pypdf import PdfReader
+            import pypdfium2 as pdfium
             try:
-                pdf_reader = PdfReader(file_path)
-                page_texts = []
-                for p in pdf_reader.pages:
-                    t = p.extract_text() or ""
-                    if t:
-                        page_texts.append(t)
-                content = "\n\n".join(page_texts)
-                # 文本质量检测：CJK 占比过低 → OCR（无文本层或编码乱码）
-                total_chars = len(content)
-                cjk = sum(1 for c in content if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
-                cjk_ratio = cjk / max(total_chars, 1)
-                if total_chars == 0 or (cjk_ratio < 0.10 and total_chars > 100):
-                    print(f"  [OCR] PDF {'无文本层' if total_chars==0 else f'CJK占比{cjk_ratio:.1%}'}，走 OCR")
+                # 二进制判断 PDF 类型
+                with open(file_path, 'rb') as f:
+                    raw = f.read()
+                has_font = b'/Font' in raw
+
+                if not has_font:
+                    # 无文本层 → OCR
+                    print(f"  [OCR] PDF 无文本层，走 OCR")
                     from pdf2image import convert_from_path
                     import numpy as np
                     import easyocr
@@ -101,6 +96,20 @@ def run_import(file_path, kb=None, json_output=False, auto_classify=False):
                         result = reader.readtext(arr)
                         all_text.append("\n".join([r[1] for r in result]))
                     content = "\n\n--- 换页 ---\n\n".join(all_text)
+                else:
+                    # pypdfium2 提取全部页文本
+                    pdf = pdfium.PdfDocument(file_path)
+                    page_texts = []
+                    for i in range(len(pdf)):
+                        page = pdf[i]
+                        tp = page.get_textpage()
+                        t = tp.get_text_range()
+                        tp.close()
+                        page.close()
+                        if t:
+                            page_texts.append(t)
+                    pdf.close()
+                    content = "\n\n".join(page_texts)
             except Exception:
                 content = ""
         else:

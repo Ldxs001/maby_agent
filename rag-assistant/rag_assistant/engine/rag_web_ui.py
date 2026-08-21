@@ -134,7 +134,7 @@ if os.path.isdir(VENDOR_DIR):
 # ==================== 输入源依赖检测 ====================
 
 _DEP_MODULES = {
-    "enable_pdf": ["pypdf", "pdfplumber"],
+    "enable_pdf": ["pypdfium2"],
     "enable_ocr": ["paddleocr", "easyocr"],
     "enable_html2md": ["markdownify"],
 }
@@ -1757,7 +1757,7 @@ input:disabled + .toggle-slider {{ background: #ddd; cursor: not-allowed; }}
           <input type="checkbox" onclick="event.stopPropagation();" {"checked" if input_src.get("enable_pdf", False) else ""}>
           <span class="toggle-slider"></span>
         </label>
-        <div style="font-size:11px;color:#888;margin-top:4px;">pypdf / pdfplumber</div>
+        <div style="font-size:11px;color:#888;margin-top:4px;">pypdfium2（PDFium）</div>
       </div>
       <div class="form-group">
         <label>OCR 图片提取 <span class="src-dot {_dot_cls_ocr}" id="dot-enable_ocr" style="font-size:12px;">⬤</span></label>
@@ -2422,7 +2422,7 @@ class RAGHandler(http.server.BaseHTTPRequestHandler):
                 # 开启时自动检测并安装依赖
                 if new_state:
                     _DEP_MAP = {
-                        "enable_pdf": {"modules": ["pypdf", "pdfplumber"], "pip": "pypdf"},
+                        "enable_pdf": {"modules": ["pypdfium2"], "pip": "pypdfium2"},
                         "enable_ocr": {"modules": ["paddleocr", "easyocr"], "pip": ["paddleocr", "easyocr"]},
                         "enable_html2md": {"modules": ["markdownify"], "pip": "markdownify"},
                     }

@@ -13,7 +13,7 @@ DEFAULT_CONFIG = {
         "enable_pdf": False,
         "enable_ocr": False,
         "enable_html2md": False,
-        "pdf_backend": "pypdf",  # pypdf / pdfplumber
+        "pdf_backend": "pypdfium2",  # pypdfium2（Google PDFium 引擎）
     },
     "splitting": {
         "strategy": "recursive",

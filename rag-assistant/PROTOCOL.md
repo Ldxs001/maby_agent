@@ -345,7 +345,7 @@
     "enable_pdf": true,                         // 是否开启 PDF 解析
     "enable_ocr": true,                         // 扫描 PDF 是否自动 OCR 回退
     "enable_html2md": true,                     // HTML 是否转 Markdown
-    "pdf_backend": "pypdf"                      // "pypdf" | "pdfplumber"
+    "pdf_backend": "pypdfium2"                   // pypdfium2（Google PDFium 引擎）
   },
 
   // ── 文本切分 ──

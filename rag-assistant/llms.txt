@@ -52,7 +52,7 @@ main.py ─── 入口（CLI / Web / Batch / External API 四模式）
   │   ├── prompt_manager.py         ← Prompt 管理（模板/插槽/预设）
   │   └── ...
   │
-  ├── vendor/                       ← 嵌入的第三方库（bs4 / pypdf / markdownify）
+  ├── vendor/                       ← 嵌入的第三方库（pypdfium2 / bs4 / markdownify）
   └── data/                         ← 运行时数据
       ├── config/rag_config.json    ← 全量配置文件
       ├── kb/                       ← ChromaDB 知识库

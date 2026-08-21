@@ -3,6 +3,26 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`__init__.py` 唯一源）。
 
+## [2.4.0] - 2026-08-21
+### 新增（PDF 引擎迁移 pypdf → pypdfium2 + 乱码检测）
+> 本次更新使用 **CodeArts + GLM-5.2** 协同完成。
+
+- **PDF 文本提取引擎从 pypdf 切换到 pypdfium2**（Google PDFium 引擎，BSD-3-Clause / Apache-2.0）：从根源消除 pypdf 的 ToUnicode CMap 映射缺陷导致的形似字问题（`Iethods`→`Methods`、`sarnple`→`sample`、`fro m`→`from`）。三处调用同步替换：`rag_core.py`（主导入链路）、`rag_skill.py`（自动分类预读）、`agent.py`（智能体预览）
+- **二进制 PDF 类型判断**（`rag_core.py:586-614`）：读取 PDF 二进制检测 `/Font` 和 `/Image`。无 `/Font` → 直接 OCR（无文本层）；有 `/Image` 且无文本页占比 > 50% → 直接 OCR（混合版扫描件）
+- **信号 2+4 逐页质量检测**（`rag_core.py:632-655`）：提取后切分前检测两种乱码信号。信号 2：英文词间距丢失（`alpha > 0.5 且 max_run > 30`）；信号 4：中文常用字覆盖率 < 50%。乱码页占比 > 10% → 整篇 OCR。乱码 chunk 不剔除，让检索自然降权
+- **`_COMMON_CJK` 常用字表**（`rag_core.py` 顶部）：~200 高频汉字 set，供信号 4 检测使用
+
+### 变更
+- **OCR 触发条件重构**：旧版两层判断（`total_chars < 50` + `中文文件名 and CJK占比<10%`）→ 新版三层判断（二进制类型 → 混合版无文本页占比 → 信号 2+4 乱码页占比），消除旧版漏判乱码 PDF 的问题
+- **删除 `vendor/pypdf/`，新增 `vendor/pypdfium2/` + `vendor/pypdfium2_raw/` + `vendor/pypdfium2_cfg/`**：pypdfium2 官方支持 vendor 打包（pip install 时自动下载预编译 PDFium 二进制），将安装后的包目录（含 `pdfium.dll` 7MB）直接复制到 vendor/，从 `requirements.txt` 移除 pypdfium2 依赖
+- **`vendor/NOTICE.md` 更新**：删 pypdf 条目（BSD 3-Clause），加 pypdfium2 / pypdfium2_raw / pypdfium2_cfg 条目（BSD-3-Clause / Apache-2.0）
+- **死配置 `pdf_backend` 默认值 pypdf → pypdfium2**：`config.py`、`rag_web_ui.py`×3、`PROTOCOL.md`、`rag_setup_orchestrator.py` 同步更新（注：此配置项代码层仍不读取，UI 切换无效果）
+- **描述性文字清理**：`__init__.py` 注释、`CHANGELOG.md` vendor 列表、`llms.txt` vendor 列表删除 pypdf 提及
+- **`docs/pdf-import-audit.md` 重写**：按当前 pypdfium2 架构重写审查报告，标注已修复/仍存在/设计意图
+- bump 2.4.0
+
+---
+
 ## [2.3.0] - 2026-08-20
 ### 新增（top-N 多 KB 路由 + 死代码清理）
 > 本次更新使用 **CodeArts + GLM-5.2** 协同完成。
@@ -700,7 +720,7 @@ RAG Assistant 引入标准化插件系统，支持信息补充类（input_return
 
 ### 架构（自包容技能副本）
 - `engine/` — local-rag-builder 完整技能引擎（rag_core / router / reranker / text_splitter / KB 管理 / 嵌入模型管理 / prompt 管理）
-- `vendor/` — 嵌入第三方依赖（bs4 / pypdf / markdownify / soupsieve）
+- `vendor/` — 嵌入第三方依赖（pypdfium2 / bs4 / markdownify / soupsieve）
 - `rag_assistant/agent.py` — LLM 自主决策循环（query / search / import 三动作 + 自修正 + 穷举组合查询）
 - `rag_assistant/rag_wrapper.py` — 技能封装桥接层，保持技能完整流程
 - `rag_assistant/llm_client.py` — Ollama（/api/chat） + LM Studio（OpenAI 兼容）双后端

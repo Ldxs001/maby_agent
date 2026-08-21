@@ -1042,13 +1042,18 @@ Agent 会自动将 entities × attrs 穷举组合后查询。
                     ext = os.path.splitext(path)[1].lower()
                     content = ""
                     if ext == ".pdf":
-                        from pypdf import PdfReader
-                        reader = PdfReader(path)
+                        import pypdfium2 as pdfium
+                        pdf = pdfium.PdfDocument(path)
                         snippets = []
-                        for p in reader.pages[:4]:
-                            text = (p.extract_text() or "")[:500]
+                        for i in range(min(4, len(pdf))):
+                            page = pdf[i]
+                            tp = page.get_textpage()
+                            text = tp.get_text_range()[:500]
+                            tp.close()
+                            page.close()
                             if text:
                                 snippets.append(text)
+                        pdf.close()
                         content = "\n\n".join(snippets)
                     elif ext in (".txt", ".md", ".html"):
                         with open(path, "r", encoding="utf-8", errors="ignore") as f:
