@@ -1,0 +1,59 @@
+# silprespec-emulator · 前置规范效果模拟器
+
+> 通用实验台：用户自由选择/裁剪 8 种前置规范方式，对输入真实执行（LLM 真填空），观测填入内容、重试次数、是否撑满、重现性。不替用户选方式，只管执行并产出可观测结果。
+
+## 概述
+
+前置规范效果实验台是一个通用实验台。用户根据自己的场景，从 8 种前置规范方式中选择一种或多种、自由裁剪配置，对输入**真实执行**（LLM 真填空），观测：
+
+- 填入了什么（门禁填了哪个穷举词、凝练成什么、槽位填了什么）——填入内容本身就是结果
+- 重试次数、是否撑满 max_retry、撑满失败次数
+- 命中/留空分布
+- 并行 N 次的重现性（命中一致率、填入一致率）
+
+不绑定具体场景，不替用户决定用哪种方式。后置验证（任务完成后全量验证）不在本系统。
+
+## 8 种前置规范方式
+
+| 方式 | 作用点 | 核心机制 | 关键配置 |
+|------|--------|----------|----------|
+| gate 门禁穷举词组 | 填空出口 | 多道门禁 AND，每道内穷举词组 OR 命中，未命中留空不 block（减法） | gates: [[词组]], max_retry |
+| guide 软引导 | 填空出口 | 引导提示词，无硬约束 | guide_prompt, max_retry |
+| condense 凝练+代码枚举 | 填空出口 | LLM 凝练为禁泛化短语，代码枚举校验是否在允许集 | allowed: [短语], max_retry |
+| slot 槽位限定+查多余编造 | 填空出口 | 槽位填空 + 检测填入是否超出槽位定义（编造） | slots: {名: 描述}, max_retry |
+| diverge 发散+纠偏 | 填空出口 | 允许发散，命中禁用词后纠偏重试 | forbidden: [词], max_retry |
+| deterministic 确定性后处理 | 填空出口 | LLM 生成后用代码强制纠正/钉住 | correct_rules, pin_fields |
+| detect_report 检出即上报 | 填空出口 | 检出特定模式（如数字）即上报，不阻塞 | detect_pattern |
+| required_min required 最小化 | 填空出口 | 只设最少 required 字段，其余留空 | required: [字段] |
+
+## 启动
+
+- bat：双击 `setup.bat`
+- 命令行：`python main.py`（默认 LM Studio）、`python main.py --backend ollama`
+- 批处理：`python main.py --batch input.json output.json`
+
+## 后端
+
+- LM Studio（默认 `http://localhost:1234`）
+- Ollama（默认 `http://localhost:11434`）
+- Custom（任意 OpenAI 兼容 API）
+
+## 界面
+
+深色主题 Web UI（端口 8805），三 Tab：配置（选方式+各方式参数）/ 运行（输入+并行数）/ 结果（每方式填入内容、重试、撑满、重现性）。
+
+## 核心模块
+
+- `silprespec_emulator/config_manager.py` — ConfigManager + DEFAULT_CONFIG（配置推动：CLI > config.json > DEFAULT）
+- `silprespec_emulator/pipeline_model.py` — 8 种方式配置 + 结果模型 + 重现性计算
+- `silprespec_emulator/simulator.py` — 执行引擎 + 8 种方式真实执行器 + 确定性代码辅助
+- `silprespec_emulator/llm_client.py` — 多后端 LLM 客户端
+- `silprespec_emulator/web_ui.py` — 实验台 Web UI
+
+## 设计依据
+
+- 08a 前置规范 > 后置验证；三态谱系；validate()的死亡
+- 08b 空坐标系；双判据交点（容错宽度 × 注意力窗口）；内容轴不可穷举，格式轴可收束
+- 08c 四论断；三场景自由度光谱；减法操作集①-⑥
+- 07 四原则（如无必要勿增实体/如无规矩勿增操作/如无能力勿增限制/如无资源勿增承诺）
+- 09b 配置推动的穷举一致性；偏差一致=可校准

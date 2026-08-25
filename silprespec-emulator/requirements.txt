@@ -1,0 +1,4 @@
+# silprespec-emulator 依赖
+# 仅使用 Python 标准库（http.server / threading / json / urllib）
+# LLM 推理由外部后端服务提供：LM Studio / Ollama / 任意 OpenAI 兼容 API
+# 无第三方 pip 包依赖
