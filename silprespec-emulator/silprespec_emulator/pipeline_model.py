@@ -42,145 +42,176 @@ WAY_HELPS = {
 多道门禁 AND，每道内候选词 OR 命中。LLM 每道填一个词或"未指定"，不 block。
 编造（填了不在候选词里的）才标记失败并重试。
 
-示例：
-{"gates": [{"name": "情绪", "words": ["积极","消极","中性"], "logic": "or"}], "allow_unspecified": true}
-
-字段：
-- gates: 门禁列表，多道 AND
-- gates[].name: 维度名
-- gates[].words: 候选词组，OR 命中
-- allow_unspecified: true=允许"未指定"（减法），false=必须命中
+表单：
+- 门禁行：每行一道门禁（维度名 + 候选词逗号分隔）；点"+ 门禁"增加、"删"删除
+- 允许未指定：勾选=允许填"未指定"（减法），不勾=必须命中候选词
+- 多道门禁 AND，每道内候选词 OR 命中
 
 观测：filled（每道填了什么）、hit/unspecified/fabricated 计数
 
 检测什么：LLM 在穷举词组中能否命中，编造了什么词
-适用：维度可穷举（情绪/时态/语态等有限分类）
+适用场景：维度可穷举的有限分类（情绪/时态/语态/类别等）
+输入类型：自然语言短文本（一句话/评论/短语），需归入有限候选词
 缺陷：维度不可穷举时无法用；词组太少逼 LLM 硬造（PhantomFill）""",
 
     "guide": """【软引导·引导提示词】
 名词：软引导=只给提示词引导方向，不限定候选集，不硬约束。LLM 自由填空但受引导影响。
 给 LLM 引导提示词，让它填空。无硬约束，LLM 正常响应即成功。
 
-示例：
-{"guide_prompt": "围绕主题展开，保持语义一致"}
-
-字段：
-- guide_prompt: 引导提示词
+表单：
+- 引导提示词：文本框，给 LLM 的引导方向（如"围绕主题展开，保持语义一致"）
 
 观测：filled.output（LLM 输出内容）
 
 检测什么：LLM 在软引导下填了什么内容
-适用：无法穷举的开放维度，只需引导方向
+适用场景：无法穷举的开放维度，只需引导方向
+输入类型：自然语言文本（开放内容，如摘要/续写/改写）
 缺陷：无硬约束，LLM 可能偏离引导""",
 
     "condense": """【凝练+代码固定枚举拼接】
 名词：凝练=把长文本浓缩为短词/短语。代码枚举=用预定义允许词列表校验凝练结果。泛化=LLM 造了不在允许列表中的新词。
 LLM 凝练为短词，代码枚举校验是否在允许集（禁泛化）。只保留在 enums 中的词或其子串，编造的丢弃。
 
-示例：
-{"condense_rule": "浓缩为短词，禁止泛化造新词", "enums": ["环境治理","生态文明","绿色发展"]}
-
-字段：
-- condense_rule: 凝练规则提示词
-- enums: 允许的候选词列表（代码枚举校验：输出词必须是 enums 中某词的子串或超串）
+表单：
+- 凝练规则：文本框，给 LLM 的浓缩规则
+- 枚举词：逗号分隔输入（如 环境治理,生态文明,绿色发展）；代码校验输出词必须是其中某词的子串或超串
 
 观测：filled.condensed（通过校验的词）、filled.raw（原始输出）、fabricated_count
 
 检测什么：LLM 凝练后是否泛化造新词
-适用：需要把长文本浓缩为标准短语（标签/分类）
+适用场景：把长文本浓缩为标准短语/标签/分类
+输入类型：自然语言长文本（文章/段落/描述），输出需落在枚举词集
 缺陷：enums 太少时 LLM 可能无法命中；子串匹配可能误判""",
 
     "slot": """【槽位限定+查多余编造】
 名词：槽位=预定义的信息字段（如 who/what/why），LLM 从输入文本中提取信息填入。与门禁不同：门禁是从穷举词中"选"，槽位是从文本中"提取"，值是开放的。多余编造=LLM 输出了槽位定义以外的字段。
 LLM 填指定槽位，代码检测是否有多余 key（编造）。有多余 key 则重试。
 
-示例：
-{"slots": [{"name": "who", "required": true}, {"name": "what", "required": true}, {"name": "why", "required": false}]}
-
-字段：
-- slots: 槽位列表
-- slots[].name: 槽位名
-- slots[].required: 是否必填（slot 方式不强制检查 required，仅检查多余 key）
+表单：
+- 槽位行：每行一个槽位（槽位名 + 必填勾选）；点"+ 槽位"增加、"删"删除
+- 注：slot 方式不强制检查必填，仅检查 LLM 是否编造了槽位以外的多余字段
 
 观测：filled（各槽位填入）、extra_fabrication（多余 key 列表）
 
 检测什么：LLM 是否编造了槽位以外的字段
-适用：结构化抽取（who/what/why 等固定字段）
+适用场景：结构化抽取（who/what/why 等固定字段）
+输入类型：自然语言文本（含可提取实体/事件的事实描述，如新闻/履历）
 缺陷：槽位定义太死可能逼 LLM 硬填；不检查槽位内容质量""",
 
     "diverge": """【发散+确定性纠偏】
 名词：发散=让 LLM 高温度自由生成，不限制方向。纠偏=生成后用代码（正则替换）把偏离的部分拉回。与门禁相反：门禁是生成前限制，纠偏是生成后修正。
 LLM 高温度发散生成，代码按配置确定性纠偏（正则替换+空行归一化）。不设硬失败。
 
-示例：
-{"diverge_prompt": "自由发散生成", "regex_replaces": [{"pattern": "【引用自来源\\\\d+】", "replace": ""}], "normalize_blanklines": true}
-
-字段：
-- diverge_prompt: 发散提示词
-- regex_replaces: 正则替换规则列表（代码按顺序执行）
-- regex_replaces[].pattern / .replace: 正则模式 / 替换文本
-- normalize_blanklines: true=多余空行归一化为双换行
+表单：
+- 发散提示词：文本框，给 LLM 的发散方向
+- 替换规则行：每行一条（正则 pattern + 替换文本）；点"+ 替换规则"增加、"删"删除；代码按顺序执行
+- 空行归一化：勾选=多余空行压成双换行
 
 观测：filled.raw（纠偏前）、filled.corrected（纠偏后）、changed（是否改过）
 
 检测什么：LLM 发散生成后纠偏改了什么
-适用：需要创意发散但有些维度要纠偏
+适用场景：需要创意发散但有些维度要纠偏
+输入类型：自然语言主题/提示词（创意生成，如故事/文案/扩写）
 缺陷：纠偏规则有限（正则替换），复杂语义错误无法纠""",
 
     "deterministic": """【确定性后处理（完全封死）】
 名词：钉死=用代码强制固定某些维度（如编号重排、格式归一化），LLM 零参与，百分百准确。封死=这些维度不再需要验证。与纠偏类似但更彻底：纠偏是部分修正，钉死是完全固定。
 LLM 生成，代码按配置钉死（正则替换+编号重排+空行归一化）。代码部分百分百准确不需测试，测的是 LLM 原始输出——钉死前后差异反映 LLM 不可控程度。
 
-示例：
-{"regex_replaces": [{"pattern": "【引用自来源\\\\d+】", "replace": ""}], "renumber_source": true, "normalize_blanklines": true}
-
-字段：
-- regex_replaces: 正则替换规则列表（代码按顺序执行）
-- regex_replaces[].pattern / .replace: 正则模式 / 替换文本
-- renumber_source: true=来源编号重排为 1,2,3...
-- normalize_blanklines: true=多余空行归一化
+表单：
+- 替换规则行：每行一条（正则 pattern + 替换文本）；点"+ 替换规则"增加、"删"删除；代码按顺序执行
+- 编号重排：勾选=来源编号重排为 1,2,3...
+- 空行归一化：勾选=多余空行压成双换行
 
 观测：filled.raw（钉死前）、filled.pinned（钉死后）、changed（是否改过）
 
 检测什么：LLM 原始输出中需要钉死的内容（编号/格式），钉死前后差异
-适用：某些维度可代码封死（编号/格式），减少需验证维度
+适用场景：某些维度可代码封死（编号/格式/空行），减少需验证维度
+输入类型：自然语言文本（含来源编号/引用标记/多空行等格式噪声，需钉死格式）
 缺陷：只能封死格式轴（编号/空行），内容轴无法封死""",
 
-    "detect_report": """【检出即上报】
+    "detect_report": r"""【检出即上报】
 名词：检出=用正则扫描 LLM 输出中的特定内容（如数值）。上报=检出项不在合法值集（allowed_values）中则标记人工复审，不阻塞生成。与封死相反：封不死的内容轴只能检出后交给人工。
 LLM 生成，代码按配置检出内容（正则），对照 allowed_values 标记未命中的为上报。不阻塞。
 
-示例：
-{"detect_pattern": "\\\\d+(?:\\\\.\\\\d+)?(%|亿|万|元|人次)", "allowed_values": ["100%","3.5亿"], "report_label": "建议人工复审"}
-
-字段：
-- detect_pattern: 检出正则（匹配需要审核的内容）
-- allowed_values: 合法值列表（配了则只标记不在此列表的检出项；不配则标记所有检出项）
-- report_label: 上报标记文本
+表单：
+- 检出正则：输入框，匹配需要审核的内容（如 \d+(?:\.\d+)?(%|亿|万|元|人次)）
+- 合法值：逗号分隔输入（如 100%,3.5亿）；配了则只标记不在此列表的检出项，不配则标记所有检出项
+- 上报标签：输入框，上报标记文本（如"建议人工复审"）
 
 观测：filled.raw（原始输出）、filled.flagged（检出列表，含 value/pos/report/unmatched）、flagged_count/unmatched_count
 
 检测什么：LLM 输出中检出项（如数值）是否在合法值集
-适用：内容轴封不死（数值/事实），需人工审核
+适用场景：内容轴封不死（数值/事实），需人工审核
+输入类型：自然语言文本（含数值/事实陈述，如报告/新闻/统计描述）
 缺陷：正则检出有限；allowed_values 需人工维护""",
 
     "required_min": """【required 最小化】
 名词：required=必填字段。最小化=只设最少必填字段，其余可留空（填"未指定"）。与 slot 互补：slot 查"多"（编造多余字段），required_min 查"少"（必填字段缺失）。
 只设最少 required 槽必填，可留空槽填"未指定"。required 槽没填或填"未指定"则重试。
 
-示例：
-{"slots": [{"name": "entity", "required": true}, {"name": "attr", "required": true}, {"name": "rel", "required": false}]}
-
-字段：
-- slots: 槽位列表
-- slots[].name: 槽位名
-- slots[].required: true=必填（必须有内容），false=可留空（填"未指定"）
+表单：
+- 槽位行：每行一个槽位（槽位名 + 必填勾选）；点"+ 槽位"增加、"删"删除
+- 必填勾选：勾=必须有内容，不勾=可留空（填"未指定"）
 
 观测：filled（各槽位填入）、required_count/optional_count/left_empty
 
 检测什么：required 槽是否都填了，可留空槽填了什么
-适用：部分字段必填、部分可留空的场景
-缺陷：只检查有无内容，不检查内容质量""",
+适用场景：部分字段必填、部分可留空的场景
+输入类型：自然语言文本（含可提取字段的事实描述，部分字段可能缺失）
+    缺陷：只检查有无内容，不检查内容质量""",
+
+    "custom": r"""【自定义模板·自由组合原子】
+名词：自定义模板=从 10 个原子中自由选组合，配出自己的前置规范方式。recipe（原子配方）决定执行哪些原子，config（配置 JSON）提供这些原子需要的参数。
+
+原子名词：
+- text：文本生成，LLM 自由填空输出一段文本（受 guide_prompt/diverge_prompt/condense_rule 引导）
+- select：穷举选择，LLM 从预定义候选词表中每道选一个词或"未指定"
+- slot：槽位填空，LLM 从输入中提取信息填入预定义槽位，输出 JSON
+- deterministic：确定性后处理，代码执行正则替换+编号重排+空行归一化，LLM 零参与
+- enum_filter：枚举过滤，只保留在允许词列表中的词或其子串，标记编造词
+- detect_report：检出即上报，正则扫描输出中的特定内容，未命中白名单的标记人工复审
+- json_parse：JSON 解析，把 LLM 输出解析为槽位 dict，找出多余 key
+- in_set：集合成员校验，每个维度值必须在候选词表中或"未指定"（点对面）
+- no_extra：无多余校验，检查是否编造了不在允许集的词或多余字段
+- required_full：必填齐全校验，所有 required 槽位必须有内容
+- in_range：区间容差校验，数值必须在指定区间内（面对面）
+- eq_exact：精确相等校验，值必须精确等于指定值（点对点）
+- none：不校验，直接通过
+- hit：命中分布，统计每道门禁命中/未指定/编造
+- fabricated：编造统计，统计造了不在允许集的词
+- extra_keys：多余字段，列出 LLM 编造的槽位以外的 key
+- left_empty：留空统计，统计必填/可留空/实际留空数
+- flagged：检出统计，统计检出项数和未命中白名单数
+- changed：改过标记，对比后处理前后是否改过
+
+recipe 表单和 config JSON 的配合：
+- recipe 选了什么原子 → config 里就要填对应字段
+- 生成原子决定 LLM 怎么填：text→自由文本（需 guide_prompt 或 diverge_prompt 或 condense_rule）；select→从候选词选（需 gates）；slot→填槽位（需 slots）
+- 后处理原子决定代码怎么加工：deterministic→正则替换+编号重排+空行归一化（需 regex_replaces/renumber_source/normalize_blanklines）；enum_filter→枚举过滤（需 enums）；detect_report→检出上报（需 detect_pattern/allowed_values/report_label）
+- 校验原子决定怎么判合规：in_set→候选词命中（需 gates）；no_extra→查多余字段（需 slots）；required_full→必填检查（需 slots）；in_range→区间容差（需 allowed_values）；eq_exact→精确相等（需 allowed_values）；none→不校验
+- 同一字段可被多个原子共用（如 gates 同时给 gen_select 和 validate in_set 用）
+
+config JSON 全部可用字段：
+- guide_prompt：字符串，引导提示词（gen_text 用）
+- diverge_prompt：字符串，发散提示词（gen_text 用，与 guide_prompt 二选一）
+- condense_rule：字符串，凝练规则提示词（gen_text 用）
+- gates：数组，每项 {name, words, logic}，门禁维度+候选词+逻辑（gen_select / validate in_set 用）
+- slots：数组，每项 {name, required}，槽位名+是否必填（gen_slot / validate no_extra / validate required_full 用）
+- enums：字符串数组，允许的候选词列表（apply_enum_filter 用）
+- regex_replaces：数组，每项 {pattern, replace}，正则替换规则（apply_deterministic 用）
+- renumber_source：布尔，来源编号重排为 1,2,3...（apply_deterministic 用）
+- normalize_blanklines：布尔，多余空行归一化为双换行（apply_deterministic 用）
+- detect_pattern：字符串，检出正则（apply_detect_report 用）
+- allowed_values：字符串数组，合法值列表（apply_detect_report / validate in_range / validate eq_exact 用）
+- report_label：字符串，上报标记文本（apply_detect_report 用）
+
+观测：取决于 recipe 选的观测原子（hit/fabricated/extra_keys/left_empty/flagged/changed）
+
+检测什么：由 recipe 的校验原子和观测原子决定
+适用场景：8 种预置方式都不满足时，自由组合原子
+输入类型：取决于 recipe 的生成原子
+缺陷：config 字段必须与 recipe 原子匹配，填了没用的字段被忽略，漏了需要的字段原子报错""",
 }
 
 # 空坐标形态由 validate 原子承载（in_set=点对面 / in_range=面对面 / eq_exact=点对点 / none=不校验）

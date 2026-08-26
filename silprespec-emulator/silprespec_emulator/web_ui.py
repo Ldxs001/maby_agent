@@ -95,6 +95,7 @@ class SilPrespecEmulatorHandler(BaseHTTPRequestHandler):
                                        "default_task_prompt": TASK_PROMPTS.get(w[0], ""),
                                        "default_recipe": (WAY_RECIPES[w[0]].to_dict() if w[0] in WAY_RECIPES else {})} for w in WAYS],
 
+                             "custom_help": WAY_HELPS.get("custom", ""),
                              "custom_templates": config_mgr.get_custom_templates()})
         elif self.path == "/api/backends":
             self._send(200, {"backends": ["lm-studio", "ollama", "custom"],
@@ -249,6 +250,14 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .checkbox-row{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim)}
 .badge{display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px}
 .badge.ok{background:var(--green);color:#fff}.badge.fail{background:var(--accent);color:#fff}.badge.warn{background:#d68910;color:#fff}.badge.dim{background:var(--bg-input);color:var(--text-dim)}
+.stages-area{background:var(--bg-input);border-radius:6px;padding:8px 12px;margin-bottom:8px}
+.stage-row{display:flex;gap:8px;padding:4px 0;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border)}
+.stage-row:last-child{border-bottom:none}
+.stage-label{min-width:64px;font-size:12px;color:var(--accent);flex-shrink:0}
+.stage-body{flex:1;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.atom-sel{flex:0 0 auto;min-width:auto;padding:3px 6px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:12px}
+.atom-readonly{font-size:12px;color:var(--text);background:var(--bg-panel);padding:2px 8px;border-radius:3px}
+.config-header{font-size:12px;color:var(--text-dim);margin:6px 0 4px;border-bottom:1px solid var(--border);padding-bottom:3px}
 .run-block{background:var(--bg-panel);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:10px}
 .run-block .rb-head{display:flex;align-items:center;gap:8px;margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:6px}
 .wr-block{background:var(--bg-input);border-radius:4px;padding:8px;margin-bottom:6px;font-size:12px}
@@ -277,6 +286,8 @@ select option{background:var(--bg-input);color:var(--text)}
 <div class="topbar">
   <span class="logo">⚡ silprespec-emulator</span>
   <span class="tag">前置规范效果模拟器</span>
+  <span style="flex:1"></span>
+  <span class="status" id="autosave-status">● 已就绪</span>
 </div>
 <div class="tab-bar">
   <div class="tab-btn active" data-tab="config">配置</div>
@@ -312,8 +323,7 @@ select option{background:var(--bg-input);color:var(--text)}
       <div class="form-row">
         <button class="btn btn-sm btn-primary" id="btn-test-conn">测试连接</button>
         <span id="conn-status" class="status">未检测</span>
-        <span style="flex:1"></span>
-        <button class="btn btn-sm btn-success" id="btn-save-llm">保存后端配置</button>
+
       </div>
     </div>
     <div class="section">
@@ -331,9 +341,8 @@ select option{background:var(--bg-input);color:var(--text)}
       <div id="template-library-list"></div>
     </div>
     <div class="section">
-      <button class="btn btn-primary" id="btn-save">保存</button>
+      <span class="kv">配置改动自动保存</span>
       <button class="btn btn-secondary" id="btn-reset">重置</button>
-      <span id="save-status" class="status" style="margin-left:12px"></span>
     </div>
   </div>
 </div>
@@ -383,7 +392,7 @@ select option{background:var(--bg-input);color:var(--text)}
 </div>
 
 <script>
-let experiment=null, waysMeta=null, customTemplates=null, currentTaskId=null, pollTimer=null;
+let experiment=null, waysMeta=null, customTemplates=null, customHelp='', currentTaskId=null, pollTimer=null;
 let _modalCb=null;
 function showModal(opts){
   document.getElementById('modal-title').textContent=opts.title||'提示';
@@ -435,17 +444,32 @@ document.getElementById('llm-backend').onchange=()=>{
   const b=document.getElementById('llm-backend').value;
   const def={'lm-studio':'http://localhost:1234','ollama':'http://localhost:11434','custom':''};
   document.getElementById('llm-base-url').value=def[b]||'';
+  refreshModels();saveLLMAuto();
 };
 document.getElementById('btn-refresh-models').onclick=()=>refreshModels(document.getElementById('llm-model').value);
 document.getElementById('btn-test-conn').onclick=()=>{
   const llm={backend:document.getElementById('llm-backend').value,base_url:document.getElementById('llm-base-url').value,model:document.getElementById('llm-model').value};
   fetch('/api/backend/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(llm)}).then(r=>r.json()).then(d=>{const el=document.getElementById('conn-status');el.textContent=d.ok?'已连接':'连接失败';el.className='status '+(d.ok?'ok':'fail');if(!d.ok)el.textContent+=': '+d.message;});
 };
-document.getElementById('btn-save-llm').onclick=()=>{
+let _saveTimer=null;
+function setAutosave(text,cls){const el=document.getElementById('autosave-status');if(!el)return;el.textContent=text;el.className='status '+(cls||'');}
+function saveLLMAuto(){
   const llm={backend:document.getElementById('llm-backend').value,base_url:document.getElementById('llm-base-url').value,model:document.getElementById('llm-model').value,timeout:parseInt(document.getElementById('llm-timeout').value)||120,max_tokens:parseInt(document.getElementById('llm-max-tokens').value)||4096,temperature:parseFloat(document.getElementById('llm-temperature').value)||0.7};
-  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({llm})}).then(r=>r.json()).then(()=>{const el=document.getElementById('conn-status');el.textContent='已保存';el.className='status ok';setTimeout(()=>el.textContent='',2000);});
-};
-function loadWays(){fetch('/api/ways').then(r=>r.json()).then(d=>{waysMeta=d.ways;customTemplates=d.custom_templates||[];renderTemplateLibrary();loadExp();});}
+  setAutosave('● 保存中…','');
+  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({llm})}).then(r=>r.json()).then(()=>setAutosave('● 已保存 '+new Date().toLocaleTimeString(),'ok'));
+}
+function saveExpAuto(){
+  if(_saveTimer)clearTimeout(_saveTimer);
+  setAutosave('● 编辑中…','');
+  _saveTimer=setTimeout(()=>{const e=collectExp();fetch('/api/experiment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(e)}).then(r=>r.json()).then(()=>setAutosave('● 已保存 '+new Date().toLocaleTimeString(),'ok'));},500);
+}
+['llm-base-url','llm-timeout','llm-max-tokens','llm-temperature'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('blur',saveLLMAuto);});
+document.getElementById('llm-model').addEventListener('change',saveLLMAuto);
+['exp-name','exp-desc'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('blur',saveExpAuto);});
+document.getElementById('run-parallel').addEventListener('change',saveExpAuto);
+document.getElementById('ways-list').addEventListener('change',saveExpAuto);
+document.getElementById('ways-list').addEventListener('focusout',saveExpAuto);
+function loadWays(){fetch('/api/ways').then(r=>r.json()).then(d=>{waysMeta=d.ways;customTemplates=d.custom_templates||[];customHelp=d.custom_help||'';renderTemplateLibrary();loadExp();});}
 function loadExp(){fetch('/api/experiment').then(r=>r.json()).then(d=>{experiment=d;renderExp();});}
 function renderExp(){
   document.getElementById('exp-name').value=experiment.name||'';
@@ -455,63 +479,173 @@ function renderExp(){
   (experiment.ways||[]).forEach(w=>list.appendChild(renderWay(w)));
 }
 function wayName(id){return(waysMeta||[]).find(w=>w.id===id)?.name||id;}
+const ATOM_AXES={
+  'text':{axis:'内容轴',cls:'fail',note:'自由文本·不可枚举'},
+  'select':{axis:'集合轴',cls:'dim',note:'穷举选择·可枚举'},
+  'slot':{axis:'集合轴',cls:'dim',note:'槽位填空·可枚举'},
+  'deterministic':{axis:'格式轴',cls:'ok',note:'代码封死·A形态'},
+  'enum_filter':{axis:'集合轴',cls:'dim',note:'枚举过滤·A形态'},
+  'detect_report':{axis:'数值轴',cls:'warn',note:'检出即上报·B形态'},
+  'json_parse':{axis:'集合轴',cls:'dim',note:'解析槽位'},
+  'in_set':{axis:'集合轴',cls:'dim',note:'点对面'},
+  'no_extra':{axis:'集合轴',cls:'dim',note:'无多余'},
+  'required_full':{axis:'集合轴',cls:'dim',note:'必填齐全'},
+  'in_range':{axis:'数值轴',cls:'warn',note:'面对面·收窄后校验'},
+  'eq_exact':{axis:'数值轴',cls:'warn',note:'点对点·收窄后校验'},
+  'none':{axis:'—',cls:'dim',note:'不校验'},
+};
+const ATOM_GLOSS={
+  'text':'文本生成：LLM 自由填空输出一段文本',
+  'select':'穷举选择：LLM 从候选词表每道选一个词或未指定',
+  'slot':'槽位填空：LLM 从输入提取信息填入预定义槽位，输出 JSON',
+  'deterministic':'确定性后处理：正则替换+编号重排+空行归一化，LLM 零参与',
+  'enum_filter':'枚举过滤：只留允许词列表中的词，标记编造',
+  'detect_report':'检出即上报：正则扫描+白名单对照+标记人工复审',
+  'json_parse':'JSON 解析：解析槽位 dict，找多余 key',
+  'in_set':'集合成员校验：值必须在候选词表或未指定（点对面）',
+  'no_extra':'无多余校验：查编造词或多余字段',
+  'required_full':'必填齐全校验：required 槽位必须有内容',
+  'in_range':'区间容差校验：数值必须在区间内（面对面）',
+  'eq_exact':'精确相等校验：值必须等于指定值（点对点）',
+  'none':'不校验：直接通过',
+  'hit':'命中分布：统计命中/未指定/编造',
+  'fabricated':'编造统计：造了不在允许集的词数',
+  'extra_keys':'多余字段：LLM 编造的槽位以外的 key',
+  'left_empty':'留空统计：必填/可留空/实际留空数',
+  'flagged':'检出统计：检出项数和未命中白名单数',
+  'changed':'改过标记：后处理前后是否改过',
+};
+function axisTag(atom){const a=ATOM_AXES[atom];if(!a)return'';return ` <span class="badge ${a.cls}" style="font-size:10px">${a.axis}</span><span class="kv" style="font-size:10px;margin-left:4px">${a.note}</span>`;}
+function renderStages(way,recipe,isCustom){
+  recipe=recipe||{};const r=recipe;
+  const optT=(vals,cur)=>vals.map(v=>`<option value="${v[0]}" title="${esc(ATOM_GLOSS[v[0]]||'')}" ${v[0]===cur?'selected':''}>${v[1]}</option>`).join('');
+  const row=(label,content)=>`<div class="stage-row"><span class="stage-label">${label}</span><div class="stage-body">${content}</div></div>`;
+  const ro=(atom)=>`<span class="atom-readonly" title="${esc(ATOM_GLOSS[atom]||'')}">${atom}</span>`;
+  let gen;
+  if(isCustom){
+    gen=`<select data-w="r_generate" class="atom-sel" title="${esc(ATOM_GLOSS[r.generate||'text']||'')}" onchange="var a=this.nextElementSibling;a.style.display=this.value==='slot'?'inline-block':'none'">${optT([['text','text'],['select','select'],['slot','slot']],r.generate||'text')}</select>`;
+    gen+=`<select data-w="r_generate_arg" class="atom-sel" style="display:${(r.generate||'text')==='slot'?'inline-block':'none'}">${optT([['','（无）'],['extra_check','extra_check'],['required_min','required_min']],r.generate_arg||'')}</select>`;
+  }else{
+    gen=ro(r.generate||'text');
+    if(r.generate_arg)gen+=` ${ro(r.generate_arg)}`;
+  }
+  gen+=axisTag(r.generate||'text');
+  const ppAtoms=['deterministic','enum_filter','detect_report','json_parse'];
+  let pp;
+  if(isCustom){
+    pp=ppAtoms.map(a=>`<label class="checkbox-row" style="font-size:11px;gap:3px" title="${esc(ATOM_GLOSS[a]||'')}"><input type="checkbox" data-w="r_pp_${a}" ${(r.postprocess||[]).includes(a)?'checked':''}>${a}</label>`).join('');
+    if((r.postprocess||[]).length)pp+=axisTag((r.postprocess||[])[0]);
+  }else{
+    pp=(r.postprocess&&r.postprocess.length)?r.postprocess.map(a=>ro(a)+axisTag(a)).join(' '):'<span class="kv">（无）</span>';
+  }
+  let val;
+  if(isCustom)val=`<select data-w="r_validate" class="atom-sel" title="${esc(ATOM_GLOSS[r.validate||'none']||'')}">${optT([['none','none'],['in_set','in_set'],['no_extra','no_extra'],['required_full','required_full'],['in_range','in_range'],['eq_exact','eq_exact']],r.validate||'none')}</select>`;
+  else val=ro(r.validate||'none');
+  val+=axisTag(r.validate||'none');
+  let rt;
+  if(isCustom)rt=`<label class="checkbox-row"><input type="checkbox" data-w="r_retry" ${r.retry!==false?'checked':''}>启用重试</label>`;
+  else rt=`<span class="atom-readonly">${r.retry!==false?'☑ 启用':'☐ 不启用'}</span>`;
+  const obAtoms=['hit','fabricated','extra_keys','left_empty','flagged','changed'];
+  let ob;
+  if(isCustom)ob=obAtoms.map(a=>`<label class="checkbox-row" style="font-size:11px;gap:3px" title="${esc(ATOM_GLOSS[a]||'')}"><input type="checkbox" data-w="r_ob_${a}" ${(r.observe||[]).includes(a)?'checked':''}>${a}</label>`).join('');
+  else ob=(r.observe&&r.observe.length)?r.observe.map(a=>ro(a)).join(' '):'<span class="kv">（无）</span>';
+  return row('① 生成',gen)+row('② 后处理',pp)+row('③ 校验',val)+row('④ 重试',rt)+row('⑤ 观测',ob);
+}
+
 function renderWay(w){
   const card=document.createElement('div');card.className='way-card';
   const meta=(waysMeta||[]).find(x=>x.id===w.way)||{desc:'',help:''};
+  const helpText=(w.way==='custom')?customHelp:(meta.help||'');
+  const isCustom=w.way==='custom';
+  const presetMeta=(waysMeta||[]).find(x=>x.id===w.way);
+  const recipe=isCustom?(w.recipe||{}):(presetMeta&&presetMeta.default_recipe)||{};
   const tmplOpts=(customTemplates||[]).map(t=>`<option value="custom" data-tmpl="${t.id}" ${w.way==='custom'&&w.template_id===t.id?'selected':''}>★ ${esc(t.name)}</option>`).join('');
   card.innerHTML=`
     <div class="wc-head">
       <select data-w="way"><option value="custom" ${w.way==='custom'&&!w.template_id?'selected':''}>自定义模板（临时）</option>${tmplOpts}${(waysMeta||[]).map(x=>`<option value="${x.id}" ${x.id===w.way?'selected':''}>${x.name}</option>`).join('')}</select>
       <span class="wc-desc">${esc(meta.desc)}</span>
       <label class="checkbox-row"><input type="checkbox" data-w="enabled" ${w.enabled?'checked':''}>启用</label>
-
       <input type="number" data-w="max_retry" value="${w.max_retry||3}" min="0" max="10" style="width:70px" title="max_retry">
       <button class="btn btn-sm btn-secondary" data-act="saveas-tmpl">另存为模板</button>
-      <button class="btn btn-sm btn-success tmpl-acts" data-act="save-tmpl" style="display:${w.way==='custom'&&w.template_id?'inline-block':'none'}">更新模板</button>
+      <button class="btn btn-sm btn-success tmpl-acts" data-act="save-tmpl" style="display:${isCustom&&w.template_id?'inline-block':'none'}">更新模板</button>
       <button class="btn btn-sm btn-danger" data-act="del">删除</button>
     </div>
     <input type="hidden" data-w="template_id" value="${esc(w.template_id||'')}">
-    <div class="form-row"><label>配置JSON</label><textarea data-w="config" rows="6">${esc(JSON.stringify(w.config||{},null,2))}</textarea></div>
+    <details style="margin-top:4px;margin-bottom:6px"><summary style="cursor:pointer;color:var(--text-dim);font-size:12px">📖 说明</summary><pre class="way-help" style="background:#0d0d1f;padding:8px;border-radius:4px;font-size:11px;white-space:pre-wrap;word-break:break-word;margin-top:6px;max-height:300px;overflow-y:auto">${esc(helpText)}</pre></details>
+    <div class="stages-area">${renderStages(w.way,recipe,isCustom)}</div>
+    <div class="config-header">配置</div>
+    <div data-w="config-area">${renderConfigForm(w.way,w.config)}</div>
     <div class="form-row"><label>任务提示词（系统提示词）</label><textarea data-w="task_prompt" rows="2">${esc(w.task_prompt||meta.default_task_prompt||'')}</textarea></div>
-    <div class="recipe-block" style="display:${w.way==='custom'?'block':'none'}">
-      <div class="form-row"><label>原子配方JSON（自定义模板）</label><textarea data-w="recipe" rows="6" placeholder='{"generate":"text","postprocess":[],"validate":"none","retry":false,"observe":[]}'>${esc(JSON.stringify(w.recipe||{},null,2))}</textarea></div>
-    </div>
-    <details style="margin-top:8px"><summary style="cursor:pointer;color:var(--text-dim);font-size:12px">📖 说明+示例</summary><pre class="way-help" style="background:#0d0d1f;padding:8px;border-radius:4px;font-size:11px;white-space:pre-wrap;word-break:break-word;margin-top:6px;max-height:300px;overflow-y:auto">${esc(meta.help||'')}</pre></details>
   `;
-  card.querySelector('[data-act="del"]').onclick=()=>card.remove();
+  card.querySelector('[data-act="del"]').onclick=()=>{card.remove();saveExpAuto();};
   card.querySelector('[data-act="save-tmpl"]').onclick=()=>saveAsTemplate(card,'update');
   card.querySelector('[data-act="saveas-tmpl"]').onclick=()=>saveAsTemplate(card,'saveAs');
+  card.addEventListener('click',ev=>{
+    const act=ev.target.getAttribute('data-act');
+    if(act==='del-row'){const row=ev.target.closest('.cfg-row');if(row)row.remove();saveExpAuto();}
+    else if(act==='add-gate'){const c=card.querySelector('[data-w="cfg_gates"]');if(c)c.insertAdjacentHTML('beforeend',configGateRow({}));}
+    else if(act==='add-slot'){const c=card.querySelector('[data-w="cfg_slots"]');if(c)c.insertAdjacentHTML('beforeend',configSlotRow({}));}
+    else if(act==='add-replace'){const c=card.querySelector('[data-w="cfg_replaces"]');if(c)c.insertAdjacentHTML('beforeend',configReplaceRow({}));}
+  });
   card.querySelector('[data-w="way"]').onchange=(e)=>{
     const sel=e.target.selectedOptions[0];
     const tmplId=sel.getAttribute('data-tmpl')||'';
-    const isCustom=e.target.value==='custom';
+    const newIsCustom=e.target.value==='custom';
+    const newWay=e.target.value;
     card.querySelector('[data-w="template_id"]').value=tmplId;
-    const upBtn=card.querySelector('[data-act="save-tmpl"]');if(upBtn)upBtn.style.display=(isCustom&&tmplId)?'inline-block':'none';
-    if(isCustom&&tmplId){
-      const t=(customTemplates||[]).find(x=>x.id===tmplId)||{};
-      card.querySelector('.wc-desc').textContent=t.name?('模板：'+t.name):'自定义原子组合';
-      card.querySelector('.way-help').textContent='';
-      card.querySelector('[data-w="config"]').value=JSON.stringify(t.default_config||{},null,2);
-      card.querySelector('[data-w="task_prompt"]').value=t.task_prompt||'';
-      card.querySelector('[data-w="recipe"]').value=JSON.stringify(t.recipe||{},null,2);
-    }else if(isCustom){
-      card.querySelector('.wc-desc').textContent='自定义原子组合';
-      card.querySelector('.way-help').textContent='';
-      card.querySelector('[data-w="config"]').value='{}';
-      card.querySelector('[data-w="task_prompt"]').value='';
-      card.querySelector('[data-w="recipe"]').value='{}';
-    }else{
-      const nm=(waysMeta||[]).find(x=>x.id===e.target.value)||{desc:'',help:'',default_config:{}};
-      card.querySelector('.wc-desc').textContent=nm.desc;
-      card.querySelector('.way-help').textContent=nm.help||'';
-      card.querySelector('[data-w="config"]').value=JSON.stringify(nm.default_config||{},null,2);
-      card.querySelector('[data-w="task_prompt"]').value=nm.default_task_prompt||'';
-    }
-    const rb=card.querySelector('.recipe-block');if(rb)rb.style.display=isCustom?'block':'none';
+    const upBtn=card.querySelector('[data-act="save-tmpl"]');if(upBtn)upBtn.style.display=(newIsCustom&&tmplId)?'inline-block':'none';
+    let cfg={},newRecipe={},taskPrompt='',desc='',help='';
+    if(newIsCustom&&tmplId){const t=(customTemplates||[]).find(x=>x.id===tmplId)||{};desc=t.name?('模板：'+t.name):'自定义原子组合';cfg=t.default_config||{};newRecipe=t.recipe||{};taskPrompt=t.task_prompt||'';help=customHelp;}
+    else if(newIsCustom){desc='自定义原子组合';help=customHelp;}
+    else{const nm=(waysMeta||[]).find(x=>x.id===newWay)||{desc:'',help:'',default_config:{},default_task_prompt:'',default_recipe:{}};desc=nm.desc;help=nm.help||'';cfg=nm.default_config||{};taskPrompt=nm.default_task_prompt||'';newRecipe=nm.default_recipe||{};}
+    card.querySelector('.wc-desc').textContent=desc;
+    card.querySelector('.way-help').textContent=help;
+    card.querySelector('.stages-area').innerHTML=renderStages(newWay,newRecipe,newIsCustom);
+    card.querySelector('[data-w="config-area"]').innerHTML=renderConfigForm(newWay,cfg);
+    card.querySelector('[data-w="task_prompt"]').value=taskPrompt;
   };
   return card;
 }
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+function collectRecipe(card){
+  const get=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.value:'';};
+  const chk=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.checked:false;};
+  let postprocess=[];['deterministic','enum_filter','detect_report','json_parse'].forEach(a=>{const el=card.querySelector(`[data-w="r_pp_${a}"]`);if(el&&el.checked)postprocess.push(a);});
+  if(!postprocess.length){const el=card.querySelector('[data-w="r_postprocess"]');if(el)postprocess=Array.from(el.selectedOptions).map(o=>o.value);}
+  let observe=[];['hit','fabricated','extra_keys','left_empty','flagged','changed'].forEach(a=>{const el=card.querySelector(`[data-w="r_ob_${a}"]`);if(el&&el.checked)observe.push(a);});
+  if(!observe.length){const el=card.querySelector('[data-w="r_observe"]');if(el)observe=Array.from(el.selectedOptions).map(o=>o.value);}
+  return {generate:get('r_generate'),generate_arg:get('r_generate_arg'),postprocess,validate:get('r_validate'),retry:chk('r_retry'),observe};
+}
+function configGateRow(g){return `<div class="form-row cfg-row" style="gap:6px"><input data-w="cfg_gate_name" value="${esc(g.name||'')}" placeholder="维度名" style="flex:1"><input data-w="cfg_gate_words" value="${esc((g.words||[]).join(','))}" placeholder="词1,词2,词3" style="flex:2"><button class="btn btn-sm btn-danger" data-act="del-row">删</button></div>`;}
+function configSlotRow(s){return `<div class="form-row cfg-row" style="gap:6px"><input data-w="cfg_slot_name" value="${esc(s.name||'')}" placeholder="槽位名" style="flex:2"><label class="checkbox-row"><input type="checkbox" data-w="cfg_slot_req" ${s.required?'checked':''}>必填</label><button class="btn btn-sm btn-danger" data-act="del-row">删</button></div>`;}
+function configReplaceRow(r){return `<div class="form-row cfg-row" style="gap:6px"><input data-w="cfg_repl_pat" value="${esc(r.pattern||'')}" placeholder="正则 pattern" style="flex:2"><input data-w="cfg_repl_rep" value="${esc(r.replace||'')}" placeholder="替换" style="flex:1"><button class="btn btn-sm btn-danger" data-act="del-row">删</button></div>`;}
+function renderConfigForm(way,cfg){
+  cfg=cfg||{};
+  if(way==='custom'||!way) return `<div class="form-row"><label>配置JSON</label><textarea data-w="config" rows="6">${esc(JSON.stringify(cfg,null,2))}</textarea></div>`;
+  if(way==='gate'){const gates=(cfg.gates&&cfg.gates.length)?cfg.gates.map(configGateRow).join(''):configGateRow({});return `<div data-w="cfg_gates">${gates}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-gate">+ 门禁</button></div><div class="form-row"><label>允许未指定</label><input type="checkbox" data-w="cfg_allow_unspec" ${cfg.allow_unspecified!==false?'checked':''}></div>`;}
+  if(way==='guide') return `<div class="form-row"><label>引导提示词</label><textarea data-w="cfg_guide_prompt" rows="3">${esc(cfg.guide_prompt||'')}</textarea></div>`;
+  if(way==='condense') return `<div class="form-row"><label>凝练规则</label><textarea data-w="cfg_condense_rule" rows="2">${esc(cfg.condense_rule||'')}</textarea></div><div class="form-row"><label>枚举词</label><input data-w="cfg_enums" value="${esc((cfg.enums||[]).join(','))}" placeholder="词1,词2,词3"></div>`;
+  if(way==='slot'||way==='required_min'){const slots=(cfg.slots&&cfg.slots.length)?cfg.slots.map(configSlotRow).join(''):configSlotRow({});return `<div data-w="cfg_slots">${slots}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-slot">+ 槽位</button></div>`;}
+  if(way==='diverge'){const reps=(cfg.regex_replaces&&cfg.regex_replaces.length)?cfg.regex_replaces.map(configReplaceRow).join(''):configReplaceRow({});return `<div class="form-row"><label>发散提示词</label><textarea data-w="cfg_diverge_prompt" rows="2">${esc(cfg.diverge_prompt||'')}</textarea></div><div data-w="cfg_replaces">${reps}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-replace">+ 替换规则</button></div><div class="form-row"><label>空行归一化</label><input type="checkbox" data-w="cfg_norm_blank" ${cfg.normalize_blanklines?'checked':''}></div>`;}
+  if(way==='deterministic'){const reps=(cfg.regex_replaces&&cfg.regex_replaces.length)?cfg.regex_replaces.map(configReplaceRow).join(''):configReplaceRow({});return `<div data-w="cfg_replaces">${reps}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-replace">+ 替换规则</button></div><div class="form-row"><label>编号重排</label><input type="checkbox" data-w="cfg_renumber" ${cfg.renumber_source?'checked':''}></div><div class="form-row"><label>空行归一化</label><input type="checkbox" data-w="cfg_norm_blank" ${cfg.normalize_blanklines?'checked':''}></div>`;}
+  if(way==='detect_report') return `<div class="form-row"><label>检出正则</label><input data-w="cfg_detect_pat" value="${esc(cfg.detect_pattern||'')}" placeholder="\\d+(?:\\.\\d+)?(%|亿|万|元|人次)"></div><div class="form-row"><label>合法值</label><input data-w="cfg_allowed" value="${esc((cfg.allowed_values||[]).join(','))}" placeholder="100%,3.5亿（逗号分隔，可留空）"></div><div class="form-row"><label>上报标签</label><input data-w="cfg_report_label" value="${esc(cfg.report_label||'')}" placeholder="建议人工复审"></div>`;
+  return `<div class="form-row"><label>配置JSON</label><textarea data-w="config" rows="6">${esc(JSON.stringify(cfg,null,2))}</textarea></div>`;
+}
+function collectReplaces(card){const out=[];card.querySelectorAll('[data-w="cfg_replaces"] .cfg-row').forEach(row=>{const p=row.querySelector('[data-w="cfg_repl_pat"]').value;if(p)out.push({pattern:p,replace:row.querySelector('[data-w="cfg_repl_rep"]').value});});return out;}
+function collectConfig(card,way){
+  const get=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.value:'';};
+  const chk=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.checked:false;};
+  if(way==='custom'||!way){const el=card.querySelector('[data-w="config"]');try{return JSON.parse(el.value);}catch(e){return {};}}
+  if(way==='gate'){const gates=[];card.querySelectorAll('[data-w="cfg_gates"] .cfg-row').forEach(row=>{const name=row.querySelector('[data-w="cfg_gate_name"]').value.trim();const words=row.querySelector('[data-w="cfg_gate_words"]').value.split(',').map(s=>s.trim()).filter(Boolean);if(name)gates.push({name,words,logic:'or'});});return {gates,allow_unspecified:chk('cfg_allow_unspec')};}
+  if(way==='guide') return {guide_prompt:get('cfg_guide_prompt')};
+  if(way==='condense') return {condense_rule:get('cfg_condense_rule'),enums:get('cfg_enums').split(',').map(s=>s.trim()).filter(Boolean)};
+  if(way==='slot'||way==='required_min'){const slots=[];card.querySelectorAll('[data-w="cfg_slots"] .cfg-row').forEach(row=>{const name=row.querySelector('[data-w="cfg_slot_name"]').value.trim();if(name)slots.push({name,required:row.querySelector('[data-w="cfg_slot_req"]').checked});});return {slots};}
+  if(way==='diverge') return {diverge_prompt:get('cfg_diverge_prompt'),regex_replaces:collectReplaces(card),normalize_blanklines:chk('cfg_norm_blank')};
+  if(way==='deterministic') return {regex_replaces:collectReplaces(card),renumber_source:chk('cfg_renumber'),normalize_blanklines:chk('cfg_norm_blank')};
+  if(way==='detect_report') return {detect_pattern:get('cfg_detect_pat'),allowed_values:get('cfg_allowed').split(',').map(s=>s.trim()).filter(Boolean),report_label:get('cfg_report_label')};
+  return {};
+}
 function rebuildWayDropdown(card,selTmplId){
   const sel=card.querySelector('[data-w="way"]');const cur=sel.value;
   const tmplOpts=(customTemplates||[]).map(t=>`<option value="custom" data-tmpl="${t.id}" ${selTmplId===t.id?'selected':''}>★ ${esc(t.name)}</option>`).join('');
@@ -521,9 +655,9 @@ function saveAsTemplate(card,mode){
   const get=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.value:'';};
   const way=get('way');
   let recipe={};
-  if(way==='custom'){try{recipe=JSON.parse(get('recipe'));}catch(e){alertModal('配方JSON解析失败');return;}}
+  if(way==='custom')recipe=collectRecipe(card);
   else{const m=(waysMeta||[]).find(x=>x.id===way);recipe=(m&&m.default_recipe)||{};}
-  let cfg={};try{cfg=JSON.parse(get('config'));}catch(e){}
+  const cfg=collectConfig(card,way);
   const taskPrompt=get('task_prompt');
   const curTmplId=get('template_id');
   const doSave=(name)=>{
@@ -533,11 +667,11 @@ function saveAsTemplate(card,mode){
       customTemplates=d.custom_templates||[];
       card.querySelector('[data-w="template_id"]').value=d.id;
       const waySel=card.querySelector('[data-w="way"]');
-      if(way!=='custom'){waySel.value='custom';const rb=card.querySelector('.recipe-block');if(rb)rb.style.display='block';card.querySelector('[data-w="recipe"]').value=JSON.stringify(recipe,null,2);}
+      if(way!=='custom'){waySel.value='custom';card.querySelector('[data-w="config-area"]').innerHTML=renderConfigForm('custom',cfg);card.querySelector('.stages-area').innerHTML=renderStages('custom',recipe,true);}
       const upBtn=card.querySelector('[data-act="save-tmpl"]');if(upBtn)upBtn.style.display='inline-block';
       rebuildWayDropdown(card,d.id);
       renderTemplateLibrary();
-      const el=document.getElementById('save-status');el.textContent='模板已保存：'+(name||'已更新');el.className='status ok';setTimeout(()=>el.textContent='',2000);
+      setAutosave('● 模板已保存：'+(name||'已更新')+' '+new Date().toLocaleTimeString(),'ok');
     });
   };
   if(mode==='update'){doSave('');return;}
@@ -578,20 +712,20 @@ function collectExp(){
   document.querySelectorAll('#ways-list .way-card').forEach(card=>{
     const get=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.value:'';};
     const chk=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.checked:false;};
-    let cfg={};try{cfg=JSON.parse(get('config'));}catch(e){}
-    let recipe={};if(get('way')==='custom'){try{recipe=JSON.parse(get('recipe'));}catch(e){}}
-    ways.push({way:get('way'),enabled:chk('enabled'),config:cfg,max_retry:parseInt(get('max_retry'))||3,task_prompt:get('task_prompt'),recipe,template_id:get('template_id')});
+    const way=get('way');
+    const cfg=collectConfig(card,way);
+    let recipe={};if(way==='custom')recipe=collectRecipe(card);
+    ways.push({way,enabled:chk('enabled'),config:cfg,max_retry:parseInt(get('max_retry'))||3,task_prompt:get('task_prompt'),recipe,template_id:get('template_id')});
   });
   return {name:document.getElementById('exp-name').value,description:document.getElementById('exp-desc').value,
     parallel:parseInt(document.getElementById('run-parallel').value)||5,ways};
 }
-document.getElementById('btn-save').onclick=()=>{const e=collectExp();fetch('/api/experiment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(e)}).then(r=>r.json()).then(()=>{const el=document.getElementById('save-status');el.textContent='已保存';el.className='status ok';setTimeout(()=>el.textContent='',2000);});};
 document.getElementById('btn-add-way').onclick=()=>{
   const list=document.getElementById('ways-list');
   list.appendChild(renderWay({way:'gate',enabled:true,config:{},max_retry:3}));
+  saveExpAuto();
 };
 document.getElementById('btn-reset').onclick=()=>{confirmModal('重置当前实验配置？',()=>{fetch('/api/experiment').then(r=>r.json()).then(d=>{experiment=d;renderExp();});},'重置');};
-document.getElementById('run-parallel').onchange=()=>{};
 document.getElementById('btn-run').onclick=()=>{
   const e=collectExp();const input=document.getElementById('run-input').value;const parallel=parseInt(document.getElementById('run-parallel').value)||5;
   if(!input.trim()){alertModal('请输入内容');return;}

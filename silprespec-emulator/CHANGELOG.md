@@ -1,5 +1,107 @@
 # 更新日志 / CHANGELOG
 
+## 0.3.1b0 — 阶段化 UI：按 5 阶段 + 轴标注 + 原子名词
+
+### 改动
+- **方式卡片按 5 阶段分组展示**（替代原来的 config + recipe 平铺）
+  - ① 生成：LLM 怎么填（text/select/slot）+ 轴标注
+  - ② 后处理：代码怎么加工（deterministic/enum_filter/detect_report/json_parse）+ 轴标注
+  - ③ 校验：代码怎么判合规（in_set/no_extra/required_full/in_range/eq_exact/none）+ 轴标注
+  - ④ 重试：不合格怎么办（retry bool）
+  - ⑤ 观测：记录什么（hit/fabricated/extra_keys/left_empty/flagged/changed）
+- **原子→轴映射**（ATOM_AXES 常量）：每个原子标注对应的轴（格式轴/集合轴/数值轴/内容轴）+ 理论形态（A 封死 / B 检出即上报）
+  - 格式轴=可枚举→代码封死（A 形态）；集合轴=可枚举→代码校验（A 形态）；数值轴=不可枚举但可收窄→校验或检出上报；内容轴=不可枚举且不可收窄→无法前置封死
+  - 对应理论 08a §7 三态谱系 + 09b §3.3 穷举边界
+- **预置方式也显示阶段**（只读）：用户能看到 gate 背后跑了 select+in_set，diverge 背后跑了 text+deterministic
+- **custom 方式阶段可编辑**：原子下拉/复选融入阶段区块，替代原独立 recipe 表单
+- 后处理/观测改用 checkbox 替代 select-multiple，更直观
+- 删除死代码 renderRecipeForm（已被 renderStages 替代）
+- help 移至卡片顶部（说明在前，配置在后）
+- 新增 CSS：.stages-area / .stage-row / .stage-label / .stage-body / .atom-sel / .atom-readonly / .config-header
+- **原子名词解释**：
+  - custom help 加"原子名词"表，解释全部 19 个原子（3 生成+4 后处理+6 校验+6 观测）各自干啥
+  - UI 阶段区块每个原子加 title tooltip（悬停显示一句话名词解释）
+  - ATOM_GLOSS JS 常量 + optT/ro 辅助函数给 option/span/label 加 title
+
+### 验证
+- py_compile 全模块通过（-W error 无警告）
+- HTML 含 stages-area/renderStages/ATOM_AXES/ATOM_GLOSS/axisTag/stage-row/config-header/r_pp_/r_ob_；无残留 recipe-block/renderRecipeForm
+
+## 0.3.0b0 — 方式说明改成表单语言 + custom 方式 help
+
+### 改动
+- **WAY_HELPS 全部 8 种方式的说明从 JSON 描述改为表单描述**
+  - 旧："示例：{json}\n\n字段：- xxx: 说明" → 新："表单：\n- 控件名：控件类型 + 说明"
+  - gate：门禁行 + 允许未指定勾选
+  - guide：引导提示词文本框
+  - condense：凝练规则文本框 + 枚举词逗号输入
+  - slot：槽位行动态增删 + 注（不强制检查必填）
+  - diverge：发散提示词 + 替换规则行动态增删 + 空行归一化勾选
+  - deterministic：替换规则行 + 编号重排勾选 + 空行归一化勾选
+  - detect_report：检出正则输入框 + 合法值逗号 + 上报标签（raw string 避免 \d 转义警告）
+  - required_min：槽位行 + 必填勾选说明
+- 说明与 UI 表单控件一一对应，用户看说明即知怎么填
+- **新增 custom 方式 help**（WAY_HELPS["custom"]）
+  - 解释 recipe 表单和 config JSON 的配合关系（选了什么原子 → 需要填什么字段）
+  - 列出 config JSON 全部 12 个可用字段及含义、哪个原子用
+  - 后端 `/api/ways` 返回 `custom_help`；前端 `customHelp` 全局变量，custom 方式时显示此 help
+
+### 验证
+- py_compile 通过（-W error 无警告）；8 个预置方式 help 均以"表单："开头；custom help 含"config JSON 全部可用字段"参考
+
+## 0.2.9b0 — 全站不暴露 JSON：recipe 表单 + 8 套 config 表单
+
+### 改动
+- **recipe 表单**（自定义模板）：原子配方 JSON textarea → 结构化表单，从有限原子集下拉/多选
+  - 生成：下拉 text/select/slot；槽位参数：下拉 extra_check/required_min/无
+  - 后处理：多选 deterministic/enum_filter/detect_report/json_parse
+  - 校验：下拉 in_set/no_extra/required_full/in_range/eq_exact/none（标注点对面/面对面/点对点）
+  - 重试：勾选；观测：多选 hit/fabricated/extra_keys/left_empty/flagged/changed
+  - `renderRecipeForm`/`collectRecipe` 表单↔对象双向同步，不可能填出不存在的原子
+- **8 套 config 表单**（预置方式）：配置 JSON textarea → 方式专属表单
+  - gate：门禁行（维度名+候选词逗号+删）动态增删 + 允许未指定勾选
+  - guide：引导提示词文本框
+  - condense：凝练规则文本框 + 枚举词逗号输入
+  - slot/required_min：槽位行（名+必填勾选）动态增删
+  - diverge：发散提示词 + 替换规则行（pattern+replace）动态增删 + 空行归一化勾选
+  - deterministic：替换规则行 + 编号重排勾选 + 空行归一化勾选
+  - detect_report：检出正则 + 合法值逗号 + 上报标签
+  - custom：仍用配置 JSON textarea（高级，schema 不固定）
+  - `renderConfigForm`/`collectConfig` 按方式分支，字段名与 atoms.py 期望一致
+- 动态行增删用事件委托（card click → add-gate/add-slot/add-replace/del-row）
+- 方式切换时按 default_config/default_recipe 重新渲染对应表单
+- `collectExp`/`saveAsTemplate` 改用 `collectConfig`/`collectRecipe` 从表单收集
+
+### 验证
+- py_compile 通过；HTML 含 renderRecipeForm/collectRecipe/renderConfigForm/collectConfig/config-area/r_generate/r_validate/r_postprocess/add-gate/add-slot/add-replace/del-row；旧 recipe textarea placeholder 和"原子配方JSON"label 已删
+- 字段名核对：表单收集的 config 字段与 atoms.py（gen_text/gen_select/gen_slot/apply_deterministic/validate_*）期望全部一致
+
+## 0.2.8b0 — 自动落盘，去掉两个保存按钮
+
+### 改动
+- **自动落盘**：去掉"保存后端配置"和最下方"保存"两个按钮，改完即存
+  - LLM 后端字段（backend/base_url/model/timeout/max_tokens/temperature）change/blur → `saveLLMAuto()` → POST `/api/config` → 写 `config.json`
+  - 实验字段（名称/说明/并行数/方式卡片任何字段）blur/change → `saveExpAuto()`（debounce 500ms）→ POST `/api/experiment` → 写 `experiment.json`
+  - 方式卡片用事件委托：`#ways-list` 监听 `change`+`focusout`，增删卡片也触发保存
+- **topbar 自动保存状态**：`● 已就绪 / 保存中… / 编辑中… / 已保存 HH:MM:SS`，全局可见
+- 最下方 section 改为"配置改动自动保存"说明 + 重置按钮
+
+### 验证
+- py_compile 通过；HTML 含 `autosave-status`/`saveLLMAuto`/`saveExpAuto`/`focusout` 监听；旧 `btn-save-llm`/`btn-save`/`save-status` 已删
+
+## 0.2.7b0 — 方式说明加"适用场景 + 输入类型"
+
+### 改动
+- 8 个方式的 `WAY_HELPS` 把"适用："扩充为"适用场景 + 输入类型"两行，明确告诉用户运行时应提供什么输入：
+  - gate：自然语言短文本（一句话/评论），归入有限候选词
+  - guide：自然语言文本（开放内容，摘要/续写/改写）
+  - condense：自然语言长文本（文章/段落），输出落枚举词集
+  - slot：自然语言文本（含实体/事件的事实描述，如新闻/履历）
+  - diverge：自然语言主题/提示词（创意生成，故事/文案/扩写）
+  - deterministic：自然语言文本（含来源编号/引用标记/多空行等格式噪声）
+  - detect_report：自然语言文本（含数值/事实陈述，如报告/新闻/统计描述）
+  - required_min：自然语言文本（含可提取字段的事实描述，部分字段可能缺失）
+
 ## 0.2.6b0 — 下拉框深色统一
 
 ### 改动
