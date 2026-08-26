@@ -1,5 +1,21 @@
 # 更新日志 / CHANGELOG
 
+## 0.3.1b1 — PyPI 更新说明粘合修复 + 文档对齐
+
+### 修复
+- **PyPI 描述缺「更新说明」区块**：现象——PyPI 页面 long_description 只有 README，不含当前版本 CHANGELOG；根因——git-sync 粘合正则语法错误（未闭合字符类 `[|Z)`）导致 CHANGELOG 区块粘合必然失败；且 manifest 登记类型错误（skill→agent）、source_path 指向无 CHANGELOG.md 的残留目录，粘合段被 `os.path.exists` 提前跳过
+- git-sync.py 粘合正则改为 `##\s*\[?版本号\]?[^\n]*\n.*?(?=\n##\s|\Z)`：兼容带方括号（`## [2.4.1] - 日期`）与不带方括号（`## 0.3.1b0 — 标题`）两种版本行格式，终止于下一个 `## ` 行或文件尾
+- manifest 修正：type=skill→agent、source_path→独立源 `C:/Users/sm001/WorkBuddy/silprespec-emulator`、repo_path→`silprespec-emulator`
+
+### 文档
+- README 对齐智能体发布骨架（rag-assistant / structured-writer 同型）：版本行 / 目录锚点 / 中文数字编号章节（一~十）/ 协议；修正空坐标形态描述（0.2.5b0 已删 coord 字段，改由校验原子承载）、界面描述（0.2.9b0 表单化 + 0.3.1b0 5 阶段分组）、目录树补 atoms.py/llms.txt
+- llms.txt 方式表关键配置列改真实字段（enums/regex_replaces/slots 等），标注单次不重试方式；核心模块补 atoms.py
+- atoms.py 头部注释 10→19 个原子（0.2.0b0 遗留），`_record_attempt`→`_attempt_for`
+
+### 验证
+- 修复后正则对三份 CHANGELOG（silprespec 无方括号 / rag / sw 带方括号）全部正确匹配当前版本区块
+- 0.3.1b1 发布后 PyPI 描述将包含「更新说明」区块
+
 ## 0.3.1b0 — 阶段化 UI：按 5 阶段 + 轴标注 + 原子名词
 
 ### 改动
