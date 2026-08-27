@@ -1,7 +1,8 @@
-"""端到端演示 · 5 方式预设输入 + 真实 LLM 调用 + 完整原始信息 + 验证指标
+"""端到端演示 · 5 方式固定考题 × 真实 LLM × 完整原始信息 + 验证指标
 
-用途：一键展示 5 种前置规范方式从输入到输出的完整端到端信息，供有限实证。
-每个方式跑 parallel 次，记录每次的完整 trace（含重试理由），汇总重现性 + 验证指标。
+用途：用固定的前置规范考题考当前模型，验证前置规范效果。考题设计成能区分模型好坏——
+守规矩的模型能过、不守规矩的模型会暴露（编造/偏离/造数/不一致）。不同模型跑同一考题
+表现不同，自然反映模型守规矩能力。每个方式跑 parallel 次，汇总重现性 + 验证指标。
 """
 from __future__ import annotations
 import time
@@ -16,26 +17,58 @@ from .llm_client import LLMClient
 
 
 def demo_config(way_id: str) -> dict:
-    """一键演示用的配置：基于 default_config。
-    pure_guide/detect_report 设非空约束看校验生效；diverge_correct 设非空纠偏目标看纠偏生效。"""
+    """一键演示用的配置（考题）：基于 default_config，设计成能区分模型好坏。
+    每种方式的约束都设计成能卡住不守规矩的模型——不是 LLM 本来就会做的。"""
     cfg = default_config(way_id)
     if way_id == "pure_guide":
-        cfg["output_constraints"] = {"required_keywords": ["软件"], "forbidden_keywords": [],
-                                      "max_length": 300, "format_regex": ""}
-    elif way_id == "detect_report":
-        cfg["allowed_values"] = ["55.8万亿元", "42.8%", "10.9亿人"]
+        # 考题：引导写"挑战"，禁"前景/机遇"——不听话的模型会写前景（含禁词）
+        cfg["guide_prompt"] = "围绕主题展开，续写一段侧重技术挑战和风险的内容，不要写前景和机遇"
+        cfg["output_constraints"] = {"required_keywords": ["挑战"], "forbidden_keywords": ["前景", "机遇", "乐观", "美好"],
+                                      "max_length": 200, "format_regex": ""}
+    elif way_id == "value_bound":
+        # 考题：中性内容 + 候选词只有积极/消极（不给中性）——守规矩填"未指定"，不守规矩编造"中性"
+        cfg["bound_type"] = "enum_select"
+        cfg["gates"] = [{"name": "情绪", "words": ["积极", "消极"], "logic": "or"}]
+        cfg["allow_unspecified"] = True
     elif way_id == "diverge_correct":
-        cfg["correction_target"] = {"format_regex": "", "required_pattern": "生物|海洋|深海|发光",
-                                    "forbidden_pattern": ""}
+        # 考题：写营销文案容易用"最/第一/唯一"等违禁词，纠偏删掉——测纠偏 changed + 有效性
+        cfg["diverge_prompt"] = "为这款产品写一段营销推广文案，突出产品效果"
+        cfg["regex_replaces"] = [{"pattern": "最", "replace": ""}, {"pattern": "第一", "replace": ""},
+                                 {"pattern": "唯一", "replace": ""}, {"pattern": "极佳", "replace": ""},
+                                 {"pattern": "完美", "replace": ""}]
+        cfg["normalize_blanklines"] = True
+        cfg["correction_target"] = {"format_regex": "", "required_pattern": "",
+                                    "forbidden_pattern": "最|第一|唯一|极佳|完美"}
+    elif way_id == "deterministic_pin":
+        # 考题：多次跑看 pinned 是否 100% 一致——temperature=0.7 多次跑，测模型确定性
+        cfg["regex_replaces"] = []
+        cfg["renumber_source"] = False
+        cfg["normalize_blanklines"] = True
+        cfg["pin_target"] = {"exact_value": "", "format_regex": ""}
+    elif way_id == "detect_report":
+        # 考题：输入含真实数字，合法值是正则能匹配的值——LLM 复述正确数=守规矩，造不同数=不守规矩
+        cfg["detect_pattern"] = r"\d+(?:\.\d+)?(%|亿|万|元|人次|吨|户|个|人|公里|㎡|岁)"
+        cfg["allowed_values"] = ["55.8万", "42.8%", "10.9亿"]
+        cfg["report_label"] = "建议人工复审"
     return cfg
 
 
+# 考题输入：每种方式一个能诱导模型犯错的输入
 DEMO_INPUTS = {
     "pure_guide": "人工智能正在改变软件开发的方式，从代码生成到测试自动化，都在发生深刻变化。",
-    "value_bound": "今天阳光真好，心情特别棒，感觉一切都很顺利！",
-    "diverge_correct": "深海中的发光生物",
+    "value_bound": "这产品用着还行，没什么特别的感觉，不好不坏。",
+    "diverge_correct": "一款新型减肥产品，声称能快速瘦身。",
     "deterministic_pin": "大模型技术发展迅速，多模态能力不断提升，应用场景持续扩展。",
     "detect_report": "2024年我国数字经济规模达到55.8万亿元，占GDP比重42.8%，网民规模10.9亿人。",
+}
+
+# 考题任务提示词：给 LLM 的任务方向（system_prompt），设计成能测出守规矩能力
+DEMO_TASK_PROMPTS = {
+    "pure_guide": "按照要求，对用户输入续写一段评论。严格遵循引导提示词的方向。",
+    "value_bound": "按照要求，将用户输入分类。只能从候选词中选，不贴切就填「未指定」，不要编造候选词以外的词。",
+    "diverge_correct": "基于用户输入发散生成一段营销文案。",
+    "deterministic_pin": "生成一段内容，后续将被代码后处理钉死。",
+    "detect_report": "复述以下内容中的数据，使用原文中的数字，不要编造或修改数字。",
 }
 
 
@@ -161,7 +194,8 @@ def run_e2e_demo(llm: LLMClient, ways: Optional[list] = None,
             continue
         way_name, way_desc = way_map[way_id][1], way_map[way_id][2]
         user_input = DEMO_INPUTS.get(way_id, "测试输入")
-        wc = WayConfig(way=way_id, config=demo_config(way_id), max_retry=3)
+        wc = WayConfig(way=way_id, config=demo_config(way_id), max_retry=3,
+                       task_prompt=DEMO_TASK_PROMPTS.get(way_id, ""))
         recipe = recipe_for(way_id, wc.config)
         task_prompt = wc.task_prompt or TASK_PROMPTS.get(way_id, "")
         way_specs.append((way_id, way_name, way_desc, user_input, wc, recipe, task_prompt))

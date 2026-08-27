@@ -1,5 +1,38 @@
 # 更新日志 / CHANGELOG
 
+## 0.5.0b4 — 一键演示考题重设计（从"功能展示"改成"真正能验证效果的考题"）
+
+### 背景
+用户指出一键演示是糊弄——DEMO_INPUTS/demo_config 随便选，约束都是 LLM 本来就会做的，测不出任何东西。一键应该是用固定考题考当前模型，做好了自然兼有模型评价能力。不改框架，只把考题做好。
+
+### 改动
+- **考题设计原则**：输入要诱导模型犯错，约束要能卡住不守规矩的模型，考题要能区分模型好坏
+- **pure_guide 考题**：引导写"挑战和风险"，禁"前景/机遇/乐观/美好"，必含"挑战"，≤200字。不听话的模型会写前景（含禁词）→重试
+- **value_bound 考题**：中性输入"不好不坏"+候选词只有积极/消极（故意不给中性）。守规矩填"未指定"，不守规矩编造"中性"→fabricated
+- **diverge_correct 考题**：写营销文案+删"最/第一/唯一/极佳/完美"（广告法违禁词）+禁含这些词。LLM 容易用违禁词，纠偏删掉→changed=true+纠偏有效
+- **deterministic_pin 考题**：多次跑看 pinned 100% 一致。temperature=0.7 多次跑不一致→测出模型随机性
+- **detect_report 考题**：输入含真实数字+合法值=正则能匹配的值（55.8万/42.8%/10.9亿）。复述正确数=守规矩，造不同数=上报
+- **DEMO_TASK_PROMPTS**：新增，每种方式的 task_prompt 设计成能测出守规矩能力（如"不要编造候选词以外的词"、"使用原文数字不要编造"）
+- **文档字符串**：改成"用固定考题考当前模型，验证前置规范效果，不同模型表现不同反映模型守规矩能力"
+- 验证：py_compile 通过；同步 WorkBuddy
+
+## 0.5.0b3 — WAY_HELPS 加详细字段填写指南（每个空怎么填/可填什么/留空效果）
+
+### 背景
+用户反馈说明示例太简单，"看了和没看一样"，没说明每个空怎么填、可以填什么、留空怎样。
+
+### 改动
+- **5 种方式 + custom 的 WAY_HELPS 全部重写**，每个字段加详细填写指南：
+  - 字段名 + 填什么（类型/格式）+ 可填值（示例值）+ 留空效果 + 填了效果
+  - 示例改成"照填即可"格式，列出每个字段具体填什么值
+- **pure_guide**：task_prompt/guide_prompt/required_keywords/forbidden_keywords/max_length/format_regex 6 个字段逐个说明
+- **value_bound**：bound_type 4 种子类型 + 各子类型字段（门禁行/槽位行/凝练规则/枚举词）逐个说明，4 个子示例
+- **diverge_correct**：diverge_prompt/替换规则行/空行归一化/correction_target(格式正则/必含模式/禁含模式) 逐个说明
+- **deterministic_pin**：替换规则行/编号重排/空行归一化/pin_target(精确值/格式正则) 逐个说明
+- **detect_report**：detect_pattern/allowed_values/report_label 逐个说明
+- **custom**：recipe(generate/generate_arg/postprocess/validate/retry/observe) + config JSON 全字段说明 + 组合示例
+- 验证：py_compile 通过；同步 WorkBuddy
+
 ## 0.5.0b2 — 修文档/报告/命名遗漏 + 去重 custom
 
 ### 改动
