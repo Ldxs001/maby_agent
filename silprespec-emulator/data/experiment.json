@@ -1,0 +1,29 @@
+{
+  "name": "前置规范效果实验·示例",
+  "description": "选一种或多种前置规范方式，观测填入内容/重试/撑满失败",
+  "parallel": 2,
+  "ways": [
+    {
+      "way": "gate",
+      "enabled": true,
+      "config": {
+        "gates": [
+          {
+            "name": "情绪",
+            "words": [
+              "积极",
+              "消极",
+              "中性"
+            ],
+            "logic": "or"
+          }
+        ],
+        "allow_unspecified": true
+      },
+      "max_retry": 3,
+      "task_prompt": "按照以下要求，将用户输入分类。",
+      "recipe": {},
+      "template_id": ""
+    }
+  ]
+}

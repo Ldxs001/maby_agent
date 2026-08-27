@@ -319,8 +319,11 @@ class WayResult:
     filled: dict = field(default_factory=dict)    # 实际填入内容（门禁填了什么词、凝练成什么...）
     retry_count: int = 0
     exhausted: bool = False           # 是否撑满 max_retry 仍失败
-    attempts: list = field(default_factory=list)  # 每次尝试的填入内容（看重试过程）
+    attempts: list = field(default_factory=list)  # 每次尝试的填入内容（含 retry_reason/raw/filled/fabricated/missing_required/flagged）
     extra: dict = field(default_factory=dict)     # 各方式专属观测（命中分布/编造项/纠偏前后...）
+    calls: list = field(default_factory=list)     # 每次 LLM 调用记录（prompt/system_prompt/response/elapsed/prompt_tokens/response_tokens）
+    total_tokens: int = 0                         # 该方式本次 run 的 prompt+response tokens（粗估）
+    elapsed_total: float = 0.0                    # 该方式本次 run 总耗时（秒）
     error: str = ""
 
     def to_dict(self) -> dict:

@@ -15,16 +15,16 @@
 
 ## 8 种前置规范方式
 
-| 方式 | 作用点 | 核心机制 | 关键配置（真实字段） |
+| 方式 | 作用点 | 核心机制 | 关键配置 |
 |------|--------|----------|----------|
-| gate 门禁穷举词组 | 填空出口 | 多道门禁 AND，每道内穷举词组选一或"未指定"，未命中留空不 block（减法） | gates: [{name, words}], allow_unspecified, max_retry |
-| guide 软引导 | 填空出口 | 引导提示词，无硬约束（单次不重试） | guide_prompt |
-| condense 凝练+代码枚举 | 填空出口 | LLM 凝练为禁泛化短语，代码枚举校验是否在允许集 | enums: [候选词], max_retry |
-| slot 槽位限定+查多余编造 | 填空出口 | 槽位填空 + json_parse 查超出槽位定义的 key（编造） | slots: [{name, required}], max_retry |
-| diverge 发散+确定性纠偏 | 填空出口 | LLM 发散生成 → 代码正则纠偏（单次不重试） | regex_replaces: [{pattern, replace}] |
-| deterministic 确定性后处理 | 填空出口 | LLM 生成后代码钉死：正则替换 + 编号重排 + 空行归一化（单次不重试） | regex_replaces, renumber_source, normalize_blanklines |
-| detect_report 检出即上报 | 填空出口 | 正则检出特定模式对照白名单，未命中标记上报（单次不重试） | detect_pattern, allowed_values, report_label |
-| required_min required 最小化 | 填空出口 | 只设最少 required 槽，其余可留空 | slots: [{name, required}], max_retry |
+| gate 门禁穷举词组 | 填空出口 | 多道门禁 AND，每道内穷举词组 OR 命中，未命中留空不 block（减法） | gates: [[词组]], max_retry |
+| guide 软引导 | 填空出口 | 引导提示词，无硬约束 | guide_prompt, max_retry |
+| condense 凝练+代码枚举 | 填空出口 | LLM 凝练为禁泛化短语，代码枚举校验是否在允许集 | allowed: [短语], max_retry |
+| slot 槽位限定+查多余编造 | 填空出口 | 槽位填空 + 检测填入是否超出槽位定义（编造） | slots: {名: 描述}, max_retry |
+| diverge 发散+纠偏 | 填空出口 | 允许发散，命中禁用词后纠偏重试 | forbidden: [词], max_retry |
+| deterministic 确定性后处理 | 填空出口 | LLM 生成后用代码强制纠正/钉住 | correct_rules, pin_fields |
+| detect_report 检出即上报 | 填空出口 | 检出特定模式（如数字）即上报，不阻塞 | detect_pattern |
+| required_min required 最小化 | 填空出口 | 只设最少 required 字段，其余留空 | required: [字段] |
 
 ## 启动
 
@@ -40,16 +40,15 @@
 
 ## 界面
 
-深色主题 Web UI（端口 8805），三 Tab：配置（方式卡片按 5 阶段分组：生成/后处理/校验/重试/观测，原子带轴标注，custom 方式阶段可编辑，配置表单化 + 自动落盘）/ 运行（输入+并行数）/ 结果（每方式填入内容、重试、撑满、重现性）。
+深色主题 Web UI（端口 8805），三 Tab：配置（选方式+各方式参数）/ 运行（输入+并行数）/ 结果（每方式填入内容、重试、撑满、重现性）。
 
 ## 核心模块
 
 - `silprespec_emulator/config_manager.py` — ConfigManager + DEFAULT_CONFIG（配置推动：CLI > config.json > DEFAULT）
-- `silprespec_emulator/pipeline_model.py` — 方式配置 + 结果模型 + 重现性计算 + TASK_PROMPTS
-- `silprespec_emulator/atoms.py` — 19 个原子（生成3/后处理4/校验6/观测6）+ 8 方式配方（WAY_RECIPES）+ 通用执行器 exec_recipe
-- `silprespec_emulator/simulator.py` — 执行引擎（ExperimentRunner 编排并行与重现性）
+- `silprespec_emulator/pipeline_model.py` — 8 种方式配置 + 结果模型 + 重现性计算
+- `silprespec_emulator/simulator.py` — 执行引擎 + 8 种方式真实执行器 + 确定性代码辅助
 - `silprespec_emulator/llm_client.py` — 多后端 LLM 客户端
-- `silprespec_emulator/web_ui.py` — 实验台 Web UI（5 阶段表单 + ATOM_AXES/ATOM_GLOSS）
+- `silprespec_emulator/web_ui.py` — 实验台 Web UI
 
 ## 设计依据
 

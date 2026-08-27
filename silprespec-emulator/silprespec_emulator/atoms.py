@@ -1,14 +1,14 @@
-"""前置规范原子库 — 19 个原子 + 配方 + 通用执行器
+"""前置规范原子库 — 10 个原子 + 配方 + 通用执行器
 
 5 类原子：
   生成(3): text / select / slot
   后处理(4): deterministic / enum_filter / detect_report / json_parse
-  校验(6): in_set(点对面) / no_extra / required_full / in_range(面对面) / eq_exact(点对点) / none
-  控制流: retry 循环（exec_recipe 编排，非原子）
-  观测(6): hit / fabricated / extra_keys / left_empty / flagged / changed
+  校验(1, 可配): in_set(点对面) / no_extra / required_full / in_range(面对面) / eq_exact(点对点) / none
+  控制流(1): retry 循环（exec_recipe 编排）
+  观测(1, 可配): hit / fabricated / extra_keys / left_empty / flagged / changed
 
 8 方式 = 原子配方（WAY_RECIPES）。执行层无 way_id 分支；
-filled/extra 的展示格式由 _filled_for/_attempt_for 按 way_id 兼容（保 UI 不变，
+filled/extra 的展示格式由 _filled_for/_record_attempt 按 way_id 兼容（保 UI 不变，
 第二步统一展示格式后可去掉）。
 """
 from __future__ import annotations
@@ -227,7 +227,7 @@ POSTPROCESSORS = {"json_parse": pp_json_parse, "deterministic": pp_deterministic
 
 
 # ======================================================================
-# 校验原子（6 种判定）
+# 校验原子（1，可配 4 种判定）
 # ======================================================================
 def validate_in_set(ctx: AtomCtx):
     """集合内：每个维度值 ∈ 对应词表 或 允许未指定"""
@@ -321,7 +321,7 @@ VALIDATORS = {"in_set": validate_in_set, "no_extra": validate_no_extra,
 
 
 # ======================================================================
-# 观测原子（6 种统计）
+# 观测原子（1，可配 6 种统计）
 # ======================================================================
 def ob_hit(ctx: AtomCtx, wr: WayResult, attempts: list):
     cfg = ctx.cfg

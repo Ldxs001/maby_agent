@@ -21,10 +21,13 @@ from .simulator import ExperimentRunner
 from .llm_client import LLMClient, LLMClientError
 from .config_manager import ConfigManager, BACKEND_DEFAULTS
 from .atoms import WAY_RECIPES
+from .e2e_demo import run_e2e_demo
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 _EXP_FILE = _DATA_DIR / "experiment.json"
+_RESULTS_DIR = _DATA_DIR / "results"
+_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 config_mgr = ConfigManager()
 
@@ -43,6 +46,40 @@ def _load_exp() -> dict:
 
 def _save_exp(d: dict):
     _EXP_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _save_result(rtype: str, payload: dict) -> str:
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    rid = f"{ts}_{rtype}"
+    (_RESULTS_DIR / f"{rid}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return rid
+
+
+def _list_results() -> list:
+    out = []
+    for f in sorted(_RESULTS_DIR.glob("*.json"), reverse=True):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        out.append({"id": f.stem, "type": d.get("type", ""), "saved_at": d.get("saved_at", ""), "summary": d.get("summary", "")})
+    return out
+
+
+def _read_result(rid: str) -> dict:
+    p = _RESULTS_DIR / f"{rid}.json"
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _delete_result(rid: str) -> bool:
+    p = _RESULTS_DIR / f"{rid}.json"
+    if p.exists():
+        p.unlink()
+        return True
+    return False
 
 
 class SilPrespecEmulatorHandler(BaseHTTPRequestHandler):
@@ -124,6 +161,11 @@ class SilPrespecEmulatorHandler(BaseHTTPRequestHandler):
             else:
                 self._send(200, {"done": task["done"], "running": task["running"],
                                  "result": task["result"], "error": task["error"], "progress": task["progress"]})
+        elif self.path == "/api/results":
+            self._send(200, {"results": _list_results()})
+        elif self.path.startswith("/api/results/read"):
+            rid = self.path.split("id=")[-1] if "id=" in self.path else ""
+            self._send(200, _read_result(rid))
         else:
             self._send(404, {"error": "not found"})
 
@@ -165,6 +207,15 @@ class SilPrespecEmulatorHandler(BaseHTTPRequestHandler):
             t = threading.Thread(target=self._run_task, args=(tid, exp, user_input, parallel), daemon=True)
             t.start()
             self._send(200, {"task_id": tid})
+        elif self.path == "/api/e2e_demo":
+            body = self._read_body()
+            parallel = int(body.get("parallel", 3))
+            tid = f"e2e_{int(time.time() * 1000)}"
+            with _run_lock:
+                _run_tasks[tid] = {"done": False, "running": True, "result": None, "error": "", "progress": 0}
+            t = threading.Thread(target=self._e2e_task, args=(tid, parallel), daemon=True)
+            t.start()
+            self._send(200, {"task_id": tid})
         elif self.path == "/api/custom_templates":
             body = self._read_body()
             tid = config_mgr.save_custom_template({
@@ -175,6 +226,15 @@ class SilPrespecEmulatorHandler(BaseHTTPRequestHandler):
                 "default_config": body.get("default_config", {}),
             })
             self._send(200, {"ok": True, "id": tid, "custom_templates": config_mgr.get_custom_templates()})
+        elif self.path == "/api/results/delete":
+            body = self._read_body()
+            ok = _delete_result(body.get("id", ""))
+            self._send(200, {"ok": ok, "results": _list_results()})
+        elif self.path == "/api/results/clear":
+            for f in _RESULTS_DIR.glob("*.json"):
+                try: f.unlink()
+                except Exception: pass
+            self._send(200, {"ok": True, "results": []})
         else:
             self._send(404, {"error": "not found"})
 
@@ -202,8 +262,48 @@ class SilPrespecEmulatorHandler(BaseHTTPRequestHandler):
             with _run_lock:
                 task["progress"] = 10
             result = runner.run(exp, user_input, parallel=parallel)
+            import datetime
+            _ways = [w.get("way","") for w in (exp.get("ways",[]) if isinstance(exp,dict) else []) if w.get("enabled",True)]
+            _save_result("run", {"type":"run","saved_at":datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 "input":user_input,"summary":f"运行 {'/'.join(_ways) or '?'} · 并行{parallel}","result":result})
             with _run_lock:
                 task["result"] = result; task["progress"] = 100; task["done"] = True; task["running"] = False
+        except Exception as e:
+            with _run_lock:
+                task["error"] = f"{e}\n{traceback.format_exc()}"; task["done"] = True; task["running"] = False
+
+    def _e2e_task(self, tid, parallel=3):
+        with _run_lock:
+            task = _run_tasks[tid]
+        try:
+            backend = config_mgr.get("llm.backend", "lm-studio")
+            base_url = config_mgr.get("llm.base_url", "")
+            if not base_url:
+                base_url = BACKEND_DEFAULTS.get(backend, "")
+            llm = LLMClient(backend=backend, base_url=base_url,
+                            model=config_mgr.get("llm.model", ""),
+                            api_key=config_mgr.get("llm.api_key", "not-needed"),
+                            timeout=config_mgr.get("llm.timeout", 1200),
+                            max_tokens=config_mgr.get("llm.max_tokens", 4096),
+                            temperature=config_mgr.get("llm.temperature", 0.7))
+            ok, msg = llm.test_connection()
+            if not ok:
+                with _run_lock:
+                    task["error"] = f"LLM 连接失败：{msg}"; task["done"] = True; task["running"] = False
+                return
+            partial = []
+            def on_progress(done, total, res):
+                partial.append(res)
+                with _run_lock:
+                    task["result"] = {"demo_results": list(partial)}
+                    task["progress"] = int(done / total * 100)
+            results = run_e2e_demo(llm, parallel=parallel, on_progress=on_progress)
+            import datetime
+            _save_result("e2e", {"type":"e2e","saved_at":datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 "summary":f"端到端演示 {len(results)}方式 · 并行{parallel}","result":results})
+            with _run_lock:
+                task["result"] = {"demo_results": results}
+                task["progress"] = 100; task["done"] = True; task["running"] = False
         except Exception as e:
             with _run_lock:
                 task["error"] = f"{e}\n{traceback.format_exc()}"; task["done"] = True; task["running"] = False
@@ -217,7 +317,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>silprespec-emulator · 前置规范效果模拟器</title>
+<title>silprespec-emulator · LLM 有限行为量化工具</title>
 <style>
 :root{--bg:#1a1a2e;--bg-card:#16213e;--bg-panel:#0f3460;--bg-input:#1a1a3e;--text:#e0e0e0;--text-dim:#8899aa;--accent:#e94560;--accent2:#533483;--green:#00b894;--border:#2a2a4e;--radius:8px}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -257,6 +357,22 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .stage-body{flex:1;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .atom-sel{flex:0 0 auto;min-width:auto;padding:3px 6px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:12px}
 .atom-readonly{font-size:12px;color:var(--text);background:var(--bg-panel);padding:2px 8px;border-radius:3px}
+.results-layout{display:flex;gap:12px;align-items:flex-start}
+.results-main{flex:1;min-width:0}
+.history-sidebar{width:240px;flex-shrink:0;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;max-height:calc(100vh - 160px);position:sticky;top:0}
+.history-sidebar .sidebar-header{padding:10px 12px;font-size:13px;font-weight:600;color:var(--text-dim);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.history-list{flex:1;overflow-y:auto;padding:0}
+.history-item{padding:6px 10px;font-size:12px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .15s}
+.history-item:hover{background:rgba(255,255,255,.05)}
+.history-item.active{background:var(--bg-panel)}
+.history-item .h-type{display:inline-block;padding:0 5px;border-radius:8px;font-size:10px;margin-right:4px}
+.history-item .h-type.run{background:var(--accent2);color:#fff}
+.history-item .h-type.e2e{background:var(--accent);color:#fff}
+.history-item .h-summary{color:var(--text);display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.history-item .h-date{font-size:10px;color:var(--text-dim)}
+.history-item .h-del{font-size:12px;color:var(--accent);cursor:pointer;opacity:.5;float:right;padding:0 2px}
+.history-item .h-del:hover{opacity:1}
+.history-item .h-del-cancel{font-size:10px;cursor:pointer;color:var(--text-dim);margin-left:4px}
 .config-header{font-size:12px;color:var(--text-dim);margin:6px 0 4px;border-bottom:1px solid var(--border);padding-bottom:3px}
 .run-block{background:var(--bg-panel);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:10px}
 .run-block .rb-head{display:flex;align-items:center;gap:8px;margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:6px}
@@ -285,7 +401,7 @@ select option{background:var(--bg-input);color:var(--text)}
 <body>
 <div class="topbar">
   <span class="logo">⚡ silprespec-emulator</span>
-  <span class="tag">前置规范效果模拟器</span>
+  <span class="tag">LLM 有限行为量化工具</span>
   <span style="flex:1"></span>
   <span class="status" id="autosave-status">● 已就绪</span>
 </div>
@@ -358,8 +474,16 @@ select option{background:var(--bg-input);color:var(--text)}
       <div class="progress-bar"><div class="fill" id="progress-fill" style="width:0%"></div></div>
     </div>
     <div class="section">
+      <h3>一键端到端演示 <span style="font-size:12px;color:var(--text-dim);font-weight:400">8 方式 × 预设输入 × 真实 LLM × 完整原始信息</span></h3>
+      <p style="font-size:13px;color:var(--text-dim);margin-bottom:10px">用预设输入对 8 种方式逐一端到端真实调用 LLM，展示从输入到输出的完整信息（配置/每次 LLM 调用/attempt/结果/观测），供有限实证。</p>
+      <div class="form-row" style="margin-bottom:10px"><label>每方式并行</label><input type="number" id="e2e-parallel" value="3" min="1" max="10" style="max-width:80px"><button class="btn btn-primary" id="btn-e2e">一键端到端演示（8 方式）</button></div>
+      <span id="e2e-status" class="status" style="margin-left:12px"></span>
+      <div class="progress-bar" style="margin-top:8px"><div class="fill" id="e2e-progress" style="width:0%"></div></div>
+    </div>
+    <div class="section">
       <h3>说明</h3>
       <p style="font-size:13px;color:var(--text-dim);line-height:1.7">
+        <b style="color:var(--text)">本工具是 LLM 的有限行为量化工具</b>：对 LLM 在前置规范下的填空行为做有限、可重复的量化观测（填入内容/重试/撑满/重现性），供有限实证。<br>
         • 从 8 种前置规范方式中选一种或多种，对输入真实执行（LLM 真填空），观测<b>填入了什么</b>。<br>
         • 指标：填入内容、重试次数、是否撑满 max_retry、撑满失败次数、命中/留空分布。<br>
         • 并行 N 次观测<b>重现性</b>（各方式跨 run 填入一致率）。<br>
@@ -371,8 +495,17 @@ select option{background:var(--bg-input);color:var(--text)}
 
 <div class="tab-content" id="tab-result">
   <div class="panel">
-    <div class="section"><h3>实验结果 <button class="btn btn-sm btn-secondary" id="btn-refresh" style="margin-left:12px">刷新</button></h3><div id="results-list"><p style="color:var(--text-dim);font-size:13px">尚未运行。</p></div></div>
-    <div class="section"><h3>重现性</h3><div id="repro-list"></div></div>
+    <div class="results-layout">
+      <div class="results-main">
+        <div class="section"><h3>实验结果 <button class="btn btn-sm btn-secondary" id="btn-refresh" style="margin-left:12px">刷新</button></h3><div id="results-list"><p style="color:var(--text-dim);font-size:13px">尚未运行。</p></div></div>
+        <div class="section"><h3>重现性</h3><div id="repro-list"></div></div>
+        <div class="section"><h3>端到端演示结果</h3><div id="e2e-list"><p style="color:var(--text-dim);font-size:13px">点击「一键端到端演示」后展示。</p></div></div>
+      </div>
+      <div class="history-sidebar">
+        <div class="sidebar-header"><span>历史结果</span><button class="btn btn-sm btn-danger" id="btn-clear-history">清空</button></div>
+        <div class="history-list" id="history-list"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -735,7 +868,7 @@ function pollStatus(){
   if(!currentTaskId)return;
   fetch('/api/run/status?id='+currentTaskId).then(r=>r.json()).then(d=>{
     document.getElementById('progress-fill').style.width=d.progress+'%';
-    if(d.done){clearInterval(pollTimer);pollTimer=null;const el=document.getElementById('run-status');if(d.error){el.textContent='失败: '+d.error.slice(0,100);el.className='status fail';}else{el.textContent='完成';el.className='status ok';}renderResult(d.result);document.querySelector('.tab-btn[data-tab="result"]').click();}
+    if(d.done){clearInterval(pollTimer);pollTimer=null;const el=document.getElementById('run-status');if(d.error){el.textContent='失败: '+d.error.slice(0,100);el.className='status fail';}else{el.textContent='完成';el.className='status ok';}renderResult(d.result);document.querySelector('.tab-btn[data-tab="result"]').click();loadHistory();}
   });
 }
 function renderResult(result){
@@ -745,18 +878,32 @@ function renderResult(result){
   runs.forEach(r=>{
     const div=document.createElement('div');div.className='run-block';
     let wrs=(r.way_results||[]).map(w=>{
-      const filledStr=JSON.stringify(w.filled,null,2);
-      const attemptsStr=(w.attempts||[]).map((a,i)=>{const parts=Object.entries(a).map(([k,v])=>typeof v==='object'&&v!==null?`${k}=${JSON.stringify(v)}`:`${k}=${v}`);return `  尝试${i+1}/${w.attempts.length}: ${parts.join(' · ')}`;}).join('\n');
-      const extraStr=Object.keys(w.extra||{}).length?`<div class="kv">${Object.entries(w.extra).map(([k,v])=>`${k}=<b>${esc(JSON.stringify(v))}</b>`).join(' · ')}</div>`:'';
+      const callsHtml=(w.calls||[]).map((c,i)=>`<div style="margin:4px 0;padding:6px;background:var(--bg-panel);border-radius:4px">
+        <div class="kv">[调用 ${i+1}] 耗时 <b>${c.elapsed}s</b> prompt_tokens=<b>${c.prompt_tokens}</b> response_tokens=<b>${c.response_tokens}</b></div>
+        ${c.system_prompt?`<div class="kv">system: <b>${esc(c.system_prompt)}</b></div>`:''}
+        <div class="kv">prompt:</div><pre style="margin:2px 0;white-space:pre-wrap;font-size:11px">${esc(c.prompt)}</pre>
+        <div class="kv">返回:</div><pre style="margin:2px 0;white-space:pre-wrap;font-size:11px">${esc(c.response)}</pre></div>`).join('');
+      const attHtml=(w.attempts||[]).map(a=>{const o=a||{};const reason=o.retry_reason||'';
+        return `<div style="margin:4px 0;padding:6px;background:var(--bg-panel);border-radius:4px">
+        <div class="kv">[attempt ${o.attempt!=null?o.attempt:'?'}] valid=<b>${o.valid!=null?o.valid:'?'}</b>${reason?` 重试理由=<b style="color:var(--accent)">${esc(reason)}</b>`:''}</div>
+        ${o.raw!=null?`<div class="kv">raw: <span style="color:var(--text-dim)">${esc(String(o.raw).slice(0,200))}${String(o.raw).length>200?'…':''}</span></div>`:''}
+        ${o.filled!=null?`<div class="kv">filled: <b>${esc(JSON.stringify(o.filled))}</b></div>`:''}
+        ${o.fabricated&&o.fabricated.length?`<div class="kv">fabricated: <b style="color:var(--accent)">${esc(JSON.stringify(o.fabricated))}</b></div>`:''}
+        ${o.missing_required&&o.missing_required.length?`<div class="kv">missing_required: <b style="color:#d68910">${esc(JSON.stringify(o.missing_required))}</b></div>`:''}
+        ${o.flagged&&o.flagged.length?`<div class="kv">flagged: <b style="color:var(--accent)">${esc(JSON.stringify(o.flagged))}</b></div>`:''}</div>`;
+      }).join('');
+      const extraStr=Object.keys(w.extra||{}).length?`<pre style="white-space:pre-wrap;font-size:11px">${esc(JSON.stringify(w.extra,null,2))}</pre>`:'';
       return `<div class="wr-block">
         <div class="wb-head">${esc(wayName(w.way))}
           <span class="badge ${w.success?'ok':'fail'}">${w.success?'成功':'失败'}</span>
-          <span class="badge ${w.exhausted?'fail':'dim'}">${w.exhausted?'撑满失败':'未撑满'}</span>
-          <span class="kv">重试 <b>${w.retry_count}</b></span>
+          <span class="badge ${w.exhausted?'fail':'dim'}">${w.exhausted?'撑满上限':'未撑满'}</span>
+          <span class="kv">重试 <b>${w.retry_count}</b> · 耗时 <b>${w.elapsed_total}s</b> · tokens <b>${w.total_tokens}</b></span>
         </div>
-        <div class="kv">最终填入：</div><pre>${esc(filledStr)}</pre>
-        ${attemptsStr?`<div class="kv">每次尝试（偏移方向）：</div><pre>${esc(attemptsStr)}</pre>`:''}
-        ${extraStr}
+        <div class="config-header">LLM 调用（${(w.calls||[]).length} 次）</div>${callsHtml}
+        <div class="config-header">attempt 记录（${(w.attempts||[]).length} 次，含重试理由）</div>${attHtml}
+        <div class="config-header">最终填入</div>
+        <pre>${esc(JSON.stringify(w.filled,null,2))}</pre>
+        ${extraStr?`<div class="config-header">观测 extra</div>${extraStr}`:''}
         ${w.error?`<div style="color:var(--accent)">${esc(w.error)}</div>`:''}
       </div>`;
     }).join('');
@@ -773,7 +920,97 @@ function renderResult(result){
   });
 }
 document.getElementById('btn-refresh').onclick=()=>{if(currentTaskId)pollStatus();};
-loadLLMConfig();loadWays();
+let e2eTaskId=null,e2eTimer=null;
+document.getElementById('btn-e2e').onclick=()=>{
+  const parallel=parseInt(document.getElementById('e2e-parallel').value)||3;
+  fetch('/api/e2e_demo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parallel})}).then(r=>r.json()).then(d=>{
+    e2eTaskId=d.task_id;document.getElementById('e2e-status').textContent='运行中...';document.getElementById('e2e-status').className='status';document.getElementById('e2e-progress').style.width='0%';
+    if(e2eTimer)clearInterval(e2eTimer);
+    e2eTimer=setInterval(()=>{
+      fetch('/api/run/status?id='+e2eTaskId).then(r=>r.json()).then(s=>{
+        document.getElementById('e2e-progress').style.width=s.progress+'%';
+        if(s.result&&s.result.demo_results)renderE2E(s.result.demo_results);
+        if(s.done){clearInterval(e2eTimer);e2eTimer=null;const el=document.getElementById('e2e-status');if(s.error){el.textContent='失败: '+s.error.slice(0,100);el.className='status fail';}else{el.textContent='完成';el.className='status ok';}document.querySelector('.tab-btn[data-tab="result"]').click();loadHistory();}
+      });
+    },1000);
+  });
+};
+function renderE2E(results){
+  const el=document.getElementById('e2e-list');el.innerHTML='';
+  if(!results||!results.length){el.innerHTML='<p style="color:var(--text-dim)">无结果</p>';return;}
+  results.forEach(r=>{
+    const div=document.createElement('div');div.className='wr-block';div.style.cssText='background:var(--bg-input);border-radius:4px;padding:10px;margin-bottom:12px;font-size:12px';
+    const runsHtml=(r.runs||[]).map(run=>{
+      const callsHtml=(run.calls||[]).map((c,i)=>`<div style="margin:4px 0;padding:6px;background:var(--bg-panel);border-radius:4px">
+        <div class="kv">[调用 ${i+1}] 耗时 <b>${c.elapsed}s</b> prompt_tokens=<b>${c.prompt_tokens}</b> response_tokens=<b>${c.response_tokens}</b></div>
+        ${c.system_prompt?`<div class="kv">system: <b>${esc(c.system_prompt)}</b></div>`:''}
+        <div class="kv">prompt:</div><pre style="margin:2px 0;white-space:pre-wrap;font-size:11px">${esc(c.prompt)}</pre>
+        <div class="kv">返回:</div><pre style="margin:2px 0;white-space:pre-wrap;font-size:11px">${esc(c.response)}</pre></div>`).join('');
+      const attHtml=(run.attempts||[]).map(a=>`<div style="margin:4px 0;padding:6px;background:var(--bg-panel);border-radius:4px">
+        <div class="kv">[attempt ${a.attempt}] valid=<b>${a.valid}</b>${a.retry_reason?` 重试理由=<b style="color:var(--accent)">${esc(a.retry_reason)}</b>`:''}</div>
+        <div class="kv">raw: <span style="color:var(--text-dim)">${esc((a.raw||'').slice(0,200))}${(a.raw||'').length>200?'…':''}</span></div>
+        <div class="kv">filled: <b>${esc(JSON.stringify(a.filled))}</b></div>
+        ${a.fabricated&&a.fabricated.length?`<div class="kv">fabricated: <b style="color:var(--accent)">${esc(JSON.stringify(a.fabricated))}</b></div>`:''}
+        ${a.missing_required&&a.missing_required.length?`<div class="kv">missing_required: <b style="color:#d68910">${esc(JSON.stringify(a.missing_required))}</b></div>`:''}
+        ${a.flagged&&a.flagged.length?`<div class="kv">flagged: <b style="color:var(--accent)">${esc(JSON.stringify(a.flagged))}</b></div>`:''}</div>`).join('');
+      return `<div style="margin:8px 0;padding:8px;border:1px solid var(--border);border-radius:4px">
+        <div class="wb-head"><b>run ${run.run_id}</b>
+          <span class="badge ${run.success?'ok':'fail'}">${run.success?'成功':'失败'}</span>
+          <span class="badge ${run.exhausted?'fail':'dim'}">${run.exhausted?'撑满上限':'未撑满'}</span>
+          <span class="kv">重试 <b>${run.retry_count}</b> · 耗时 <b>${run.elapsed_total}s</b> · tokens <b>${run.total_tokens}</b></span></div>
+        <div class="config-header">LLM 调用（${(run.calls||[]).length} 次）</div>${callsHtml}
+        <div class="config-header">attempt 记录（${(run.attempts||[]).length} 次，含重试理由）</div>${attHtml}
+        <div class="config-header">最终 filled</div>
+        <pre style="white-space:pre-wrap;font-size:11px">${esc(JSON.stringify(run.filled,null,2))}</pre>
+        <div class="config-header">观测 extra</div>
+        <pre style="white-space:pre-wrap;font-size:11px">${esc(JSON.stringify(run.extra,null,2))}</pre>
+        ${run.error?`<div style="color:var(--accent)">error: ${esc(run.error)}</div>`:''}</div>`;
+    }).join('');
+    const rp=r.reproducibility||{};
+    const rpPre=rp.distinct_fills&&rp.distinct_fills.length?`<pre style="white-space:pre-wrap;font-size:11px">${esc(rp.distinct_fills.map(f=>{try{return JSON.stringify(JSON.parse(f),null,2);}catch(e){return f;}}).join('\n---\n'))}</pre>`:'';
+    div.innerHTML=`<div class="wb-head"><b>${esc(r.way)} · ${esc(r.name)}</b>
+      <span class="badge ${r.success_all?'ok':'fail'}">${r.success_all?'全部成功':'有失败'}</span>
+      <span class="kv">并行 <b>${r.parallel}</b> · 总耗时 <b>${r.elapsed_all}s</b> · 总 tokens <b>${r.total_tokens_all}</b></span></div>
+      <div class="kv">说明: ${esc(r.desc)}</div>
+      <div class="kv">输入: <b>${esc(r.user_input)}</b></div>
+      <div class="kv">task_prompt: <b>${esc(r.task_prompt)}</b></div>
+      <div class="kv">recipe: <b>${esc(JSON.stringify(r.recipe))}</b></div>
+      <div class="kv">config: <b>${esc(JSON.stringify(r.config))}</b> · max_retry=<b>${r.max_retry}</b></div>
+      <div class="config-header" style="color:var(--accent)">重现性: consistency=<b>${rp.consistency}</b> · ${rp.distinct_fills?rp.distinct_fills.length:0} 种不同填入</div>${rpPre}
+      <div class="config-header">各次运行（共 ${(r.runs||[]).length} 次）</div>${runsHtml}`;
+    el.appendChild(div);
+  });
+}
+function loadHistory(){
+  fetch('/api/results').then(r=>r.json()).then(d=>{
+    const list=document.getElementById('history-list');if(!list)return;
+    const rs=d.results||[];
+    if(!rs.length){list.innerHTML='<p style="color:var(--text-dim);font-size:12px;padding:8px 10px">暂无历史结果</p>';return;}
+    list.innerHTML=rs.map(r=>{
+      const tb=r.type==='e2e'?'<span class="h-type e2e">演示</span>':'<span class="h-type run">运行</span>';
+      return `<div class="history-item" data-id="${esc(r.id)}" onclick="openHistory('${esc(r.id)}')">
+        ${tb}<span class="h-del" onclick="event.stopPropagation();deleteHistory(this,'${esc(r.id)}')" title="删除">✕</span>
+        <span class="h-summary">${esc(r.summary||'')}</span>
+        <span class="h-date">${esc(r.saved_at||'')}</span></div>`;
+    }).join('');
+  });
+}
+function openHistory(id){
+  document.querySelectorAll('.history-item').forEach(el=>el.classList.toggle('active',el.dataset.id===id));
+  fetch('/api/results/read?id='+encodeURIComponent(id)).then(r=>r.json()).then(d=>{
+    if(!d||!d.type)return;
+    document.querySelector('.tab-btn[data-tab="result"]').click();
+    if(d.type==='e2e'){renderE2E(d.result||[]);document.getElementById('results-list').innerHTML='<p class="kv">演示结果见下方「端到端演示结果」</p>';document.getElementById('repro-list').innerHTML='';}
+    else{renderResult(d.result||{});document.getElementById('e2e-list').innerHTML='<p class="kv">运行结果见上方「实验结果」</p>';}
+  });
+}
+function deleteHistory(btn,id){
+  if(btn.dataset.confirming!=='true'){btn.dataset.confirming='true';btn.textContent='确认?';btn.style.background='#e74c3c';btn.style.color='#fff';
+    const c=document.createElement('span');c.className='h-del-cancel';c.textContent='取消';c.onclick=function(e){e.stopPropagation();btn.dataset.confirming='false';btn.textContent='✕';btn.style.background='';btn.style.color='';c.remove();};btn.parentNode.insertBefore(c,btn.nextSibling);return;}
+  fetch('/api/results/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(r=>r.json()).then(()=>loadHistory());
+}
+document.getElementById('btn-clear-history').onclick=()=>{confirmModal('清空全部历史结果？不可恢复',()=>{fetch('/api/results/clear',{method:'POST'}).then(r=>r.json()).then(()=>loadHistory());},'清空');};
+loadLLMConfig();loadWays();loadHistory();
 </script>
 </body>
 </html>

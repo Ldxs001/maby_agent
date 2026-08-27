@@ -19,7 +19,7 @@ from .pipeline_model import (
     Experiment, WayConfig, WayResult, RunResult, calc_reproducibility,
 )
 from .llm_client import LLMClient, LLMClientError
-from .atoms import exec_recipe
+from .e2e_demo import _exec_with_trace, _make_chat
 
 
 class ExperimentRunner:
@@ -62,25 +62,31 @@ class ExperimentRunner:
 
     # ------------------------------------------------------------------
     # 单次执行：对每种启用方式真实填空（方式间串行，不传状态）
+    # 复用 e2e_demo._exec_with_trace + _make_chat，记录每次 attempt 的
+    # retry_reason + 每次 LLM 调用的 prompt/response/elapsed/tokens
     # ------------------------------------------------------------------
     def _run_one(self, experiment: Experiment, user_input: str, run_id: int) -> dict:
         res = RunResult(run_id=run_id)
         for wc in experiment.ways:
             if not wc.enabled:
                 continue
-            wr = self._exec_way(wc, user_input, run_id)
+            calls: list = []
+            chat = _make_chat(self.llm, calls)
+            try:
+                r = _exec_with_trace(wc.way, wc, user_input, chat)
+            except Exception as e:
+                res.way_results.append(WayResult(way=wc.way, error=f"{e}\n{traceback.format_exc()}"))
+                continue
+            wr = WayResult(way=wc.way)
+            wr.success = r["success"]
+            wr.retry_count = r["retry_count"]
+            wr.exhausted = r["exhausted"]
+            wr.filled = r["filled"]
+            wr.extra = r["extra"]
+            wr.attempts = r["attempts"]
+            wr.error = r["error"]
+            wr.calls = calls
+            wr.total_tokens = sum(c["prompt_tokens"] + c["response_tokens"] for c in calls)
+            wr.elapsed_total = round(sum(c["elapsed"] for c in calls), 2)
             res.way_results.append(wr)
         return res.to_dict()
-
-    def _exec_way(self, wc: WayConfig, user_input: str, run_id: int) -> WayResult:
-        try:
-            return exec_recipe(wc.way, wc, user_input, self._chat)
-        except Exception as e:
-            return WayResult(way=wc.way, error=f"{e}\n{traceback.format_exc()}")
-
-    def _chat(self, prompt, max_tokens=None, temperature=0.5, system_prompt=None):
-        msgs = []
-        if system_prompt:
-            msgs.append({"role": "system", "content": system_prompt})
-        msgs.append({"role": "user", "content": prompt})
-        return self.llm.chat(msgs, max_tokens=max_tokens, temperature=temperature).strip()

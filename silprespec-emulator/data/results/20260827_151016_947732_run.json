@@ -1,0 +1,125 @@
+{
+  "type": "run",
+  "saved_at": "2026-08-27 15:10:16",
+  "input": "很高兴",
+  "summary": "运行 gate · 并行2",
+  "result": {
+    "runs": [
+      {
+        "run_id": 1,
+        "way_results": [
+          {
+            "way": "gate",
+            "success": true,
+            "filled": {
+              "情绪": "积极"
+            },
+            "retry_count": 0,
+            "exhausted": false,
+            "attempts": [
+              {
+                "attempt": 0,
+                "valid": true,
+                "retry_reason": "",
+                "raw": "",
+                "filled": {
+                  "情绪": "积极"
+                },
+                "output": {
+                  "情绪": "积极"
+                },
+                "extra_keys": [],
+                "fabricated": [],
+                "missing_required": [],
+                "flagged": []
+              }
+            ],
+            "extra": {
+              "hit": 1,
+              "total": 1,
+              "unspecified": 0,
+              "fabricated": 0
+            },
+            "calls": [
+              {
+                "prompt": "在「情绪」维度的候选词 ['积极', '消极', '中性'] 中，为以下内容选一个最贴切的词。\n若都不贴切，填「未指定」。\n内容：很高兴\n只输出一个词。",
+                "system_prompt": "按照以下要求，将用户输入分类。",
+                "max_tokens": null,
+                "temperature": 0.2,
+                "response": "积极",
+                "elapsed": 39.12,
+                "prompt_tokens": 136,
+                "response_tokens": 3
+              }
+            ],
+            "total_tokens": 139,
+            "elapsed_total": 39.12,
+            "error": ""
+          }
+        ]
+      },
+      {
+        "run_id": 2,
+        "way_results": [
+          {
+            "way": "gate",
+            "success": true,
+            "filled": {
+              "情绪": "积极"
+            },
+            "retry_count": 0,
+            "exhausted": false,
+            "attempts": [
+              {
+                "attempt": 0,
+                "valid": true,
+                "retry_reason": "",
+                "raw": "",
+                "filled": {
+                  "情绪": "积极"
+                },
+                "output": {
+                  "情绪": "积极"
+                },
+                "extra_keys": [],
+                "fabricated": [],
+                "missing_required": [],
+                "flagged": []
+              }
+            ],
+            "extra": {
+              "hit": 1,
+              "total": 1,
+              "unspecified": 0,
+              "fabricated": 0
+            },
+            "calls": [
+              {
+                "prompt": "在「情绪」维度的候选词 ['积极', '消极', '中性'] 中，为以下内容选一个最贴切的词。\n若都不贴切，填「未指定」。\n内容：很高兴\n只输出一个词。",
+                "system_prompt": "按照以下要求，将用户输入分类。",
+                "max_tokens": null,
+                "temperature": 0.2,
+                "response": "积极",
+                "elapsed": 38.22,
+                "prompt_tokens": 136,
+                "response_tokens": 3
+              }
+            ],
+            "total_tokens": 139,
+            "elapsed_total": 38.22,
+            "error": ""
+          }
+        ]
+      }
+    ],
+    "reproducibility": [
+      {
+        "way": "gate",
+        "distinct_fills": [
+          "{\"情绪\": \"积极\"}"
+        ],
+        "consistency": 1.0
+      }
+    ]
+  }
+}

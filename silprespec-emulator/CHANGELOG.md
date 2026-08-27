@@ -1,20 +1,59 @@
 # 更新日志 / CHANGELOG
 
-## 0.3.1b1 — PyPI 更新说明粘合修复 + 文档对齐
+## 0.3.2b3 — 结果落盘 + 右侧历史边栏（保存/复看/删除/清空）
 
-### 修复
-- **PyPI 描述缺「更新说明」区块**：现象——PyPI 页面 long_description 只有 README，不含当前版本 CHANGELOG；根因——git-sync 粘合正则语法错误（未闭合字符类 `[|Z)`）导致 CHANGELOG 区块粘合必然失败；且 manifest 登记类型错误（skill→agent）、source_path 指向无 CHANGELOG.md 的残留目录，粘合段被 `os.path.exists` 提前跳过
-- git-sync.py 粘合正则改为 `##\s*\[?版本号\]?[^\n]*\n.*?(?=\n##\s|\Z)`：兼容带方括号（`## [2.4.1] - 日期`）与不带方括号（`## 0.3.1b0 — 标题`）两种版本行格式，终止于下一个 `## ` 行或文件尾
-- manifest 修正：type=skill→agent、source_path→独立源 `C:/Users/sm001/WorkBuddy/silprespec-emulator`、repo_path→`silprespec-emulator`
+### 改动
+- **结果自动落盘**：每次正常运行 / 一键演示完成后，结果写入 `data/results/{时间戳}_{类型}.json`（含 type/saved_at/summary/input/result），时间戳精确到微秒保证唯一递增
+- **右侧历史边栏**（结果 tab，参考 structured-writer outputs-sidebar）：
+  - 结果 tab 改 flex 布局：左结果展示区 + 右 240px 历史边栏（sticky）
+  - 边栏列表每条：类型徽章（运行/演示）+ 摘要 + 时间 + 删除✕
+  - 点条目 → fetch /api/results/read → 按 type 调 renderResult / renderE2E 重新展示（反复看）
+  - 删除：二次确认（✕→确认?→取消），fetch /api/results/delete
+  - 清空：顶部「清空」按钮，confirmModal 确认后 fetch /api/results/clear
+- **后端 API**：GET /api/results（列表，按时间逆序）/ GET /api/results/read?id= / POST /api/results/delete / POST /api/results/clear
+- **自动刷新**：运行/演示完成回调里调 loadHistory() 刷新边栏；启动时 loadHistory()
+- 验证：辅助函数 _save_result/_list_results/_read_result/_delete_result 全通过（保存/逆序/读取/删除）
 
-### 文档
-- README 对齐智能体发布骨架（rag-assistant / structured-writer 同型）：版本行 / 目录锚点 / 中文数字编号章节（一~十）/ 协议；修正空坐标形态描述（0.2.5b0 已删 coord 字段，改由校验原子承载）、界面描述（0.2.9b0 表单化 + 0.3.1b0 5 阶段分组）、目录树补 atoms.py/llms.txt
-- llms.txt 方式表关键配置列改真实字段（enums/regex_replaces/slots 等），标注单次不重试方式；核心模块补 atoms.py
-- atoms.py 头部注释 10→19 个原子（0.2.0b0 遗留），`_record_attempt`→`_attempt_for`
+## 0.3.2b2 — 正常运行统一详细报告 + 一键演示并行数可设
 
-### 验证
-- 修复后正则对三份 CHANGELOG（silprespec 无方括号 / rag / sw 带方括号）全部正确匹配当前版本区块
-- 0.3.1b1 发布后 PyPI 描述将包含「更新说明」区块
+### 改动
+- **正常运行报告对齐 e2e 详细度**（用户要求统一）：
+  - pipeline_model.WayResult 加 calls/total_tokens/elapsed_total 字段
+  - simulator.ExperimentRunner 复用 e2e_demo._exec_with_trace + _make_chat：每次 attempt 记 retry_reason/raw/filled/fabricated/missing_required/flagged，每次 LLM 调用记 prompt/system_prompt/response/elapsed/prompt_tokens/response_tokens
+  - web_ui renderResult 重写：每方式子块含 LLM 调用记录 + attempt 重试理由高亮 + token + 耗时 + 最终填入 + 观测，与 renderE2E 同款展示
+- **一键演示并行数可设**（原来写死 3）：
+  - 前端按钮旁加「每方式并行」输入框（id=e2e-parallel，默认 3）
+  - 后端 /api/e2e_demo 读 body.parallel 传给 _e2e_task → run_e2e_demo(parallel=...)
+- **WorkBuddy 同步路径收窄**：只同步 C:\Users\sm001\WorkBuddy\silprespec-emulator（maby_agent 那个是仓库用的，不再覆盖）
+- 验证：gate 正常运行 parallel=2 跑通，WayResult 含 calls/total_tokens/elapsed_total + attempts 含 retry_reason，6 项信息全覆盖
+
+## 0.3.2b1 — 端到端演示加并行重现性：每方式跑 N 次 + 重试理由 + token 估算
+
+### 改动
+- **e2e_demo.py 重写**：run_e2e_demo 加 parallel 参数（每方式跑 N 次），返回结构从扁平改为 {runs, reproducibility}
+  - _exec_with_trace：记录每次 attempt 的完整 trace（valid/retry_reason/raw/filled/fabricated/missing_required/flagged）
+  - _make_chat：包装 LLM 调用，记录 prompt_tokens/response_tokens（粗估 1.5 token/字）+ elapsed
+  - 重现性：Counter 统计各次 filled，算 consistency（最多见填入占比）+ distinct_fills + fill_counts
+  - 每方式汇总：success_all/total_tokens_all/elapsed_all + reproducibility
+- **web_ui renderE2E 适配新结构**：每方式一个卡片，顶部汇总（并行/总耗时/总tokens/consistency），中部各次运行子块（run_id/success/撑满/重试/耗时/tokens + LLM调用 + attempt含重试理由 + filled/extra），底部重现性（不同填入列表）
+- **main.py run_e2e_cli 适配新结构**：终端输出各次运行 + attempt 重试理由 + 重现性统计
+- **验证**：gate parallel=2 端到端跑通，consistency=1.0（两次都填"积极"），6 项信息全覆盖（输入/提示词配置/耗时token/重试理由内容/撑满成功输出/并行重现性）
+
+## 0.3.2b0 — 一键端到端演示：8 方式 × 预设输入 × 真实 LLM × 完整原始信息
+
+### 改动
+- **新增 e2e_demo.py 模块**：8 方式预设输入（DEMO_INPUTS）+ run_e2e_demo(llm, ways, on_progress)
+  - 预设输入：每个方式配一个能体现该方式特性的输入（gate=情绪句/guide=技术段/condense=环境治理长文/slot=新闻/diverge=主题/deterministic=带来源编号/detect_report=含数值统计/required_min=查询问句）
+  - 返回每个方式的完整原始信息：配置(recipe/config/task_prompt/max_retry/user_input) + 每次 LLM 调用(system/prompt/max_tokens/temperature/原始返回/耗时) + attempt 记录 + 最终结果(success/retry_count/exhausted/filled/观测extra/error)
+  - 进度回调 on_progress(done, total, res)：每跑完一个方式通知，供 web 异步展示
+- **web_ui 加一键端到端演示**：
+  - 后端 POST /api/e2e_demo：启动后台线程跑 run_e2e_demo，复用 _run_tasks 进度机制
+  - 后端 _e2e_task：创建带 timeout/max_tokens 的 LLMClient（避免默认 180s 超时），on_progress 实时更新 task result/progress
+  - 前端运行 tab 加「一键端到端演示」按钮 + 进度条
+  - 前端结果 tab 加「端到端演示结果」展示区（renderE2E）：每方式一个卡片，含配置/LLM调用记录/attempt/最终结果/观测
+  - 轮询 /api/run/status 实时展示已完成方式的结果（边跑边出）
+- **main.py 加 --e2e 命令行入口**：python main.py --e2e 跑 8 方式端到端，终端输出完整原始信息
+- 用途：证明能跑通 + 预设输入省心 + 完整输入到输出端到端信息供有限实证 + 智能体内一键展示
 
 ## 0.3.1b0 — 阶段化 UI：按 5 阶段 + 轴标注 + 原子名词
 

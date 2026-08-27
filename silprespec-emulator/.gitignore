@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-server.pid
-server_err.txt
-data/experiment.json

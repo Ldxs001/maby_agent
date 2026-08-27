@@ -29,7 +29,7 @@ if _SCRIPT_DIR not in sys.path:
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="silprespec-emulator · 前置规范效果模拟器",
+        description="silprespec-emulator · LLM 有限行为量化工具（前置规范效果模拟器）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--web", action="store_true", help="启动 Web UI（默认行为）")
@@ -38,6 +38,7 @@ def build_parser():
     p.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
     p.add_argument("--pidfile", default="", help="PID 文件路径（setup.bat 用）")
     p.add_argument("--check", action="store_true", help="仅检测后端连接，不进入对话")
+    p.add_argument("--e2e", action="store_true", help="一键端到端演示：8 方式 × 预设输入 × 真实 LLM，输出完整原始信息")
 
     p.add_argument("--batch", nargs=2, metavar=("INPUT", "OUTPUT"), default=None,
                    help="批处理模式: --batch input.json output.json")
@@ -114,16 +115,84 @@ def run_batch(input_path, output_path, llm):
     print(f"[OK] 批处理完成 → {output_path}（{len(result.get('runs', []))} 并行）")
 
 
+def run_e2e_cli(llm):
+    """命令行一键端到端演示：8 方式 × 预设输入 × 真实 LLM × 并行重现性"""
+    import json
+    from silprespec_emulator.e2e_demo import run_e2e_demo
+
+    print("=" * 70)
+    print("  一键端到端演示 · 8 方式 × 预设输入 × 真实 LLM × 并行重现性")
+    print("=" * 70)
+
+    def on_progress(done, total, res):
+        rp = res.get("reproducibility", {})
+        print(f"\n  [{done}/{total}] {res['way']} · {res['name']}  "
+              f"success_all={res['success_all']}  并行={res['parallel']}  "
+              f"consistency={rp.get('consistency')}  耗时={res['elapsed_all']}s  tokens={res['total_tokens_all']}")
+
+    results = run_e2e_demo(llm, parallel=3, on_progress=on_progress)
+
+    print("\n" + "=" * 70)
+    print("  完整原始信息")
+    print("=" * 70)
+    for r in results:
+        print(f"\n{'█'*70}\n  {r['way']} · {r['name']}\n{'█'*70}")
+        print(f"  说明       : {r['desc']}")
+        print(f"  输入       : {r['user_input']}")
+        print(f"  task_prompt: {r['task_prompt']}")
+        print(f"  recipe     : {json.dumps(r['recipe'], ensure_ascii=False)}")
+        print(f"  config     : {json.dumps(r['config'], ensure_ascii=False)}")
+        print(f"  max_retry  : {r['max_retry']}  并行: {r['parallel']}")
+        print(f"  汇总       : success_all={r['success_all']}  总耗时={r['elapsed_all']}s  总tokens={r['total_tokens_all']}")
+        rp = r.get("reproducibility", {})
+        print(f"  重现性     : consistency={rp.get('consistency')}  不同填入={len(rp.get('distinct_fills',[]))} 种")
+        for k, v in rp.get("fill_counts", {}).items():
+            print(f"    [{v}次] {k}")
+        for run in r.get("runs", []):
+            print(f"\n  {'─'*60}")
+            print(f"  run {run['run_id']}: success={run['success']}  retry={run['retry_count']}  exhausted={run['exhausted']}  耗时={run['elapsed_total']}s  tokens={run['total_tokens']}")
+            print(f"  LLM 调用（{len(run.get('calls',[]))} 次）:")
+            for i, c in enumerate(run.get('calls', []), 1):
+                print(f"    [调用 {i}] 耗时 {c['elapsed']}s  prompt_tokens={c['prompt_tokens']}  response_tokens={c['response_tokens']}")
+                if c['system_prompt']:
+                    print(f"      system : {c['system_prompt']}")
+                print(f"      prompt : {c['prompt']}")
+                print(f"      返回   : {c['response']}")
+            print(f"  attempt 记录（{len(run.get('attempts',[]))} 次，含重试理由）:")
+            for a in run.get('attempts', []):
+                print(f"    [attempt {a['attempt']}] valid={a['valid']}  重试理由={a.get('retry_reason','') or '(无)'}")
+                print(f"      raw   : {(a.get('raw','') or '')[:200]}")
+                print(f"      filled: {json.dumps(a.get('filled',{}), ensure_ascii=False)}")
+                if a.get('fabricated'):
+                    print(f"      fabricated: {json.dumps(a['fabricated'], ensure_ascii=False)}")
+                if a.get('missing_required'):
+                    print(f"      missing_required: {json.dumps(a['missing_required'], ensure_ascii=False)}")
+                if a.get('flagged'):
+                    print(f"      flagged: {json.dumps(a['flagged'], ensure_ascii=False)}")
+            print(f"  最终 filled: {json.dumps(run.get('filled',{}), ensure_ascii=False)}")
+            print(f"  观测 extra : {json.dumps(run.get('extra',{}), ensure_ascii=False)}")
+            if run.get('error'):
+                print(f"  error: {run['error']}")
+    print(f"\n{'='*70}\n  端到端演示完成（{len(results)} 方式）\n{'='*70}")
+
+
 def main():
     args = build_parser().parse_args()
 
     print("=" * 56)
-    print("  silprespec-emulator · 前置规范效果模拟器")
+    print("  silprespec-emulator · LLM 有限行为量化工具")
+    print("  前置规范效果模拟器 · 8 方式 × 真实填空 × 量化观测")
     print("=" * 56)
     print()
 
     if args.check:
         make_llm(args)
+        return
+
+    if args.e2e:
+        llm = make_llm(args)
+        llm.timeout = 1200
+        run_e2e_cli(llm)
         return
 
     if args.batch:
