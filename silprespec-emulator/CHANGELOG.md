@@ -1,5 +1,69 @@
 # 更新日志 / CHANGELOG
 
+## 0.5.0b1 — 架构重构：8 方式 → 5 方式（按逻辑分类，软引导为第一位基础原子）
+
+### 背景
+用户指出原 8 种方式是从工程实例硬凑的，不是从前置规范逻辑分类来的：gate（关键词精确匹配）和 slot（槽位范围）逻辑上都是从一句话分类/提取，带正则的关键词也是槽位；diverge 的纠偏是语义偏离拉回不是格式校验；软引导（任务提示词）是第一位原子所有方式建立在它之上不是平行的一种。要求重新规划成 5 种，加验证方案量化每种后置是否真的生效。
+
+### 改动
+- **5 种方式（按逻辑分类）**：
+  1. `pure_guide` 纯软引导（只 task_prompt，可加输出约束校验）
+  2. `value_bound` 值域限定（gate/slot/required_min/condense 合并，`bound_type` 区分：enum_select/slot_extract/required_min/condense_enum）
+  3. `diverge_correct` 发散纠偏（高温度发散+代码确定性纠偏，语义偏离拉回，非格式校验）
+  4. `deterministic_pin` 确定性封死（代码钉死可枚举，A 形态错误无通道）
+  5. `detect_report` 检出上报（不可枚举检出+上报，不阻塞，B 形态）
+  + `custom` 自定义组合（A 与 B 互斥，其余任意组合）
+- **软引导提升为第一位基础原子**：task_prompt 从方式附属→所有方式必有的基础配置（WAY_HELPS 说明"软引导=第一位基础原子"）
+- **value_bound 合并**：gate/slot/required_min/condense 四种合并成一种，`bound_type` 下拉区分值域类型（可枚举选择/槽位提取/必填最小化/凝练+枚举过滤）。`recipe_for(way_id, cfg)` 根据 bound_type 动态返回子 recipe
+- **验证指标落地**（`calc_metrics`，跨 run 聚合，量化每种后置是否真的生效）：
+  - pure_guide：达标比例 + 重复性
+  - value_bound：值域命中率 + 编造检出率 + 重试回值域率 + 重复性
+  - diverge_correct：changed 比例 + **纠偏编辑距离**（Levenshtein raw→corrected）+ **纠偏有效性**（raw不达标且corrected达标比例）+ 达标比例 + 重复性
+  - deterministic_pin：changed 比例 + 达标率 + **多次 100% 完全一致**（代码零采样）+ 重复性
+  - detect_report：检出率 + 上报率 + 重复性
+- **Levenshtein 编辑距离**：`levenshtein(a,b)` 量化纠偏改了多少字符
+- **diverge_correct 示例**：correction_target 设非空（required_pattern=生物|海洋|深海|发光），展示纠偏约束效果
+- **UI**：方式下拉用新 5 种；value_bound 表单 bound_type 下拉+子表单动态切换（change 事件）；e2e 结果展示加验证指标区块
+- **WAY_HELPS 重写**：5 种方式说明 + 组合规则（A 与 B 互斥）+ 验证指标说明
+- 验证：py_compile 全通过；import 测试通过；recipe_for 按 bound_type 正确返回子 recipe；levenshtein(kitten,sitting)=3
+
+## 0.4.0b3 — diverge/deterministic/detect_report 泛化（去照搬工程实例，回归泛化理论）
+
+### 背景
+diverge 照搬 novel-weaver 引用标记实例（假设 LLM 造【引用自来源】+删标记），但 LLM 无理由产生该标记，纠偏空转；deterministic demo 照搬 Structured Writer 引用编号实例（输入塞标记但 LLM 生成新内容不复制）；detect_report 的"全 unmatched 判失败"违反 B 形态"上报器不阻塞生成通道"。三者都把工程实例当实现照搬，而非泛化理论。用户澄清：前置规范内部的校验（correction_target/pin_target）属于前置规范，不是任务完成后的全量后置验证，保留不违反理论。
+
+### 改动
+- **diverge（08c 场景三 泛化）**：放开+收紧配对=误差抵消。validate_diverge 加空响应判失败；correction_target 保留（前置规范内部校验纠偏达标，留空=只观测 changed）；retry=True（前置规范内部重试）。default_config 去掉默认删【引用标记】规则（regex_replaces=[]），用 normalize_blanklines 泛化收紧。WAY_HELPS 泛化重写（不绑死引用标记，说明用户针对自己场景配纠偏规则）
+- **deterministic（08a §7 A 形态 泛化）**：生成时封死可枚举值域。validate_deterministic 加空响应判失败；pin_target 保留（前置规范内部校验钉死达标，留空=纯 A 钉死观测 changed）。default_config 去掉默认删【引用标记】+renumber_source=False（不照搬引用编号）。DEMO_INPUTS 去掉【引用自来源】标记改成主题。WAY_HELPS 泛化重写（不绑死引用编号，说明用户有编号场景才开 renumber）
+- **detect_report（08a §7 B 形态 泛化）**：上报器不阻塞生成通道。validate_detect_report 去掉"全 unmatched 判失败"——有检出=success（哪怕全 unmatched 也是"全部需上报"+人工兜底，不阻塞）；只判空响应/无检出失败（检出器无效）。WAY_HELPS 明确"上报器不是验证器，不宣称没问题，只上报"
+- **ATOM_GLOSS/ATOM_AXES**：diverge note 改"放开+收紧·误差抵消"，detect_report 说明改"有检出=success不阻塞"
+- 验证：mock chat 跑通——detect_report 全 unmatched 现在 success；diverge/deterministic 空响应失败、泛化默认空规则+normalize；DEMO_INPUTS 无【引用自来源】标记；import 无警告
+
+## 0.4.0b2 — custom 暴露新校验原子 + 一键演示约束示例 + WAY_HELPS 填写示例
+
+### 改动
+- **custom 下拉补新校验**：validate 下拉原只有 none/in_set/no_extra/required_full/in_range/eq_exact，补进 guide/diverge/detect_report/deterministic 四个新校验原子，custom 用户可自由组合
+- **ATOM_GLOSS/ATOM_AXES**：加 guide（软引导·输出约束）/diverge（纠偏目标校验）说明，更新 deterministic/detect_report 说明兼顾后处理+校验
+- **一键演示约束示例**：原 run_e2e_demo 用 default_config，新约束字段全空（向后兼容）导致一键看不到约束效果。新增 demo_config(way_id) 给 guide（必含"软件"+限长300）/diverge（禁含【）/deterministic（格式含来源1）/detect_report（合法值=55.8万亿元,42.8%,10.9亿人）设非空示例，run_e2e_demo 改用 demo_config
+- **WAY_HELPS 填写示例**：8 种方式各加"示例"段（示例输入+配置+预期），降低填写门槛，尤其新约束（output_constraints/correction_target/pin_target）用户知道填什么
+- 验证：import 无警告（-W error），demo_config 输出正确，8 方式示例齐全
+
+## 0.4.0b1 — 四种 validate=none 方式补可配置约束（guide/diverge/deterministic/detect_report）
+
+### 背景
+guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配置约束，什么都通过，用户无法设置门禁/验证来测试场景。按理论（08a §7 三态谱系 / 08b 面对面弱约束 / 08c 场景三 novel-weaver）给这四种加可配置的门禁/验证约束。
+
+### 改动
+- **guide（08b 软引导）**：加 `output_constraints`（required_keywords/forbidden_keywords/max_length/format_regex），校验续写是否满足约束，不满足重试。约束全空=纯软引导不校验（向后兼容）
+- **diverge（08c 场景三 发散+纠偏）**：加 `correction_target`（format_regex/required_pattern/forbidden_pattern），校验纠偏后 corrected 是否达标，不达标重试。目标全空=不校验纠偏（向后兼容）。retry 改 True（纠偏不达标可重试）
+- **deterministic（08a §7 A 形态 封死）**：加 `pin_target`（exact_value/format_regex），校验钉死后 corrected 是否满足封死目标。目标全空=只钉死不比对（向后兼容）
+- **detect_report（08a §7 B 形态 上报）**：修 `detect_and_report`——allowed 为空时所有检出项 unmatched=True（原 `bool(allowed) and ...` 导致 allowed 空时永不 unmatched）；加 `validate_detect_report`——空响应/无检出/全部需上报判失败，有命中且有合法判成功（上报不阻塞）
+- **WAY_RECIPES**：guide→validate=guide/retry=True，diverge→validate=diverge/retry=True，deterministic→validate=deterministic，detect_report→validate=detect_report
+- **VALIDATORS**：新增 validate_guide/validate_diverge/validate_deterministic/validate_detect_report
+- **UI**：renderConfigForm + collectConfig 给 guide/diverge/deterministic 加约束配置项（detect_report 已有 allowed_values，校验逻辑改即可）
+- **default_config + WAY_HELPS**：更新说明，明确可配约束及留空=不校验
+- 验证：mock chat 跑 18 用例全通过——四种带约束能判失败/成功，约束留空向后兼容
+
 ## 0.3.2b4 — 一键演示改实验级并行（与正常运行一致）
 
 ### 改动

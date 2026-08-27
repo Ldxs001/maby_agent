@@ -1,7 +1,7 @@
-"""端到端演示 · 8 方式预设输入 + 真实 LLM 调用 + 完整原始信息
+"""端到端演示 · 5 方式预设输入 + 真实 LLM 调用 + 完整原始信息 + 验证指标
 
-用途：一键展示 8 种前置规范方式从输入到输出的完整端到端信息，供有限实证。
-每个方式跑 parallel 次，记录每次的完整 trace（含重试理由），汇总重现性。
+用途：一键展示 5 种前置规范方式从输入到输出的完整端到端信息，供有限实证。
+每个方式跑 parallel 次，记录每次的完整 trace（含重试理由），汇总重现性 + 验证指标。
 """
 from __future__ import annotations
 import time
@@ -10,20 +10,32 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from .pipeline_model import WayConfig, default_config, TASK_PROMPTS, WAYS, WayResult, json_key
-from .atoms import (WAY_RECIPES, AtomCtx, Recipe, GENERATORS, POSTPROCESSORS,
-                    VALIDATORS, OBSERVERS, _filled_for)
+from .atoms import (recipe_for, AtomCtx, Recipe, GENERATORS, POSTPROCESSORS,
+                    VALIDATORS, OBSERVERS, _filled_for, calc_metrics)
 from .llm_client import LLMClient
 
 
+def demo_config(way_id: str) -> dict:
+    """一键演示用的配置：基于 default_config。
+    pure_guide/detect_report 设非空约束看校验生效；diverge_correct 设非空纠偏目标看纠偏生效。"""
+    cfg = default_config(way_id)
+    if way_id == "pure_guide":
+        cfg["output_constraints"] = {"required_keywords": ["软件"], "forbidden_keywords": [],
+                                      "max_length": 300, "format_regex": ""}
+    elif way_id == "detect_report":
+        cfg["allowed_values"] = ["55.8万亿元", "42.8%", "10.9亿人"]
+    elif way_id == "diverge_correct":
+        cfg["correction_target"] = {"format_regex": "", "required_pattern": "生物|海洋|深海|发光",
+                                    "forbidden_pattern": ""}
+    return cfg
+
+
 DEMO_INPUTS = {
-    "gate": "今天阳光真好，心情特别棒，感觉一切都很顺利！",
-    "guide": "人工智能正在改变软件开发的方式，从代码生成到测试自动化，都在发生深刻变化。",
-    "condense": "近年来我国在环境治理方面取得显著成效，生态文明建设深入推进，绿色发展理念贯穿经济社会发展全过程，污染防治攻坚战取得重大成果。",
-    "slot": "张三于2024年3月在北京大学发表了关于大模型训练优化的演讲，吸引了数百名研究者参与。",
-    "diverge": "深海中的发光生物",
-    "deterministic": "大模型技术发展迅速【引用自来源5】。多模态能力不断提升【引用自来源3】。应用场景持续扩展【引用自来源5】。",
+    "pure_guide": "人工智能正在改变软件开发的方式，从代码生成到测试自动化，都在发生深刻变化。",
+    "value_bound": "今天阳光真好，心情特别棒，感觉一切都很顺利！",
+    "diverge_correct": "深海中的发光生物",
+    "deterministic_pin": "大模型技术发展迅速，多模态能力不断提升，应用场景持续扩展。",
     "detect_report": "2024年我国数字经济规模达到55.8万亿元，占GDP比重42.8%，网民规模10.9亿人。",
-    "required_min": "茅台酒的价格是多少？",
 }
 
 
@@ -57,7 +69,7 @@ def _make_chat(llm: LLMClient, calls: list):
 def _exec_with_trace(way_id: str, wc, user_input: str, chat):
     """跑一次方式，记录每次 attempt 的完整 trace（含重试理由）"""
     custom = getattr(wc, "recipe", None)
-    recipe = Recipe.from_dict(custom) if custom else WAY_RECIPES.get(way_id)
+    recipe = Recipe.from_dict(custom) if custom else recipe_for(way_id, wc.config)
     if recipe is None:
         return {"success": False, "retry_count": 0, "exhausted": False,
                 "filled": {}, "extra": {}, "attempts": [], "error": f"无配方: {way_id}"}
@@ -123,6 +135,7 @@ def _aggregate(way_specs, pipes):
             "config": wc.config, "max_retry": wc.max_retry,
             "user_input": user_input, "parallel": len(runs),
             "runs": runs,
+            "metrics": calc_metrics(way_id, runs),
             "reproducibility": {
                 "consistency": consistency,
                 "distinct_fills": [k for k, _ in cnt.most_common()],
@@ -138,9 +151,9 @@ def _aggregate(way_specs, pipes):
 def run_e2e_demo(llm: LLMClient, ways: Optional[list] = None,
                  parallel: int = 3,
                  on_progress: Optional[Callable[[int, int, list], None]] = None) -> list:
-    """跑 8 方式（或指定子集）端到端，实验级并行：parallel 个管道并发，每管道内方式串行
+    """跑 5 方式（或指定子集）端到端，实验级并行：parallel 个管道并发，每管道内方式串行
     （各方式用预设输入），收齐按方式聚合算重现性。on_progress(done_pipes, total_pipes, 聚合列表)。"""
-    target = ways or [w[0] for w in WAYS]
+    target = ways or [w[0] for w in WAYS if w[0] != "custom"]
     way_map = {w[0]: w for w in WAYS}
     way_specs = []
     for way_id in target:
@@ -148,8 +161,8 @@ def run_e2e_demo(llm: LLMClient, ways: Optional[list] = None,
             continue
         way_name, way_desc = way_map[way_id][1], way_map[way_id][2]
         user_input = DEMO_INPUTS.get(way_id, "测试输入")
-        wc = WayConfig(way=way_id, config=default_config(way_id), max_retry=3)
-        recipe = WAY_RECIPES.get(way_id)
+        wc = WayConfig(way=way_id, config=demo_config(way_id), max_retry=3)
+        recipe = recipe_for(way_id, wc.config)
         task_prompt = wc.task_prompt or TASK_PROMPTS.get(way_id, "")
         way_specs.append((way_id, way_name, way_desc, user_input, wc, recipe, task_prompt))
 

@@ -1,7 +1,7 @@
 """Web UI — 前置规范效果实验台
 
 界面：深色主题（对齐 structured-writer），三 Tab：
-  - 配置：从 8 种前置规范方式中选一种或多种，各方式配置 + 并行数
+  - 配置：从 5 种前置规范方式中选一种或多种，各方式配置 + 并行数
   - 运行：输入 + 启动并行
   - 结果：每种方式每次并行的填入内容、重试次数、撑满失败、重现性
 """
@@ -20,7 +20,7 @@ from .pipeline_model import (
 from .simulator import ExperimentRunner
 from .llm_client import LLMClient, LLMClientError
 from .config_manager import ConfigManager, BACKEND_DEFAULTS
-from .atoms import WAY_RECIPES
+from .atoms import WAY_RECIPES, recipe_for
 from .e2e_demo import run_e2e_demo
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -126,12 +126,16 @@ class SilPrespecEmulatorHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/config":
             self._send(200, config_mgr.get_all())
         elif self.path == "/api/ways":
-            self._send(200, {"ways": [{"id": w[0], "name": w[1], "desc": w[2],
-                                       "help": WAY_HELPS.get(w[0], ""),
-                                       "default_config": default_config(w[0]),
-                                       "default_task_prompt": TASK_PROMPTS.get(w[0], ""),
-                                       "default_recipe": (WAY_RECIPES[w[0]].to_dict() if w[0] in WAY_RECIPES else {})} for w in WAYS],
-
+            ways_list = []
+            for w in WAYS:
+                dc = default_config(w[0])
+                r = recipe_for(w[0], dc)
+                ways_list.append({"id": w[0], "name": w[1], "desc": w[2],
+                                   "help": WAY_HELPS.get(w[0], ""),
+                                   "default_config": dc,
+                                   "default_task_prompt": TASK_PROMPTS.get(w[0], ""),
+                                   "default_recipe": r.to_dict() if r else {}})
+            self._send(200, {"ways": ways_list,
                              "custom_help": WAY_HELPS.get("custom", ""),
                              "custom_templates": config_mgr.get_custom_templates()})
         elif self.path == "/api/backends":
@@ -472,9 +476,9 @@ select option{background:var(--bg-input);color:var(--text)}
       <div class="progress-bar"><div class="fill" id="progress-fill" style="width:0%"></div></div>
     </div>
     <div class="section">
-      <h3>一键端到端演示 <span style="font-size:12px;color:var(--text-dim);font-weight:400">8 方式 × 预设输入 × 真实 LLM × 完整原始信息</span></h3>
-      <p style="font-size:13px;color:var(--text-dim);margin-bottom:10px">用预设输入对 8 种方式逐一端到端真实调用 LLM，展示从输入到输出的完整信息（配置/每次 LLM 调用/attempt/结果/观测），供有限实证。</p>
-      <div class="form-row" style="margin-bottom:10px"><label>每方式并行</label><input type="number" id="e2e-parallel" value="3" min="1" max="10" style="max-width:80px"><button class="btn btn-primary" id="btn-e2e">一键端到端演示（8 方式）</button></div>
+      <h3>一键端到端演示 <span style="font-size:12px;color:var(--text-dim);font-weight:400">5 方式 × 预设输入 × 真实 LLM × 完整原始信息</span></h3>
+      <p style="font-size:13px;color:var(--text-dim);margin-bottom:10px">用预设输入对 5 种方式逐一端到端真实调用 LLM，展示从输入到输出的完整信息（配置/每次 LLM 调用/attempt/结果/观测），供有限实证。</p>
+      <div class="form-row" style="margin-bottom:10px"><label>每方式并行</label><input type="number" id="e2e-parallel" value="3" min="1" max="10" style="max-width:80px"><button class="btn btn-primary" id="btn-e2e">一键端到端演示（5 方式）</button></div>
       <span id="e2e-status" class="status" style="margin-left:12px"></span>
       <div class="progress-bar" style="margin-top:8px"><div class="fill" id="e2e-progress" style="width:0%"></div></div>
     </div>
@@ -482,10 +486,10 @@ select option{background:var(--bg-input);color:var(--text)}
       <h3>说明</h3>
       <p style="font-size:13px;color:var(--text-dim);line-height:1.7">
         <b style="color:var(--text)">本工具是 LLM 的有限行为量化工具</b>：对 LLM 在前置规范下的填空行为做有限、可重复的量化观测（填入内容/重试/撑满/重现性），供有限实证。<br>
-        • 从 8 种前置规范方式中选一种或多种，对输入真实执行（LLM 真填空），观测<b>填入了什么</b>。<br>
-        • 指标：填入内容、重试次数、是否撑满 max_retry、撑满失败次数、命中/留空分布。<br>
+        • 从 5 种前置规范方式中选一种或多种，对输入真实执行（LLM 真填空），观测<b>填入了什么</b>。<br>
+        • 指标：填入内容、重试次数、撑满失败、重现性 + <b>验证指标</b>（值域命中率/纠偏编辑距离/纠偏有效性/钉死确定性/检出率/上报率，量化每种后置是否真的生效）。<br>
         • 并行 N 次观测<b>重现性</b>（各方式跨 run 填入一致率）。<br>
-        • 8 种都是前置规范（生成通道/填空出口）；后置验证（任务完成后全量验证）不在本系统。
+        • 5 种都是前置规范（生成通道/填空出口）；后置验证（任务完成后全量验证）不在本系统。
       </p>
     </div>
   </div>
@@ -623,6 +627,8 @@ const ATOM_AXES={
   'required_full':{axis:'集合轴',cls:'dim',note:'必填齐全'},
   'in_range':{axis:'数值轴',cls:'warn',note:'面对面·收窄后校验'},
   'eq_exact':{axis:'数值轴',cls:'warn',note:'点对点·收窄后校验'},
+  'guide':{axis:'集合轴',cls:'dim',note:'软引导·输出约束'},
+  'diverge':{axis:'格式轴',cls:'warn',note:'放开+收紧·误差抵消'},
   'none':{axis:'—',cls:'dim',note:'不校验'},
 };
 const ATOM_GLOSS={
@@ -638,6 +644,10 @@ const ATOM_GLOSS={
   'required_full':'必填齐全校验：required 槽位必须有内容',
   'in_range':'区间容差校验：数值必须在区间内（面对面）',
   'eq_exact':'精确相等校验：值必须等于指定值（点对点）',
+  'guide':'软引导输出约束校验：检查续写满足必含关键词/禁词/长度/格式正则',
+  'diverge':'发散纠偏目标校验：检查纠偏后 corrected 满足格式/必含/禁含模式',
+  'deterministic':'确定性后处理/封死目标校验：正则替换+编号重排+空行归一化，并校验钉死后达标',
+  'detect_report':'检出即上报/上报校验：正则扫描+白名单对照，空响应/无检出判失败，有检出=success不阻塞',
   'none':'不校验：直接通过',
   'hit':'命中分布：统计命中/未指定/编造',
   'fabricated':'编造统计：造了不在允许集的词数',
@@ -670,7 +680,7 @@ function renderStages(way,recipe,isCustom){
     pp=(r.postprocess&&r.postprocess.length)?r.postprocess.map(a=>ro(a)+axisTag(a)).join(' '):'<span class="kv">（无）</span>';
   }
   let val;
-  if(isCustom)val=`<select data-w="r_validate" class="atom-sel" title="${esc(ATOM_GLOSS[r.validate||'none']||'')}">${optT([['none','none'],['in_set','in_set'],['no_extra','no_extra'],['required_full','required_full'],['in_range','in_range'],['eq_exact','eq_exact']],r.validate||'none')}</select>`;
+  if(isCustom)val=`<select data-w="r_validate" class="atom-sel" title="${esc(ATOM_GLOSS[r.validate||'none']||'')}">${optT([['none','none'],['in_set','in_set'],['no_extra','no_extra'],['required_full','required_full'],['in_range','in_range'],['eq_exact','eq_exact'],['guide','guide'],['diverge','diverge'],['deterministic','deterministic'],['detect_report','detect_report']],r.validate||'none')}</select>`;
   else val=ro(r.validate||'none');
   val+=axisTag(r.validate||'none');
   let rt;
@@ -718,6 +728,9 @@ function renderWay(w){
     else if(act==='add-slot'){const c=card.querySelector('[data-w="cfg_slots"]');if(c)c.insertAdjacentHTML('beforeend',configSlotRow({}));}
     else if(act==='add-replace'){const c=card.querySelector('[data-w="cfg_replaces"]');if(c)c.insertAdjacentHTML('beforeend',configReplaceRow({}));}
   });
+  card.addEventListener('change',ev=>{
+    if(ev.target.getAttribute('data-act')==='bound-type-change'){const bt=ev.target.value;card.querySelectorAll('[data-w="cfg_bound_enum_select"],[data-w="cfg_bound_slots"],[data-w="cfg_bound_condense_enum"]').forEach(d=>d.style.display='none');const map={'enum_select':'cfg_bound_enum_select','slot_extract':'cfg_bound_slots','required_min':'cfg_bound_slots','condense_enum':'cfg_bound_condense_enum'};const t=card.querySelector(`[data-w="${map[bt]||'cfg_bound_enum_select'}"]`);if(t)t.style.display='block';}
+  });
   card.querySelector('[data-w="way"]').onchange=(e)=>{
     const sel=e.target.selectedOptions[0];
     const tmplId=sel.getAttribute('data-tmpl')||'';
@@ -754,12 +767,10 @@ function configReplaceRow(r){return `<div class="form-row cfg-row" style="gap:6p
 function renderConfigForm(way,cfg){
   cfg=cfg||{};
   if(way==='custom'||!way) return `<div class="form-row"><label>配置JSON</label><textarea data-w="config" rows="6">${esc(JSON.stringify(cfg,null,2))}</textarea></div>`;
-  if(way==='gate'){const gates=(cfg.gates&&cfg.gates.length)?cfg.gates.map(configGateRow).join(''):configGateRow({});return `<div data-w="cfg_gates">${gates}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-gate">+ 门禁</button></div><div class="form-row"><label>允许未指定</label><input type="checkbox" data-w="cfg_allow_unspec" ${cfg.allow_unspecified!==false?'checked':''}></div>`;}
-  if(way==='guide') return `<div class="form-row"><label>引导提示词</label><textarea data-w="cfg_guide_prompt" rows="3">${esc(cfg.guide_prompt||'')}</textarea></div>`;
-  if(way==='condense') return `<div class="form-row"><label>凝练规则</label><textarea data-w="cfg_condense_rule" rows="2">${esc(cfg.condense_rule||'')}</textarea></div><div class="form-row"><label>枚举词</label><input data-w="cfg_enums" value="${esc((cfg.enums||[]).join(','))}" placeholder="词1,词2,词3"></div>`;
-  if(way==='slot'||way==='required_min'){const slots=(cfg.slots&&cfg.slots.length)?cfg.slots.map(configSlotRow).join(''):configSlotRow({});return `<div data-w="cfg_slots">${slots}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-slot">+ 槽位</button></div>`;}
-  if(way==='diverge'){const reps=(cfg.regex_replaces&&cfg.regex_replaces.length)?cfg.regex_replaces.map(configReplaceRow).join(''):configReplaceRow({});return `<div class="form-row"><label>发散提示词</label><textarea data-w="cfg_diverge_prompt" rows="2">${esc(cfg.diverge_prompt||'')}</textarea></div><div data-w="cfg_replaces">${reps}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-replace">+ 替换规则</button></div><div class="form-row"><label>空行归一化</label><input type="checkbox" data-w="cfg_norm_blank" ${cfg.normalize_blanklines?'checked':''}></div>`;}
-  if(way==='deterministic'){const reps=(cfg.regex_replaces&&cfg.regex_replaces.length)?cfg.regex_replaces.map(configReplaceRow).join(''):configReplaceRow({});return `<div data-w="cfg_replaces">${reps}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-replace">+ 替换规则</button></div><div class="form-row"><label>编号重排</label><input type="checkbox" data-w="cfg_renumber" ${cfg.renumber_source?'checked':''}></div><div class="form-row"><label>空行归一化</label><input type="checkbox" data-w="cfg_norm_blank" ${cfg.normalize_blanklines?'checked':''}></div>`;}
+  if(way==='pure_guide'){const con=cfg.output_constraints||{};return `<div class="form-row"><label>引导提示词</label><textarea data-w="cfg_guide_prompt" rows="3">${esc(cfg.guide_prompt||'')}</textarea></div><div class="form-row"><label>必含关键词</label><input data-w="cfg_req_kw" value="${esc((con.required_keywords||[]).join(','))}" placeholder="逗号分隔，留空不校验"></div><div class="form-row"><label>禁词</label><input data-w="cfg_forbid_kw" value="${esc((con.forbidden_keywords||[]).join(','))}" placeholder="逗号分隔，留空不校验"></div><div class="form-row"><label>长度上限</label><input type="number" data-w="cfg_max_len" value="${con.max_length||0}" placeholder="0=不限"></div><div class="form-row"><label>格式正则</label><input data-w="cfg_fmt_regex" value="${esc(con.format_regex||'')}" placeholder="留空不校验"></div>`;}
+  if(way==='value_bound'){const bt=cfg.bound_type||'enum_select';const gates=(cfg.gates&&cfg.gates.length)?cfg.gates.map(configGateRow).join(''):configGateRow({});const slots=(cfg.slots&&cfg.slots.length)?cfg.slots.map(configSlotRow).join(''):configSlotRow({});const showE=bt==='enum_select'?'block':'none',showS=(bt==='slot_extract'||bt==='required_min')?'block':'none',showC=bt==='condense_enum'?'block':'none';return `<div class="form-row"><label>值域类型</label><select data-w="cfg_bound_type" data-act="bound-type-change">${optT([['enum_select','可枚举选择'],['slot_extract','槽位提取'],['required_min','必填最小化'],['condense_enum','凝练+枚举过滤']],bt)}</select></div><div data-w="cfg_bound_enum_select" style="display:${showE}"><div data-w="cfg_gates">${gates}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-gate">+ 门禁</button></div><div class="form-row"><label>允许未指定</label><input type="checkbox" data-w="cfg_allow_unspec" ${cfg.allow_unspecified!==false?'checked':''}></div></div><div data-w="cfg_bound_slots" style="display:${showS}"><div data-w="cfg_slots">${slots}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-slot">+ 槽位</button></div></div><div data-w="cfg_bound_condense_enum" style="display:${showC}"><div class="form-row"><label>凝练规则</label><textarea data-w="cfg_condense_rule" rows="2">${esc(cfg.condense_rule||'')}</textarea></div><div class="form-row"><label>枚举词</label><input data-w="cfg_enums" value="${esc((cfg.enums||[]).join(','))}" placeholder="词1,词2,词3"></div></div>`;}
+  if(way==='diverge_correct'){const reps=(cfg.regex_replaces&&cfg.regex_replaces.length)?cfg.regex_replaces.map(configReplaceRow).join(''):configReplaceRow({});const tgt=cfg.correction_target||{};return `<div class="form-row"><label>发散提示词</label><textarea data-w="cfg_diverge_prompt" rows="2">${esc(cfg.diverge_prompt||'')}</textarea></div><div data-w="cfg_replaces">${reps}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-replace">+ 替换规则</button></div><div class="form-row"><label>空行归一化</label><input type="checkbox" data-w="cfg_norm_blank" ${cfg.normalize_blanklines?'checked':''}></div><div class="form-row"><label>纠偏·格式正则</label><input data-w="cfg_ct_fmt" value="${esc(tgt.format_regex||'')}" placeholder="纠偏后须匹配，留空不校验"></div><div class="form-row"><label>纠偏·必含模式</label><input data-w="cfg_ct_req" value="${esc(tgt.required_pattern||'')}" placeholder="纠偏后须包含的正则，留空不校验"></div><div class="form-row"><label>纠偏·禁含模式</label><input data-w="cfg_ct_forbid" value="${esc(tgt.forbidden_pattern||'')}" placeholder="纠偏后不得包含的正则，留空不校验"></div>`;}
+  if(way==='deterministic_pin'){const reps=(cfg.regex_replaces&&cfg.regex_replaces.length)?cfg.regex_replaces.map(configReplaceRow).join(''):configReplaceRow({});const tgt=cfg.pin_target||{};return `<div data-w="cfg_replaces">${reps}</div><div class="form-row"><button class="btn btn-sm btn-secondary" data-act="add-replace">+ 替换规则</button></div><div class="form-row"><label>编号重排</label><input type="checkbox" data-w="cfg_renumber" ${cfg.renumber_source?'checked':''}></div><div class="form-row"><label>空行归一化</label><input type="checkbox" data-w="cfg_norm_blank" ${cfg.normalize_blanklines?'checked':''}></div><div class="form-row"><label>封死·精确值</label><textarea data-w="cfg_pt_exact" rows="2">${esc(tgt.exact_value||'')}</textarea></div><div class="form-row"><label>封死·格式正则</label><input data-w="cfg_pt_fmt" value="${esc(tgt.format_regex||'')}" placeholder="钉死后须匹配，留空不校验"></div>`;}
   if(way==='detect_report') return `<div class="form-row"><label>检出正则</label><input data-w="cfg_detect_pat" value="${esc(cfg.detect_pattern||'')}" placeholder="\\d+(?:\\.\\d+)?(%|亿|万|元|人次)"></div><div class="form-row"><label>合法值</label><input data-w="cfg_allowed" value="${esc((cfg.allowed_values||[]).join(','))}" placeholder="100%,3.5亿（逗号分隔，可留空）"></div><div class="form-row"><label>上报标签</label><input data-w="cfg_report_label" value="${esc(cfg.report_label||'')}" placeholder="建议人工复审"></div>`;
   return `<div class="form-row"><label>配置JSON</label><textarea data-w="config" rows="6">${esc(JSON.stringify(cfg,null,2))}</textarea></div>`;
 }
@@ -768,12 +779,10 @@ function collectConfig(card,way){
   const get=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.value:'';};
   const chk=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.checked:false;};
   if(way==='custom'||!way){const el=card.querySelector('[data-w="config"]');try{return JSON.parse(el.value);}catch(e){return {};}}
-  if(way==='gate'){const gates=[];card.querySelectorAll('[data-w="cfg_gates"] .cfg-row').forEach(row=>{const name=row.querySelector('[data-w="cfg_gate_name"]').value.trim();const words=row.querySelector('[data-w="cfg_gate_words"]').value.split(',').map(s=>s.trim()).filter(Boolean);if(name)gates.push({name,words,logic:'or'});});return {gates,allow_unspecified:chk('cfg_allow_unspec')};}
-  if(way==='guide') return {guide_prompt:get('cfg_guide_prompt')};
-  if(way==='condense') return {condense_rule:get('cfg_condense_rule'),enums:get('cfg_enums').split(',').map(s=>s.trim()).filter(Boolean)};
-  if(way==='slot'||way==='required_min'){const slots=[];card.querySelectorAll('[data-w="cfg_slots"] .cfg-row').forEach(row=>{const name=row.querySelector('[data-w="cfg_slot_name"]').value.trim();if(name)slots.push({name,required:row.querySelector('[data-w="cfg_slot_req"]').checked});});return {slots};}
-  if(way==='diverge') return {diverge_prompt:get('cfg_diverge_prompt'),regex_replaces:collectReplaces(card),normalize_blanklines:chk('cfg_norm_blank')};
-  if(way==='deterministic') return {regex_replaces:collectReplaces(card),renumber_source:chk('cfg_renumber'),normalize_blanklines:chk('cfg_norm_blank')};
+  if(way==='pure_guide') return {guide_prompt:get('cfg_guide_prompt'),output_constraints:{required_keywords:get('cfg_req_kw').split(',').map(s=>s.trim()).filter(Boolean),forbidden_keywords:get('cfg_forbid_kw').split(',').map(s=>s.trim()).filter(Boolean),max_length:parseInt(get('cfg_max_len')||'0',10)||0,format_regex:get('cfg_fmt_regex')}};
+  if(way==='value_bound'){const bt=get('cfg_bound_type')||'enum_select';const out={bound_type:bt};if(bt==='enum_select'){const gates=[];card.querySelectorAll('[data-w="cfg_gates"] .cfg-row').forEach(row=>{const name=row.querySelector('[data-w="cfg_gate_name"]').value.trim();const words=row.querySelector('[data-w="cfg_gate_words"]').value.split(',').map(s=>s.trim()).filter(Boolean);if(name)gates.push({name,words,logic:'or'});});out.gates=gates;out.allow_unspecified=chk('cfg_allow_unspec');}else if(bt==='slot_extract'||bt==='required_min'){const slots=[];card.querySelectorAll('[data-w="cfg_slots"] .cfg-row').forEach(row=>{const name=row.querySelector('[data-w="cfg_slot_name"]').value.trim();if(name)slots.push({name,required:row.querySelector('[data-w="cfg_slot_req"]').checked});});out.slots=slots;}else if(bt==='condense_enum'){out.condense_rule=get('cfg_condense_rule');out.enums=get('cfg_enums').split(',').map(s=>s.trim()).filter(Boolean);}return out;}
+  if(way==='diverge_correct') return {diverge_prompt:get('cfg_diverge_prompt'),regex_replaces:collectReplaces(card),normalize_blanklines:chk('cfg_norm_blank'),correction_target:{format_regex:get('cfg_ct_fmt'),required_pattern:get('cfg_ct_req'),forbidden_pattern:get('cfg_ct_forbid')}};
+  if(way==='deterministic_pin') return {regex_replaces:collectReplaces(card),renumber_source:chk('cfg_renumber'),normalize_blanklines:chk('cfg_norm_blank'),pin_target:{exact_value:get('cfg_pt_exact'),format_regex:get('cfg_pt_fmt')}};
   if(way==='detect_report') return {detect_pattern:get('cfg_detect_pat'),allowed_values:get('cfg_allowed').split(',').map(s=>s.trim()).filter(Boolean),report_label:get('cfg_report_label')};
   return {};
 }
@@ -853,7 +862,7 @@ function collectExp(){
 }
 document.getElementById('btn-add-way').onclick=()=>{
   const list=document.getElementById('ways-list');
-  list.appendChild(renderWay({way:'gate',enabled:true,config:{},max_retry:3}));
+  list.appendChild(renderWay({way:'pure_guide',enabled:true,config:{},max_retry:3}));
   saveExpAuto();
 };
 document.getElementById('btn-reset').onclick=()=>{confirmModal('重置当前实验配置？',()=>{fetch('/api/experiment').then(r=>r.json()).then(d=>{experiment=d;renderExp();});},'重置');};
@@ -912,8 +921,10 @@ function renderResult(result){
   if(!repro.length){pl.innerHTML='<p class="kv">无重现性数据</p>';return;}
   repro.forEach(rp=>{
     const div=document.createElement('div');div.className='wr-block';
+    const m=result.metrics&&result.metrics[rp.way];
+    const mStr=m&&Object.keys(m).length?`<div class="config-header" style="color:var(--accent)">验证指标（量化后置是否生效）</div><pre style="white-space:pre-wrap;font-size:11px">${esc(JSON.stringify(m,null,2))}</pre>`:'';
     div.innerHTML=`<div class="wb-head">${esc(wayName(rp.way))} <span class="badge ${rp.consistency>=0.8?'ok':(rp.consistency>=0.5?'warn':'fail')}">一致率 ${rp.consistency}</span></div>
-      <div class="kv">出现 ${rp.distinct_fills.length} 种不同填入：</div><pre>${esc(rp.distinct_fills.map(f=>{try{return JSON.stringify(JSON.parse(f),null,2);}catch(e){return f;}}).join('\n---\n'))}</pre>`;
+      <div class="kv">出现 ${rp.distinct_fills.length} 种不同填入：</div><pre>${esc(rp.distinct_fills.map(f=>{try{return JSON.stringify(JSON.parse(f),null,2);}catch(e){return f;}}).join('\n---\n'))}</pre>${mStr}`;
     pl.appendChild(div);
   });
 }
@@ -975,6 +986,7 @@ function renderE2E(results){
       <div class="kv">recipe: <b>${esc(JSON.stringify(r.recipe))}</b></div>
       <div class="kv">config: <b>${esc(JSON.stringify(r.config))}</b> · max_retry=<b>${r.max_retry}</b></div>
       <div class="config-header" style="color:var(--accent)">重现性: consistency=<b>${rp.consistency}</b> · ${rp.distinct_fills?rp.distinct_fills.length:0} 种不同填入</div>${rpPre}
+      ${r.metrics&&Object.keys(r.metrics).length?`<div class="config-header" style="color:var(--accent)">验证指标（量化后置是否生效）</div><pre style="white-space:pre-wrap;font-size:11px">${esc(JSON.stringify(r.metrics,null,2))}</pre>`:''}
       <div class="config-header">各次运行（共 ${(r.runs||[]).length} 次）</div>${runsHtml}`;
     el.appendChild(div);
   });

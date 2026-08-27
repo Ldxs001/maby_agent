@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """前置规范效果实验台 — 入口
 
-按方法论（08a/08b/08c/09b）提供 8 种前置规范方式，用户选一种或多种，
-对输入真实执行（LLM 真填空），观测填入了什么、重试次数、撑满失败、重现性。
+按方法论（08a/08b/08c/09b）提供 5 种前置规范方式，用户选一种或多种，
+对输入真实执行（LLM 真填空），观测填入了什么、重试次数、撑满失败、重现性 + 验证指标。
 
 用法：
   python main.py                                       # 启动 Web UI（默认 LM Studio）
@@ -38,7 +38,7 @@ def build_parser():
     p.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
     p.add_argument("--pidfile", default="", help="PID 文件路径（setup.bat 用）")
     p.add_argument("--check", action="store_true", help="仅检测后端连接，不进入对话")
-    p.add_argument("--e2e", action="store_true", help="一键端到端演示：8 方式 × 预设输入 × 真实 LLM，输出完整原始信息")
+    p.add_argument("--e2e", action="store_true", help="一键端到端演示：5 方式 × 预设输入 × 真实 LLM，输出完整原始信息")
 
     p.add_argument("--batch", nargs=2, metavar=("INPUT", "OUTPUT"), default=None,
                    help="批处理模式: --batch input.json output.json")
@@ -116,12 +116,12 @@ def run_batch(input_path, output_path, llm):
 
 
 def run_e2e_cli(llm):
-    """命令行一键端到端演示：8 方式 × 预设输入 × 真实 LLM × 并行重现性"""
+    """命令行一键端到端演示：5 方式 × 预设输入 × 真实 LLM × 并行重现性"""
     import json
     from silprespec_emulator.e2e_demo import run_e2e_demo
 
     print("=" * 70)
-    print("  一键端到端演示 · 8 方式 × 预设输入 × 真实 LLM × 并行重现性")
+    print("  一键端到端演示 · 5 方式 × 预设输入 × 真实 LLM × 并行重现性")
     print("=" * 70)
 
     def on_progress(done, total, res):
@@ -178,7 +178,7 @@ def main():
 
     print("=" * 56)
     print("  silprespec-emulator · LLM 有限行为量化工具")
-    print("  前置规范效果模拟器 · 8 方式 × 真实填空 × 量化观测")
+    print("  前置规范效果模拟器 · 5 方式 × 真实填空 × 量化观测")
     print("=" * 56)
     print()
 

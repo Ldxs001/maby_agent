@@ -4,8 +4,9 @@
   - 填入了什么（实际内容）
   - 重试次数、是否撑满 max_retry
   - 各方式专属观测（命中分布/编造项/纠偏前后...）
+  - 验证指标（跨 run 聚合，量化每种后置是否真的生效）
 
-8 种方式都是前置规范（生成通道/填空出口），后置验证不在本系统。
+5 种方式都是前置规范（生成通道/填空出口），后置验证不在本系统。
 并行 N 次观测重现性。
 
 执行逻辑由原子配方驱动（atoms.exec_recipe），本文件只做并行编排。
@@ -20,6 +21,7 @@ from .pipeline_model import (
 )
 from .llm_client import LLMClient, LLMClientError
 from .e2e_demo import _exec_with_trace, _make_chat
+from .atoms import calc_metrics
 
 
 class ExperimentRunner:
@@ -58,7 +60,13 @@ class ExperimentRunner:
                 results.append(res)
         results.sort(key=lambda r: r.get("run_id", 0))
         repro = calc_reproducibility([r for r in results if "way_results" in r])
-        return {"runs": results, "reproducibility": repro}
+        way_runs: dict = {}
+        for r in results:
+            for wr in r.get("way_results", []):
+                wid = wr.get("way", "")
+                way_runs.setdefault(wid, []).append(wr)
+        metrics = {wid: calc_metrics(wid, runs) for wid, runs in way_runs.items()}
+        return {"runs": results, "reproducibility": repro, "metrics": metrics}
 
     # ------------------------------------------------------------------
     # 单次执行：对每种启用方式真实填空（方式间串行，不传状态）

@@ -7,7 +7,7 @@
   控制流(1): retry 循环（exec_recipe 编排）
   观测(1, 可配): hit / fabricated / extra_keys / left_empty / flagged / changed
 
-8 方式 = 原子配方（WAY_RECIPES）。执行层无 way_id 分支；
+5 方式 = 原子配方（WAY_RECIPES + recipe_for）。执行层无 way_id 分支；
 filled/extra 的展示格式由 _filled_for/_record_attempt 按 way_id 兼容（保 UI 不变，
 第二步统一展示格式后可去掉）。
 """
@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 import re
 
-from .pipeline_model import WayResult, TASK_PROMPTS
+from .pipeline_model import WayResult, TASK_PROMPTS, json_key
 
 
 # ======================================================================
@@ -66,16 +66,116 @@ def apply_deterministic(raw: str, cfg: dict) -> str:
 
 
 def detect_and_report(raw: str, pattern: str, allowed: list, label: str) -> list:
-    """检出+对照数据源：未命中 allowed 的标记上报"""
+    """检出+对照数据源：未命中 allowed 的标记上报。
+    allowed 非空：不在 allowed 的检出项 unmatched=True（需上报）。
+    allowed 为空：所有检出项都 unmatched=True（未配合法域，全部需上报）。"""
     flagged = []
     try:
         for m in re.finditer(pattern, raw):
             val = m.group(0)
-            unmatched = bool(allowed) and val not in allowed
+            if allowed:
+                unmatched = val not in allowed
+            else:
+                unmatched = True
             flagged.append({"value": val, "pos": m.start(), "report": label, "unmatched": unmatched})
     except Exception:
         pass
     return flagged
+
+
+def levenshtein(a: str, b: str) -> int:
+    """Levenshtein 编辑距离（量化纠偏改了多少字符）"""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def calc_metrics(way_id: str, runs: list) -> dict:
+    """跨 run 聚合验证指标（量化每种后置是否真的生效）。
+    runs: list of single-run result dict（含 success/filled/extra/attempts）。"""
+    n = len(runs)
+    if n == 0:
+        return {}
+    m = {"n": n}
+
+    if way_id == "pure_guide":
+        ok = sum(1 for r in runs if r.get("success"))
+        m["达标比例"] = round(ok / n, 3)
+
+    elif way_id == "value_bound":
+        total_hit = total_fab = total = 0
+        for r in runs:
+            extra = r.get("extra", {})
+            total_hit += extra.get("hit", 0)
+            total_fab += extra.get("fabricated", 0)
+            total += extra.get("total", 0) or 1
+            if extra.get("fabricated_count"):
+                total_fab += extra["fabricated_count"]
+            if extra.get("extra_fabrication"):
+                total_fab += len(extra["extra_fabrication"])
+        m["值域命中率"] = round(total_hit / total, 3) if total else 0.0
+        m["编造检出率"] = round(total_fab / n, 3)
+        retry_back = sum(1 for r in runs if r.get("retry_count", 0) > 0 and r.get("success"))
+        m["重试回值域率"] = round(retry_back / n, 3)
+
+    elif way_id == "diverge_correct":
+        changed = sum(1 for r in runs if r.get("extra", {}).get("changed"))
+        m["changed比例"] = round(changed / n, 3)
+        edits = []
+        for r in runs:
+            f = r.get("filled", {})
+            raw = f.get("raw", "")
+            cor = f.get("corrected", "")
+            edits.append(levenshtein(raw, cor))
+        m["纠偏编辑距离均值"] = round(sum(edits) / n, 1) if edits else 0
+        m["纠偏编辑距离分布"] = sorted(edits)
+        ok = sum(1 for r in runs if r.get("success"))
+        m["达标比例"] = round(ok / n, 3)
+        raw_bad_cor_ok = 0
+        for r in runs:
+            ats = r.get("attempts", [])
+            if len(ats) >= 2:
+                if not ats[-2].get("valid", True) and ats[-1].get("valid", False):
+                    raw_bad_cor_ok += 1
+        m["纠偏有效性"] = round(raw_bad_cor_ok / n, 3)
+
+    elif way_id == "deterministic_pin":
+        changed = sum(1 for r in runs if r.get("extra", {}).get("changed"))
+        m["changed比例"] = round(changed / n, 3)
+        ok = sum(1 for r in runs if r.get("success"))
+        m["达标率"] = round(ok / n, 3)
+        pinned_set = set()
+        for r in runs:
+            f = r.get("filled", {})
+            pinned_set.add(f.get("pinned", ""))
+        m["多次完全一致"] = len(pinned_set) == 1
+        m["distinct_pinned_count"] = len(pinned_set)
+
+    elif way_id == "detect_report":
+        detected = sum(1 for r in runs if r.get("extra", {}).get("flagged_count", 0) > 0)
+        m["检出率"] = round(detected / n, 3)
+        total_flagged = total_unmatched = 0
+        for r in runs:
+            extra = r.get("extra", {})
+            total_flagged += extra.get("flagged_count", 0)
+            total_unmatched += extra.get("unmatched_count", 0)
+        m["上报率"] = round(total_unmatched / total_flagged, 3) if total_flagged else 0.0
+
+    fills = [json_key(r.get("filled", {})) for r in runs]
+    from collections import Counter
+    cnt = Counter(fills)
+    m["重复性"] = round(cnt.most_common(1)[0][1] / n, 3) if fills else 0.0
+    return m
 
 
 # ======================================================================
@@ -309,6 +409,114 @@ def validate_eq_exact(ctx: AtomCtx):
     ctx.offset = "全部精确命中" if not bad else " · ".join(bad)
 
 
+def validate_guide(ctx: AtomCtx):
+    """软引导输出约束校验（08b 面对面弱约束）：检查 LLM 续写是否满足可配输出约束。
+    可配：required_keywords（必含关键词）/ forbidden_keywords（禁词）/ max_length（长度上限）/ format_regex（格式正则）。
+    约束为空则不校验（纯软引导，与旧 validate=none 等价），约束非空则按约束判定。"""
+    con = ctx.cfg.get("output_constraints", {})
+    output = str(ctx.output)
+    bad = []
+    for kw in con.get("required_keywords", []):
+        if kw and kw not in output:
+            bad.append(f"缺关键词:{kw}")
+    for kw in con.get("forbidden_keywords", []):
+        if kw and kw in output:
+            bad.append(f"含禁词:{kw}")
+    ml = con.get("max_length")
+    if ml and len(output) > ml:
+        bad.append(f"超长:{len(output)}>{ml}")
+    fr = con.get("format_regex", "")
+    if fr:
+        try:
+            if not re.search(fr, output):
+                bad.append(f"不匹配格式:{fr}")
+        except re.error:
+            bad.append(f"正则无效:{fr}")
+    ctx.valid = not bad
+    ctx.offset = "满足输出约束" if not bad else " · ".join(bad)
+
+
+def validate_diverge(ctx: AtomCtx):
+    """发散纠偏目标校验（08c 场景三 泛化）：前置规范内部校验纠偏后 corrected 是否达标。
+    空响应/异常→失败（没产出可纠偏）；correction_target 空→不校验（纯观测纠偏 changed）；
+    非空→按 format_regex/required_pattern/forbidden_pattern 判定纠偏是否达标，不达标重试。"""
+    output = str(ctx.output)
+    if not output.strip() or output.strip() == "[空响应]":
+        ctx.valid = False
+        ctx.offset = "空响应无法纠偏"
+        return
+    tgt = ctx.cfg.get("correction_target", {})
+    corrected = ctx.corrected
+    bad = []
+    fr = tgt.get("format_regex", "")
+    if fr:
+        try:
+            if not re.search(fr, corrected):
+                bad.append(f"纠偏后不匹配格式:{fr}")
+        except re.error:
+            bad.append(f"正则无效:{fr}")
+    rp = tgt.get("required_pattern", "")
+    if rp:
+        try:
+            if not re.search(rp, corrected):
+                bad.append(f"纠偏后缺模式:{rp}")
+        except re.error:
+            bad.append(f"正则无效:{rp}")
+    fp = tgt.get("forbidden_pattern", "")
+    if fp:
+        try:
+            if re.search(fp, corrected):
+                bad.append(f"纠偏后含禁模式:{fp}")
+        except re.error:
+            bad.append(f"正则无效:{fp}")
+    ctx.valid = not bad
+    ctx.offset = "纠偏达标" if not bad else " · ".join(bad)
+
+
+def validate_deterministic(ctx: AtomCtx):
+    """确定性封死目标校验（08a §7 A 形态 泛化）：前置规范内部校验钉死后 corrected 是否达标。
+    空响应/异常→失败（没产出可钉死）；pin_target 空→不校验（纯 A 形态钉死，错误无通道，观测 changed）；
+    非空→按 exact_value/format_regex 判定钉死是否达标。"""
+    output = str(ctx.output)
+    if not output.strip() or output.strip() == "[空响应]":
+        ctx.valid = False
+        ctx.offset = "空响应无法钉死"
+        return
+    tgt = ctx.cfg.get("pin_target", {})
+    corrected = ctx.corrected
+    bad = []
+    ev = tgt.get("exact_value", "")
+    if ev and corrected != ev:
+        bad.append(f"钉死后≠目标:{ev[:60]}")
+    fr = tgt.get("format_regex", "")
+    if fr:
+        try:
+            if not re.search(fr, corrected):
+                bad.append(f"钉死后不匹配格式:{fr}")
+        except re.error:
+            bad.append(f"正则无效:{fr}")
+    ctx.valid = not bad
+    ctx.offset = "封死达标" if not bad else " · ".join(bad)
+
+
+def validate_detect_report(ctx: AtomCtx):
+    """检出即上报校验（08a §7 B 形态 泛化）：上报器不阻塞生成通道，不判"没问题"，只上报。
+    空响应→失败（没东西可检出）；无检出→失败（正则没命中，检出器无效）；
+    有检出→成功（上报器工作了，哪怕全 unmatched 也是"全部需上报"=+人工兜底，不阻塞=success）。"""
+    output = str(ctx.output)
+    if not output.strip() or output.strip() == "[空响应]":
+        ctx.valid = False
+        ctx.offset = "空响应无法检出"
+        return
+    if not ctx.flagged:
+        ctx.valid = False
+        ctx.offset = "未检出任何项"
+        return
+    unmatched = [f for f in ctx.flagged if f.get("unmatched")]
+    ctx.valid = True
+    ctx.offset = f"检出{len(ctx.flagged)}项，{len(unmatched)}项需上报（不阻塞）"
+
+
 def validate_none(ctx: AtomCtx):
     ctx.valid = True
     ctx.offset = ""
@@ -317,6 +525,8 @@ def validate_none(ctx: AtomCtx):
 VALIDATORS = {"in_set": validate_in_set, "no_extra": validate_no_extra,
               "required_full": validate_required_full,
               "in_range": validate_in_range, "eq_exact": validate_eq_exact,
+              "guide": validate_guide, "diverge": validate_diverge,
+              "deterministic": validate_deterministic, "detect_report": validate_detect_report,
               "none": validate_none}
 
 
@@ -366,7 +576,7 @@ OBSERVERS = {"hit": ob_hit, "fabricated": ob_fabricated, "extra_keys": ob_extra_
 
 
 # ======================================================================
-# 配方 + 8 方式配方声明
+# 配方 + 5 方式配方声明
 # ======================================================================
 @dataclass
 class Recipe:
@@ -390,15 +600,25 @@ class Recipe:
 
 
 WAY_RECIPES: dict[str, Recipe] = {
-    "gate":         Recipe("select", "",        [],                  "in_set",       True,  ["hit"]),
-    "guide":        Recipe("text",  "",        [],                  "none",         False, []),
-    "condense":     Recipe("text",  "",        ["enum_filter"],     "no_extra",     True,  ["fabricated"]),
-    "slot":         Recipe("slot",  "extra_check", ["json_parse"],  "no_extra",     True,  ["extra_keys"]),
-    "diverge":      Recipe("text",  "",        ["deterministic"],   "none",         False, ["changed"]),
-    "deterministic":Recipe("text",  "",        ["deterministic"],   "none",         False, ["changed"]),
-    "detect_report":Recipe("text",  "",        ["detect_report"],   "none",         False, ["flagged"]),
-    "required_min": Recipe("slot",  "required_min", ["json_parse"], "required_full",True,  ["left_empty"]),
+    "pure_guide":       Recipe("text",  "",        [],                  "guide",        True,  []),
+    "diverge_correct":  Recipe("text",  "",        ["deterministic"],   "diverge",      True,  ["changed"]),
+    "deterministic_pin":Recipe("text",  "",        ["deterministic"],   "deterministic",False, ["changed"]),
+    "detect_report":    Recipe("text",  "",        ["detect_report"],   "detect_report",False, ["flagged"]),
 }
+_VALUE_BOUND_RECIPES = {
+    "enum_select":  Recipe("select", "",            [],          "in_set",       True,  ["hit"]),
+    "slot_extract": Recipe("slot",  "extra_check",  ["json_parse"], "no_extra",  True,  ["extra_keys"]),
+    "required_min": Recipe("slot",  "required_min", ["json_parse"], "required_full",True,["left_empty"]),
+    "condense_enum":Recipe("text",  "",            ["enum_filter"], "no_extra",   True,  ["fabricated"]),
+}
+
+
+def recipe_for(way_id: str, cfg: dict | None = None) -> Recipe | None:
+    """根据方式 id（和 value_bound 的 bound_type）返回配方。custom 用 Recipe.from_dict(cfg.recipe)。"""
+    if way_id == "value_bound":
+        bt = (cfg or {}).get("bound_type", "enum_select")
+        return _VALUE_BOUND_RECIPES.get(bt, _VALUE_BOUND_RECIPES["enum_select"])
+    return WAY_RECIPES.get(way_id)
 
 
 def recipe_of(way_id: str) -> Recipe:
@@ -420,22 +640,19 @@ def _filled_for(way_id: str, ctx: AtomCtx, recipe=None) -> dict:
         if "enum_filter" in pp:
             return {"condensed": ctx.valid_words, "raw": ctx.raw}
         return {"output": ctx.output}
-    if way_id == "gate":
-        return dict(ctx.filled)
-    if way_id == "guide":
+    if way_id == "pure_guide":
         return {"output": ctx.output}
-    if way_id == "condense":
-        return {"condensed": ctx.valid_words, "raw": ctx.raw}
-    if way_id == "slot":
+    if way_id == "value_bound":
+        bt = ctx.cfg.get("bound_type", "enum_select")
+        if bt == "condense_enum":
+            return {"condensed": ctx.valid_words, "raw": ctx.raw}
         return dict(ctx.filled)
-    if way_id == "diverge":
+    if way_id == "diverge_correct":
         return {"raw": ctx.raw, "corrected": ctx.corrected}
-    if way_id == "deterministic":
+    if way_id == "deterministic_pin":
         return {"raw": ctx.raw, "pinned": ctx.corrected}
     if way_id == "detect_report":
         return {"raw": ctx.raw, "flagged": ctx.flagged}
-    if way_id == "required_min":
-        return dict(ctx.filled)
     return {"output": ctx.output}
 
 
@@ -451,22 +668,23 @@ def _attempt_for(way_id: str, ctx: AtomCtx, recipe=None) -> dict:
         if "enum_filter" in pp:
             return {"raw": ctx.raw, "valid": ctx.valid_words, "fabricated": ctx.fabricated}
         return {"output": ctx.output}
-    if way_id == "gate":
-        return dict(ctx.filled)
-    if way_id == "guide":
+    if way_id == "pure_guide":
         return {"error": str(ctx.output)} if str(ctx.output).startswith("[异常]") else {"output": ctx.output}
-    if way_id == "condense":
-        return {"raw": ctx.raw, "valid": ctx.valid_words, "fabricated": ctx.fabricated}
-    if way_id == "slot":
-        return {"raw": ctx.raw, "filled": dict(ctx.filled), "extra_keys": ctx.extra_keys}
-    if way_id == "diverge":
+    if way_id == "value_bound":
+        bt = ctx.cfg.get("bound_type", "enum_select")
+        if bt == "condense_enum":
+            return {"raw": ctx.raw, "valid": ctx.valid_words, "fabricated": ctx.fabricated}
+        if bt == "slot_extract":
+            return {"raw": ctx.raw, "filled": dict(ctx.filled), "extra_keys": ctx.extra_keys}
+        if bt == "required_min":
+            return {"raw": ctx.raw, "filled": dict(ctx.filled), "missing_required": ctx.missing_required}
+        return dict(ctx.filled)
+    if way_id == "diverge_correct":
         return {"raw": ctx.raw, "corrected": ctx.corrected}
-    if way_id == "deterministic":
+    if way_id == "deterministic_pin":
         return {"raw": ctx.raw, "pinned": ctx.corrected}
     if way_id == "detect_report":
         return {"raw": ctx.raw, "flagged": ctx.flagged}
-    if way_id == "required_min":
-        return {"raw": ctx.raw, "filled": dict(ctx.filled), "missing_required": ctx.missing_required}
     return {"output": ctx.output}
 
 
@@ -475,7 +693,7 @@ def _attempt_for(way_id: str, ctx: AtomCtx, recipe=None) -> dict:
 # ======================================================================
 def exec_recipe(way_id: str, wc, user_input: str, chat: Callable) -> WayResult:
     custom = getattr(wc, "recipe", None)
-    recipe = Recipe.from_dict(custom) if custom else WAY_RECIPES.get(way_id)
+    recipe = Recipe.from_dict(custom) if custom else recipe_for(way_id, wc.config)
     if recipe is None:
         return WayResult(way=way_id, error=f"无配方: {way_id}")
     wr = WayResult(way=way_id)
