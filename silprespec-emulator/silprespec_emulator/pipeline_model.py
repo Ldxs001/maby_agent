@@ -16,14 +16,13 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 
-# 5 种前置规范方式 + custom
+# 5 种前置规范方式（custom 不是预置方式，是 UI 特殊入口：自由组合原子 + 保存为模板）
 WAYS = [
     ("pure_guide", "纯软引导", "只任务提示词，LLM 自由填空，可加输出约束校验"),
     ("value_bound", "值域限定", "gate/slot/required_min/condense 合并，bound_type 区分值域类型"),
     ("diverge_correct", "发散纠偏", "高温度发散+代码确定性纠偏，语义偏离拉回（非格式校验）"),
     ("deterministic_pin", "确定性封死", "代码钉死可枚举，LLM 零参与，A 形态错误无通道"),
     ("detect_report", "检出上报", "不可枚举检出+上报，不阻塞生成通道，B 形态"),
-    ("custom", "自定义组合", "自由组合原子，A 与 B 互斥，其余任意组合"),
 ]
 
 # 5 种方式的默认任务提示词（系统提示词=软引导，第一位基础原子；用户可在 UI 编辑覆盖）

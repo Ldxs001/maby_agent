@@ -703,7 +703,7 @@ function renderWay(w){
   const tmplOpts=(customTemplates||[]).map(t=>`<option value="custom" data-tmpl="${t.id}" ${w.way==='custom'&&w.template_id===t.id?'selected':''}>★ ${esc(t.name)}</option>`).join('');
   card.innerHTML=`
     <div class="wc-head">
-      <select data-w="way"><option value="custom" ${w.way==='custom'&&!w.template_id?'selected':''}>自定义模板（临时）</option>${tmplOpts}${(waysMeta||[]).map(x=>`<option value="${x.id}" ${x.id===w.way?'selected':''}>${x.name}</option>`).join('')}</select>
+      <select data-w="way"><option value="custom" ${w.way==='custom'&&!w.template_id?'selected':''}>自定义组合（临时）</option>${tmplOpts}${(waysMeta||[]).map(x=>`<option value="${x.id}" ${x.id===w.way?'selected':''}>${x.name}</option>`).join('')}</select>
       <span class="wc-desc">${esc(meta.desc)}</span>
       <label class="checkbox-row"><input type="checkbox" data-w="enabled" ${w.enabled?'checked':''}>启用</label>
       <input type="number" data-w="max_retry" value="${w.max_retry||3}" min="0" max="10" style="width:70px" title="max_retry">
@@ -789,7 +789,7 @@ function collectConfig(card,way){
 function rebuildWayDropdown(card,selTmplId){
   const sel=card.querySelector('[data-w="way"]');const cur=sel.value;
   const tmplOpts=(customTemplates||[]).map(t=>`<option value="custom" data-tmpl="${t.id}" ${selTmplId===t.id?'selected':''}>★ ${esc(t.name)}</option>`).join('');
-  sel.innerHTML=`<option value="custom" ${cur==='custom'&&!selTmplId?'selected':''}>自定义模板（临时）</option>${tmplOpts}${(waysMeta||[]).map(x=>`<option value="${x.id}" ${x.id===cur&&cur!=='custom'?'selected':''}>${x.name}</option>`).join('')}`;
+  sel.innerHTML=`<option value="custom" ${cur==='custom'&&!selTmplId?'selected':''}>自定义组合（临时）</option>${tmplOpts}${(waysMeta||[]).map(x=>`<option value="${x.id}" ${x.id===cur&&cur!=='custom'?'selected':''}>${x.name}</option>`).join('')}`;
 }
 function saveAsTemplate(card,mode){
   const get=f=>{const el=card.querySelector(`[data-w="${f}"]`);return el?el.value:'';};

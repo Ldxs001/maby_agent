@@ -1,5 +1,17 @@
 # 更新日志 / CHANGELOG
 
+## 0.5.0b2 — 修文档/报告/命名遗漏 + 去重 custom
+
+### 改动
+- **simulator.py**：文档改"5 种"；`run()` 加 `calc_metrics` 跨 run 聚合返回 metrics（原遗漏，正常运行报告无验证指标）
+- **run_e2e_demo**：默认排除 custom（custom 无预设输入/配方）
+- **renderResult**（正常运行报告）：重现性区块加验证指标展示（原遗漏，只有 e2e 报告有）
+- **README.md / llms.txt**：重写 5 种方式 + 验证指标 + 组合规则（原遗漏，还是"8 种"）
+- **所有"8 种/8 方式"文字**：web_ui/e2e_demo/atoms/main 共 32 处改"5 种/5 方式"
+- **UI 说明文字**：指标描述加验证指标（值域命中率/纠偏编辑距离/钉死确定性/检出率等）
+- **custom 去重**：从 WAYS 移除 custom（它不是预置方式，是 UI 特殊入口）；UI 下拉"自定义模板（临时）"→"自定义组合（临时）"。下拉不再有两个 custom 入口
+- 验证：py_compile 全通过；WAYS=[pure_guide,value_bound,diverge_correct,deterministic_pin,detect_report]；同步 WorkBuddy
+
 ## 0.5.0b1 — 架构重构：8 方式 → 5 方式（按逻辑分类，软引导为第一位基础原子）
 
 ### 背景
