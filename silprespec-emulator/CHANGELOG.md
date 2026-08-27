@@ -1,5 +1,15 @@
 # 更新日志 / CHANGELOG
 
+## 0.3.2b4 — 一键演示改实验级并行（与正常运行一致）
+
+### 改动
+- **一键演示并行模型修正**：原 e2e_demo 是"方式间串行 + 方式内串行重复 N 次"（纯串行，parallel 参数名不副实），改成与正常运行一致的**实验级并行**——parallel 个管道并发，每管道内方式串行（各方式用预设输入），收齐按方式聚合算重现性
+  - 新增 _aggregate(way_specs, pipes)：按方式聚合各管道结果，跳过未完成管道(None)
+  - run_e2e_demo 用 ThreadPoolExecutor 并发跑 N 管道，as_completed 收齐，每管道完成调 on_progress(done_pipes, total_pipes, 聚合快照)
+  - on_progress 签名变更：res 从"单方式结果"改为"全部方式聚合列表"，web/main 适配（web 替换不累加，main 打印管道进度）
+- **正常运行不动**：ExperimentRunner 已是实验级并行（N 管道各跑所有方式，方式间交错），用户认可效率高
+- 验证：gate parallel=2 跑通，2 管道并发 45s（串行会 60-80s），runs=2 run_ids=[1,2] consistency=1.0
+
 ## 0.3.2b3 — 结果落盘 + 右侧历史边栏（保存/复看/删除/清空）
 
 ### 改动

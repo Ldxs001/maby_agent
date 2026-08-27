@@ -291,11 +291,9 @@ class SilPrespecEmulatorHandler(BaseHTTPRequestHandler):
                 with _run_lock:
                     task["error"] = f"LLM 连接失败：{msg}"; task["done"] = True; task["running"] = False
                 return
-            partial = []
             def on_progress(done, total, res):
-                partial.append(res)
                 with _run_lock:
-                    task["result"] = {"demo_results": list(partial)}
+                    task["result"] = {"demo_results": res}
                     task["progress"] = int(done / total * 100)
             results = run_e2e_demo(llm, parallel=parallel, on_progress=on_progress)
             import datetime

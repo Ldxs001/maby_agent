@@ -125,10 +125,7 @@ def run_e2e_cli(llm):
     print("=" * 70)
 
     def on_progress(done, total, res):
-        rp = res.get("reproducibility", {})
-        print(f"\n  [{done}/{total}] {res['way']} · {res['name']}  "
-              f"success_all={res['success_all']}  并行={res['parallel']}  "
-              f"consistency={rp.get('consistency')}  耗时={res['elapsed_all']}s  tokens={res['total_tokens_all']}")
+        print(f"\n  [{done}/{total}] 管道完成，已聚合 {len(res)} 方式")
 
     results = run_e2e_demo(llm, parallel=3, on_progress=on_progress)
 

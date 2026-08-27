@@ -6,6 +6,7 @@
 from __future__ import annotations
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from .pipeline_model import WayConfig, default_config, TASK_PROMPTS, WAYS, WayResult, json_key
@@ -107,14 +108,42 @@ def _exec_with_trace(way_id: str, wc, user_input: str, chat):
             "filled": filled, "extra": extra, "attempts": attempts, "error": ""}
 
 
+def _aggregate(way_specs, pipes):
+    """按方式聚合各管道结果（pipes 含 None 表示未完成，跳过）"""
+    results = []
+    for idx, (way_id, way_name, way_desc, user_input, wc, recipe, task_prompt) in enumerate(way_specs):
+        runs = [pipe[idx] for pipe in pipes if pipe is not None]
+        fills = [json_key(r["filled"]) for r in runs]
+        cnt = Counter(fills)
+        consistency = round(cnt.most_common(1)[0][1] / len(fills), 3) if fills else 0.0
+        results.append({
+            "way": way_id, "name": way_name, "desc": way_desc,
+            "task_prompt": task_prompt,
+            "recipe": recipe.to_dict() if recipe else {},
+            "config": wc.config, "max_retry": wc.max_retry,
+            "user_input": user_input, "parallel": len(runs),
+            "runs": runs,
+            "reproducibility": {
+                "consistency": consistency,
+                "distinct_fills": [k for k, _ in cnt.most_common()],
+                "fill_counts": dict(cnt),
+            },
+            "success_all": all(r["success"] for r in runs) if runs else False,
+            "total_tokens_all": sum(r["total_tokens"] for r in runs),
+            "elapsed_all": round(sum(r["elapsed_total"] for r in runs), 2),
+        })
+    return results
+
+
 def run_e2e_demo(llm: LLMClient, ways: Optional[list] = None,
                  parallel: int = 3,
-                 on_progress: Optional[Callable[[int, int, dict], None]] = None) -> list:
-    """跑 8 方式（或指定子集）端到端，每个方式跑 parallel 次，返回完整原始信息 + 重现性。"""
+                 on_progress: Optional[Callable[[int, int, list], None]] = None) -> list:
+    """跑 8 方式（或指定子集）端到端，实验级并行：parallel 个管道并发，每管道内方式串行
+    （各方式用预设输入），收齐按方式聚合算重现性。on_progress(done_pipes, total_pipes, 聚合列表)。"""
     target = ways or [w[0] for w in WAYS]
     way_map = {w[0]: w for w in WAYS}
-    results = []
-    for i, way_id in enumerate(target):
+    way_specs = []
+    for way_id in target:
         if way_id not in way_map:
             continue
         way_name, way_desc = way_map[way_id][1], way_map[way_id][2]
@@ -122,39 +151,29 @@ def run_e2e_demo(llm: LLMClient, ways: Optional[list] = None,
         wc = WayConfig(way=way_id, config=default_config(way_id), max_retry=3)
         recipe = WAY_RECIPES.get(way_id)
         task_prompt = wc.task_prompt or TASK_PROMPTS.get(way_id, "")
+        way_specs.append((way_id, way_name, way_desc, user_input, wc, recipe, task_prompt))
 
-        runs = []
-        for run_idx in range(parallel):
+    def _one_pipe(pipe_id):
+        pipe = []
+        for (way_id, way_name, way_desc, user_input, wc, recipe, task_prompt) in way_specs:
             calls = []
             chat = _make_chat(llm, calls)
             res = _exec_with_trace(way_id, wc, user_input, chat)
-            res["run_id"] = run_idx + 1
+            res["run_id"] = pipe_id
             res["calls"] = calls
             res["total_tokens"] = sum(c["prompt_tokens"] + c["response_tokens"] for c in calls)
             res["elapsed_total"] = round(sum(c["elapsed"] for c in calls), 2)
-            runs.append(res)
+            pipe.append(res)
+        return pipe
 
-        fills = [json_key(r["filled"]) for r in runs]
-        cnt = Counter(fills)
-        consistency = round(cnt.most_common(1)[0][1] / len(fills), 3) if fills else 0.0
-
-        res = {
-            "way": way_id, "name": way_name, "desc": way_desc,
-            "task_prompt": task_prompt,
-            "recipe": recipe.to_dict() if recipe else {},
-            "config": wc.config, "max_retry": wc.max_retry,
-            "user_input": user_input, "parallel": parallel,
-            "runs": runs,
-            "reproducibility": {
-                "consistency": consistency,
-                "distinct_fills": [k for k, _ in cnt.most_common()],
-                "fill_counts": dict(cnt),
-            },
-            "success_all": all(r["success"] for r in runs),
-            "total_tokens_all": sum(r["total_tokens"] for r in runs),
-            "elapsed_all": round(sum(r["elapsed_total"] for r in runs), 2),
-        }
-        results.append(res)
-        if on_progress:
-            on_progress(i + 1, len(target), res)
-    return results
+    pipes: list = [None] * parallel
+    with ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = {pool.submit(_one_pipe, pid): pid for pid in range(1, parallel + 1)}
+        done = 0
+        for fut in as_completed(futures):
+            pid = futures[fut]
+            pipes[pid - 1] = fut.result()
+            done += 1
+            if on_progress:
+                on_progress(done, parallel, _aggregate(way_specs, pipes))
+    return _aggregate(way_specs, pipes)
