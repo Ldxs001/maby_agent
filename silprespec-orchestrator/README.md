@@ -1,6 +1,6 @@
 # silprespec-orchestrator — 多 agent 协同头部规划器
 
-> **版本：v0.1.0**
+> **版本：v0.1.0** | 作者：wUwproject | 许可证：Apache 2.0
 > 基于"我思故我写"方法论的多 agent 协同头部规划器。
 > 根据用户任务 + 工具集，从 14 种穷举的原子化前置规范组合里选最合适的，
 > PY 确定性组合，LLM 填空执行，输出交付给子智能体走各自内部流程。
@@ -165,4 +165,4 @@ python main.py --check
 
 ## License
 
-MIT
+Apache 2.0 © wUwproject（见 LICENSE）

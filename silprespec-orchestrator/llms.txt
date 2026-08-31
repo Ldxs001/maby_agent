@@ -1,7 +1,7 @@
 # silprespec-orchestrator
 
 > 多 agent 协同头部规划器 — 基于"我思故我写"方法论。
-> 版本: 0.1.0 | 端口: 8789 | 许可证: MIT
+> 版本: 0.1.0 | 作者: wUwproject | 端口: 8789 | 许可证: Apache 2.0
 
 ## 定位
 
