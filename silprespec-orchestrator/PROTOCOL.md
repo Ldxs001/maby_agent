@@ -1,4 +1,4 @@
-# Silprespec Orchestrator Protocol
+# silprespec-orchestrator Protocol
 
 > 版本: 0.1.0
 > 更新: 2026-08-31
@@ -7,11 +7,13 @@
 
 ## 1. 概述
 
-silprespec-orchestrator 是前置规范编排器，基于"我思故我写"方法论的多 agent 协同头部规划器。
+silprespec-orchestrator 是多 agent 协同头部规划器，基于"我思故我写"方法论。
+根据用户任务 + 工具集，从 14 种穷举的原子化前置规范组合里选最合适的，
+PY 确定性组合，LLM 填空执行，输出交付给子智能体走各自内部流程。
 
 ### 技术栈
 
-- Python 3.11+ 标准库（无外部框架依赖）
+- Python 3.11+ 标准库（零第三方依赖）
 - HTTP 服务器: `http.server`（内置）
 - LLM 通信: `urllib`（OpenAI 兼容 API）
 - 前端: 纯 HTML/CSS/JS（无构建步骤）
@@ -41,11 +43,19 @@ python main.py [OPTIONS]
 
 ## 3. HTTP API
 
-### `GET /`
-返回 Web UI 页面（HTML）。
+| 路由 | 方法 | 功能 |
+|------|------|------|
+| `/` | GET | Web UI 主页面 |
+| `/static/*` | GET | 静态资源（CSS/JS） |
+| `/api/combos` | GET | 列出 14 种穷举组合 |
+| `/api/tools` | GET | 列出已注册工具（含完整 ToolSpec） |
+| `/api/config` | GET | 获取配置 |
+| `/api/config` | POST | 保存配置到文件 + 更新内存 |
+| `/api/llm/models` | GET | 列出 LLM 可用模型（?backend=&base_url=） |
+| `/api/llm/test` | GET | 测试 LLM 连接（?backend=&base_url=&api_key=） |
+| `/api/run` | POST | 执行编排 |
 
-### `POST /api/run`
-执行编排。
+### POST /api/run
 
 **请求:**
 ```json
@@ -64,14 +74,22 @@ python main.py [OPTIONS]
 }
 ```
 
-### `GET /api/combos`
-列出 14 种穷举组合。
+### POST /api/config
 
-### `GET /api/tools`
-列出已注册工具。
+**请求:**
+```json
+{
+  "llm": { "backend": "...", "model": "...", "max_tokens": 4096 },
+  "orchestrator": { "max_steps": 20, "max_retry": 3 }
+}
+```
 
-### `GET /api/config`
-获取配置。
+**响应:**
+```json
+{ "success": true }
+```
+
+合并到现有配置 → 落盘 config.json → 更新内存。
 
 ---
 
@@ -98,19 +116,31 @@ python main.py [OPTIONS]
 
 ## 5. ToolSpec 标准化接口
 
-```json
-{
-  "name": "rag-assistant",
-  "url": "http://localhost:8767",
-  "endpoint": "/api/query",
-  "input_requirements": ["query", "kb?"],
-  "output_schema": ["answer", "docs", "summary", "sources"],
-  "internal_prespec": ["路由", "重排序", "NLI验证"],
-  "description": "RAG 知识库问答智能体"
-}
+子智能体声明完整接口契约：
+
+```python
+ToolSpec(
+    name="rag-assistant",
+    url="http://localhost:8767",
+    endpoint="/api/kb/query",
+    description="RAG 知识库问答智能体",
+    input_fields=[
+        FieldSpec(name="query", type="string", required=True, description="用户问题"),
+        FieldSpec(name="kb", type="string", required=False, description="知识库名"),
+        FieldSpec(name="top_k", type="int", required=False, default=5, description="检索数量"),
+    ],
+    output_fields=[
+        FieldSpec(name="answer", type="string", required=True, description="生成的回答"),
+        FieldSpec(name="docs", type="array", required=True, description="检索到的文档片段"),
+    ],
+    examples=[ExampleSpec(title="基础问答", input={"query": "..."}, explanation="...")],
+    internal_prespec=["路由", "向量检索", "重排序", "NLI验证"],
+    capabilities=["多知识库问答", "自动路由"],
+    limitations=["需要预建知识库"],
+)
 ```
 
-`?` 结尾的 input_requirements 为可选参数。
+**直通判定**：`can_accept(available_keys)` — 上一步输出的 key 包含下一步工具所有必填字段 → 直通。
 
 ---
 

@@ -1,42 +1,70 @@
-# LLM 配置说明
+# silprespec-orchestrator
 
-## 支持的后端
+> 多 agent 协同头部规划器 — 基于"我思故我写"方法论。
+> 版本: 0.1.0 | 端口: 8789 | 许可证: MIT
 
-### LM Studio（默认）
-- 地址: http://localhost:1234
-- 配置: backend = "lm-studio"
-- 需启动 LM Studio 并加载模型
+## 定位
 
-### Ollama
-- 地址: http://localhost:11434
-- 配置: backend = "ollama"
-- 需运行: ollama serve
+根据用户任务 + 工具集，从 14 种穷举的原子化前置规范组合里选最合适的，
+PY 确定性组合，LLM 填空执行，输出交付给子智能体走各自内部流程。
+前置规范是核心手段，不是全部 — 编排器还做任务分类、子任务分解、
+编排模式选择、步骤间适配、进度地图贯穿、HTTP 调智能体、汇总输出。
 
-### 自定义 OpenAI 兼容 API
-- 配置: backend = "custom"
-- 需指定 base_url 和 api_key
+## 核心流程
 
-## 配置文件
-
-config.json 的 llm 段：
-
-```json
-{
-  "llm": {
-    "backend": "lm-studio",
-    "base_url": "http://localhost:1234",
-    "model": "qwen/qwen3.6-35b-a3b",
-    "api_key": "not-needed",
-    "timeout": 180,
-    "max_tokens": 4096,
-    "temperature": 0.7
-  }
-}
+```
+用户输入 → Orchestrator(分类→选模式→分解→进度地图)
+  → 对每个子任务：
+      Mapper(选组合) → Composer(PY组合+LLM填空) → Executor(调智能体API)
+      → Adapter(直通 or loop 回 Mapper)
+  → 汇总输出
 ```
 
-## CLI 覆盖
+## 6 核心模块
 
-```bash
-python main.py --backend ollama --model qwen2.5
-python main.py --backend custom --base-url http://api.example.com/v1 --api-key sk-xxx
+- orchestrator.py — 主控（分类→选模式→分解→执行→汇总）
+- progress_map.py — 进度地图 + 输入分类（穷举 6 类）+ 编排模式（serial/parallel）
+- mapper.py — 选 14 种组合之一 + 设参（LLM 填空选编号，PY 查表验证）
+- composer.py — PY 确定性组合（调 exec_recipe: 生成→后处理→校验→观测）
+- executor.py — LLM 填空生成工具输入 → HTTP POST 调智能体 API
+- adapter.py — 步骤间适配（can_accept 直通，否则 loop 回 Mapper）
+
+## 14 种穷举组合
+
+1. pure_guide（纯软引导）2. diverge_correct（发散纠偏）3. deterministic_pin（确定性封死）
+4. detect_report（检出上报）5. enum_select（枚举选择）6. condense_enum（凝练+枚举过滤）
+7. slot_extract（槽位提取）8. required_min（必填最小化）9. diverge_detect（纠偏+检出）
+10. diverge_condense（纠偏+凝练）11. detect_condense（检出+凝练）12. range_bound_gen（范围约束生成）
+13. exact_match_gen（精确匹配生成）14. enum_filter_fabricate（枚举+过滤编造）
+
+当前原子库下穷举完，不存在第 15 种。
+
+## 已注册智能体
+
+| 工具 | 端口 | 接口 | 内部前置规范 |
+|------|------|------|-------------|
+| rag-assistant | 8767 | /api/kb/query | 路由→检索→重排序→NLI→生成 |
+| structured-writer | 8770 | /api/write | 模板选择→大纲规划→逐段生成→引用后处理 |
+| silprespec-emulator | 8789 | /api/emulate | 原子库→Recipe→14种组合→验证指标 |
+
+## LLM 后端
+
+- LM Studio（默认）: http://localhost:1234
+- Ollama: http://localhost:11434
+- 自定义 OpenAI 兼容 API
+
+配置在 config.json 的 llm 段，Web UI 配置 Tab 可选后端/拉模型/测连接/保存。
+
+## CLI
+
 ```
+python main.py --web                # Web UI（8789）
+python main.py --query "任务"       # 单次任务
+python main.py --list-combos        # 列出 14 种组合
+python main.py --list-tools         # 列出已注册工具
+python main.py --check              # 检测 LLM 连接
+```
+
+## 依赖
+
+Python 3.11+ 纯标准库，零第三方依赖。
