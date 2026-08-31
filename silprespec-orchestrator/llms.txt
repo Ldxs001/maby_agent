@@ -1,0 +1,42 @@
+# LLM 配置说明
+
+## 支持的后端
+
+### LM Studio（默认）
+- 地址: http://localhost:1234
+- 配置: backend = "lm-studio"
+- 需启动 LM Studio 并加载模型
+
+### Ollama
+- 地址: http://localhost:11434
+- 配置: backend = "ollama"
+- 需运行: ollama serve
+
+### 自定义 OpenAI 兼容 API
+- 配置: backend = "custom"
+- 需指定 base_url 和 api_key
+
+## 配置文件
+
+config.json 的 llm 段：
+
+```json
+{
+  "llm": {
+    "backend": "lm-studio",
+    "base_url": "http://localhost:1234",
+    "model": "qwen/qwen3.6-35b-a3b",
+    "api_key": "not-needed",
+    "timeout": 180,
+    "max_tokens": 4096,
+    "temperature": 0.7
+  }
+}
+```
+
+## CLI 覆盖
+
+```bash
+python main.py --backend ollama --model qwen2.5
+python main.py --backend custom --base-url http://api.example.com/v1 --api-key sk-xxx
+```

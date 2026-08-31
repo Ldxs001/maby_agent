@@ -1,7 +1,7 @@
 # Maby Agent
 
 > **用户智能体仓库** — 由 git-sync 自动同步维护。
-> 最后更新：2026-08-27
+> 最后更新：2026-08-31
 
 本仓库托管 wUwproject 智能体项目，由 git-sync 自动同步维护。码云（Gitee）和 GitHub 双平台同步。
 
@@ -18,6 +18,7 @@
 | `Orchestrator` | **版本：v2.8.1** 基于本地 LLM 的 Python 编排器。人工编排技能链（Pipeline），LLM 只做前处理与输出整理，中间由 subprocess 确定性执行技能脚本。 |
 | `rag-assistant` | 基于 LLM 的组合式语义检索与多库路由智能体。连接本地 LLM，对你的文档库做知识问答——自动识别查询意图、拆分组合检索、跨库路由、精排与语义验证，最终给出带来源的答案。 |
 | `silprespec-emulator` | 通用实验台：从 **5 种前置规范方式**中选择/组合，对输入**真实执行**（LLM 真填空），观测填入内容、重试次数、撑满失败、重现性 + **验证指标**（量化每种后置是否真的生效）。不替用户选方式，只管执行并产出可观测结果。 |
+| `silprespec-orchestrator` | **版本：v0.1.0** 基于"我思故我写"方法论的多 agent 协同头部规划器。 |
 | `structured-writer` | 模板驱动的大纲规划 + 串行写作引擎。基于 LLM 的结构化长文写作系统，支持两级 RAG 增强、事实自检、引用自动格式化、交互式大纲控制、快速范例复用、两级局部重规划，以及**小说模式**（章级规划→写作→章检→修复→全文三检）。 |
 
 ---
@@ -29,6 +30,7 @@ maby_agent/
 ├── Orchestrator/
 ├── rag-assistant/
 ├── silprespec-emulator/
+├── silprespec-orchestrator/
 └── structured-writer/
 ```
 

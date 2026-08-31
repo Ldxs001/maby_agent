@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>前置规范编排器</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="tab-bar">
+  <div class="tab active" data-tab="orchestrate">编排</div>
+  <div class="tab" data-tab="combos">14 种组合</div>
+  <div class="tab" data-tab="tools">工具</div>
+  <div class="tab" data-tab="config">配置</div>
+</div>
+<div class="tab-content active" id="page-orchestrate">
+  <div class="orch-page">
+    <div class="input-group">
+      <label>用户任务</label>
+      <textarea id="task-input" placeholder="输入任务，如：分析茅台酒的制作工艺并生成报告"></textarea>
+    </div>
+    <div class="input-group">
+      <label>选择工具（可多选）</label>
+      <div id="tool-checks" class="tool-list"></div>
+    </div>
+    <div class="actions">
+      <button id="run-btn" class="btn btn-primary">执行编排</button>
+      <label class="checkbox"><input type="checkbox" id="verbose"> 详细输出</label>
+    </div>
+    <div class="result-area">
+      <pre id="result" class="result-placeholder">等待执行...</pre>
+    </div>
+  </div>
+</div>
+<div class="tab-content" id="page-combos">
+  <div class="orch-page">
+    <table id="combos-table">
+      <thead><tr><th>#</th><th>名称</th><th>描述</th><th>方式</th><th>场景</th><th>输出限制</th></tr></thead>
+      <tbody id="combos-body"></tbody>
+    </table>
+    <div id="combo-detail" class="combo-detail"></div>
+  </div>
+</div>
+<div class="tab-content" id="page-tools">
+  <div class="orch-page" id="tools-page"></div>
+</div>
+<div class="tab-content" id="page-config">
+  <div class="config-page">
+    <div class="config-section">
+      <h3>LLM 后端</h3>
+      <div class="config-row">
+        <label>后端类型</label>
+        <select id="cfg-backend" onchange="onBackendChange()">
+          <option value="lm-studio">LM Studio</option>
+          <option value="ollama">Ollama</option>
+          <option value="custom">OpenAI 兼容 (云端)</option>
+        </select>
+      </div>
+      <div class="config-row">
+        <label>地址</label>
+        <input type="text" id="cfg-base-url" value="http://localhost:1234">
+      </div>
+      <div class="config-row">
+        <label>API Key</label>
+        <input type="password" id="cfg-api-key" placeholder="not-needed">
+      </div>
+      <div class="config-row">
+        <label>模型</label>
+        <select id="cfg-model" style="flex:1;min-width:200px">
+          <option value="">-- 选择模型 --</option>
+        </select>
+        <button class="btn btn-secondary" onclick="loadModels()">刷新</button>
+      </div>
+      <div class="config-row">
+        <label>超时(秒)</label>
+        <input type="number" id="cfg-timeout" value="180" min="30" max="1800" step="30">
+        <label style="margin-left:16px">Max Tokens</label>
+        <input type="number" id="cfg-maxtokens" value="4096" min="256" max="131072" step="1024">
+      </div>
+      <div class="config-row">
+        <button class="btn btn-primary" onclick="testLLM()">测试连接</button>
+        <button class="btn btn-primary" onclick="saveConfig()">保存配置</button>
+        <span id="cfg-status" class="config-status"></span>
+      </div>
+    </div>
+    <div class="config-section">
+      <h3>编排参数</h3>
+      <div class="config-row">
+        <label>最大步数</label>
+        <input type="number" id="cfg-max-steps" value="20" min="1" max="100">
+        <label style="margin-left:16px">最大重试</label>
+        <input type="number" id="cfg-max-retry" value="3" min="0" max="10">
+      </div>
+      <div class="config-row">
+        <label>软引导限长</label>
+        <input type="number" id="cfg-ol-guide" value="500" min="100" max="5000" step="100">
+        <label style="margin-left:16px">发散纠偏限长</label>
+        <input type="number" id="cfg-ol-diverge" value="800" min="200" max="10000" step="100">
+        <label style="margin-left:16px">槽位限数</label>
+        <input type="number" id="cfg-ol-slot" value="5" min="1" max="20">
+      </div>
+    </div>
+  </div>
+</div>
+<script src="/static/web_ui.js"></script>
+</body>
+</html>

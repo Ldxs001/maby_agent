@@ -1,0 +1,6 @@
+# silprespec-orchestrator 依赖清单
+
+# 标准库依赖（无需安装）
+# - urllib (LLM 客户端)
+# - http.server (Web UI)
+# - json / os / sys / argparse / threading
