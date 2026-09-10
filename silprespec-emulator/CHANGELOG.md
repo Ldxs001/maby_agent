@@ -1,5 +1,12 @@
 # 更新日志 / CHANGELOG
 
+## 0.5.0b8 — 仓库卫生修复
+
+- **现象**：`__pycache__/` 字节码被纳入版本控制，8 个 `.pyc` 内嵌本机用户名明文、22 个内嵌本机绝对路径；项目根缺 `.gitignore`
+- **根因**：项目无 `.gitignore`，同步流程按整目录复制，源码侧 `__pycache__/` 被原样搬入仓库并被 `git add` 全量收录
+- **修复**：新增 `.gitignore`；从版本控制移除 `__pycache__/` 下的 8 个 `.pyc`
+- **验证**：`git ls-files` 无 `.pyc` / `__pycache__` 命中
+
 ## 0.5.0b7 — 许可证与归属补齐
 
 - **现象**：README 声明"许可证：Apache 2.0"，但项目内不存在任何 `LICENSE` 文件；亦无 `NOTICE`
