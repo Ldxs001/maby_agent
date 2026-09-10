@@ -3,6 +3,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [3.1.9] - 2026-09-10
+### 修复（Apache-2.0 合规）
+- **现象**：项目无 `NOTICE` 文件，归属声明无载体
+- **根因**：`NOTICE` 从未建立；`LICENSE`（Apache-2.0 全文）虽完整但缺配套归属声明
+- **修复**：新增 `NOTICE`（项目名 + 版权署名 + 许可证指引），与 lc-ms-group-advisor 口径一致
+- **验证**：`scripts/check_version.py` 通过（`structured_writer/__init__.py` / CHANGELOG 首条 / pyproject 动态版本三者一致）
+
 ## [3.1.8] - 2026-08-20
 ### 重构（C5 通用线字数默认值统一——09b 配置推动的穷举一致性）
 > 本次更新使用 **CodeArts + GLM-5.2** 协同完成。
