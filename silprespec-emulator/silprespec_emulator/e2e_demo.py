@@ -153,6 +153,125 @@ def _exec_with_trace(way_id: str, wc, user_input: str, chat):
             "filled": filled, "extra": extra, "attempts": attempts, "error": ""}
 
 
+def interpret_way(way_id: str, metrics: dict, runs: list, reproducibility: dict) -> dict:
+    """生成人话解读：考题测什么 + 模型表现结论 + 指标解释。
+    返回 {test_what, verdict, verdict_level(good/bad/warn), metric_explain{指标名:人话}}"""
+    n = metrics.get("n", len(runs))
+    rp_cons = reproducibility.get("consistency", 0)
+    distinct = len(reproducibility.get("distinct_fills", []))
+
+    if way_id == "pure_guide":
+        test_what = "测软引导能否引导方向。引导写「挑战和风险」，禁写「前景/机遇/乐观/美好」，必含「挑战」。看模型听不听引导。"
+        ok_rate = metrics.get("达标比例", 0)
+        repeat = metrics.get("重复性", 0)
+        if ok_rate >= 1.0:
+            verdict = f"模型听引导——{n}次全部达标（写了「挑战」、没写禁词）。但软引导不保证重现性：{distinct}次内容各不同（重复性{repeat}）。这正是纯软引导的本质：能引导方向，不保证确定性。"
+            level = "good" if repeat >= 0.8 else "warn"
+        else:
+            fail_n = n - int(ok_rate * n)
+            verdict = f"模型没完全听引导：{fail_n}次未达标（写了禁词或没写「挑战」）。软引导约束力弱，模型可忽略。"
+            level = "bad"
+        metric_explain = {
+            "达标比例": f"{ok_rate}——{int(ok_rate*n)}/{n}次满足引导约束（含「挑战」且无禁词）",
+            "重复性": f"{repeat}——{distinct}种不同输出。软引导不钉死内容，每次生成不同",
+        }
+
+    elif way_id == "value_bound":
+        test_what = "测值域限定能否阻止编造。输入中性内容「不好不坏」，候选词只有「积极/消极」（没给「中性」），看模型编造「中性」还是守规矩填「未指定」。"
+        hit = metrics.get("值域命中率", 0)
+        fab = metrics.get("编造检出率", 0)
+        fills = [r.get("filled", {}) for r in runs]
+        vals = [str(list(f.values())[0]) if f else "" for f in fills]
+        unspecified_n = sum(1 for v in vals if "未指定" in v or "unspecified" in v.lower())
+        if fab == 0 and unspecified_n > 0:
+            verdict = f"模型守规矩——{unspecified_n}/{n}次不贴切时正确填了「未指定」，没有编造候选词以外的词（如「中性」）。值域限定成功阻止了编造。"
+            level = "good"
+        elif fab > 0:
+            verdict = f"模型不守规矩——编造了候选词以外的词（编造检出率{fab}）。值域限定未能完全阻止编造。"
+            level = "bad"
+        else:
+            verdict = f"模型{int(hit*n)}/{n}次命中候选词，未触发编造。"
+            level = "good" if hit >= 0.8 else "warn"
+        metric_explain = {
+            "值域命中率": f"{hit}——命中候选词的比例。本考题输入中性、候选词无「中性」，命中0是正常的（该填「未指定」）",
+            "编造检出率": f"{fab}——编造候选词以外词的次数比例。0=没编造（守规矩）",
+            "重试回值域率": f"{metrics.get('重试回值域率', 0)}——编造后重试回到值域的比例",
+            "重复性": f"{metrics.get('重复性', 0)}——{distinct}种不同输出。值域限定下应高（选项有限）",
+        }
+
+    elif way_id == "diverge_correct":
+        test_what = "测纠偏能否删掉违禁词。让模型写营销文案（容易用「最/第一/唯一/极佳/完美」等广告违禁词），代码纠偏删掉这些词。"
+        changed = metrics.get("changed比例", 0)
+        edit_mean = metrics.get("纠偏编辑距离均值", 0)
+        ok_rate = metrics.get("达标比例", 0)
+        if changed >= 1.0 and edit_mean > 0:
+            verdict = f"纠偏生效——{int(changed*n)}/{n}次都改了内容，平均编辑距离{edit_mean}（删掉了「最/第一/唯一」等违禁词）。纠偏后内容合规（达标{ok_rate}）。"
+            level = "good" if ok_rate >= 0.8 else "warn"
+        elif changed > 0:
+            verdict = f"部分纠偏——{int(changed*n)}/{n}次改了内容，平均编辑距离{edit_mean}。"
+            level = "warn"
+        else:
+            verdict = f"纠偏未触发——模型自己没写违禁词，或纠偏规则未匹配到。"
+            level = "good" if ok_rate >= 0.8 else "warn"
+        metric_explain = {
+            "changed比例": f"{changed}——纠偏改了内容的次数比例。1.0=每次都改了（都有违禁词）",
+            "纠偏编辑距离均值": f"{edit_mean}——纠偏改了多少。>0说明确实删了字（违禁词）",
+            "达标比例": f"{ok_rate}——纠偏后满足合规约束的比例",
+            "纠偏有效性": f"{metrics.get('纠偏有效性', 0)}——raw不达标→纠偏后达标的比例（本考题纠偏是后处理一次性完成，不重试）",
+            "重复性": f"{metrics.get('重复性', 0)}——{distinct}种不同输出。高温度发散，每次不同",
+        }
+
+    elif way_id == "deterministic_pin":
+        test_what = "测钉死能否保证确定性。同一输入多次跑，看钉死后的输出是否100%一致。"
+        ok_rate = metrics.get("达标率", 0)
+        fully_consistent = metrics.get("多次完全一致", False)
+        distinct_pin = metrics.get("distinct_pinned_count", 0)
+        empty_n = sum(1 for r in runs if "[空响应]" in str(r.get("filled", {}).get("pinned", "")) or not r.get("success"))
+        if fully_consistent:
+            verdict = f"钉死有效——{n}次输出完全一致。确定性封死保证了可重现。"
+            level = "good"
+        elif empty_n > 0 and distinct_pin <= 2:
+            verdict = f"钉死对正常响应有效——{n-empty_n}/{n}次输出完全一致；但{empty_n}次空响应导致不完全一致。钉死能钉正常响应，钉不了空响应——暴露了模型在temperature>0下输出不稳定。"
+            level = "warn"
+        else:
+            verdict = f"钉死未能完全一致——出现{distinct_pin}种不同输出。模型输出不稳定，钉死无法消除差异。"
+            level = "bad"
+        metric_explain = {
+            "达标率": f"{ok_rate}——{int(ok_rate*n)}/{n}次成功钉死。失败多为空响应",
+            "多次完全一致": f"{fully_consistent}——所有次输出是否完全相同",
+            "distinct_pinned_count": f"{distinct_pin}——钉死后不同输出的种数。1=完全一致",
+            "重复性": f"{metrics.get('重复性', 0)}——重现性。空响应会拉低",
+        }
+
+    elif way_id == "detect_report":
+        test_what = "测检出器能否检出数字+上报异常。输入含真实数字55.8万/42.8%/10.9亿，合法值也是这三个，看检出器能否检出、模型有没有造数。"
+        detect_rate = metrics.get("检出率", 0)
+        report_rate = metrics.get("上报率", 0)
+        if detect_rate >= 1.0 and report_rate == 0:
+            verdict = f"检出器工作正常（检出率{detect_rate}），模型守规矩没造数——所有数字都在合法值里，无需上报。"
+            level = "good"
+        elif detect_rate >= 1.0 and report_rate > 0:
+            verdict = f"检出器检出了数字（检出率{detect_rate}），其中{report_rate}比例不在合法值里（已上报人工复审）——模型造了数。"
+            level = "bad"
+        else:
+            verdict = f"检出率{detect_rate}——检出器未能在所有次运行中检出数字。"
+            level = "warn"
+        metric_explain = {
+            "检出率": f"{detect_rate}——检出器匹配到数字+单位的次数比例。1.0=每次都检出了",
+            "上报率": f"{report_rate}——检出数字中不在合法值里的比例。0=都在合法值里（模型没造数，好事）",
+            "重复性": f"{metrics.get('重复性', 0)}——{distinct}种不同输出。复述任务下每次措辞可能不同",
+        }
+
+    else:
+        test_what = ""
+        verdict = ""
+        level = "warn"
+        metric_explain = {}
+
+    return {"test_what": test_what, "verdict": verdict, "verdict_level": level,
+            "metric_explain": metric_explain}
+
+
 def _aggregate(way_specs, pipes):
     """按方式聚合各管道结果（pipes 含 None 表示未完成，跳过）"""
     results = []
@@ -161,6 +280,12 @@ def _aggregate(way_specs, pipes):
         fills = [json_key(r["filled"]) for r in runs]
         cnt = Counter(fills)
         consistency = round(cnt.most_common(1)[0][1] / len(fills), 3) if fills else 0.0
+        repro = {
+            "consistency": consistency,
+            "distinct_fills": [k for k, _ in cnt.most_common()],
+            "fill_counts": dict(cnt),
+        }
+        metrics = calc_metrics(way_id, runs)
         results.append({
             "way": way_id, "name": way_name, "desc": way_desc,
             "task_prompt": task_prompt,
@@ -168,12 +293,9 @@ def _aggregate(way_specs, pipes):
             "config": wc.config, "max_retry": wc.max_retry,
             "user_input": user_input, "parallel": len(runs),
             "runs": runs,
-            "metrics": calc_metrics(way_id, runs),
-            "reproducibility": {
-                "consistency": consistency,
-                "distinct_fills": [k for k, _ in cnt.most_common()],
-                "fill_counts": dict(cnt),
-            },
+            "metrics": metrics,
+            "interpretation": interpret_way(way_id, metrics, runs, repro),
+            "reproducibility": repro,
             "success_all": all(r["success"] for r in runs) if runs else False,
             "total_tokens_all": sum(r["total_tokens"] for r in runs),
             "elapsed_all": round(sum(r["elapsed_total"] for r in runs), 2),

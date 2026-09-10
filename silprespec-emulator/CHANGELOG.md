@@ -1,11 +1,35 @@
 # 更新日志 / CHANGELOG
 
+## 0.5.0b7 — 许可证与归属补齐
+
+- **现象**：README 声明"许可证：Apache 2.0"，但项目内不存在任何 `LICENSE` 文件；亦无 `NOTICE`
+- **根因**：许可证声明停留在文档层面，未落成文件；违反 §4(a)（分发须给接收者许可证副本）
+- **修复**：新增 `LICENSE`（Apache-2.0 全文）；新增 `NOTICE`（项目名 + 版权署名 + 许可证指引）；README 版本行由 0.5.0b1 校正为 0.5.0b7
+- **验证**：`LICENSE` 含第 1–9 条与 APPENDIX；`NOTICE` 与 lc-ms-group-advisor 口径一致
+
+## 0.5.0b6 — 结果展示重新设计（清晰布局 + 专用 CSS class）
+
+- **专用 CSS class**：e2e-card / e2e-title / e2e-test / e2e-verdict / e2e-mtable / e2e-raw-toggle，取代内联 style
+- **renderE2E 布局重设计**：每种方式一张大卡片，内分区块用留白分隔不再框套框；结论左侧色条最醒目；指标三列表格；原始数据 details 折叠
+- 信息不减少，层次更清晰
+
+## 0.5.0b5 — 结果加解读（考题测什么 + 模型表现结论 + 指标人话解释）
+
+- **interpret_way 函数**（e2e_demo.py）：根据 way_id + metrics + runs 生成结构化解读
+  - `test_what`：这个考题测什么能力（如"测软引导能否引导方向"）
+  - `verdict`：基于指标的人话结论（如"模型听引导——4次全部达标，但软引导不保证重现性"）
+  - `verdict_level`：good/bad/warn（用于着色：绿/红/黄）
+  - `metric_explain`：每个指标的人话解释（如"值域命中率0——命中候选词比例，本考题该填未指定，命中0是正常的"）
+- **_aggregate 调用 interpret_way**：解读塞进结果 JSON 的 `interpretation` 字段，落盘自带解读
+- **renderE2E 重写**（web_ui.py）：
+  - 解读放最前面（考题说明 + 结论着色框）
+  - 验证指标解读区（每指标一行：左数字右人话）
+  - 重现性区
+  - 原始数据用 `<details>` 折叠（默认收起，点击展开看 prompt/response/attempts/filled/extra）
+- 验证：用已有 e2e 结果测试 interpret_way，5 种方式解读均正确生成
+
 ## 0.5.0b4 — 一键演示考题重设计（从"功能展示"改成"真正能验证效果的考题"）
 
-### 背景
-用户指出一键演示是糊弄——DEMO_INPUTS/demo_config 随便选，约束都是 LLM 本来就会做的，测不出任何东西。一键应该是用固定考题考当前模型，做好了自然兼有模型评价能力。不改框架，只把考题做好。
-
-### 改动
 - **考题设计原则**：输入要诱导模型犯错，约束要能卡住不守规矩的模型，考题要能区分模型好坏
 - **pure_guide 考题**：引导写"挑战和风险"，禁"前景/机遇/乐观/美好"，必含"挑战"，≤200字。不听话的模型会写前景（含禁词）→重试
 - **value_bound 考题**：中性输入"不好不坏"+候选词只有积极/消极（故意不给中性）。守规矩填"未指定"，不守规矩编造"中性"→fabricated
@@ -18,10 +42,6 @@
 
 ## 0.5.0b3 — WAY_HELPS 加详细字段填写指南（每个空怎么填/可填什么/留空效果）
 
-### 背景
-用户反馈说明示例太简单，"看了和没看一样"，没说明每个空怎么填、可以填什么、留空怎样。
-
-### 改动
 - **5 种方式 + custom 的 WAY_HELPS 全部重写**，每个字段加详细填写指南：
   - 字段名 + 填什么（类型/格式）+ 可填值（示例值）+ 留空效果 + 填了效果
   - 示例改成"照填即可"格式，列出每个字段具体填什么值
@@ -35,7 +55,6 @@
 
 ## 0.5.0b2 — 修文档/报告/命名遗漏 + 去重 custom
 
-### 改动
 - **simulator.py**：文档改"5 种"；`run()` 加 `calc_metrics` 跨 run 聚合返回 metrics（原遗漏，正常运行报告无验证指标）
 - **run_e2e_demo**：默认排除 custom（custom 无预设输入/配方）
 - **renderResult**（正常运行报告）：重现性区块加验证指标展示（原遗漏，只有 e2e 报告有）
@@ -47,10 +66,6 @@
 
 ## 0.5.0b1 — 架构重构：8 方式 → 5 方式（按逻辑分类，软引导为第一位基础原子）
 
-### 背景
-用户指出原 8 种方式是从工程实例硬凑的，不是从前置规范逻辑分类来的：gate（关键词精确匹配）和 slot（槽位范围）逻辑上都是从一句话分类/提取，带正则的关键词也是槽位；diverge 的纠偏是语义偏离拉回不是格式校验；软引导（任务提示词）是第一位原子所有方式建立在它之上不是平行的一种。要求重新规划成 5 种，加验证方案量化每种后置是否真的生效。
-
-### 改动
 - **5 种方式（按逻辑分类）**：
   1. `pure_guide` 纯软引导（只 task_prompt，可加输出约束校验）
   2. `value_bound` 值域限定（gate/slot/required_min/condense 合并，`bound_type` 区分：enum_select/slot_extract/required_min/condense_enum）
@@ -74,10 +89,6 @@
 
 ## 0.4.0b3 — diverge/deterministic/detect_report 泛化（去照搬工程实例，回归泛化理论）
 
-### 背景
-diverge 照搬 novel-weaver 引用标记实例（假设 LLM 造【引用自来源】+删标记），但 LLM 无理由产生该标记，纠偏空转；deterministic demo 照搬 Structured Writer 引用编号实例（输入塞标记但 LLM 生成新内容不复制）；detect_report 的"全 unmatched 判失败"违反 B 形态"上报器不阻塞生成通道"。三者都把工程实例当实现照搬，而非泛化理论。用户澄清：前置规范内部的校验（correction_target/pin_target）属于前置规范，不是任务完成后的全量后置验证，保留不违反理论。
-
-### 改动
 - **diverge（08c 场景三 泛化）**：放开+收紧配对=误差抵消。validate_diverge 加空响应判失败；correction_target 保留（前置规范内部校验纠偏达标，留空=只观测 changed）；retry=True（前置规范内部重试）。default_config 去掉默认删【引用标记】规则（regex_replaces=[]），用 normalize_blanklines 泛化收紧。WAY_HELPS 泛化重写（不绑死引用标记，说明用户针对自己场景配纠偏规则）
 - **deterministic（08a §7 A 形态 泛化）**：生成时封死可枚举值域。validate_deterministic 加空响应判失败；pin_target 保留（前置规范内部校验钉死达标，留空=纯 A 钉死观测 changed）。default_config 去掉默认删【引用标记】+renumber_source=False（不照搬引用编号）。DEMO_INPUTS 去掉【引用自来源】标记改成主题。WAY_HELPS 泛化重写（不绑死引用编号，说明用户有编号场景才开 renumber）
 - **detect_report（08a §7 B 形态 泛化）**：上报器不阻塞生成通道。validate_detect_report 去掉"全 unmatched 判失败"——有检出=success（哪怕全 unmatched 也是"全部需上报"+人工兜底，不阻塞）；只判空响应/无检出失败（检出器无效）。WAY_HELPS 明确"上报器不是验证器，不宣称没问题，只上报"
@@ -86,7 +97,6 @@ diverge 照搬 novel-weaver 引用标记实例（假设 LLM 造【引用自来�
 
 ## 0.4.0b2 — custom 暴露新校验原子 + 一键演示约束示例 + WAY_HELPS 填写示例
 
-### 改动
 - **custom 下拉补新校验**：validate 下拉原只有 none/in_set/no_extra/required_full/in_range/eq_exact，补进 guide/diverge/detect_report/deterministic 四个新校验原子，custom 用户可自由组合
 - **ATOM_GLOSS/ATOM_AXES**：加 guide（软引导·输出约束）/diverge（纠偏目标校验）说明，更新 deterministic/detect_report 说明兼顾后处理+校验
 - **一键演示约束示例**：原 run_e2e_demo 用 default_config，新约束字段全空（向后兼容）导致一键看不到约束效果。新增 demo_config(way_id) 给 guide（必含"软件"+限长300）/diverge（禁含【）/deterministic（格式含来源1）/detect_report（合法值=55.8万亿元,42.8%,10.9亿人）设非空示例，run_e2e_demo 改用 demo_config
@@ -95,10 +105,6 @@ diverge 照搬 novel-weaver 引用标记实例（假设 LLM 造【引用自来�
 
 ## 0.4.0b1 — 四种 validate=none 方式补可配置约束（guide/diverge/deterministic/detect_report）
 
-### 背景
-guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配置约束，什么都通过，用户无法设置门禁/验证来测试场景。按理论（08a §7 三态谱系 / 08b 面对面弱约束 / 08c 场景三 novel-weaver）给这四种加可配置的门禁/验证约束。
-
-### 改动
 - **guide（08b 软引导）**：加 `output_constraints`（required_keywords/forbidden_keywords/max_length/format_regex），校验续写是否满足约束，不满足重试。约束全空=纯软引导不校验（向后兼容）
 - **diverge（08c 场景三 发散+纠偏）**：加 `correction_target`（format_regex/required_pattern/forbidden_pattern），校验纠偏后 corrected 是否达标，不达标重试。目标全空=不校验纠偏（向后兼容）。retry 改 True（纠偏不达标可重试）
 - **deterministic（08a §7 A 形态 封死）**：加 `pin_target`（exact_value/format_regex），校验钉死后 corrected 是否满足封死目标。目标全空=只钉死不比对（向后兼容）
@@ -111,7 +117,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.3.2b4 — 一键演示改实验级并行（与正常运行一致）
 
-### 改动
 - **一键演示并行模型修正**：原 e2e_demo 是"方式间串行 + 方式内串行重复 N 次"（纯串行，parallel 参数名不副实），改成与正常运行一致的**实验级并行**——parallel 个管道并发，每管道内方式串行（各方式用预设输入），收齐按方式聚合算重现性
   - 新增 _aggregate(way_specs, pipes)：按方式聚合各管道结果，跳过未完成管道(None)
   - run_e2e_demo 用 ThreadPoolExecutor 并发跑 N 管道，as_completed 收齐，每管道完成调 on_progress(done_pipes, total_pipes, 聚合快照)
@@ -121,7 +126,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.3.2b3 — 结果落盘 + 右侧历史边栏（保存/复看/删除/清空）
 
-### 改动
 - **结果自动落盘**：每次正常运行 / 一键演示完成后，结果写入 `data/results/{时间戳}_{类型}.json`（含 type/saved_at/summary/input/result），时间戳精确到微秒保证唯一递增
 - **右侧历史边栏**（结果 tab，参考 structured-writer outputs-sidebar）：
   - 结果 tab 改 flex 布局：左结果展示区 + 右 240px 历史边栏（sticky）
@@ -135,7 +139,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.3.2b2 — 正常运行统一详细报告 + 一键演示并行数可设
 
-### 改动
 - **正常运行报告对齐 e2e 详细度**（用户要求统一）：
   - pipeline_model.WayResult 加 calls/total_tokens/elapsed_total 字段
   - simulator.ExperimentRunner 复用 e2e_demo._exec_with_trace + _make_chat：每次 attempt 记 retry_reason/raw/filled/fabricated/missing_required/flagged，每次 LLM 调用记 prompt/system_prompt/response/elapsed/prompt_tokens/response_tokens
@@ -148,7 +151,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.3.2b1 — 端到端演示加并行重现性：每方式跑 N 次 + 重试理由 + token 估算
 
-### 改动
 - **e2e_demo.py 重写**：run_e2e_demo 加 parallel 参数（每方式跑 N 次），返回结构从扁平改为 {runs, reproducibility}
   - _exec_with_trace：记录每次 attempt 的完整 trace（valid/retry_reason/raw/filled/fabricated/missing_required/flagged）
   - _make_chat：包装 LLM 调用，记录 prompt_tokens/response_tokens（粗估 1.5 token/字）+ elapsed
@@ -160,7 +162,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.3.2b0 — 一键端到端演示：8 方式 × 预设输入 × 真实 LLM × 完整原始信息
 
-### 改动
 - **新增 e2e_demo.py 模块**：8 方式预设输入（DEMO_INPUTS）+ run_e2e_demo(llm, ways, on_progress)
   - 预设输入：每个方式配一个能体现该方式特性的输入（gate=情绪句/guide=技术段/condense=环境治理长文/slot=新闻/diverge=主题/deterministic=带来源编号/detect_report=含数值统计/required_min=查询问句）
   - 返回每个方式的完整原始信息：配置(recipe/config/task_prompt/max_retry/user_input) + 每次 LLM 调用(system/prompt/max_tokens/temperature/原始返回/耗时) + attempt 记录 + 最终结果(success/retry_count/exhausted/filled/观测extra/error)
@@ -176,7 +177,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.3.1b0 — 阶段化 UI：按 5 阶段 + 轴标注 + 原子名词
 
-### 改动
 - **方式卡片按 5 阶段分组展示**（替代原来的 config + recipe 平铺）
   - ① 生成：LLM 怎么填（text/select/slot）+ 轴标注
   - ② 后处理：代码怎么加工（deterministic/enum_filter/detect_report/json_parse）+ 轴标注
@@ -203,7 +203,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.3.0b0 — 方式说明改成表单语言 + custom 方式 help
 
-### 改动
 - **WAY_HELPS 全部 8 种方式的说明从 JSON 描述改为表单描述**
   - 旧："示例：{json}\n\n字段：- xxx: 说明" → 新："表单：\n- 控件名：控件类型 + 说明"
   - gate：门禁行 + 允许未指定勾选
@@ -225,7 +224,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.2.9b0 — 全站不暴露 JSON：recipe 表单 + 8 套 config 表单
 
-### 改动
 - **recipe 表单**（自定义模板）：原子配方 JSON textarea → 结构化表单，从有限原子集下拉/多选
   - 生成：下拉 text/select/slot；槽位参数：下拉 extra_check/required_min/无
   - 后处理：多选 deterministic/enum_filter/detect_report/json_parse
@@ -252,7 +250,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.2.8b0 — 自动落盘，去掉两个保存按钮
 
-### 改动
 - **自动落盘**：去掉"保存后端配置"和最下方"保存"两个按钮，改完即存
   - LLM 后端字段（backend/base_url/model/timeout/max_tokens/temperature）change/blur → `saveLLMAuto()` → POST `/api/config` → 写 `config.json`
   - 实验字段（名称/说明/并行数/方式卡片任何字段）blur/change → `saveExpAuto()`（debounce 500ms）→ POST `/api/experiment` → 写 `experiment.json`
@@ -265,7 +262,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.2.7b0 — 方式说明加"适用场景 + 输入类型"
 
-### 改动
 - 8 个方式的 `WAY_HELPS` 把"适用："扩充为"适用场景 + 输入类型"两行，明确告诉用户运行时应提供什么输入：
   - gate：自然语言短文本（一句话/评论），归入有限候选词
   - guide：自然语言文本（开放内容，摘要/续写/改写）
@@ -278,12 +274,10 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.2.6b0 — 下拉框深色统一
 
-### 改动
 - 全局 `select{background:var(--bg-input);color:var(--text)}`：兜底所有未被 `.form-row select` 覆盖的 select（如方式卡片 `.wc-head` 内的 way 下拉），下拉框本身不再白底
 
 ## 0.2.5b0 — 删冗余 coord + validate 原子承载空坐标（in_range/eq_exact）
 
-### 改动
 - **删除 `coord` 字段**：点对点/点对面/面对面原本是冗余且有害的自由下拉（能乱配出门禁配面对面这种无意义组合），现已删除。空坐标形态改由 `validate` 原子承载：
   - `in_set` = 点对面（集合成员，门禁/凝练用）
   - `in_range`（新增）= 面对面（区间容差，数值 ∈ [lo,hi]）
@@ -303,7 +297,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.2.4b0 — 模态框统一 + 预置模板另存为 + 下拉深色 + 自定义无默认提示词
 
-### 改动
 - **模态框替代弹窗**：所有 `alert`/`prompt`/`confirm` 改为统一模态框（对齐 structured-writer 深色风格：overlay+box+header+body+footer），用于模板命名/删除确认/重置确认/输入校验提示
 - **下拉深色选项**：`select option` 加 `background:var(--bg-input);color:var(--text)`，下拉列表不再白底
 - **预置模板另存为**：预置模板本身只读不可改存；改后点"另存为模板"转成自定义模板（带上预置 `default_recipe`）
@@ -319,7 +312,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.2.3b0 — 自定义模板库 + 任务提示词默认常显
 
-### 改动
 - **自定义模板库**：自定义模板可**保存（命名）/另存为/删除，多个**，持久化到 `config.json` 的 `custom_templates`
   - `ConfigManager` 加 `get/save/delete_custom_templates` 方法
   - 后端 `GET /api/ways` 返回 `custom_templates`；`POST /api/custom_templates` 保存（有 id 更新、无 id 新建）；`DELETE /api/custom_templates?id=` 删除
@@ -334,7 +326,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.2.2b0 — UI 自定义模板（自由组合原子）
 
-### 改动
 - 方式卡片 way 下拉加"自定义模板"选项
 - 选"自定义模板"时显示**原子配方JSON编辑器**：用户可自由组合生成/后处理/校验/重试/观测原子成自定义模板
 - `WayConfig` 加 `recipe` 字段（自定义原子配方 dict，空则用 `WAY_RECIPES[way]`）
@@ -348,7 +339,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.2.1b0 — 任务提示词 + 连接修复 + max_tokens 配置推动
 
-### 改动
 - **任务提示词（系统提示词）**：每个预置模板配泛化任务提示词（`TASK_PROMPTS`），作为 system message 传给 LLM，让 LLM 知道要完成什么任务再填空
 - `WayConfig` 加 `task_prompt` 字段；空则 fallback 到 `TASK_PROMPTS[way]`；用户可在 UI 编辑覆盖
 - 切换方式时 UI 自动填入该方式默认任务提示词
@@ -361,7 +351,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.2.0b0 — 原子化重构（执行层）
 
-### 改动
 - 新增 `atoms.py`：10 个前置规范原子（生成3 + 后处理4 + 校验1可配 + 控制流1 + 观测1可配）
 - 8 种方式声明式表达为原子配方（`WAY_RECIPES`），执行逻辑不再按方式 id 分支
 - `simulator.py` 的 8 个 `_way_xxx` 方法和 3 个辅助函数移入 `atoms.py`，`_exec_way` 改走 `exec_recipe`
@@ -380,21 +369,18 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.1.6b0 — 并行数统一到运行Tab
 
-### 改动
 - 去掉配置Tab的并行数输入（与运行Tab重复）
 - 并行数唯一来源为运行Tab的"并行数"输入框
 - 加载实验时把 experiment.parallel 同步到运行Tab的并行数
 
 ## 0.1.5b0 — 每种方式加名词解释
 
-### 改动
 - 8 种方式 help 开头加"名词："解释核心概念（门禁/槽位/凝练/发散/钉死/检出/required 等）
 - slot 明确说明与门禁的区别：门禁是从穷举词中"选"，槽位是从文本中"提取"
 - required_min 明确说明与 slot 的互补：slot 查"多"，required_min 查"少"
 
 ## 0.1.4b0 — 配置跟随方式切换 + 结果显示每次尝试 + help补充检测/缺陷
 
-### 改动
 - 切换方式时配置 JSON 自动填入该方式 default_config（不再保留旧方式配置）
 - 结果 Tab：每次尝试展开显示"偏移方向"（如 情绪=积极 · 时态=现在），不再只有结论
 - 每种方式 help 补充"检测什么/适用/缺陷"
@@ -414,7 +400,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 
 ## 0.1.2b0 — LLM 配置移入配置 Tab
 
-### 改动
 - LLM 后端设置从 topbar 移到配置 Tab（对齐 structured-writer：配置 Tab 内设后端/地址/模型/超时/Token/温度）
 - topbar 只保留 logo + tag
 - 默认填好 API 地址（LM Studio → http://localhost:1234，Ollama → http://localhost:11434）
@@ -434,7 +419,6 @@ guide/diverge/detect_report/deterministic 四种原 validate=none，没有可配
 - 前端 topbar 后端切换自动填默认 base_url
 - 英文品牌名 `silprespec-emulator`（对齐 structured-writer 样式：logo `⚡ silprespec-emulator` + tag `前置规范效果模拟器`）
 
-### 改动
 - 删除 Handler 类变量（backend/base_url/model/api_key），改为 ConfigManager 推动
 - `run_server` / `make_llm` 从 config 读，CLI 参数覆盖 config
 - 端口 8790 → 8805

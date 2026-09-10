@@ -384,6 +384,28 @@ textarea:focus{outline:none;border-color:var(--accent)}
 .progress-bar{height:6px;background:var(--bg-input);border-radius:3px;overflow:hidden;margin:8px 0}
 .progress-bar .fill{height:100%;background:var(--accent);transition:width .3s}
 .kv{color:var(--text-dim);font-size:11px}.kv b{color:var(--text)}
+.e2e-card{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:16px 18px;margin-bottom:16px}
+.e2e-card .e2e-title{font-size:15px;font-weight:700;margin-bottom:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border);padding-bottom:10px}
+.e2e-card .e2e-title .e2e-name{color:var(--text)}
+.e2e-card .e2e-title .e2e-stat{color:var(--text-dim);font-size:11px;font-weight:400;margin-left:auto}
+.e2e-test{font-size:12px;color:var(--text-dim);margin-bottom:12px;line-height:1.6;padding-left:2px}
+.e2e-test b{color:var(--text)}
+.e2e-verdict{border-left:3px solid;padding:8px 12px;margin-bottom:14px;border-radius:0 4px 4px 0;font-size:13px;line-height:1.6}
+.e2e-verdict .v-head{font-weight:700;margin-bottom:3px;font-size:13px}
+.e2e-verdict .v-body{color:var(--text)}
+.e2e-mtable{width:100%;margin-bottom:14px;border-collapse:collapse}
+.e2e-mtable td{padding:5px 8px;vertical-align:top;font-size:12px;border-bottom:1px solid var(--border)}
+.e2e-mtable tr:last-child td{border-bottom:none}
+.e2e-mtable td.mk{color:var(--accent);font-weight:700;white-space:nowrap;width:150px}
+.e2e-mtable td.mv{color:var(--text);font-weight:600;white-space:nowrap;width:70px;text-align:right}
+.e2e-mtable td.me{color:var(--text-dim);line-height:1.5;padding-left:12px}
+.e2e-section-label{font-size:12px;color:var(--accent);margin-bottom:6px;font-weight:600}
+.e2e-repro{margin-bottom:12px}
+.e2e-raw-toggle{margin-top:10px}
+.e2e-raw-toggle summary{cursor:pointer;color:var(--text-dim);padding:8px 12px;background:var(--bg-panel);border-radius:4px;font-size:12px;list-style:none;user-select:none}
+.e2e-raw-toggle summary::-webkit-details-marker{display:none}
+.e2e-raw-toggle summary:hover{color:var(--text)}
+.e2e-raw-content{padding:10px 4px 0}
 select{background:var(--bg-input);color:var(--text)}
 select option{background:var(--bg-input);color:var(--text)}
 .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center}
@@ -948,15 +970,28 @@ function renderE2E(results){
   const el=document.getElementById('e2e-list');el.innerHTML='';
   if(!results||!results.length){el.innerHTML='<p style="color:var(--text-dim)">无结果</p>';return;}
   results.forEach(r=>{
-    const div=document.createElement('div');div.className='wr-block';div.style.cssText='background:var(--bg-input);border-radius:4px;padding:10px;margin-bottom:12px;font-size:12px';
+    const div=document.createElement('div');div.className='e2e-card';
+    const interp=r.interpretation||{};
+    const lvl=interp.verdict_level||'warn';
+    const lvlColor=lvl==='good'?'var(--green)':lvl==='bad'?'var(--accent)':'#d68910';
+    const lvlIcon=lvl==='good'?'✅':lvl==='bad'?'❌':'⚠️';
+    const lvlText=lvl==='good'?'表现好':lvl==='bad'?'有问题':'需注意';
+    const me=interp.metric_explain||{};
+    const metrics=r.metrics||{};
+    const metricRows=Object.keys(metrics).filter(k=>k!=='n').map(k=>{
+      const v=metrics[k];const vStr=Array.isArray(v)?`[${v.join(',')}]`:String(v);
+      return `<tr><td class="mk">${esc(k)}</td><td class="mv">${esc(vStr)}</td><td class="me">${esc(me[k]||'')}</td></tr>`;
+    }).join('');
+    const rp=r.reproducibility||{};
+    const rpPre=rp.distinct_fills&&rp.distinct_fills.length?`<pre style="white-space:pre-wrap;font-size:11px;max-height:100px;overflow-y:auto;margin-top:4px">${esc(rp.distinct_fills.map(f=>{try{return JSON.stringify(JSON.parse(f),null,2);}catch(e){return f;}}).join('\n---\n'))}</pre>`:'';
     const runsHtml=(r.runs||[]).map(run=>{
       const callsHtml=(run.calls||[]).map((c,i)=>`<div style="margin:4px 0;padding:6px;background:var(--bg-panel);border-radius:4px">
-        <div class="kv">[调用 ${i+1}] 耗时 <b>${c.elapsed}s</b> prompt_tokens=<b>${c.prompt_tokens}</b> response_tokens=<b>${c.response_tokens}</b></div>
+        <div class="kv">[调用 ${i+1}] 耗时 <b>${c.elapsed}s</b> · prompt <b>${c.prompt_tokens}</b> · response <b>${c.response_tokens}</b> tokens</div>
         ${c.system_prompt?`<div class="kv">system: <b>${esc(c.system_prompt)}</b></div>`:''}
-        <div class="kv">prompt:</div><pre style="margin:2px 0;white-space:pre-wrap;font-size:11px">${esc(c.prompt)}</pre>
-        <div class="kv">返回:</div><pre style="margin:2px 0;white-space:pre-wrap;font-size:11px">${esc(c.response)}</pre></div>`).join('');
+        <div class="kv">prompt:</div><pre>${esc(c.prompt)}</pre>
+        <div class="kv">返回:</div><pre>${esc(c.response)}</pre></div>`).join('');
       const attHtml=(run.attempts||[]).map(a=>`<div style="margin:4px 0;padding:6px;background:var(--bg-panel);border-radius:4px">
-        <div class="kv">[attempt ${a.attempt}] valid=<b>${a.valid}</b>${a.retry_reason?` 重试理由=<b style="color:var(--accent)">${esc(a.retry_reason)}</b>`:''}</div>
+        <div class="kv">[attempt ${a.attempt}] valid=<b>${a.valid}</b>${a.retry_reason?` · 重试理由=<b style="color:var(--accent)">${esc(a.retry_reason)}</b>`:''}</div>
         <div class="kv">raw: <span style="color:var(--text-dim)">${esc((a.raw||'').slice(0,200))}${(a.raw||'').length>200?'…':''}</span></div>
         <div class="kv">filled: <b>${esc(JSON.stringify(a.filled))}</b></div>
         ${a.fabricated&&a.fabricated.length?`<div class="kv">fabricated: <b style="color:var(--accent)">${esc(JSON.stringify(a.fabricated))}</b></div>`:''}
@@ -968,26 +1003,31 @@ function renderE2E(results){
           <span class="badge ${run.exhausted?'fail':'dim'}">${run.exhausted?'撑满上限':'未撑满'}</span>
           <span class="kv">重试 <b>${run.retry_count}</b> · 耗时 <b>${run.elapsed_total}s</b> · tokens <b>${run.total_tokens}</b></span></div>
         <div class="config-header">LLM 调用（${(run.calls||[]).length} 次）</div>${callsHtml}
-        <div class="config-header">attempt 记录（${(run.attempts||[]).length} 次，含重试理由）</div>${attHtml}
+        <div class="config-header">attempt 记录（${(run.attempts||[]).length} 次）</div>${attHtml}
         <div class="config-header">最终 filled</div>
-        <pre style="white-space:pre-wrap;font-size:11px">${esc(JSON.stringify(run.filled,null,2))}</pre>
+        <pre>${esc(JSON.stringify(run.filled,null,2))}</pre>
         <div class="config-header">观测 extra</div>
-        <pre style="white-space:pre-wrap;font-size:11px">${esc(JSON.stringify(run.extra,null,2))}</pre>
+        <pre>${esc(JSON.stringify(run.extra,null,2))}</pre>
         ${run.error?`<div style="color:var(--accent)">error: ${esc(run.error)}</div>`:''}</div>`;
     }).join('');
-    const rp=r.reproducibility||{};
-    const rpPre=rp.distinct_fills&&rp.distinct_fills.length?`<pre style="white-space:pre-wrap;font-size:11px">${esc(rp.distinct_fills.map(f=>{try{return JSON.stringify(JSON.parse(f),null,2);}catch(e){return f;}}).join('\n---\n'))}</pre>`:'';
-    div.innerHTML=`<div class="wb-head"><b>${esc(r.way)} · ${esc(r.name)}</b>
-      <span class="badge ${r.success_all?'ok':'fail'}">${r.success_all?'全部成功':'有失败'}</span>
-      <span class="kv">并行 <b>${r.parallel}</b> · 总耗时 <b>${r.elapsed_all}s</b> · 总 tokens <b>${r.total_tokens_all}</b></span></div>
-      <div class="kv">说明: ${esc(r.desc)}</div>
-      <div class="kv">输入: <b>${esc(r.user_input)}</b></div>
-      <div class="kv">task_prompt: <b>${esc(r.task_prompt)}</b></div>
-      <div class="kv">recipe: <b>${esc(JSON.stringify(r.recipe))}</b></div>
-      <div class="kv">config: <b>${esc(JSON.stringify(r.config))}</b> · max_retry=<b>${r.max_retry}</b></div>
-      <div class="config-header" style="color:var(--accent)">重现性: consistency=<b>${rp.consistency}</b> · ${rp.distinct_fills?rp.distinct_fills.length:0} 种不同填入</div>${rpPre}
-      ${r.metrics&&Object.keys(r.metrics).length?`<div class="config-header" style="color:var(--accent)">验证指标（量化后置是否生效）</div><pre style="white-space:pre-wrap;font-size:11px">${esc(JSON.stringify(r.metrics,null,2))}</pre>`:''}
-      <div class="config-header">各次运行（共 ${(r.runs||[]).length} 次）</div>${runsHtml}`;
+    div.innerHTML=
+      `<div class="e2e-title"><span class="e2e-name">${esc(r.name)}</span>
+        <span class="badge ${r.success_all?'ok':'fail'}">${r.success_all?'全部成功':'有失败'}</span>
+        <span class="e2e-stat">并行 ${r.parallel} · 总耗时 ${r.elapsed_all}s · 总 tokens ${r.total_tokens_all}</span></div>`
+      + (interp.test_what?`<div class="e2e-test"><b>📋 考题：</b>${esc(interp.test_what)}</div>`:'')
+      + (interp.verdict?`<div class="e2e-verdict" style="border-left-color:${lvlColor}">
+          <div class="v-head" style="color:${lvlColor}">${lvlIcon} ${lvlText}</div>
+          <div class="v-body">${esc(interp.verdict)}</div></div>`:'')
+      + (metricRows?`<div class="e2e-section-label">验证指标解读</div>
+          <table class="e2e-mtable"><tbody>${metricRows}</tbody></table>`:'')
+      + `<div class="e2e-repro"><div class="e2e-section-label">重现性 · 一致率 ${rp.consistency} · ${rp.distinct_fills?rp.distinct_fills.length:0} 种不同填入</div>${rpPre}</div>`
+      + `<details class="e2e-raw-toggle"><summary>▶ 展开原始数据（输入 / 配置 / ${r.runs?r.runs.length:0} 次运行详情）</summary>
+          <div class="e2e-raw-content">
+            <div class="kv">输入: <b>${esc(r.user_input)}</b></div>
+            <div class="kv">task_prompt: <b>${esc(r.task_prompt)}</b></div>
+            <div class="kv">recipe: <b>${esc(JSON.stringify(r.recipe))}</b></div>
+            <div class="kv">config: <b>${esc(JSON.stringify(r.config))}</b> · max_retry=<b>${r.max_retry}</b></div>
+            <div class="config-header" style="margin-top:8px">各次运行</div>${runsHtml}</div></details>`;
     el.appendChild(div);
   });
 }
