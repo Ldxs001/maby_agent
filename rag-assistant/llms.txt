@@ -1,4 +1,4 @@
-# RAG Assistant v2.4.2
+# RAG Assistant v2.4.3
 
 > 一个自包含的独立 RAG（检索增强生成）智能体应用。
 > 从 local-rag-builder 技能孵化，封装了完整技能能力，同时自带 Agent 决策循环、Web UI、CLI、批量处理模式和外部接入协议。

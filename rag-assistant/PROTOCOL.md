@@ -713,5 +713,5 @@ python scripts/embedding_model_manager.py --model BAAI/bge-small-zh-v1.5
 
 > 以上协议版本：v1.0
 > 对应 RAG Assistant 版本：v1.7.0
-> 组件级外部 API 详见：`EXTERNAL_API.md`（port 8767，27 个端点）
+> 组件级外部 API 详见：`EXTERNAL_API.md`（port 8767，28 个端点）
 > 协议更新方式：修改此文件 + bump 版本号

@@ -3,6 +3,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`__init__.py` 唯一源）。
 
+## [2.4.3] - 2026-09-10
+
+- **现象**：`EXTERNAL_API.md` 端点总览表自报合计 27，与正文实际列出的端点数量不一致
+- **根因**：`GET /api/kb/backups`（列举备份）未计入 KB 管理域，`kb/backup`（手动备份）与 `kb/backups`（列举备份）两条独立路径被合并计数
+- **修复**：KB 管理计数 7 → 8、合计 27 → 28；`PROTOCOL.md` 引用「27 个端点」同步为 28
+- **验证**：正文 `### METHOD /path` 标题去重后路径数为 28，与合计一致
+
 ## [2.4.2] - 2026-09-10
 ### 修复（Apache-2.0 合规）
 - **现象**：项目 `LICENSE` 仅 16 行声明段、无条款正文；无 `NOTICE`；`vendor/pypdfium2` 三件套（`pypdfium2` / `pypdfium2_cfg` / `pypdfium2_raw`）无任何许可文件
