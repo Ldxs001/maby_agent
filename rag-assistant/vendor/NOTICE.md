@@ -14,6 +14,11 @@ Each is used under its respective open source license.
 | [pypdfium2_raw](https://github.com/pypdfium2-team/pypdfium2) | 5.11.0 | BSD-3-Clause / Apache-2.0 (PDFium 二进制) |
 | [pypdfium2_cfg](https://github.com/pypdfium2-team/pypdfium2) | 5.11.0 | BSD-3-Clause / Apache-2.0 |
 
+各组件对应的许可正文随组件保留在 `<包名>-<版本>.dist-info/licenses/` 下。
+pypdfium2 的完整许可与 NOTICE 集合位于
+`pypdfium2-5.11.0.dist-info/licenses/`（含 `LICENSES/` 与 `data/windows_x64/BUILD_LICENSES/`，
+后者为 `pdfium.dll` 捆绑的第三方组件许可）。
+
 # Pre-downloaded Model Weights
 
 The following model weight files can be downloaded into `data/models/` via the configuration UI.

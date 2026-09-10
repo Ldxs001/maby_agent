@@ -3,6 +3,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`__init__.py` 唯一源）。
 
+## [2.4.2] - 2026-09-10
+### 修复（Apache-2.0 合规）
+- **现象**：项目 `LICENSE` 仅 16 行声明段、无条款正文；无 `NOTICE`；`vendor/pypdfium2` 三件套（`pypdfium2` / `pypdfium2_cfg` / `pypdfium2_raw`）无任何许可文件
+- **根因**：`LICENSE` 被写成声明摘要而非许可证副本，违反 §4(a)"give any other recipients a copy of this License"；内嵌 `vendor/` 时上游 `dist-info/licenses/` 未随包保留，违反 §4(c)"retain all copyright, patent, trademark, and attribution notices"
+- **修复**：`LICENSE` 换为 Apache-2.0 全文（219 行）；新增 `NOTICE`（含 vendor 第三方归属清单）；把 pypdfium2 5.11.0 的 `licenses/` 全量回溯至 `vendor/pypdfium2-5.11.0.dist-info/licenses/`（19 个文件，含 PDFium 二进制的 `BUILD_LICENSES/`）；`vendor/NOTICE.md` 补上许可正文路径指引
+- **验证**：`LICENSE` 段落齐全；`vendor/` 内 6 个上游包均可定位到许可正文；版本四处（`rag_assistant/__init__.py` / README.md / llms.txt / CHANGELOG.md）同步为 2.4.2
+
 ## [2.4.1] - 2026-08-21
 ### 变更（版本号重发）
 - **2.4.0 的 wheel 文件名在 PyPI 已上传后被删除，文件名永久锁定（PyPI file-name-reuse 规则：`Deleted files cannot be re-uploaded`）**——同版本号同类型无法重传，故 bump 至 2.4.1 重发（代码内容与 2.4.0 完全一致，仅版本号变更）
