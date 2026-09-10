@@ -1,4 +1,4 @@
-# Orchestrator v2.8.1
+# Orchestrator v2.8.2
 
 > 基于本地 LLM 的链驱动编排器（Skill Pipeline Orchestrator）。
 > 人工编排技能链 → LLM 只做前处理与输出整理 → 中间 subprocess 确定性执行。

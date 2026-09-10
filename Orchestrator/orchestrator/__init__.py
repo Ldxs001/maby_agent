@@ -38,7 +38,7 @@ from .chain_model import SkillInfo, Pipeline, PipelineNode
 from .skill_scanner import scan_skills, search_skills
 from .chain_engine import execute_pipeline, execute_node
 
-__version__ = "2.8.1"
+__version__ = "2.8.2"
 __all__ = [
     "AgentConfig",
     "LLMClient", "DirectLLMClient",

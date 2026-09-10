@@ -1,6 +1,6 @@
 # Orchestrator — 链驱动技能编排器
 
-> **版本：v2.8.1**
+> **版本：v2.8.2**
 > 基于本地 LLM 的 Python 编排器。人工编排技能链（Pipeline），LLM 只做前处理与输出整理，中间由 subprocess 确定性执行技能脚本。
 > **Orchestrator 不是聊天工具。**
 

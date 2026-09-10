@@ -5,6 +5,14 @@
 
 ---
 
+## [2.8.2] - 2026-09-10
+
+### 修复（Apache-2.0 合规）
+- **现象**：项目根 `LICENSE` 为 MIT 全文，与仓库整体 Apache-2.0 口径冲突；无 `NOTICE`，归属声明无载体
+- **根因**：`LICENSE` 为历史遗留文件，未随仓库许可证口径统一；`NOTICE` 从未建立
+- **修复**：`LICENSE` 换为 Apache-2.0 全文（含第 1–9 条与 APPENDIX）；新增 `NOTICE`（项目名 + 版权署名 + 许可证指引）
+- **验证**：`LICENSE` 含定义/版权/专利/分发/免责/END/APPENDIX 全部段落；`NOTICE` 与 lc-ms-group-advisor 口径一致；版本三处（`orchestrator/__init__.py` / README.md / llms.txt）同步为 2.8.2
+
 ## [2.8.1] - 2026-08-07
 
 ### 文档补齐（与 rag-assistant 对齐）
