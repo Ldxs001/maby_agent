@@ -1,5 +1,13 @@
 # 变更日志
 
+## 0.1.1 — 2026-09-10
+
+### 修复（Apache-2.0 合规）
+- **现象**：项目无 `NOTICE` 文件，归属声明无载体
+- **根因**：`NOTICE` 从未建立；`LICENSE`（Apache-2.0 全文）虽完整但缺配套归属声明
+- **修复**：新增 `NOTICE`（项目名 + 版权署名 + 许可证指引），与 lc-ms-group-advisor 口径一致
+- **验证**：版本四处（`silprespec_orchestrator/__init__.py` / README.md / llms.txt / PROTOCOL.md）同步为 0.1.1
+
 ## 0.1.0 — 2026-08-31
 
 ### 新增
