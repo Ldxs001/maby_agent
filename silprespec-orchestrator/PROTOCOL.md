@@ -1,6 +1,6 @@
 # silprespec-orchestrator Protocol
 
-> 版本: 0.1.1 | 作者: wUwproject | 许可证: Apache 2.0
+> 版本: 0.1.2 | 作者: wUwproject | 许可证: Apache 2.0
 > 更新: 2026-08-31
 
 ---

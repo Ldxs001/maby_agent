@@ -28,7 +28,7 @@ from .composer import Composer
 from .executor import Executor
 from .adapter import Adapter
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = [
     "LLMClient", "LLMClientError",
     "COMBOS", "ComboSpec", "get_combo", "list_combos",
