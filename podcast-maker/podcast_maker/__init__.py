@@ -20,8 +20,9 @@
     ConfigManager / PARAM_SPEC / MODE_SPEC / GATE_SPEC / PRESET_SPEC
 """
 
-# 版本字面量必须写在这里（不能写成 __version__ = VERSION）：
-# 发布工具按 __version__ = "x.y.z" 字面量读版本号（PyPI setup.py 解析同理）。
+# 版本字面量必须写在本行下方（不能写成 __version__ = VERSION）：
+# 发布工具读取 __version__ 赋值行的引号字面量（PyPI setup.py 解析同理），
+# 故本文件任何注释都不得出现形如 赋值名 + 等号 + 引号 的文本。
 # 与 config_manager.VERSION 同步修改。
 __version__ = "0.12.2"
 
