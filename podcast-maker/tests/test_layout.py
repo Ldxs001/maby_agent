@@ -1,0 +1,669 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Copyright 2026 wUwproject
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""排版与画面回归测试。
+
+五条缺陷都在这里钉住：
+
+1. 给主标题下方画框线时用了与字号无关的绝对偏移（ty+118），字号 108 的字
+   实际高约 130，线正好横穿标题字。这类缺陷不能靠调数值解决——换个字号
+   或换套字体又会穿，只能改成按实测包围盒推位置。
+2. 缓推档用 min(zoom+常数, 上限) 表达缩放，62 秒的片子在第 9.5 秒就撞顶，
+   之后 52 秒完全静止。缩放必须按整段帧数归一。
+3. 文字块顶边若随文案行数浮动，同一档节目每集的主标题高度都不一样，
+   横屏换竖屏还会再挪一次。块顶必须钉住。
+4. 压暗若在带范围的 YUV 里叠黑，亮度与色度会被分开处理，等比压暗变成偏色。
+5. 声波间距按像素写死，小于相邻振幅之和，包络从第一帧就重叠。
+   留白必须是结构条件（相邻中线间距 = 振幅之和 + 留白），不能是手感数值。
+"""
+
+import math
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from PIL import Image, ImageDraw                                  # noqa: E402
+
+from podcast_maker import assets_factory as AF                    # noqa: E402
+from podcast_maker import video_engine as VE                      # noqa: E402
+from podcast_maker.config_manager import PARAM_SPEC               # noqa: E402
+
+LINES = {
+    "brand": "COGITO · SCRIBO",
+    "kind": "PODCAST",
+    "program": "我思故我写",
+    "title": "链与两头",
+    "subtitle": "我思故我写 · 播客系列",
+    "tagline": "能不能让代码干代码的活",
+    "attribution": "wUwproject · CC BY-SA 4.0",
+}
+
+CANVAS = [(1920, 1080), (1080, 1920), (1080, 1440), (1080, 1080)]
+
+
+def _font_path():
+    try:
+        return AF.resolve_font()["path"]
+    except AF.AssetError:
+        return None
+
+
+def _titles(seq):
+    """序列里承载主标题的那一项。"""
+    return next(it for it in seq if it.get("label") == "主标题")
+
+
+class TestBackgroundLayout(unittest.TestCase):
+    """位置必须由实测包围盒推出，元素之间不得压叠。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = _font_path()
+        if not cls.path:
+            raise unittest.SkipTest("未找到中文字体")
+        cls.draw = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+
+    def _seq(self, size, hero_size=None, titles_only=False):
+        w, h = size
+        scale = min(w, h) / 1080.0
+        fonts = AF._font_set(self.path, AF.FONT_SIZES_BG, scale)
+        if hero_size:
+            fonts["hero"] = AF._font(self.path, hero_size)
+        lines = ({"program": LINES["program"], "title": LINES["title"]}
+                 if titles_only else LINES)
+        return AF._background_sequence(
+            lines.get("title", ""), lines.get("subtitle", ""), lines,
+            lines.get("attribution", ""), fonts,
+            ((201, 164, 92), (232, 237, 248), (150, 165, 195)), w, scale), fonts
+
+    def _flow(self, size, hero_size=None, titles_only=False):
+        seq, fonts = self._seq(size, hero_size, titles_only)
+        start, _wave, _ = AF.background_layout(size, seq, fonts["small"].size)
+        return AF._draw_sequence(
+            AF._Flow(self.draw, size[0] // 2, start, dry=True), seq)
+
+    def test_marks_recorded_for_every_element(self):
+        flow = self._flow((1920, 1080))
+        self.assertEqual(len(flow.marks), 9)
+        self.assertTrue(all(m["bottom"] > m["top"] for m in flow.marks))
+
+    def test_no_element_overlaps_the_previous_one(self):
+        for size in CANVAS:
+            with self.subTest(size=size):
+                marks = self._flow(size).marks
+                for prev, cur in zip(marks, marks[1:]):
+                    self.assertGreaterEqual(
+                        cur["top"], prev["bottom"] - 0.5,
+                        "%s 与 %s 重叠" % (prev["label"], cur["label"]))
+
+    def test_rule_sits_below_the_title(self):
+        """就是这条线曾经横穿标题字。"""
+        for size in CANVAS:
+            with self.subTest(size=size):
+                marks = self._flow(size).marks
+                title = next(m for m in marks if m["label"] == "主标题")
+                rule = next(m for m in marks if m["label"] == "主标题下框线")
+                self.assertGreater(rule["top"], title["bottom"])
+
+    def test_larger_title_never_collides(self):
+        """字号变了位置必须跟着变。
+
+        旧实现写死 ty+118，这个用例会失败：字号 200 的标题底边远超 118。
+        """
+        for size in CANVAS:
+            for hero_size in (60, 108, 160, 240):
+                with self.subTest(size=size, hero=hero_size):
+                    marks = self._flow(size, hero_size=hero_size).marks
+                    title = next(m for m in marks if m["label"] == "主标题")
+                    rule = next(m for m in marks if m["label"] == "主标题下框线")
+                    self.assertGreaterEqual(
+                        rule["top"], title["bottom"] - 0.5,
+                        "标题字号 %d 时框线压到了标题" % hero_size)
+
+    def test_block_stays_inside_the_canvas(self):
+        for size in CANVAS:
+            with self.subTest(size=size):
+                flow = self._flow(size)
+                self.assertLess(flow.y, size[1] * 0.75,
+                                "文字块占了画面四分之三以上，说明字号或间距失控")
+
+    def test_block_top_is_fixed_regardless_of_line_count(self):
+        """块顶钉在 block_top，行数不能把主标题推上推下。
+
+        品牌行、标语、署名填不填由配置决定，主标题必须落在同一高度。若改成按
+        可用区居中，同一档节目每集的主标题都不一样高，横竖屏还会各挪一次。
+        """
+        for size in CANVAS:
+            with self.subTest(size=size):
+                want = size[1] * AF.LAYOUT["block_top"]
+                for titles_only in (False, True):
+                    seq, fonts = self._seq(size, titles_only=titles_only)
+                    start, _wave, flow = AF.background_layout(size, seq, fonts["small"].size)
+                    self.assertAlmostEqual(start, want, delta=0.5,
+                                           msg="文字块顶边没有钉在 block_top")
+                    self.assertLess(start + flow.y, size[1] * 0.75,
+                                    "文字块占了画面四分之三以上，说明字号或间距失控")
+
+    def test_inner_offsets_do_not_depend_on_orientation(self):
+        """块内各行只按字号排，与画幅无关。
+
+        字号按短边缩放，横竖屏短边相同，块内相对位置就应当相同——否则换个画幅
+        整块的行距都会变。分隔线粗细取自画布宽度，两种画幅下会差几像素，留一点容差。
+        """
+        offs = []
+        for size in ((1920, 1080), (1080, 1920)):
+            seq, fonts = self._seq(size)
+            _start, _wave, flow = AF.background_layout(size, seq, fonts["small"].size)
+            offs.append([m["top"] for m in flow.marks])
+        for a, b in zip(*offs):
+            self.assertAlmostEqual(a, b, delta=4.0,
+                                   msg="同一份文案在横竖屏下的块内相对位置相差过大")
+
+    def test_wave_stays_below_the_text_block(self):
+        for size in CANVAS:
+            for titles_only in (False, True):
+                with self.subTest(size=size, titles_only=titles_only):
+                    seq, fonts = self._seq(size, titles_only=titles_only)
+                    start, wave, probe = AF.background_layout(size, seq, fonts["small"].size)
+                    self.assertGreater(wave, start + probe.y,
+                                       "声波压到了文字块")
+                    self.assertLessEqual(wave, size[1] * AF.LAYOUT["wave_max"] + 1.0)
+
+    def test_wave_keeps_a_similar_distance_in_both_orientations(self):
+        """声波不能钉死在画布比例上：两种画幅下与文字的距离应当接近。"""
+        gaps = []
+        for size in ((1920, 1080), (1080, 1920)):
+            seq, fonts = self._seq(size)
+            start, wave, probe = AF.background_layout(size, seq, fonts["small"].size)
+            gaps.append((wave - (start + probe.y)) / min(size))
+        self.assertLess(abs(gaps[0] - gaps[1]), 0.2, "横竖屏声波与文字的距离相差过大")
+
+
+class TestCoverLayout(unittest.TestCase):
+    """封面整块居中，且元素之间不得压叠。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = _font_path()
+        if not cls.path:
+            raise unittest.SkipTest("未找到中文字体")
+        cls.draw = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+
+    def _flow(self, size, preset, hero_size=None):
+        w, h = size
+        scale = min(w, h) / 1080.0
+        over = (AF.FONT_SIZES_COVER_SQUARE if size == AF.COVER_SIZES["1x1"]
+                else None)
+        fonts = AF._font_set(self.path, AF.FONT_SIZES_COVER, scale, over)
+        if hero_size:
+            fonts["hero"] = AF._font(self.path, hero_size)
+        seq = AF._cover_sequence(preset, LINES["title"], LINES["subtitle"], "03",
+                                 LINES["program"], LINES, fonts,
+                                 (201, 164, 92), (232, 237, 248), (150, 165, 195),
+                                 w * AF.LAYOUT["rule_span"],
+                                 w * AF.LAYOUT["sub_rule_span"])
+        # 折行上限要和实绘一致：干跑不折、实绘折，量出的块高差一整行，
+        # 居中位置就错位了。
+        max_w = w * AF.LAYOUT["text_max_ratio"]
+        probe = AF._draw_sequence(
+            AF._Flow(self.draw, w // 2, 0.0, dry=True, max_w=max_w), seq)
+        return AF._draw_sequence(
+            AF._Flow(self.draw, w // 2, max(0.0, (h - probe.y) / 2.0),
+                     dry=True, max_w=max_w), seq), probe
+
+    def test_no_element_overlaps_for_any_preset(self):
+        for preset in ("book", "episode", "minimal"):
+            for size in AF.COVER_SIZES.values():
+                with self.subTest(preset=preset, size=size):
+                    flow, _ = self._flow(size, preset)
+                    for prev, cur in zip(flow.marks, flow.marks[1:]):
+                        self.assertGreaterEqual(
+                            cur["top"], prev["bottom"] - 0.5,
+                            "%s 与 %s 重叠" % (prev["label"], cur["label"]))
+
+    def test_block_is_vertically_centered(self):
+        for preset in ("book", "episode", "minimal"):
+            for size in AF.COVER_SIZES.values():
+                with self.subTest(preset=preset, size=size):
+                    flow, probe = self._flow(size, preset)
+                    h = size[1]
+                    start = max(0.0, (h - probe.y) / 2.0)
+                    self.assertAlmostEqual(flow.y, start + probe.y, delta=1.0)
+                    self.assertGreaterEqual(start, 0.0)
+                    self.assertLessEqual(flow.y, h, "块超出了画布")
+
+    def test_big_title_keeps_distance_from_next_line(self):
+        """主副标题贴在一起就是封面曾经的样子。"""
+        for size in AF.COVER_SIZES.values():
+            with self.subTest(size=size):
+                flow, _ = self._flow(size, "book")
+                big = max(flow.marks, key=lambda m: m["bottom"] - m["top"])
+                nxt = next(m for m in flow.marks if m["top"] >= big["bottom"] - 0.5)
+                self.assertGreater(nxt["top"] - big["bottom"], 10.0,
+                                   "大字之后没有留出间距")
+
+    def test_large_title_still_does_not_collide(self):
+        for size in AF.COVER_SIZES.values():
+            with self.subTest(size=size):
+                flow, _ = self._flow(size, "book", hero_size=200)
+                for prev, cur in zip(flow.marks, flow.marks[1:]):
+                    self.assertGreaterEqual(cur["top"], prev["bottom"] - 0.5)
+
+
+class TestTextHierarchy(unittest.TestCase):
+    """画面上的字谁大谁小，是规矩不是手感。
+
+    最大的一档给节目名（主标题），不给期标题：播客卖的是系列品牌，不是这一期
+    讲什么。期标题字数不定，长起来在最大档只能折行，一期一个样。这两条一旦
+    被谁改回去，画面上只是「又变丑了」，没有任何一处会报错——只能钉在这里。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = _font_path()
+        if not cls.path:
+            raise unittest.SkipTest("未找到中文字体")
+
+    def test_hero_is_the_program_not_the_episode(self):
+        """主标题位印的是节目名，期标题另起一行。"""
+        fonts = AF._font_set(self.path, AF.FONT_SIZES_BG, 1.0)
+        seq = AF._background_sequence(
+            LINES["title"], LINES["subtitle"], LINES, LINES["attribution"],
+            fonts, ((201, 164, 92), (232, 237, 248), (150, 165, 195)), 1920, 1.0)
+        hero = next(it for it in seq if it.get("label") == "主标题")
+        episode = next(it for it in seq if it.get("label") == "期标题")
+        self.assertEqual(hero["text"], LINES["program"])
+        self.assertEqual(episode["text"], LINES["title"])
+        self.assertGreater(hero["font"].size, episode["font"].size,
+                           "期标题不该大过主标题")
+
+    def test_background_hero_outranks_every_other_line(self):
+        fonts = AF._font_set(self.path, AF.FONT_SIZES_BG, 1.0)
+        seq = AF._background_sequence(
+            LINES["title"], LINES["subtitle"], LINES, LINES["attribution"],
+            fonts, ((201, 164, 92), (232, 237, 248), (150, 165, 195)), 1920, 1.0)
+        hero = next(it for it in seq if it.get("label") == "主标题")["font"].size
+        for it in seq:
+            if it["k"] != "text" or it.get("label") == "主标题":
+                continue
+            with self.subTest(label=it.get("label")):
+                self.assertGreater(hero, it["font"].size,
+                                   "「%s」没有小于主标题" % it.get("label"))
+
+    def test_cover_hero_outranks_the_episode_for_every_preset(self):
+        fonts = AF._font_set(self.path, AF.FONT_SIZES_COVER, 1.0)
+        for preset in ("book", "episode", "minimal"):
+            seq = AF._cover_sequence(preset, LINES["title"], LINES["subtitle"],
+                                     "03", LINES["program"], LINES, fonts,
+                                     (201, 164, 92), (232, 237, 248),
+                                     (150, 165, 195),
+                                     1920 * AF.LAYOUT["rule_span"],
+                                     1920 * AF.LAYOUT["sub_rule_span"])
+            sizes = {it["label"]: it["font"].size
+                     for it in seq if it["k"] == "text"}
+            with self.subTest(preset=preset):
+                self.assertEqual(
+                    next(it for it in seq if it.get("label") == "主标题")["text"],
+                    LINES["program"])
+                self.assertGreater(sizes["主标题"], sizes["期标题"],
+                                   "期标题不该大过主标题")
+                self.assertGreater(sizes["主标题"], sizes["副标题"],
+                                   "副标题不该大过主标题")
+
+    def test_every_preset_has_its_own_layout(self):
+        """三个档位必须真的排出三种样子。
+
+        从前 book 与 episode 走的是同一条分支（函数里只判过 minimal），
+        配置里那个下拉选了等于没选——这种空开关只能靠比对形状来拦。
+        """
+        fonts = AF._font_set(self.path, AF.FONT_SIZES_COVER, 1.0)
+        shapes = {}
+        for preset in ("book", "episode", "minimal"):
+            seq = AF._cover_sequence(preset, LINES["title"], LINES["subtitle"],
+                                     "03", LINES["program"], LINES, fonts,
+                                     (201, 164, 92), (232, 237, 248),
+                                     (150, 165, 195),
+                                     1920 * AF.LAYOUT["rule_span"],
+                                     1920 * AF.LAYOUT["sub_rule_span"])
+            shapes[preset] = tuple(
+                (it["k"], it.get("label"),
+                 it["font"].size if it.get("font") else 0) for it in seq)
+        self.assertEqual(len(set(shapes.values())), 3,
+                         "档位之间排出了同一份结果：%s" % shapes)
+
+
+class TestLayoutSpec(unittest.TestCase):
+    """排版器与规格表的关系。
+
+    间距一旦允许就地写数值，就会再次散成各处各一套——线穿标题就是那么来的。
+    这里把「间距只能取自 LAYOUT」变成可执行约束。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = _font_path()
+        if not cls.path:
+            raise unittest.SkipTest("未找到中文字体")
+
+    def _sequences(self):
+        scale = 1.0
+        bg = AF._background_sequence(
+            LINES["title"], LINES["subtitle"], LINES, LINES["attribution"],
+            AF._font_set(self.path, AF.FONT_SIZES_BG, scale),
+            ((201, 164, 92), (232, 237, 248), (150, 165, 195)), 1920, scale)
+        cover_fonts = AF._font_set(self.path, AF.FONT_SIZES_COVER, scale)
+        covers = [AF._cover_sequence(p, LINES["title"], LINES["subtitle"], "03",
+                                     LINES["program"], LINES, cover_fonts,
+                                     (201, 164, 92), (232, 237, 248), (150, 165, 195),
+                                     1920 * AF.LAYOUT["rule_span"],
+                                     1920 * AF.LAYOUT["sub_rule_span"])
+                  for p in ("book", "episode", "minimal")]
+        return [bg] + covers
+
+    def test_every_gap_comes_from_the_spec_table(self):
+        allowed = {v for k, v in AF.LAYOUT.items() if k.startswith("gap_")}
+        allowed.add(0.0)
+        for seq in self._sequences():
+            for it in seq:
+                with self.subTest(item=it.get("label", it["k"])):
+                    self.assertIn(it.get("gap", 0.0), allowed,
+                                  "间距没有取自 LAYOUT，属于就地写数值")
+
+    def test_spec_keeps_only_ratios(self):
+        """规格表里不该出现与字号无关的绝对像素。"""
+        for key, val in AF.LAYOUT.items():
+            if not key.startswith("gap_"):
+                continue
+            with self.subTest(key=key):
+                self.assertLessEqual(val, 10.0, "%s 像是个绝对像素值" % key)
+
+    def test_every_sequence_element_can_be_measured(self):
+        """序列必须能落笔：每种类型该有的字段齐备。"""
+        for seq in self._sequences():
+            self.assertTrue(seq)
+            for it in seq:
+                with self.subTest(item=it.get("label", it["k"])):
+                    self.assertIn(it["k"], ("text", "rule", "pill"))
+                    self.assertIn("color", it)
+                    if it["k"] == "rule":
+                        self.assertIn("span", it)
+                        self.assertIn("w", it)
+                    else:
+                        self.assertIn("font", it)
+                        self.assertTrue(it["text"])
+
+
+class TestGlyphCoverage(unittest.TestCase):
+    """缺字形会画出豆腐块，属于静默产出次品，必须拦下。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = _font_path()
+        if not cls.path:
+            raise unittest.SkipTest("未找到中文字体")
+        cls.font = AF._font(cls.path, 48)
+
+    def test_notdef_is_detected(self):
+        # 微软雅黑没有 ▸（U+25B8），缺字形必须判为不支持
+        self.assertFalse(AF.glyph_ok(self.font, "▸"))
+
+    def test_present_glyphs_pass(self):
+        for ch in ("中", "A", "·", "—", "◆"):
+            with self.subTest(ch=ch):
+                self.assertTrue(AF.glyph_ok(self.font, ch))
+
+    def test_assert_glyphs_raises_with_the_offending_char(self):
+        with self.assertRaises(AF.AssetError) as cm:
+            AF.assert_glyphs(self.font, "链与两头 🎙", "背景主标题")
+        self.assertIn("🎙", str(cm.exception))
+        self.assertIn("背景主标题", str(cm.exception))
+
+    def test_assert_glyphs_passes_on_plain_text(self):
+        AF.assert_glyphs(self.font, "链与两头", "背景主标题")
+
+    def test_kind_line_picks_a_supported_mark(self):
+        line = AF.kind_line(self.font, "PODCAST")
+        self.assertTrue(line.endswith("PODCAST"))
+        self.assertTrue(AF.glyph_ok(self.font, line[0]),
+                        "选出来的前缀符号字体并不支持")
+
+    def test_kind_line_without_text(self):
+        self.assertEqual(AF.kind_line(self.font, ""), "")
+
+
+class TestAnimation(unittest.TestCase):
+    """缩放必须全程匀速，且默认不动。"""
+
+    def test_default_animation_is_static(self):
+        self.assertEqual(PARAM_SPEC["animation.mode"]["default"], "static")
+
+    def test_zoom_range_is_subtle(self):
+        self.assertLessEqual(PARAM_SPEC["animation.zoom_max"]["default"], 1.06,
+                             "缩放幅度过大会把背景构图带跑")
+
+    def test_kenburns_zoom_is_normalised_by_frame_count(self):
+        """写死上限会让运动集中在前几秒然后静止。"""
+        for duration in (10.0, 62.0, 120.0):
+            with self.subTest(duration=duration):
+                frames = int(round(duration * 30))
+                frag, _ = VE._animation_filter("kenburns", 1920, 1080, 30,
+                                               duration, "C9A45C", 1.04)
+                self.assertEqual(len(frag), 1)
+                self.assertNotIn("min(zoom", frag[0],
+                                 "缩放带上限会在中途撞顶，之后完全静止")
+                self.assertIn("on/%d" % frames, frag[0],
+                              "缩放没有按整段帧数归一")
+
+    def test_kenburns_output_length_matches_duration(self):
+        frag, _ = VE._animation_filter("kenburns", 1920, 1080, 30, 62.0,
+                                       "C9A45C", 1.04)
+        self.assertIn("d=1860", frag[0])
+
+    def test_only_kenburns_wants_a_single_frame_input(self):
+        self.assertTrue(VE.bg_wants_single_frame("kenburns"))
+        for mode in ("static", "waveform", "spectrum", "none", ""):
+            with self.subTest(mode=mode):
+                self.assertFalse(VE.bg_wants_single_frame(mode))
+
+    def test_static_produces_no_filter_fragment(self):
+        frag, _ = VE._animation_filter("static", 1920, 1080, 30, 60.0, "C9A45C")
+        self.assertEqual(frag, [])
+
+
+class TestDimFilter(unittest.TestCase):
+    """整幅压暗必须等比。
+
+    叠黑色若发生在带范围的 YUV 里，亮度与色度会被分开处理：实测蓝色压掉四成、
+    红色几乎没动，成片比背景图和封面明显偏色。压暗必须先在 RGB 域做。
+    """
+
+    def test_dim_blends_in_rgb(self):
+        frag, label = VE._dim_filter("vbase", 1920, 1080, 0.15)
+        self.assertIn("format=rgb24", frag)
+        self.assertLess(frag.index("format=rgb24"), frag.index("drawbox"),
+                        "先转 RGB 再叠黑，顺序不能反")
+        self.assertIn("black@0.15", frag)
+        self.assertEqual(label, "vdim")
+
+    def test_no_dim_produces_no_fragment(self):
+        for amount in (0.0, -0.1):
+            with self.subTest(amount=amount):
+                frag, label = VE._dim_filter("vbase", 1920, 1080, amount)
+                self.assertIsNone(frag)
+                self.assertEqual(label, "vbase")
+
+    def test_dim_covers_the_whole_frame(self):
+        frag, _ = VE._dim_filter("vbase", 1920, 1080, 0.3)
+        self.assertIn("w=1920:h=1080", frag)
+        self.assertIn("t=fill", frag)
+
+
+class TestWaveBandsDoNotIntersect(unittest.TestCase):
+    """声波包络不相交是硬约束，不是观感调参。
+
+    原先三条波的间距按像素写死（36 / 72），而振幅是 22 / 17 / 12：
+    36 < 22+17，相邻两条的包络从第一帧就重叠；频率又只差千分之三，
+    产生拍频、相位周期性重合，三条线看上去就绞成一团。
+    修法是把留白变成结构条件——相邻中线间距取「振幅之和 + 留白」，
+    于是净空恒为正，与相位、频率、画幅都无关。
+
+    这一条必须由测试守着：留白被谁改小、振幅被谁调大，
+    界面上只会表现为「波浪线又缠上了」，没有任何一处会报错。
+    """
+
+    SIZES = ((1920, 1080), (1080, 1920), (3840, 2160), (1280, 720),
+             (1080, 1080), (2560, 1080))
+    TOPS = (120.0, 260.0, 480.0, 760.0)
+
+    def _all_layouts(self):
+        for size in self.SIZES:
+            for top in self.TOPS:
+                bands = AF.wave_layout(size, top, min(size) / 1080.0)
+                yield size, top, bands
+
+    def test_layout_produces_three_bands_when_there_is_room(self):
+        """有空间就要画满三条，不能悄悄少画。"""
+        for size, top, bands in self._all_layouts():
+            if bands:
+                with self.subTest(size=size, top=top):
+                    self.assertEqual(len(bands), len(AF.WAVE_BANDS))
+
+    def test_clearance_is_positive(self):
+        """相邻两条的包络净空必须为正，且恰好等于留白量。"""
+        for size, top, bands in self._all_layouts():
+            for a, b in zip(bands, bands[1:]):
+                clear = (b["cy"] - b["amp"]) - (a["cy"] + a["amp"])
+                with self.subTest(size=size, top=top):
+                    self.assertGreater(clear, 0.0)
+                    self.assertAlmostEqual(
+                        clear, AF.WAVE_GAP * (bands[0]["amp"] / 1.00),
+                        places=6,
+                        msg="净空应恒等于 留白×单位振幅，与相位无关")
+
+    def test_sampled_curves_never_cross(self):
+        """按实际绘制点逐像素比对：任意 x 上都不出现上下关系反转。
+
+        这是最强的一条：前一条断言算的是公式，这一条量的是真正落笔的折线。
+        """
+        for size, top, bands in self._all_layouts():
+            for a, b in zip(bands, bands[1:]):
+                ya = dict(AF.wave_points(a, step=1.0))
+                yb = dict(AF.wave_points(b, step=1.0))
+                for x in sorted(set(ya) & set(yb)):
+                    with self.subTest(size=size, top=top, x=x):
+                        self.assertGreater(yb[x] - ya[x], 0.0)
+
+    def test_bands_stay_inside_the_canvas(self):
+        """波带整体不得越出画布，也不得压到画布上沿以外。"""
+        for size, top, bands in self._all_layouts():
+            if not bands:
+                continue
+            w, h = size
+            first, last = bands[0], bands[-1]
+            with self.subTest(size=size, top=top):
+                self.assertGreaterEqual(first["cy"] - first["amp"], 0.0)
+                self.assertLessEqual(last["cy"] + last["amp"], h)
+                self.assertGreaterEqual(first["x0"], 0.0)
+                self.assertLessEqual(last["x1"], w)
+
+    def test_period_weights_are_not_integer_ratios(self):
+        """周期权重取不成整数比，避免三条波长期同相。
+
+        同相不会让线相交（净空为正），但会让三条波在若干 x 上同时到顶，
+        整片看起来是「一坨」而不是「三股」。
+        """
+        cycles = [c for _r, c, _a in AF.WAVE_BANDS]
+        for i in range(len(cycles)):
+            for j in range(i + 1, len(cycles)):
+                ratio = cycles[j] / cycles[i]
+                with self.subTest(ratio=ratio):
+                    self.assertGreater(abs(ratio - round(ratio)), 0.05)
+
+    def test_wave_max_amp_is_respected(self):
+        """单位振幅不得超过上限，短文案也不能把波拉得过粗。"""
+        for size, top, _bands in self._all_layouts():
+            scale = min(size) / 1080.0
+            bands = AF.wave_layout(size, top, scale)
+            for band in bands:
+                with self.subTest(size=size, top=top):
+                    self.assertLessEqual(band["amp"], AF.WAVE_MAX_AMP * scale)
+
+    def test_no_room_means_no_wave(self):
+        """可用高度不够时不画波，而不是画出负高度或压到文字上。"""
+        size = (1920, 1080)
+        # 触底：可用高度 = 画布高×wave_max − wave_top，取到 4×scale 以下。
+        top = 1080 * AF.LAYOUT["wave_max"] - 1.0
+        self.assertEqual(AF.wave_layout(size, top, 1.0), [])
+
+
+class TestFrameFont(unittest.TestCase):
+    """画面字体是可选项，不是写死的。
+
+    背景与封面从前一律取「本机第一款可用字体」——配置里没有这一项，人看得见
+    画面上那行字，却选不了它用哪款。这一条钉住换字体真的换出不同的字来：
+    只看配置项有没有被读到（字符串出现）是不够的，得看像素变没变。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pm_frame_font_")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _shoot(self, family, tag):
+        out = os.path.join(self.dir, tag)
+        os.makedirs(out, exist_ok=True)
+        r = AF.make_covers("book", LINES["title"], LINES["subtitle"], "1",
+                           LINES["program"], LINES, out, font_family=family)
+        with open(r["3x4"], "rb") as f:
+            return f.read()
+
+    def test_two_fonts_give_two_pictures(self):
+        fonts = AF.list_fonts()
+        if len(fonts) < 2:
+            self.skipTest("本机只有一款可用字体，比不出差别")
+        try:
+            a = self._shoot(fonts[0]["family"], "a")
+            b = self._shoot(fonts[1]["family"], "b")
+        except AF.AssetError as e:
+            self.skipTest("本机字体缺中文字形，比不出来：%s" % e)
+        self.assertNotEqual(a, b, "换字体后封面一字未变——这一项没接上渲染")
+
+    def test_blank_falls_back_to_the_same_font(self):
+        # 留空即自动挑一款。它必须与「显式指定自动挑中的那款」产出同一张图，
+        # 否则「自动」就悄悄成了另一套规矩。
+        picked = AF.resolve_font()
+        try:
+            blank = self._shoot("", "blank")
+            explicit = self._shoot(picked["family"], "explicit")
+        except AF.AssetError as e:
+            self.skipTest("本机字体缺中文字形，比不出来：%s" % e)
+        self.assertEqual(blank, explicit)
+
+    def test_unknown_font_is_refused(self):
+        # 报错并列出候选，不静默换一款顶上去——悄悄换掉的话，人以为选上了。
+        with self.assertRaises(AF.AssetError):
+            self._shoot("根本没有这款字体", "bad")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,81 @@
+# Podcast Maker
+
+> 播客制作智能体。素材进，成品出：脚本 → 声音 → 字幕 → 画面 → 产物校验，一条链走完。
+
+本地运行，不依赖云服务。音频默认走本地 Qwen3-TTS 服务（`tts_service/`，Apache-2.0，音色跟着项目走：每个项目自动录一段参考音频、落在项目的「音色」目录里，整期以它为音色源头；换项目互不影响，要与别的项目一致就整目录复制；合成开工前自动拉起、收工自动停掉并归还显存），也可切回 edge-tts（客户端库 LGPL-3.0，调微软 Edge 在线朗读接口）；视频画面只提供固定档位，脚本内容由 LLM 生成。
+
+作者：wUwproject · 许可：Apache-2.0
+
+## 核心约定
+
+- 能用算法完成的事写进代码，LLM 只做两头：解析输入、生成输出。
+- 所有可调项集中在 `podcast_maker/config_manager.py` 的表里，别处不得再定义。
+- 排版间距一律写成字号的倍数，位置由实测包围盒推出，禁止就地写数值。
+- 画面层级固定：主标题＝节目名（最大）＞ 副标题 ＞ 期标题 ＞ 期号 ＞ 版权行，背景与封面共用。节目名取自项目，期标题取自期数地图。
+- 一切都是项目：成稿规划、逐期即兴、单集（`single`）三种规划方式并列，只出一集也立项，没有「不归属项目」的第二条路。
+- 画面字体与字幕字体是两个可选点位（`frame.font_family` / `subtitle.font_family`），同归「字体」卡片，都由自绘下拉渲染——原生 select 的选项不接受自定义字体。
+- 缺依赖、缺字形或参数不可达时报错停下，不静默降级。
+- 产物门禁不过即写 `LOCK.json` 中断，不产出次品；脚本门禁不过不拦人——稿子与结论一起落盘，合成前提醒一次，改稿还是照出由人定。
+
+## 文档
+
+- [README.md](README.md)：安装、启动、界面、产物、门禁、目录结构
+- [PROTOCOL.md](PROTOCOL.md)：契约五层（身份 / 触发与能力 / 行为约束 / 接口 / 数据）
+- [CHANGELOG.md](CHANGELOG.md)：版本演进与缺陷修复记录
+- [PLAN.md](PLAN.md)：原始设计方案
+
+## 入口
+
+- [main.py](main.py)：命令行入口，含 `--check` `--voices` `--fonts` `--continue`
+- [podcast_maker/pipeline.py](podcast_maker/pipeline.py)：九步编排与产物校验
+- [podcast_maker/config_manager.py](podcast_maker/config_manager.py)：配置总表、枚举点位、预设、门禁
+
+## 模块
+
+- [podcast_maker/script_engine.py](podcast_maker/script_engine.py)：脚本生成、格式收束、片头尾写死、门禁、内容检、定点修补、锁文件
+- [podcast_maker/duration_model.py](podcast_maker/duration_model.py)：字数 ↔ 时长换算、标准语速与音色校准
+- [podcast_maker/tts_engine.py](podcast_maker/tts_engine.py)：语音合成
+- [podcast_maker/audio_engine.py](podcast_maker/audio_engine.py)：拼接、混音、编码、参数校验
+- [podcast_maker/subtitle_engine.py](podcast_maker/subtitle_engine.py)：断行、SRT/ASS、时间轴
+- [podcast_maker/assets_factory.py](podcast_maker/assets_factory.py)：排版规格与流式执行器、声波几何（wave_layout）、背景、封面、BGM、字形覆盖检查
+- [podcast_maker/video_engine.py](podcast_maker/video_engine.py)：动画、说话人指示、压暗、合成
+- [podcast_maker/project_store.py](podcast_maker/project_store.py)：项目登记表、三种规划方式（成稿规划 / 逐期即兴 / 单集）、期号记忆、期数地图与分支期号、项目设定覆盖配置
+- [podcast_maker/source_store.py](podcast_maker/source_store.py)：素材库（成稿入库落盘、章节清单、按落点取原文；结构不归它管，由 probe 给）
+- [podcast_maker/planner.py](podcast_maker/planner.py)：期数地图（排图、插入点与拆分、分支期号分配、落点核对）
+- [podcast_maker/probe.py](podcast_maker/probe.py)：结构探查（四路证据、同系列归纳、杂项识别、准入、L2 类型判定；素材入库即触发，结果冻结落盘）
+- [podcast_maker/paradigms.py](podcast_maker/paradigms.py)：素材范式数据层（切分依据/整合依据/重点判据/推进方式）
+- [podcast_maker/web_ui.py](podcast_maker/web_ui.py)：界面与 HTTP 接口
+- [podcast_maker/llm_client.py](podcast_maker/llm_client.py)：LLM 客户端（流式、约束解码、静默超时与总时限分工）
+- [podcast_maker/ingest.py](podcast_maker/ingest.py)：素材导入与锚点切章
+
+## 测试
+
+- [tests/test_duration_model.py](tests/test_duration_model.py)：字数换算与校准
+- [tests/test_subtitle_wrap.py](tests/test_subtitle_wrap.py)：字幕断行与时间轴
+- [tests/test_audio_params.py](tests/test_audio_params.py)：编码参数与 BGM 来源解析
+- [tests/test_gates.py](tests/test_gates.py)：门禁判据、待复核语义、产物校验与开关一致
+- [tests/test_layout.py](tests/test_layout.py)：排版包围盒、间距规格、文字层级、画面字体换款即换图、字形覆盖、动画缩放曲线、压暗色彩域、声波包络不相交
+- [tests/test_config_keys.py](tests/test_config_keys.py)：配置点位静态对账、界面入口覆盖、枚举标签、类型归一
+- [tests/test_script_contract.py](tests/test_script_contract.py)：脚本契约、标题收束、片头尾写死、期数归属
+- [tests/test_project_store.py](tests/test_project_store.py)：期号进位、规划方式与定死、单集出完即完结、期数地图、分支期号、归档、未归属产物
+- [tests/test_source_store.py](tests/test_source_store.py)：素材入库与索引完整性、章节清单、按落点取原文与截断记账
+- [tests/test_planner.py](tests/test_planner.py)：模型输出解析、落点逐字核对与清单标题边界、期号由代码编、插入点与分支编号分配
+- [tests/test_probe.py](tests/test_probe.py)：编号形态全覆盖、围栏内不算标题、同系列归纳、准入、容量确定性、L2 判定预算与降级
+- [tests/test_ingest.py](tests/test_ingest.py)：md 标题保留为锚点、上传路径锚点存活、按锚点切章
+- [tests/test_video_escape.py](tests/test_video_escape.py)：滤镜路径转义层级
+- [tools/ui_smoke.py](tools/ui_smoke.py)：真实浏览器界面冒烟（需服务在跑）
+- [tools/e2e_http.py](tools/e2e_http.py)：走 HTTP 的端到端验收，含成稿规划全链路与 docx 样式证据入库（需服务在跑；`--scratch` 可换产物落点）
+
+## 语音服务
+
+本地 TTS 是独立环境（自带 torch，主程序不引入），通过 HTTP 与主程序解耦。
+
+- [tts_service/serve.py](tts_service/serve.py)：薄服务，`POST /tts`（含 `ref_audio` / `ref_text` 音色克隆）`GET /speakers` `GET /health`；跑 Base 变体
+- [tts_service/make_voice.py](tts_service/make_voice.py)：角色音色档案——生成 / 继承 / 查账（跑 CustomVoice，一次性进程）
+- [tts_service/check.py](tts_service/check.py)：本机能否跑通的验收脚本（只读，不动 LM Studio）
+- [tts_service/setup.bat](tts_service/setup.bat)：建独立 venv、装 CUDA torch、下两个模型
+
+## 可选
+
+- [setup.bat](setup.bat)：Windows 一键启动
+- [requirements.txt](requirements.txt)：Python 依赖

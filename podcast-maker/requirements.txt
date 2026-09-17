@@ -1,0 +1,22 @@
+# Podcast Maker 轻依赖
+#
+# 只有两个第三方包，其余全部走 Python 标准库。
+#   edge-tts  在线朗读引擎（客户端库 LGPL-3.0）。它产出的音频并非来自公开授权
+#             的接口，而是微软 Edge 的在线朗读端点，输出受微软服务条款约束。
+#   Pillow    背景图 / 封面渲染（HPND）
+#
+# 默认的本地语音引擎（Qwen3-TTS，Apache-2.0）不在这里装：它那套依赖（torch 等，
+# 约 4.8 GB）单独放在 tts_service/requirements-torch.txt 与 requirements-tts.txt，
+# 只在用户要用本地语音时才装。
+#
+# 源：清华 https://pypi.tuna.tsinghua.edu.cn/simple/
+#     备用：阿里云 / 腾讯云 / 中科大，见 tools/sources.py
+#     这一份故意不写 --index-url：装它的人（根目录的 setup.bat）会把 -i 传进来，
+#     两处都写反而互相覆盖。
+#
+# ffmpeg 与 ffprobe 需要在 PATH 上（音频与视频处理的全部工作都靠它）。
+# Python 用机器上装的那一份（3.11 或更新）。本地语音服务不用它，那份环境在
+# tts_service/.venv 里，与本文件无关。
+
+edge-tts==7.2.8
+Pillow==12.3.0

@@ -1,0 +1,24 @@
+# ---- 独立 TTS 服务：环境与权重都不进版本库 ----
+# 环境由 tts_service/setup_env.py 现建（python -m venv），动辄几个 GB；
+# 权重从网上下。两者都不入库，都是「用时再下」。
+tts_service/models/
+tts_service/_check_out/
+tts_service/.venv/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 运行产物与临时件 ----
+*.log
+server.pid
+_smoke_server.log
+
+# ---- 冒烟与调试件：截图、一次性探针脚本、试验目录 ----
+# 这里的每一样都是「看一眼就完」的：ui_*.png 是界面截图，_scratch/ 装一次性探针
+# 与试验产物（曾攒到 8 GB）。要长期留的证据进 tests/ 或 CHANGELOG，这里不入库。
+_smoke/
+/ui_*.png
