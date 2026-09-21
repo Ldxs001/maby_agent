@@ -730,17 +730,18 @@ def _warn_if_recorded_on_cpu(out_dir, role, log):
             "从别的项目复制。" % role)
 
 
-def _service_synth(text, voice, speed, cfg, emotion=None, degree=None, ref=None):
+def _service_synth(text, voice, speed, cfg, degree=None, ref=None):
     """调用本地 TTS 服务。采样率不硬编码；变速走 atempo（保持音高）。
 
     语速为什么不交给服务端：服务端也能吃自然语言调语速，但那是概率性的；
     本地 atempo 是确定性的，还能保证两条引擎的变速语义一致。所以 speed 本地做。
 
-    情绪则相反，必须交给服务端：Qwen3-TTS 没有情绪参数，它靠自然语言指令
-    （instruct）表达语气，而这句话只有服务端那侧拼得出来。所以这里把脚本里的
-    标签原样带下去，由服务端决定哪些标签配转成语气指令——判断只做一处。
-    `degree`（文体情绪档位）同样原样带下去：这一层不认识"文体"，只负责把值
-    送到拼措辞的那一处，免得档位的判断在三个模块里各写一遍。
+    `degree`（文体情绪档位）原样带下去：这一层不认识"文体"，只负责把值送到
+    拼措辞的那一处，免得档位的判断在三个模块里各写一遍。
+
+    **不收 `emotion`（v0.27.0 硬隔离）**：脚本行里的语篇标签止步于脚本层，
+    请求体里永远没有 emotion 键——服务端的 instruct 判据（`if emotion and …`）
+    因此恒为假，instruct 路径彻底死透，不靠任何调用方自觉。
 
     `ref` 是本项目的角色音色档案 `{"wav": …, "text": …}`。有它就带下去走音色克隆：
     服务端此刻的类型由这个文件决定，`voice` 只作为日志里的名字。转录文本必须一起
@@ -748,8 +749,6 @@ def _service_synth(text, voice, speed, cfg, emotion=None, degree=None, ref=None)
     """
     url = service_url(cfg, "/tts")
     body = {"text": text, "voice": voice, "speed": 1.0}
-    if emotion:
-        body["emotion"] = emotion
     if degree:
         body["degree"] = degree
     if ref:
@@ -800,11 +799,17 @@ def _service_synth(text, voice, speed, cfg, emotion=None, degree=None, ref=None)
     return data
 
 
-def synth_line(text, voice, speed, cfg, emotion=None, degree=None, ref=None):
+def synth_line(text, voice, speed, cfg, degree=None, ref=None):
     """合成一句，返回 wav 字节。
 
-    `emotion` 与 `degree` 只有本地引擎用得上（转成语气指令）；Edge 那档没有
-    等价的入口，传进去也是白传，索性不接。档位是整期一个值，逐句透传。
+    `degree` 只有本地引擎用得上（转成语气指令）；Edge 那档没有等价的入口，
+    传进去也是白传，索性不接。档位是整期一个值，逐句透传。
+
+    **没有 `emotion` 参数，这不是省事，是硬隔离（v0.27.0）**：脚本行里的
+    语篇标签（追问/解释/…）是给生成侧当句型触发器用的，合成链一个字都
+    不读它——脚本里带不带标签，这边的行为一模一样。instruct 路径是 v0.9.0
+    判死的东西（Base+instruct 实测更差），不能让标签的回归把它顺手复活。
+    语气由 Base + ICL 的参考音频决定。
 
     `ref`（音色档案）同理只有本地引擎用：Edge 的音色是服务端在线的，没有
     「一段参考音频」这个输入。整期用同一份，逐句透传。
@@ -813,7 +818,7 @@ def synth_line(text, voice, speed, cfg, emotion=None, degree=None, ref=None):
     sr = int(cfg.get("audio.sample_rate", 44100))
     if engine in LOCAL_ENGINES:
         return _service_synth(text, voice, float(speed), cfg,
-                              emotion=emotion, degree=degree, ref=ref)
+                              degree=degree, ref=ref)
     return _edge_synth(text, voice, float(speed), sr)
 
 
@@ -871,7 +876,8 @@ def synthesize(script, out_dir, cfg, log=None, emotion_level=None,
         ref = refs.get(speaker)
         speed = float(cfg.get("tts.speed_a" if speaker == "A" else "tts.speed_b", 1.0))
         text = item.get("text", "")
-        emotion = item.get("emotion", "")
+        # 语篇标签不读：emotion 是生成侧的句型触发器，合成链硬隔离
+        # （见 synth_line 的说明）。脚本里带不带标签，这边行为一模一样。
         path = os.path.join(audio_dir, "%04d_%s.wav" % (i, speaker))
 
         if i and throttle > 0:
@@ -879,7 +885,7 @@ def synthesize(script, out_dir, cfg, log=None, emotion_level=None,
 
         for attempt in range(retries):
             try:
-                data = synth_line(text, voice, speed, cfg, emotion=emotion,
+                data = synth_line(text, voice, speed, cfg,
                                   degree=emotion_level, ref=ref)
                 with open(path, "wb") as f:
                     f.write(data)

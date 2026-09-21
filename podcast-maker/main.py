@@ -68,7 +68,8 @@ def cmd_check():
     llm = LLMClient(backend=cfg.get("llm.backend"), base_url=cfg.resolve_base_url(),
                     api_key=cfg.get("llm.api_key"), model=cfg.get("llm.model"),
                     timeout=int(cfg.get("llm.timeout", 3600)),
-                    idle_timeout=int(cfg.get("llm.idle_timeout", 300)))
+                    idle_timeout=int(cfg.get("llm.idle_timeout", 300)),
+                    input_ratio=float(cfg.get("llm.input_ratio", 1.0)))
     ok, msg = llm.test_connection()
     print("  [%s] %s" % ("OK" if ok else "FAIL", msg))
     return 0 if ok else 1
@@ -130,7 +131,8 @@ def cmd_resume(args):
     llm = LLMClient(backend=cfg.get("llm.backend"), base_url=cfg.resolve_base_url(),
                     api_key=cfg.get("llm.api_key"), model=cfg.get("llm.model"),
                     timeout=int(cfg.get("llm.timeout", 3600)),
-                    idle_timeout=int(cfg.get("llm.idle_timeout", 300)))
+                    idle_timeout=int(cfg.get("llm.idle_timeout", 300)),
+                    input_ratio=float(cfg.get("llm.input_ratio", 1.0)))
     target = args.resume
     if not os.path.isabs(target):
         target = os.path.join(_SCRIPT_DIR, target)

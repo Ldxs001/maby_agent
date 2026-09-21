@@ -21,7 +21,7 @@
 
     PARAM_SPEC  全部可配置点位（类型 / 值域 / 默认 / 归属组）
     MODE_SPEC   枚举型点位的档位定义（有限枚举）
-    PRESET_SPEC 风格倾向预设（七维取值）
+    PRESET_SPEC 风格倾向预设（三维取值：体裁 / 比喻密度 / 互动词强度）
     GATE_SPEC   门禁条目（判据 / 阈值 / 级别 / 阶段）
 
 界面控件的 min/max/step 与默认值、后端校验规则、流水线执行参数、文档描述，
@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "0.12.2"
+VERSION = "0.34.4"
 
 
 # ============================================================================
@@ -68,27 +68,44 @@ def bitrate_ceiling(sample_rate, codec="mp3"):
 # ============================================================================
 # 受控词表：情绪标签（封闭集合，LLM 只能从中选）
 # ============================================================================
-# 这 16 个标签原本是混在一起用的，但它们不是一类东西：
+# 这 14 个标签原本是混在一起用的，但它们不是一类东西：
 #   · 7 个是真情绪（平静 / 好奇 / …）——描述「这句话是什么心情」，能转成语气；
-#   · 9 个是语篇功能（开场 / 过渡 / 总结 / …）——描述「这句话在结构上干什么」，
+#   · 7 个是语篇功能（追问 / 过渡 / 总结 / …）——描述「这句话在结构上干什么」，
 #     跟心情无关。
 # 混在一起有两个后果：语篇标签被当成语气送进 TTS，指令成了「用比喻的语气说」
 # ——对模型是纯噪音；真情绪又淹没在这堆噪音里，等于语气压根没接上。所以拆开：
 #   EMOTION_VOCAB   只放真情绪，供 TTS 生成语气指令
 #   DISCOURSE_VOCAB 放语篇功能，供脚本侧做结构标记
-#   EMOTION_TAGS    两者并集，是脚本 emotion 字段的合法取值（与拆分前完全一致）
+#   EMOTION_TAGS    两者并集。脚本侧 emotion 字段 v0.27.0 起恢复，但**只吃语篇词**
+#                   ——整份 DISCOURSE_ORDER 进 schema 枚举；真情绪词不回稿子。
+#
+# 「开场 / 收束」已从词表除名（v0.34.1）：片头尾由程序在定稿那一刻粘上
+# （glue_intro_outro），正文里没有哪一句该背这两个标签——留在词表里，
+# 等于给模型一个用不上的选项，还占下拉一行。
 EMOTION_VOCAB = [
     "平静", "好奇", "疑惑", "恍然", "肯定", "感慨", "轻松",
 ]
 
 DISCOURSE_VOCAB = [
-    "开场", "收束", "追问", "解释", "强调", "比喻", "铺垫", "总结", "过渡",
+    "追问", "解释", "强调", "比喻", "铺垫", "总结", "过渡",
 ]
 
+#: 「承接」是语篇枚举里的中性档——顺着上句往下讲、没有修辞动作的句子都用它。
+#: 2a 期实证：全篇近半句子落在情绪词「平静」这个中性档上（118/250），没有它，
+#: 约束解码会逼着模型给每一句都安一个修辞动作，标签必然失真。
+DISCOURSE_NEUTRAL = "承接"
+
+#: 枚举顺序：中性档排头（大多数句子是它），其余按「问→答→修辞→结构」排，
+#: 与提示词里的释义顺序一致。**这一份就是全部**：提示词、输出 schema、界面下拉、
+#: 门禁都从它取，没有任何按风格收窄的第二步——收窄过两次（提问频率去「追问」、
+#: 情绪密度去「铺垫/过渡」），两次的结果都是「提示词给十个词、门禁判八个词」。
+DISCOURSE_ORDER = [DISCOURSE_NEUTRAL, "追问", "解释", "强调", "比喻",
+                   "铺垫", "过渡", "总结"]
+
 # 顺序与拆分前逐字相同 —— 它决定提示词里列出的枚举顺序与界面下拉顺序，
-# 排一下就是一次无谓的行为变更。
+# 排一下就是一次无谓的行为变更。（开场/收束已随 v0.34.1 除名，见上。）
 EMOTION_TAGS = [
-    "开场", "收束", "平静", "好奇", "追问", "疑惑", "恍然", "解释",
+    "平静", "好奇", "追问", "疑惑", "恍然", "解释",
     "强调", "肯定", "感慨", "比喻", "铺垫", "总结", "过渡", "轻松",
 ]
 
@@ -146,20 +163,68 @@ KINSOKU_TAIL = set("一第每各某")
 
 # ============================================================================
 # 片头片尾模板
+#
+# 形状是「句子列表」，每句自带说话人。它在**整期定稿那一刻**由程序逐字拼上去（见
+# `script_engine.glue_intro_outro`）：模型只写正文，片头尾不进生成、不进任何
+# 门禁——格式轴的事由代码办，模型省下的注意力正好用在内容上。
+#
+# 为什么是列表而不是「intro_first / outro_last」两个字符串：片头本来就不止一句。
+# 标准档片头两句（A 报欢迎、B 报本期题目与播讲人），精简档只留一句欢迎。从前表里
+# 只有一个 `intro_first`，另有 `intro_lines: 2` 这个数从来没人消费——「片头有两句」
+# 这件事只写在数里、没写在句里，于是第二句永远是模型自己发挥的，各期不一样。
+#
+# `{audience_clause}` 是**可选片段**：项目里没填受众时它整段消失，句子退化成
+# 「欢迎收听《X》。」，不会留下「面向的听众」这种半句话。受众的取值与生成时机见
+# `project_store`（排地图时由模型给第一版，界面可改，人填过重排不覆盖）。
+#
+# `{title}` 是期标题（`TITLE_MAX` 字以内）。为空时那一句整个不粘——与其粘出
+# 「本期讲述，播讲人小美、大美」这种半句，不如少一句。
+#
+# `review`（前期回顾）**不是档位**，是个位置：它与 standard / brief 并列，不随
+# 档位变。粘合顺序是 `片头 → 前期回顾 → 正文 → 片尾`——回顾紧跟片头之后，因为
+# 它是「上期讲到哪儿」的交代，得在正文开始前让听众听到；放到正文后面就成了尾声。
+#
+# 内容是**逐字引用上一期**：期主旨（地图上的 gist）＋ 段主旨（上一期的旁挂规划
+# 档，见 `layout.plan_file`），取值与拼句由 `pipeline.review_rows` 负责。取不到
+# 就整句不粘——第 1 期、前一期不在本项目、上一期没留下段主旨，三种情况一律按
+# 「这句没有」处理，绝不留「上期我们聊了……」后面空着。
+#
+# `{prev_topics}` 后面那个「等」**写死在模板里**：一期三五段，全念出来是流水账，
+# 只引前三段；「等」是告诉听众"还有"，一条时也照留。不给程序按条数决定加不加——
+# 条数一变句子形状就变，听感上像两套模板。
 # ============================================================================
 INTRO_OUTRO = {
+    # 标签一律用词表内的中性档「承接」：片头尾是程序拼的，不进生成、不进门禁，
+    # 但它们落在稿子上就要守稿子的词表——词表外标签会被重判（UI 重判读全份
+    # 文件）当缺陷报出来。「开场 / 收束」已在 v0.34.1 从词表除名。
     "standard": {
-        "intro_lines": 2,
-        "outro_lines": 2,
-        "intro_first": "欢迎收听《{program}》，面向关注方法论与认知边界的听众。",
-        "outro_last": "这里是《{program}》，欢迎关注。",
+        "intro": [
+            {"speaker": "A", "emotion": "承接",
+             "text": "欢迎收听《{program}》{audience_clause}。"},
+            {"speaker": "B", "emotion": "承接",
+             "text": "本期讲述{title}{names_clause}。"},
+        ],
+        "outro": [
+            {"speaker": "B", "emotion": "承接",
+             "text": "这里是《{program}》，欢迎关注。"},
+        ],
     },
     "brief": {
-        "intro_lines": 1,
-        "outro_lines": 1,
-        "intro_first": "欢迎收听《{program}》。",
-        "outro_last": "这里是《{program}》，欢迎关注。",
+        "intro": [
+            {"speaker": "A", "emotion": "承接",
+             "text": "欢迎收听《{program}》{audience_clause}。"},
+        ],
+        "outro": [
+            {"speaker": "B", "emotion": "承接",
+             "text": "这里是《{program}》，欢迎关注。"},
+        ],
     },
+    # 前期回顾：不随档位变（所以不在 standard / brief 里面），粘在片头之后、
+    # 正文之前。开关见 PARAM_SPEC 的 `intro_outro.review`，默认关。
+    "review": [
+        {"speaker": "B", "emotion": "承接",
+         "text": "上期《{prev_title}》聊的是{prev_gist}——讲了{prev_topics}等。"},
+    ],
 }
 
 
@@ -331,30 +396,47 @@ MODE_SPEC = {
 
 
 # ============================================================================
-# PRESET_SPEC：风格倾向（七维）—— 划界权在人，LLM 不选
+# PRESET_SPEC：风格倾向（三维）—— 划界权在人，LLM 不选
 # ============================================================================
+# 风格倾向只管**调子**：全篇按什么路子推进、拿多少比方、用不用互动词。
+# 它不管「谁说几句、多久问一次」——那是对话形式的事（见 paradigms.DIALOGUE_FORMS）。
+#
+# 从前这里还挂着两维，都拆掉了，理由各不一样：
+#
+#   · 提问频率：它手里握着两把钥匙。一是提示词里那一行带数的硬要求（「每两句到
+#     三句有一处问句」）——整份提示词里唯一带数的节奏规定；二是低档时把「追问」
+#     从语篇枚举里摘掉，等于顺手管了标签表。而「多久问一次」只有两个人对话才
+#     成立，一个人念稿子哪来的提问频率？它挂在风格里，就跟对话形式抢方向盘：
+#     形式给的是上限（上限不是目标），风格给的是一条带数的硬要求——带数的那个
+#     赢，于是选了「主讲＋捧哏」也照样被逼成一句一问。
+#
+#   · 情绪密度：它一个字都不进提示词，唯一作用是低档时把「铺垫」「过渡」从枚举
+#     里删掉。人在界面上配不出、也验不了它，只有提示词列的词与门禁判的词对不上
+#     的时候才露出来——「词表外标签」那条报错正是它的来路。
+#
+# 两维都拆掉之后，语篇词表**只剩一份**（DISCOURSE_ORDER，八词）：提示词列的、
+# 输出 schema 枚举的、界面下拉给的、门禁判的，读的是同一个常量，不可能再出现
+# 「写的与判的对不上」。
 STYLE_DIMS = {
     "genre": {"label": "体裁", "options": {
         "argument": "论证型", "story": "故事型", "science": "科普型",
         "debate": "对辩型", "review": "复盘型"}},
-    "emotion_density": {"label": "情绪密度", "options": {"low": "低", "mid": "中", "high": "高"}},
-    "question_rate": {"label": "提问频率", "options": {"low": "低", "mid": "中", "high": "高"}},
     "metaphor_density": {"label": "比喻密度", "options": {"low": "低", "mid": "中", "high": "高"}},
     "interaction": {"label": "互动词强度", "options": {
         "restrained": "克制", "natural": "自然", "warm": "热络"}},
 }
 
 PRESET_SPEC = {
-    "argument": {"label": "论证型", "genre": "argument", "emotion_density": "low",
-                 "question_rate": "mid", "metaphor_density": "low", "interaction": "restrained"},
-    "story": {"label": "故事型", "genre": "story", "emotion_density": "high",
-              "question_rate": "low", "metaphor_density": "mid", "interaction": "warm"},
-    "science": {"label": "科普型", "genre": "science", "emotion_density": "mid",
-                "question_rate": "high", "metaphor_density": "high", "interaction": "natural"},
-    "debate": {"label": "对辩型", "genre": "debate", "emotion_density": "mid",
-               "question_rate": "high", "metaphor_density": "low", "interaction": "warm"},
-    "review": {"label": "复盘型", "genre": "review", "emotion_density": "low",
-               "question_rate": "mid", "metaphor_density": "mid", "interaction": "natural"},
+    "argument": {"label": "论证型", "genre": "argument",
+                 "metaphor_density": "low", "interaction": "restrained"},
+    "story": {"label": "故事型", "genre": "story",
+              "metaphor_density": "mid", "interaction": "warm"},
+    "science": {"label": "科普型", "genre": "science",
+                "metaphor_density": "high", "interaction": "natural"},
+    "debate": {"label": "对辩型", "genre": "debate",
+               "metaphor_density": "low", "interaction": "warm"},
+    "review": {"label": "复盘型", "genre": "review",
+               "metaphor_density": "mid", "interaction": "natural"},
 }
 
 # 风格倾向的档位标签取自 PRESET_SPEC，不另写一份。原先这里只有键名数组，
@@ -372,6 +454,37 @@ MODE_SPEC["script.style_preset"]["options"] = {
 # 而漂掉的那处会把界面上的下拉与提示词里的组织依据指成两套。
 MODE_SPEC["script.paradigm"] = {"label": "素材类型",
                               "options": _paradigms.options()}
+
+# 对话形式的选项同样取自范式层：六种形式的标签、说明、A/B 角色、上限只写一处，
+# 界面下拉与提示词共用一份。空值是默认项「跟随素材类型」——它代表「按卡上的站位
+# 走」，不是「没有形式」，所以在下拉里要有一行看得见的说明，而不是留空。
+#
+# 说明后面挂上**这一种形式里 A 是谁、B 是谁**，以及它的**连句上限**：上限由形式
+# 定（见 paradigms.run_caps），门禁按它判、超限也按它点出来交模型并句，人在界面
+# 上却看不到这两
+# 样——它们都是能被执行的数/角色，界面上得看得见出处。角色更是选这种形式的主要
+# 理由：选「主讲＋捧哏」的人要知道这里谁主讲。
+def _form_note(f):
+    """把一种形式的角色与两条上限说成一句人话。"""
+    roles = f.get("roles") or {}
+    run = f.get("run") or {}
+    who = "；".join("%s 是%s" % (k, str(roles[k]).split("：")[0].strip())
+                    for k in ("A", "B") if roles.get(k))
+    caps = "连着说的上限：A %d 句、B %d 句" % (int(run["A"]), int(run["B"]))
+    return "；".join(x for x in (who, caps) if x)
+
+
+MODE_SPEC["script.dialogue_form"] = {
+    "label": "对话形式",
+    "options": dict(
+        [("", {"label": "跟随素材类型",
+               "desc": "按素材类型卡上写的两人站位分工走，连着说的上限也随卡上"
+                       "默认的那种形式；选了下面某一种，角色与上限都用那一种"
+                       "顶掉卡上的"})]
+        + [(k, {"label": v["label"],
+                "desc": "%s（%s）" % (v["desc"], _form_note(v))})
+           for k, v in _paradigms.DIALOGUE_FORMS.items()]),
+}
 
 
 # ============================================================================
@@ -397,9 +510,24 @@ PARAM_SPEC = {
                                      "（压比 0.5）判没话硬写，排图时回炉"),
     "script.style_preset": _p("enum", "argument", "script", "风格倾向",
                               views=("script",)),
-    "script.extra_requirement": _p("text", "", "script", "额外要求",
+    "script.segment_min_sents": _p("int", 15, "script", "分段软句数下限",
+                                   min=3, max=60, step=1, unit="句",
                                    views=("script",),
-                                   help="自由文本，仅作补充说明；判据一律由门禁代码执行"),
+                                   help="提示词里「约 N 句」的下限，也是碎段合并"
+                                        "阈值的一因子（阈值 = 本值 × 期望句长）。"
+                                        "低于阈值的相邻段会并进配额较小的邻居，"
+                                        "避免一次调用只写三句话"),
+    "script.shape_flags": _p("bool", True, "script", "取材标记",
+                             views=("script",),
+                             help="素材里含网址、代码、公式、表格、路径、清单等"
+                                  "「给眼睛看的」内容时，在提示词里给模型打标记"
+                                  "提醒转述或跳过，不逐字念进台词。只改提示词，"
+                                  "不动素材与配额；出口台词门禁照常兜底"),
+    "script.flag_title_words": _p("str", "镜像,下载,安装,命令,参数,许可,license,"
+                                       "官网,配置,示例", "script", "清单类标题词表",
+                                  views=("script",),
+                                  help="节标题命中任一词即标为清单类节（逗号分隔，"
+                                       "不区分大小写）；只影响提示词提醒，不删料"),
     "script.gate_strict": _p("bool", True, "script", "门禁严格模式",
                              views=("script",),
                              help="开启后 warn 级条目也不放行"),
@@ -409,13 +537,26 @@ PARAM_SPEC = {
     "script.map_max_episodes": _p("int", 60, "script", "地图期数上限",
                                   min=1, max=500, step=1, views=("script",),
                                   help="成稿规划排地图时最多排多少期；项目已定计划期数时以项目为准"),
+    "script.dialogue_form": _p("enum", "", "script", "对话形式",
+                               views=("script",),
+                               help="两位主持人「话怎么接」，同时决定同一人连着"
+                                    "说的上限（A / B 各一条）；留空＝跟随素材类型。"
+                                    "生成用的哪一种会记在这**一期**上，回头重判、"
+                                    "重写都按这一期自己那份走"),
     "script.paradigm": _p("enum", "auto", "script", "素材类型",
                         views=("script",),
                         help="排地图时的组织依据：切分单位、整合依据、重点判据、推进方式。"
                              "拿不准选「自适应」，由探查按结构推断；项目里可以逐个改"),
     "intro_outro.preset": _p("enum", "standard", "script", "片头尾档位",
                              views=("script", "render"),
-                             help="首句与末句由结构写死，不交给模型自由发挥"),
+                             help="片头片尾由结构写死：模型只写正文，这几句在整期"
+                                  "定稿那一刻由程序粘上去，不进生成、也不进任何门禁"),
+    "intro_outro.review": _p("bool", False, "script", "前期回顾",
+                             views=("script",),
+                             help="开启后，在片头之后、正文之前拼一句前期回顾："
+                                  "逐字引用上一期的期主旨与段主旨（程序拼，模型不参与、"
+                                  "也不进任何门禁）。第 1 期、上一期不在本项目、"
+                                  "或上一期没留下段主旨时这一句不出现"),
 
     "gate.max_deviation_pct": _p("float", 15.0, "gate", "总时长偏差阈值（%）",
                                  min=0.5, max=50, step=0.5, unit="%",
@@ -500,8 +641,13 @@ PARAM_SPEC = {
                                min=0.0, max=3.0, step=0.1, unit="秒",
                                help="连续高频请求会被语音服务限流，逐句合成之间留出间歇"),
     "tts.max_retries": _p("int", 4, "voice", "单句重试次数", min=1, max=8, step=1, unit="次"),
-    "audio.intro_path": _p("path", "", "voice", "片头音频"),
-    "audio.outro_path": _p("path", "", "voice", "片尾音频"),
+    "audio.intro_path": _p("path", "", "voice", "片头音频", pick="audio",
+                           help="本机绝对路径，留空即不使用。整期音频按「声明 → 片头 → "
+                                "正文 → 片尾」拼，这个文件接在声明之后；它的时长会从"
+                                "脚本目标时长里扣掉"),
+    "audio.outro_path": _p("path", "", "voice", "片尾音频", pick="audio",
+                           help="本机绝对路径，留空即不使用。拼在整期音频的最末尾；"
+                                "它的时长同样从脚本目标时长里扣掉"),
     "aigc.labeling": _p("bool", True, "voice", "AIGC 合规标识",
                         help="按《人工智能生成合成内容标识办法》写入元数据隐式标识"
                              "（AIGC 字段），并在片头拼一句 AI 语音声明；封面背景的"
@@ -514,22 +660,33 @@ PARAM_SPEC = {
     "audio.ai_disclosure_text": _p("str", "本节目人声由人工智能合成。", "voice", "AI 声明文案",
                                    help="片头语音声明的内容；声明排在片头音频之前，"
                                         "字幕时间轴已自动包含它的时长"),
-    "audio.ai_disclosure_path": _p("path", "", "voice", "自定义声明音频",
-                                   help="留空则用 A 角音色按声明文案合成；填了则直接用该文件"),
+    "audio.ai_disclosure_path": _p("path", "", "voice", "自定义声明音频", pick="audio",
+                                   help="本机绝对路径。留空则用 A 角音色按声明文案合成；"
+                                        "填了则直接用该文件（这条填错会直接报错，不会"
+                                        "悄悄退回合成）"),
 
     "bgm.mode": _p("enum", "builtin", "voice", "背景音乐来源"),
     "bgm.preset": _p("enum", "pensive", "voice", "背景音乐档位",
                      preview_base="/api/bgm/",
                      help="试听按钮播放的是该档位的原始循环素材，成片里会被"
                           "拉长混音、垫在人声底下"),
-    "bgm.custom_path": _p("path", "", "voice", "自备音乐文件"),
-    "bgm.volume": _p("float", 0.18, "voice", "音乐音量",
-                     min=0.0, max=1.0, step=0.01),
+    "bgm.custom_path": _p("path", "", "voice", "自备音乐文件", pick="audio",
+                          help="本机绝对路径，留空即不使用。只在上面「背景音乐来源」"
+                               "选「自备文件」时生效；**文件不在等同于没填**——成品"
+                               "会没有背景音乐（这一条不会报错，所以界面上会提醒）"),
+    "bgm.volume": _p("float", 0.50, "voice", "音乐音量",
+                     min=0.0, max=1.0, step=0.01,
+                     help="默认值由实测确定：素材已统一到 -23 LUFS，此音量下"
+                          "音乐平均比人声低约 13 dB，落在播客垫底的常规区间"),
     "bgm.ducking": _p("bool", True, "voice", "人声闪避",
                       help="人声起时自动压低音乐"),
-    "bgm.duck_threshold": _p("float", 0.03, "voice", "闪避触发阈值",
-                             min=0.001, max=0.5, step=0.001),
-    "bgm.duck_ratio": _p("float", 8.0, "voice", "闪避压缩比", min=1.0, max=20.0, step=0.5, unit="倍"),
+    "bgm.duck_threshold": _p("float", 0.25, "voice", "闪避触发阈值",
+                             min=0.001, max=0.5, step=0.001,
+                             help="超过该电平才触发压低；原值 0.03 远低于人声峰值，"
+                                  "人声一起就压满，音乐再也抬不起来"),
+    "bgm.duck_ratio": _p("float", 2.0, "voice", "闪避压缩比", min=1.0, max=20.0, step=0.5, unit="倍",
+                         help="压低幅度；配合 400 ms 固定恢复时间，比值越大"
+                              "音乐越难在句间停顿里回升"),
     "bgm.fade_seconds": _p("float", 3.0, "voice", "淡入淡出（秒）",
                            min=0.0, max=10.0, step=0.5, unit="秒"),
 
@@ -550,8 +707,13 @@ PARAM_SPEC = {
     "speaker_indicator.mode": _p("enum", "style", "frame", "说话人指示"),
     "speaker_indicator.color_a": _p("str", "#C9A45C", "frame", "A 角色彩"),
     "speaker_indicator.color_b": _p("str", "#6FA8DC", "frame", "B 角色彩"),
-    "speaker_indicator.portrait_a": _p("path", "", "frame", "A 角立绘 PNG"),
-    "speaker_indicator.portrait_b": _p("path", "", "frame", "B 角立绘 PNG"),
+    "speaker_indicator.portrait_a": _p("path", "", "frame", "A 角立绘 PNG", pick="image",
+                                       help="本机绝对路径的透明 PNG，留空即不使用。"
+                                            "只在「说话人指示」选「自备立绘」时生效："
+                                            "说话方高亮、另一方压暗；文件不在等同于"
+                                            "没填，会退回「侧栏色块」档"),
+    "speaker_indicator.portrait_b": _p("path", "", "frame", "B 角立绘 PNG", pick="image",
+                                       help="同上，B 角那一张"),
 
     # 画面上的字（背景、封面）与字幕各有一款字体，两个下拉并排放在「字体」卡片里。
     # 从前画面字体写死成「本机第一个可用字体」，人看得见字、却选不了它用哪款。
@@ -591,11 +753,22 @@ PARAM_SPEC = {
                           min=0.0, max=2.0, step=0.05, views=("script",)),
     "llm.max_tokens": _p("int", 8192, "system", "最大输出",
                          min=512, max=65536, step=256, unit="token", views=("script",)),
-    # 素材容量不在这里配：参照系是成稿脚本，由业务线按「成稿目标字数 × 压缩档
-    # × 1.25 体检上限」推导（script_engine.material_capacity），下限恒 1:1.2。
-    # llm.max_tokens 只是输出预算（思考段与答案共用），与素材容量脱钩——
-    # 从前的「输入额度 = 最大输出 × 输入倍率」参照系挂错了，已删（见
-    # llm_client.quota_note，窗口要求换算成具体数字提醒自查）。
+    "llm.input_ratio": _p("float", 1.0, "system", "输入倍率",
+                          min=0.5, max=16.0, step=0.5, unit="倍", views=("script",),
+                          help="单次调用能装多少原文 = 最大输出 × 本倍率。这是"
+                               "唯一决定「一次调用装多少」的旋钮，与画地图的压比"
+                               "无关（那管的是「这一期该讲多少料」）。后端窗口"
+                               "有多大不归程序管，也不需要告诉它——倍率由你按自己"
+                               "的后端定。调小 → 原文被多切几块，不丢料、只是多写"
+                               "几段；调大 → 一次喂更多"),
+    # 两个量各管各的，别用一个数兼两件事：
+    #   内容额度（画地图用）= 成稿目标 × 压缩档 × 1.25，参照系是成稿脚本，
+    #     判「这一期该讲多少料」，不合格要拆期——由 probe.capacity 推导，
+    #     不进配置项（它是业务结论，不是旋钮）。
+    #   输入额度（写作侧用）= llm.max_tokens × llm.input_ratio，参照系是模型
+    #     后端，判「这一次调用装不装得下原文」——就是上面那一项。
+    # 从前把后者删掉、让前者去顶班，于是两个不同单位的数被拿来做减法再比大小。
+    # llm.max_tokens 只是输出预算（思考段与答案共用），与输入额度分开。
     # 两道闸门分工不同，别用一个数兼两件事：「多久没有下一个字」判后端是不是
     # 卡死，「整件事最久允许多久」判模型写得是不是太久。从前只有后者，且回复
     # 要等全篇才到，于是「模型慢慢写」和「后端死了」被同一个数一起判死——
@@ -638,7 +811,7 @@ SECTION_ORDER = [
 SECTION_NOTE = {
     "script": "决定脚本写多长、写成什么调子",
     "gate": "不达标的脚本直接拦下，不进入合成",
-    "intro_outro": "首末句由结构写死，模型不得自由发挥",
+    "intro_outro": "片头尾由结构写死，整期定稿那一刻粘上；模型只写正文",
     "llm": "脚本由本地或自建模型生成，此处指定用哪一个",
     "project": "品牌行、标语、版权行——每期画面上都印的那几行字",
     "tts": "两位主持人的称呼、音色与语速。音色随所选引擎切换——同屏只显示当前引擎那一套",
@@ -715,27 +888,30 @@ GATE_SPEC = {
         {"key": "json_valid", "label": "JSON 合法", "judge": "可解析为数组",
          "level": "fail", "stage": "generate"},
         {"key": "fields_complete", "label": "字段完整",
-         "judge": "speaker / text / emotion 齐备且非空", "level": "fail", "stage": "generate"},
-        {"key": "ab_run_limit", "label": "同一人连续句数",
-         "judge": "连续同一说话人 ≤ 范式卡给的 max_run", "level": "fail",
+         "judge": "speaker / emotion / text 齐备且非空", "level": "fail",
          "stage": "generate"},
+        {"key": "emotion_vocab", "label": "语篇词表",
+         "judge": "emotion 只能填本篇风格倾向收窄后的语篇词（含承接）",
+         "level": "fail", "stage": "generate"},
+        {"key": "ab_run_limit", "label": "同一人连续句数",
+         "judge": "同一人连着说的句数 ≤ 对话形式给的上限（A / B 各一条）",
+         "level": "fail", "stage": "generate"},
         {"key": "line_length", "label": "句长区间",
          "judge": "gate.min_chars ≤ 字数 ≤ gate.max_chars", "level": "fail", "stage": "generate"},
         {"key": "line_duration", "label": "单句时长",
          "judge": "≤ gate.max_seconds_per_line", "level": "fail", "stage": "generate"},
-        {"key": "emotion_vocab", "label": "情绪标签",
-         "judge": "取自受控词表", "level": "warn", "stage": "generate"},
-        {"key": "emotion_level", "label": "情绪档位",
-         "judge": "情绪标签符合文体档位：不写心情的文体只允许语篇标签与平静",
-         "level": "fail", "stage": "generate"},
         {"key": "banned_words", "label": "禁用词",
          "judge": "BANNED_RULES 未命中", "level": "fail", "stage": "generate"},
         {"key": "readable_text", "label": "可朗读",
          "judge": "台词不含 emoji / 图标 / 不可见字符 / 网址 / 命令参数 / 排版符号",
          "level": "fail", "stage": "generate"},
-        {"key": "intro_outro", "label": "片头片尾",
-         "judge": "首句含问候语与节目名，末句含收束语与节目名",
+        {"key": "line_end_punct", "label": "句尾标点",
+         "judge": "每句以终止标点（。！？…）收尾；补什么符号由语义定，py 只判有没有",
          "level": "fail", "stage": "generate"},
+        # 这里本来还有一条 intro_outro。撤掉了：片头尾现在由程序在**整期定稿那一刻**
+        # 逐字粘上去（见 script_engine.glue_intro_outro），模型根本没参与，也就没有
+        # 「它照不照做」可验——判据留在这里只会恒真，或者更糟：拿正文去验首末句，
+        # 每次都报「未命中」，然后让模型去改一句它压根没写过的句子。
         # soft：这一条判的是估算值，不是实测值——真章要等合成出来。估算系数带着
         # 校准误差，拿它把稿子打回重写，等于让模型围着一个它既测不出、也控不住的
         # 秒数反复改。所以不达标只记账，不参与放行（严格模式下也不拦）。
@@ -745,10 +921,10 @@ GATE_SPEC = {
         # 内容检：跑在脚本生成阶段内（不是等产物出来之后），不通过就回灌重写。
         # 与上面那些形式项同属一个阶段，但判法不同——这些由模型判，形式项由代码判。
         {"key": "check_semantic", "label": "语义检（LLM）",
-         "judge": "正文台词忠于素材、未编造；首末句为结构写死的片头尾语，不受本条约束",
+         "judge": "正文台词忠于素材、未编造（片头尾不在稿子里，不必豁免）",
          "level": "fail", "stage": "generate"},
         {"key": "check_promise", "label": "承诺链检（LLM）",
-         "judge": "片头设问或承诺在后文有回应",
+         "judge": "正文开头提出的设问或承诺，在后文有回应",
          "level": "warn", "stage": "generate"},
         {"key": "av_sync", "label": "音画时长差",
          "judge": "|视频时长 − 音频时长| ≤ 0.05 秒", "level": "fail", "stage": "render"},
@@ -964,6 +1140,18 @@ def validate_config(cfg):
         ratio = max(cfg["tts.speed_a"], cfg["tts.speed_b"]) / min(cfg["tts.speed_a"], cfg["tts.speed_b"])
         if ratio > 1.5:
             warns.append("A/B 语速差异超过 1.5 倍，听感上会像两个人抢话。")
+
+    # 路径类点位填了就必须在。管线一律拿 os.path.exists 判它：片头音频、片尾音频、
+    # 立绘、自备音乐这几类文件不在，就**静默当没填**——成品里什么都不出现，也不报错；
+    # 只有 AI 声明音频会直接报错。静默那几处最坑，人以为填上了。所以统一在这里说一句：
+    # 指哪一条、指哪个文件。
+    for key, spec in PARAM_SPEC.items():
+        if spec.get("type") != "path":
+            continue
+        val = str(cfg.get(key) or "").strip()
+        if val and not os.path.exists(val):
+            warns.append("%s：找不到这个文件 —— %s（成品里会当作没填）"
+                         % (spec["label"], val))
 
     return warns, errs
 

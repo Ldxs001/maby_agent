@@ -25,6 +25,7 @@ import base64
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -34,8 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import assets_factory, audio_engine, duration_model, ingest, layout, paradigms, pipeline
 from . import planner
 from . import probe, project_store, script_engine, source_store, subtitle_engine, tts_engine
-from .config_manager import (BANNED_RULES, CONTENT_CHECKS, EMOTION_TAGS,
-                             GROUPS, INTRO_OUTRO, PARAM_SPEC, PRESET_SPEC,
+from .config_manager import (BANNED_RULES, CONTENT_CHECKS,
+                             DISCOURSE_ORDER, GROUPS, PARAM_SPEC, PRESET_SPEC,
                              STYLE_DIMS, VERSION, ConfigManager, gates_payload,
                              modes_payload, param_options, params_payload,
                              presets_payload, resolve_base_url, ui_payload,
@@ -71,9 +72,11 @@ def make_llm(cfg):
                      api_key=cfg.get("llm.api_key", ""),
                      model=cfg.get("llm.model", ""),
                      timeout=int(cfg.get("llm.timeout", 3600)),
-                     idle_timeout=int(cfg.get("llm.idle_timeout", 300)))
-    # 素材容量不在客户端定：参照系是成稿脚本，由 script_engine.material_capacity
-    # 按「成稿 × 压缩档 × 1.25」推导（见 llm_client.quota_note 的窗口自查）。
+                     idle_timeout=int(cfg.get("llm.idle_timeout", 300)),
+                     input_ratio=float(cfg.get("llm.input_ratio", 1.0)))
+    # 两个量各管各的：输入额度（= 最大输出 × 输入倍率）答「这一次调用装不装得下
+    # 原文」；内容额度（= 成稿 × 压缩档 × 1.25，见 script_engine.material_capacity）
+    # 答「这一期该讲多少料」，归画地图。前者是旋钮，后者是业务结论。
 
 
 def safe_join(base, rel):
@@ -107,6 +110,83 @@ def _font_options(fonts):
             o["url"] = "/api/fontfile?family=" + quote(f["family"])
         out.append(o)
     return out
+
+
+# ------------------------------------------------------------------ 选文件
+# 路径类点位（片头音频、片尾音频、立绘 PNG、自备音乐、自定义声明音频）填的是
+# **本机绝对路径**——管线一律拿 os.path.exists 去判它。手打一条 Windows 路径既慢
+# 又容易错，所以框旁边给一个「选择…」，弹本机文件对话框，选完把绝对路径写回该点位。
+#
+# 对话框在本机弹：服务就跑在这台机器上，与浏览器同机。别处访问这个界面时弹不出来，
+# 那时回一句人话，不让前端干等。
+#
+# 用子进程而不是在本进程里开 Tk：web 请求跑在 ThreadingHTTPServer 的工作线程上，
+# 而 Tk 只保证能在主线程里建 root（Win 上多数能跑，别的平台直接崩）。子进程自己
+# 占着主线程，行为与平台无关。
+PICK_KINDS = {
+    "audio": [("音频文件", "*.wav *.mp3 *.m4a *.flac *.ogg *.aac *.wma"),
+              ("全部文件", "*.*")],
+    "image": [("图片", "*.png *.jpg *.jpeg *.webp *.bmp"), ("全部文件", "*.*")],
+    "any": [("全部文件", "*.*")],
+}
+
+_PICK_SCRIPT = r'''
+import sys
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except Exception as exc:                      # 没有图形接口的构建
+    sys.stderr.write("no-tk: %s" % exc)
+    raise SystemExit(3)
+root = tk.Tk()
+root.withdraw()
+try:
+    root.attributes("-topmost", True)         # 别让对话框藏在浏览器后面
+except Exception:
+    pass
+types = []
+for spec in sys.argv[2:]:
+    name, pats = spec.split("=", 1)
+    types.append((name, pats.split()))
+path = filedialog.askopenfilename(title=sys.argv[1], filetypes=types)
+root.destroy()
+sys.stdout.write(path or "")
+'''
+
+
+def pick_file(title, kind):
+    """弹本机文件对话框，返回 {"ok":..,"path":..} 或 {"ok":False,"error":..}。
+
+    取消（对话框直接关掉）算正常动作：返回 cancelled，前端当什么都没发生，
+    不该弹一个红字提示。
+    """
+    types = PICK_KINDS.get(kind) or PICK_KINDS["any"]
+    args = [sys.executable, "-c", _PICK_SCRIPT, title or "选择文件"]
+    args += ["%s=%s" % (name, pats) for name, pats in types]
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")   # 路径里有中文也不乱码
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env=env,
+                              timeout=900)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "等了太久没选，已放弃；可以直接手填路径"}
+    except Exception as exc:
+        return {"ok": False, "error": "打不开本机文件对话框：%s" % exc}
+    if proc.returncode != 0:
+        tail = [x for x in (proc.stderr or "").strip().splitlines() if x.strip()]
+        return {"ok": False,
+                "error": "本机文件对话框不可用（%s）——可以直接手填路径"
+                         % (tail[-1] if tail else "未知原因")}
+    path = (proc.stdout or "").strip()
+    return {"ok": True, "path": path, "cancelled": not path}
+
+
+def api_pickfile(body):
+    key = str(body.get("key") or "")
+    spec = PARAM_SPEC.get(key) or {}
+    if spec.get("type") != "path":
+        return {"ok": False, "error": "这个点位不是路径类，不该有选择按钮"}
+    return pick_file(spec.get("label") or "选择文件", spec.get("pick") or "any")
 
 
 def api_config_get():
@@ -144,8 +224,8 @@ def api_config_get():
         "ui": ui_payload(),
         "values": cfg,
         "modes": modes_payload(), "presets": presets_payload(),
-        "gates": gates_payload(), "emotions": EMOTION_TAGS,
-        "intro_outro": INTRO_OUTRO, "banned_rules": BANNED_RULES,
+        "gates": gates_payload(),
+        "banned_rules": BANNED_RULES,
         "content_checks": CONTENT_CHECKS,
         "style_dims": STYLE_DIMS, "preset_spec": PRESET_SPEC,
         "warnings": warns + warns2, "errors": errs + errs2,
@@ -215,7 +295,8 @@ def api_estimate(body):
 def api_script_gate(body):
     script = body.get("script") or []
     cfg = CFG.data()
-    # 门禁判的「同一人连续句数」上限取自范式卡，所以校验也得知道是哪一张。
+    # 门禁判的「同一人连续句数」上限取自**对话形式**（配置里选的 > 卡上的默认），
+    # 所以校验也得知道是哪一张卡：卡决定默认形式，而形式上头挂着 A/B 两条上限。
     # 页面上改一个字段就重判一次；这里若退回全局默认卡，判出来的标准会和
     # 生成这份脚本时用的不是同一套——同一份稿子在两个地方一会儿过一会儿不过。
     paradigm = None
@@ -226,6 +307,21 @@ def api_script_gate(body):
         except ValueError:
             item = None
         if item:
+            # **项目级覆盖必须一起补上**：生成那一刻走的是「全局 + 项目」，
+            # 重判只读全局的话，两条路拿的是两把尺子——同一份稿子，写的时候
+            # 合法、判的时候成了「词表外标签」，而报错就出在页面上。
+            # 从前这里只补了卡、没补配置，等于修了一半。
+            cfg = project_store.apply_to_config(cfg, item)
+            # **这一期自己记过的形式，优先于当前配置**：生成那一刻用的是哪种形式，
+            # 已经跟着稿子写进这一期的旁挂档（`layout.form_file`）。配置里那个值是
+            # 「下一次生成用哪种」，不是「这一期当初用哪种」——上限挂在形式上头，
+            # 拿此刻的配置去判当时写的稿子，就是两把尺子量同一份东西。
+            # 没记过（本功能上线前写的期）就什么都不动，回落当前配置，与从前一样。
+            ep = str(body.get("episode_no") or "").strip()
+            if ep:
+                recorded = pipeline.episode_form(_root, ep)
+                if recorded:
+                    cfg["script.dialogue_form"] = recorded
             paradigm = script_engine.resolve_paradigm(
                 {"paradigm": item.get("paradigm")}, cfg)
     rep = script_engine.gate_generate(script, cfg, paradigm)
@@ -408,6 +504,11 @@ def _script_generate_work(body, job=None):
     plan_row = None
     proj_ctx = {}
     evidence = {}
+    # 逐节原文的体量与取料回调：只有成稿规划（有地图落点）才有。没有时装箱
+    # 退化成「一节一段」，写作退回整期素材——逐期即兴与单集本来就该走整篇。
+    sec_chars = None
+    material_of = None
+    sec_flags = None
     project_id = body.get("project_id") or ""
     if project_id:
         proj_item = project_store.find(base, project_id)
@@ -429,8 +530,8 @@ def _script_generate_work(body, job=None):
         proj_ctx = {"episode_no": episode_no,
                     "planned_episodes": proj_item.get("planned_episodes"),
                     # 素材类型也一并带上：写脚本这一步用项目已定的那张卡去定
-                    # 两人的站位、情绪基调和同一人连续句数上限，与排图/凝缩取
-                    # 的是同一张卡——项目定了就贯穿到底，不在这一段另判一次。
+                    # 两人的站位与默认对话形式（连句上限跟着形式走），与排图/
+                    # 凝缩取的是同一张卡——项目定了就贯穿到底，不在这一段另判一次。
                     "paradigm": proj_item.get("paradigm") or "",
                     # 地图片段是本期"讲什么"的唯一来源，与出片阶段取同一份。
                     "title": (plan_row or {}).get("title") or "",
@@ -439,10 +540,31 @@ def _script_generate_work(body, job=None):
                     "sources": [r.get("anchor") for r in
                                 ((plan_row or {}).get("refs") or [])
                                 if r.get("anchor")]}
-        # 本期判据包：主旨/要点 + 各节凝缩。内容检判「方向」时用它，素材超出
-        # 输入预算时也拿它顶替原文。与素材取自同一处（地图落点），不另立来源——
-        # 两个来源迟早给出两套「本期讲什么」。
+        # 本期判据包：主旨/要点 + 各节凝缩。内容检判「方向」时用它。与素材取自
+        # 同一处（地图落点），不另立来源——两个来源迟早给出两套「本期讲什么」。
         evidence = pipeline.evidence_pack(base, proj_item, plan_row, log=log)
+        # 逐节原文：装箱要知道每节多重，写作要按块取「本段那几节的原文」。
+        # 与判据包同一份节清单（直接把它传进去），节号才对得上号——两处各取
+        # 一次，迟早给出对不上号的编号。
+        if evidence.get("sections"):
+            sec_texts, sec_used = pipeline.section_materials(
+                base, proj_item, plan_row, log=log,
+                sections=evidence["sections"])
+            sec_chars = [len(t) for t in sec_texts]
+            material_of = pipeline.section_material_of(sec_texts, sec_used,
+                                                       log=log)
+            # 取材标记：手牌就是逐节原文，形状判定在这里做（一次判定，
+            # 全程消费）；标记只改提示词展示，素材与配额分毫不动。
+            if cfg.get("script.shape_flags", True):
+                sec_flags = {
+                    i + 1: script_engine._shape_flags(
+                        t, cfg,
+                        anchor=(evidence["sections"][i] or {}).get("anchor"))
+                    for i, t in enumerate(sec_texts)
+                    if script_engine._shape_flags(
+                        t, cfg,
+                        anchor=(evidence["sections"][i] or {}).get("anchor"))
+                }
 
     if not material.strip():
         return {"ok": False, "logs": logs,
@@ -482,19 +604,37 @@ def _script_generate_work(body, job=None):
             return
         os.makedirs(layout.script_dir(root), exist_ok=True)
         pipeline.write_json(layout.script_file(root, no), g["script"])
+        pipeline.write_plan_file(root, no, g)
+        # 这一期用的对话形式，跟着稿子一起记进旁挂档。**记的是解析后的结果**
+        # （配置里选的 > 卡上的默认），不是配置里的原字：回头重判这一期时，判的
+        # 标准必须是当初写它的那一种，而不是此刻配置里的那一种——上限挂在形式上
+        # 头，两把尺子量同一份稿子，就会出现「写时过、判时不过」。
+        pipeline.write_form_file(
+            root, no,
+            paradigms.resolve_form(script_engine.resolve_paradigm(proj_ctx, cfg),
+                                   cfg.get("script.dialogue_form") or ""))
         script_engine.write_gate_report(layout.tmp_dir(root, no), g["report"])
 
     try:
         gen = script_engine.generate(
             material, cfg, llm,
             preset_key=preset_key,
-            extra=body.get("extra") or "",
             log=log, project=proj_ctx,
+            # 前期回顾：读上一期的期主旨（地图行）与段主旨（上一期的旁挂规划档），
+            # 组一句固定文本。开关关、或哪一路取不到，这里就是空列表——「不粘」
+            # 的判断全在这一处，粘合那层只管站位（见 `glue_intro_outro`）。
+            review=(pipeline.review_rows(base, proj_item, no, cfg, log=log)
+                    if root is not None else []),
             # 中止只在轮次之间生效：正在跑的那次调用掐不断（本地模型一个请求
             # 就是一次不可分割的生成），但下一轮不必再开。
             should_stop=(lambda: bool(job.get("stop"))) if job is not None else None,
             draft_sink=save_draft,
             evidence=evidence,
+            # 装箱要的两样：每节原文多重（按它定段边界）、按块取本段原文。
+            sec_chars=sec_chars,
+            material_of=material_of,
+            # 取材标记（命中节号 → 家族）：只改提示词提醒，不动素材与配额。
+            sec_flags=sec_flags,
             # 路线按项目模式定死，不给人选：成稿规划有地图与各节凝缩，走分段
             # （逐期配额、防重复、段级核账才有依据）；逐期即兴与单集是当场
             # 给料、出完即止，整篇一次写完就是这条路该有的样子。
@@ -882,7 +1022,6 @@ def _render_sync(body, job=None):
                                 episode_no=episode_no,
                                 script=script or None,
                                 preset_key=body.get("preset"),
-                                extra=body.get("extra") or "",
                                 do_video=do_video,
                                 project_dir=None, reuse=False, job=job,
                                 project_id=project_id,
@@ -1037,6 +1176,9 @@ def api_project_post(body):
                 plan_mode=(body.get("plan_mode") or "").strip(),
                 program_name=body.get("program_name") or "",
                 subtitle=body.get("subtitle") or "",
+                # 受众也可以立项时就填。留空不是错：排地图那一步会补一版
+                # （见 planner.MAP_SCHEMA），此后在编辑弹窗里改。
+                audience=body.get("audience") or "",
                 planned_episodes=body.get("planned_episodes"),
                 style_preset=body.get("style_preset") or "",
                 voice_a=body.get("voice_a") or "", voice_b=body.get("voice_b") or "",
@@ -1045,7 +1187,10 @@ def api_project_post(body):
                 name_a=body.get("name_a") or "", name_b=body.get("name_b") or "",
                 first_episode=body.get("first_episode") or "1",
                 note=body.get("note") or "",
-                paradigm=body.get("paradigm") or "")
+                paradigm=body.get("paradigm") or "",
+                # 人给这档节目写的侧重（可留空）。它进排图提示词，管分组粒度：
+                # 侧重的内容合得细、次要的合得粗。留空＝老口径，不放默认话。
+                focus_note=body.get("focus_note") or "")
             return {"ok": True, "project": dict(item,
                                                 progress=project_store.progress(item))}
         if action == "update":
@@ -1181,7 +1326,11 @@ def api_plan_post(body):
         if action == "paradigms":
             return {"ok": True, "logs": logs,
                     "options": paradigms.options(),
-                    "current": (item.get("paradigm") or "") if item else ""}
+                    "current": (item.get("paradigm") or "") if item else "",
+                    # 侧重与素材类型同在「排图依据」这一档，界面上也是一起改的，
+                    # 所以跟着同一次请求回来——分两次取，改到一半的界面会把
+                    # 两个值配成不同的项目。
+                    "focus_note": (item.get("focus_note") or "") if item else ""}
         if action == "save":
             item = project_store.set_map(base, pid, body.get("episodes") or [])
             return {"ok": True, "logs": logs,
@@ -1270,7 +1419,10 @@ def _map_work(body, job=None):
                            force=bool(body.get("force")),
                            progress=_job_progress(job))
     item = project_store.set_map(base, pid, res["episodes"],
-                                 note=body.get("note") or "")
+                                 note=body.get("note") or "",
+                                 # 受众只在项目里还空着时才落进去（见 set_map）：
+                                 # 人改过就以人为准，重排不该把人的话顶掉。
+                                 audience=res.get("audience"))
     return {"ok": True, "warnings": res["warnings"],
             "capacity": res["capacity"],
             "ratio": res.get("ratio", 5),
@@ -1430,6 +1582,7 @@ ROUTES_GET = {
 
 ROUTES_POST = {
     "/api/config": lambda b: api_config_post(b),
+    "/api/pickfile": lambda b: api_pickfile(b),
     "/api/backend": lambda b: api_backend_post(b),
     "/api/backend/test": lambda b: api_backend_test(b),
     "/api/project": lambda b: api_project_post(b),
@@ -1649,10 +1802,55 @@ main{flex:1;overflow:auto;padding:22px}
 .card>h2{font-size:13px;font-weight:500;margin:0 0 4px;display:flex;align-items:center;gap:8px}
 .card>h2 .tag{font-size:11px;color:var(--fg3);font-weight:400}
 .card>p.note{margin:0 0 14px;font-size:12px;color:var(--fg3);line-height:1.6}
+/* 网格：默认按可用宽度自动铺列（用在脚本页/合成页那两条窄栏里）。 */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px 20px;margin-top:14px}
+/* 配置页专用网格：列数是固定的四档，只按可用宽度整档切换，不随窗口连续伸缩——
+   连续伸缩会让同一张卡在不同窗口下排到完全不同的位置，读起来没有规矩。
+   一行填不满就让它空着（左对齐）：五个控件＝第一行四个、第二行最左一个，后面
+   三格空着。**不许用 dense 回头填补空档**——回头填会把排在后头的控件提前来填空，
+   同类控件就被拆散到两行里去了。 */
+.grid.g4{grid-template-columns:repeat(4,minmax(0,1fr));gap:12px 20px;align-items:start}
+@media(max-width:1420px){.grid.g4{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:1060px){.grid.g4{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:720px){.grid.g4{grid-template-columns:1fr}}
 
+/* 卡内功能区的小标题。一张卡里常混着好几件事（LLM 那张卡既有「连到哪个后端、
+   用哪个模型」，也有「生成参数」「超时」）：只按类型分行，这几件事会被切成几段，
+   人看不出谁和谁是一组。所以在卡内再切一层功能区，区内才按类型分行。
+   一张卡只讲一件事时**不画**这行小标题，与从前完全一样。 */
+.card .zhead{font-size:11px;color:var(--fg3);letter-spacing:.3px;
+             margin:16px 0 0;padding-bottom:5px;border-bottom:1px solid var(--line)}
+.card .zhead+.grid{margin-top:10px}
+/* 配置页每一格固定四段：标题行 / 控件槽 / 刻度槽 / 说明。
+   头两段是硬高度，滑块、下拉、输入框、开关因此落在同一条水平线上——「上下
+   对不齐」就是因为从前它们各按各的自然高度排（滑块 18px、下拉 37px），谁也
+   不知道谁在哪。没有刻度的项也留一格空的刻度槽，那样连格与格的底部都对得上。
+   骨架只管配置页这张网格：脚本页那两条窄栏照旧按内容自然排。 */
+.grid.g4>.f{display:flex;flex-direction:column;gap:3px;min-width:0}
+/* 一格一控件。跨列的只剩多行输入（textarea）——250px 宽写不下一段文字。
+   从前还按说明字数给「跨两列」，结果是同一张卡里滑杆有的占两格有的占一格、
+   下拉同理，行的起点与终点全乱。说明长短只该影响这一格**多高**，不该动它多宽。 */
+.grid.g4>.f.wide{grid-column:span 2}
+@media(max-width:720px){.grid.g4>.f.wide{grid-column:span 1}}
+/* 形态一变就另起一行：滑杆排完，开关从下一行第 1 格起；开关只剩两个，后面两格
+   就空着，紧跟着的下拉不许顶上来填空——一顶上来，两种控件又混在一行了。 */
+.grid>.f.kstart{grid-column-start:1}
+.grid.g4>.f>label{font-size:12px;color:var(--fg2);display:flex;align-items:center;
+                  justify-content:space-between;gap:10px;height:22px;flex:none}
+.grid.g4>.f>label .val{color:var(--gold);font-variant-numeric:tabular-nums;flex:none;text-align:right}
+.grid.g4>.f>label .hint{color:var(--fg3);font-size:11px;font-weight:400;min-width:0;
+                        overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.grid.g4>.f .hold{height:34px;display:flex;align-items:center;flex:none}
+.grid.g4>.f .hold>*{width:100%}
+.grid.g4>.f .hold>label.sw,.grid.g4>.f .hold>button{width:auto;flex:none}
+.grid.g4>.f .hold.pv>select,.grid.g4>.f .hold.pv>input{flex:1;width:auto;min-width:0}
+.grid.g4>.f .hold.pv>button{margin-left:8px}
+.grid.g4>.f .scale{display:flex;justify-content:space-between;font-size:10px;color:var(--fg3);
+                   font-variant-numeric:tabular-nums;height:15px;align-items:center;
+                   flex:none;margin-top:0}
+.grid.g4>.f .desc{font-size:11px;color:var(--fg3);line-height:1.55;max-width:900px}
+.grid.g4>.f>audio{height:32px;max-width:100%;margin-top:4px}
 .f{display:flex;flex-direction:column;gap:6px;min-width:0}
-.f.wide{grid-column:1/-1}
 .f>label{font-size:12px;color:var(--fg2);display:flex;align-items:baseline;justify-content:space-between;gap:10px}
 .f>label .val{color:var(--gold);font-variant-numeric:tabular-nums;flex:none;text-align:right}
 .f>label .hint{color:var(--fg3);font-size:11px;font-weight:400}
@@ -1670,8 +1868,10 @@ select{appearance:none;cursor:pointer;padding-right:28px;
   background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 select option{background:var(--panel3);color:var(--fg)}
 select option:disabled{color:var(--fg3)}
+/* 单行控件一律 34px：与网格里那条控件槽同高，横向看是一条线。 */
+input[type=text],input[type=number],select{height:34px}
 textarea{resize:vertical;min-height:110px;line-height:1.7;font-family:inherit}
-input[type=range]{width:100%;accent-color:var(--gold);height:18px;cursor:pointer;margin:0}
+input[type=range]{width:100%;accent-color:var(--gold);height:20px;cursor:pointer;margin:0}
 
 button.btn{background:var(--panel2);border:1px solid var(--line2);border-radius:6px;padding:7px 15px;cursor:pointer;transition:.12s}
 button.btn:hover{border-color:var(--gold)}
@@ -1714,7 +1914,7 @@ button.mini.del.arm:hover{color:#fff;background:#c9403a;border-color:#c9403a}
 /* 字体下拉：自绘一层。原生 select 的选项不接受自定义字体——浏览器直接忽略
    选项上的 font-family，整列字长得一模一样，选字体就成了盲选。 */
 .fpick{position:relative}
-.fpick .fsel{width:100%;display:flex;align-items:center;gap:10px;padding:7px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;cursor:pointer;color:var(--fg);text-align:left;transition:.12s}
+.fpick .fsel{width:100%;display:flex;align-items:center;gap:10px;padding:6px 10px;height:34px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;cursor:pointer;color:var(--fg);text-align:left;transition:.12s}
 .fpick .fsel:hover{border-color:var(--line2)}
 .fpick .fsel .fsample{flex:1;font-size:16px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fpick .fsel .fname{color:var(--fg3);font-size:11px;white-space:nowrap;flex:none}
@@ -1793,10 +1993,8 @@ pre.log{background:#0a0e13;border:1px solid var(--line);border-radius:7px;paddin
 .kv{display:flex;gap:10px;font-size:12px;padding:5px 0;border-bottom:1px solid var(--line);align-items:baseline}
 .kv:last-child{border-bottom:0}
 .kv b{color:var(--fg2);font-weight:400;min-width:92px;flex:none}
-.pvrow{display:inline-flex;align-items:center;gap:8px;margin-left:10px}
 .pvbtn{font-size:12px;color:var(--fg2);background:none;border:1px solid var(--line);border-radius:4px;padding:2px 10px;cursor:pointer;flex:none}
 .pvbtn:hover{color:var(--gold);border-color:rgba(201,164,92,.4)}
-.pvrow audio{height:32px;max-width:280px}
 #outputs audio,#outputs video{display:block;width:100%;max-width:560px;margin:2px 0 10px;border-radius:6px}
 .kv span,.kv a{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 a{color:var(--blue);text-decoration:none}
@@ -1870,11 +2068,15 @@ td input,td select{padding:4px 7px;font-size:12px}
           <input type="text" id="np-program" placeholder="写进片头句与封面"></div>
         <div class="f"><label>副标题 <span class="hint">封面主标题下面的一行</span></label>
           <input type="text" id="np-subtitle" placeholder="如：AI 协作写成的书"></div>
+        <div class="f"><label>受众 <span class="hint">片头「面向…的听众」里的那一句；留空则排地图时生成</span></label>
+          <input type="text" id="np-audience" placeholder="如：关注方法论与认知边界"></div>
         <div class="f" id="np-planned-wrap"><label>计划期数 <span class="hint">留空即由地图的合并与切分决定；排完地图自动回填</span></label>
           <input type="number" id="np-planned" min="1" max="999" placeholder="留空即按内容分组定"></div>
         <div class="f" id="np-first-wrap"><label>起始期号</label><input type="text" id="np-first" value="1"></div>
         <div class="f"><label>素材类型 <span class="hint">排地图的组织依据，之后可改</span></label>
           <select id="np-paradigm"><option value="">自适应（按结构推断）</option></select></div>
+        <div class="f"><label>重点方向 <span class="hint">可留空。填了与上面的组织依据一起进排图：侧重的部分合得细、多占期数，次要的合得粗</span></label>
+          <input type="text" id="np-focus" placeholder="如：多解析方法论，少讲技术细节与实现"></div>
         <div class="f"><label>风格倾向 <span class="hint">项目内各期统一</span></label>
           <select id="np-style"></select></div>
         <div class="f"><label>备注</label><input type="text" id="np-note" placeholder="可留空"></div>
@@ -1977,8 +2179,8 @@ td input,td select{padding:4px 7px;font-size:12px}
           <button class="mini" onclick="recalc()">重算</button>
         </h2>
         <div class="tbl-scroll" style="margin-top:10px"><table id="script-tbl">
-          <thead><tr><th style="width:40px">#</th><th style="width:76px">说话人</th><th>台词</th>
-          <th style="width:70px">情绪</th><th style="width:58px">字数</th>
+          <thead><tr><th style="width:40px">#</th><th style="width:76px">说话人</th><th style="width:64px">标签</th><th>台词</th>
+          <th style="width:58px">字数</th>
           <th style="width:66px">预估秒</th><th style="width:66px">实测秒</th></tr></thead>
           <tbody><tr><td colspan="7" class="empty">尚无脚本</td></tr></tbody>
         </table></div>
@@ -2053,10 +2255,14 @@ td input,td select{padding:4px 7px;font-size:12px}
   <button class="btn primary" id="m-ok">确定</button></div>
 </div></div>
 <script>
-let CFG=null, SCRIPT=[], CUR_JOB=null, VOICES_BY_ENGINE={}, PROJECTS=[], EMOTIONS=[];
+let CFG=null, SCRIPT=[], CUR_JOB=null, VOICES_BY_ENGINE={}, PROJECTS=[];
+/* 语篇标签下拉选项：占位串由 Python 侧替换成 config_manager.DISCOURSE_ORDER
+   的 JSON 数组（单源注入，见文件尾部的 replace）。 */
+const EMOTIONS="__DISCOURSE_VOCAB__";
 /* 两页各一份「可选的期」。EPISEL 是勾上的那些——勾几期就做几期。
    顺序即勾选顺序不保证，所以实际按 EPISODES 的顺序取，跟地图一致。 */
 let EPISODES={s:[],r:[]}, EPISEL={s:new Set(),r:new Set()}, LOADED_EP='';
+let EPILOADED={s:false,r:false};
 function picked(which){return (EPISODES[which]||[]).filter(x=>EPISEL[which].has(x.no)).map(x=>x.no)}
 const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
 const el=id=>document.getElementById(id);
@@ -2148,7 +2354,12 @@ function pruneReg(){
 }
 function syncKey(key,v){
   (REG[key]||[]).forEach(n=>{
-    if(n.kind==='sw') n.node.classList.toggle('on',!!v);
+    if(n.kind==='sw'){
+      n.node.classList.toggle('on',!!v);
+      // 拨杆只表达状态，字还是得有一行——网格里每个格子的标题行高度是写死的，
+      // 这里跟着亮暗一起改字，视觉上「开」与「关」的差别就不用靠猜。
+      if(n.val) n.val.textContent=(v?'开':'关');
+    }
     else if(n.kind==='font') syncFontPick(n.node,v);
     else if(n.node){
       if(n.kind==='range'&&n.val) n.val.textContent=fmtVal(n.spec,v);
@@ -2239,7 +2450,7 @@ function fontPickerHtml(id,key,spec,v){
         '<span class="fname">'+esc(cur.label||'')+'</span><span class="fname">▾</span>'+
       '</button>'+
       '<div class="fbox">'+opts.map(one).join('')+'</div>'+
-    '</div>'+(spec.help?'<div class="desc">'+esc(spec.help)+'</div>':'');
+    '</div>';
 }
 function toggleFontPick(btn){
   const box=btn.closest('.fpick'); if(!box) return;
@@ -2285,28 +2496,46 @@ document.addEventListener('click',e=>{
 
 function control(stage,key,spec){
   const wrap=document.createElement('div');
-  const wide=(spec.type==='text'||spec.type==='path');
-  wrap.className='f'+(wide?' wide':'');
   const id=cid(stage,key);
   const v=CFG.values[key];
+  /* 占几列：一律一格。只有多行输入（textarea）例外——250px 宽塞不下一段文字。
+     从前是「长文本与长说明都跨两列」，于是同一张卡里滑杆有的占两格、有的占一格，
+     下拉也一样，行的起点对不齐。说明长短只影响这一格自身的高度，不动宽度。 */
+  const cls=['f'];
+  if(spec.type==='text') cls.push('wide');
+  wrap.className=cls.join(' ');
+  let hold='', scale='', note='', auHtml='';
 
+  /* 开关也走同一副骨架：标题在标题行、拨杆在控件槽、状态写在 val。
+     从前它自带文字、整块贴左，跟旁边的下拉既不同高也不在同一条线上，一行里就它
+     最扎眼——「滑杆、输入框混杂」有一半是这个。 */
   if(spec.type==='bool'){
-    wrap.innerHTML='<label class="sw'+(v?' on':'')+'" id="'+id+'" onclick="toggleSw(this)">'+
-      '<i></i><span>'+esc(spec.label)+(spec.required?'<span class="req">必填</span>':'')+'</span></label>'+
+    wrap.innerHTML='<label><span>'+esc(spec.label)+
+        (spec.required?'<span class="req">必填</span>':'')+'</span>'+
+        '<span class="val" id="'+vid(stage,key)+'"></span></label>'+
+      '<div class="hold"><label class="sw'+(v?' on':'')+'" id="'+id+'"><i></i></label></div>'+
+      '<div class="scale"></div>'+
       (spec.help?'<div class="desc">'+esc(spec.help)+'</div>':'');
     // 在 wrap 内部找，不能用 getElementById：此刻 wrap 还没进文档树，
     // 文档里根本没有这个 id，查回来是 null，于是控件注册成空节点、
-    // 事件也没绑上——滑块滑了不生效就是这个形状。
-    const sw=wrap.querySelector('label');
-    sw.onclick=()=>{put(key,sw.classList.contains('on'))};
-    reg(stage,key,{kind:'sw',node:sw,spec:spec});
+    // 事件也没绑上——开关点了不生效就是这个形状。
+    const sw=wrap.querySelector('.sw');
+    const val=wrap.querySelector('[id="'+vid(stage,key)+'"]');
+    if(val) val.textContent=(v?'开':'关');
+    // 亮不亮由服务端回值驱动（写成功才亮），这里只负责把点击发出去。
+    // 发**目标态**（点之前是关就发开），不是当前态——发当前态的话服务端
+    // 永远写回旧值、开关永远翻不了（亮/暗只由 syncKey 按服务端回值驱动）。
+    sw.onclick=()=>{put(key,!sw.classList.contains('on'))};
+    reg(stage,key,{kind:'sw',node:sw,spec:spec,val:val});
     return wrap;
   }
 
-  let h='<label><span>'+esc(spec.label)+(spec.required?'<span class="req">必填</span>':'')+'</span><span class="val" id="'+vid(stage,key)+'"></span></label>';
+  const title='<label><span>'+esc(spec.label)+
+    (spec.required?'<span class="req">必填</span>':'')+'</span>'+
+    '<span class="val" id="'+vid(stage,key)+'"></span></label>';
 
   if(spec.font_pick&&spec.type==='enum'){
-    h+=fontPickerHtml(id,key,spec,v);
+    hold='<div class="hold">'+fontPickerHtml(id,key,spec,v)+'</div>';
   }else if(spec.type==='enum'||spec.options_source==='voices'){
     let opts=spec.options||[];
     if(spec.options_source==='voices'){
@@ -2318,54 +2547,66 @@ function control(stage,key,spec){
     }
     // 白名单里没装的项由后端标 off：照列不误，但置 disabled。
     // 暗显表达「不可选」，不再另写「未安装」字样——那是同一件事说两遍。
-    h+='<select id="'+id+'">'+opts.map(o=>'<option value="'+esc(String(o.value))+'"'+
+    const sel='<select id="'+id+'">'+opts.map(o=>'<option value="'+esc(String(o.value))+'"'+
       (o.off?' disabled':'')+
       (String(o.value)===String(v)?' selected':'')+'>'+esc(o.label)+
       (o.desc?' · '+esc(o.desc):'')+'</option>').join('')+'</select>';
     if(spec.preview_base){
-      // 档位试听：按钮 + 隐藏音频就地播放，换档自动停。data-* 寻址不用 id 拼
-      // 接——id 里有「.」，querySelector 裸拼会被当类名吃掉。
-      h+='<span class="pvrow"><button type="button" class="pvbtn" data-pv="'+id+'">▶ 试听</button>'+
-         '<audio controls preload="none" data-pvau="'+id+'"></audio></span>';
+      // 档位试听：按钮与下拉同槽；音频单占控件下方一行、默认不出现，点了才铺开。
+      // data-* 寻址不用 id 拼接——id 里有「.」，querySelector 裸拼会被当类名吃掉。
+      hold='<div class="hold pv">'+sel+
+        '<button type="button" class="pvbtn" data-pv="'+id+'">▶ 试听</button></div>';
+      auHtml='<audio controls preload="none" data-pvau="'+id+'" style="display:none"></audio>';
+    }else{
+      hold='<div class="hold">'+sel+'</div>';
     }
     // 音色这一行多带一句它相对标准语速的比例：换音色会改成品快慢，
     // 而这个数就是那件事的全部依据。跟着下拉的当前值走，换一个音色重算一次。
     // 不占 id：它是一句说明不是控件，界面上「带 id 的即控件」这条口径不能破
     // （冒烟按 id 数控件、核登记，给它一个 f_ 开头的 id 就多出一个查无登记的幽灵）。
     if(spec.options_source==='voices'){
-      h+='<div class="desc ratio-note"></div>';
+      note+='<div class="desc ratio-note"></div>';
       // 克隆变体下这些名字不是「合成用的音色」，而是「录参考音频时挑的嗓子」。
       // 不说明白，人会以为在这里换个名字整期声音就跟着换 —— 实际要重录才生效。
-      if((voicesFor(spec)[0]||{}).ref_based) h+='<div class="desc">'+
+      if((voicesFor(spec)[0]||{}).ref_based) note+='<div class="desc">'+
         '本机跑的是克隆变体：这几个名字只决定用哪把嗓子录本项目的参考音频。'+
         '录好后整期都用那份音频，要换得去项目卡片上的「音色」重录一次。</div>';
     }
-    if(spec.help) h+='<div class="desc">'+esc(spec.help)+'</div>';
   }else if(spec.options_source==='models'){
     // 模型名用下拉（select）。从前这里是「输入框 + datalist」——datalist 是浏览器的
     // **补全候选**，它拿框里已有的字去筛：框里填着 qwen/qwen3.5-35b-a3b 时，15 个
     // 候选只剩含这串字的那一个，看着就像"下拉拉不出来"。select 才是点开列全部。
     // 列表里没有的名字从末项「手动填写…」进，这条能力不丢。
-    h+='<select id="'+id+'" data-models="1"></select>';
+    hold='<div class="hold"><select id="'+id+'" data-models="1"></select></div>';
   }else if(spec.type==='int'||spec.type==='float'){
     const step=spec.step||(spec.type==='int'?1:0.1);
     if(spec.min!==undefined&&spec.max!==undefined){
-      h+='<input type="range" id="'+id+'" min="'+spec.min+'" max="'+spec.max+
-         '" step="'+step+'" value="'+v+'">'+
-         '<div class="scale"><span>'+fmtNum(spec,spec.min)+'</span><span>'+fmtNum(spec,spec.max)+'</span></div>';
+      hold='<div class="hold"><input type="range" id="'+id+'" min="'+spec.min+
+           '" max="'+spec.max+'" step="'+step+'" value="'+v+'"></div>';
+      scale='<div class="scale"><span>'+fmtNum(spec,spec.min)+'</span>'+
+            '<span>'+fmtNum(spec,spec.max)+'</span></div>';
     }else{
-      h+='<input type="number" id="'+id+'" value="'+v+'">';
+      hold='<div class="hold"><input type="number" id="'+id+'" value="'+v+'"></div>';
     }
+  }else if(spec.type==='path'){
+    /* 路径类点位填的是**本机绝对路径**——管线一律拿 os.path.exists 判它，文件不在
+       就当作没填（片头尾、立绘、自备音乐都是静默跳过）。手打一条 Windows 路径既慢
+       又容易错，所以在框旁边给「选择…」：弹本机文件对话框，选完把绝对路径写回这个
+       点位，与手填完全等价——不复制文件、不改读取位置。
+       占位符必须把「这是什么」说出来：一个空框配「留空即不使用」，只说了可不可以
+       不填，没说该往里放什么。 */
+    hold='<div class="hold pv"><input type="text" id="'+id+'" value="'+esc(v==null?'':v)+
+         '" placeholder="本机绝对路径，留空即不使用">'+
+         '<button type="button" class="pvbtn" data-pick="'+id+'">选择…</button></div>';
   }else if(spec.type==='text'){
-    // help 已经作为常驻说明渲染在下方，再塞进 placeholder 就是同一句话写两遍：
-    // 输入框里一句、框下面又一句。
-    h+='<textarea id="'+id+'">'+esc(v||'')+'</textarea>';
-    if(spec.help) h+='<div class="desc">'+esc(spec.help)+'</div>';
+    // 多行输入自成一块，不塞进 34px 的控件槽。help 已经作为常驻说明渲染在下方，
+    // 再塞进 placeholder 就是同一句话写两遍：框里一句、框下面又一句。
+    hold='<textarea id="'+id+'">'+esc(v||'')+'</textarea>';
   }else{
-    h+='<input type="text" id="'+id+'" value="'+esc(v==null?'':v)+'"'+
-       (spec.type==='path'?' placeholder="留空即不使用"':'')+'>';
+    hold='<div class="hold"><input type="text" id="'+id+'" value="'+esc(v==null?'':v)+'"></div>';
   }
-  wrap.innerHTML=h;
+  wrap.innerHTML=title+hold+(scale||'<div class="scale"></div>')+note+
+    (spec.help?'<div class="desc">'+esc(spec.help)+'</div>':'')+auHtml;
 
   const node=wrap.querySelector('[id="'+id+'"]');
   const val=wrap.querySelector('[id="'+vid(stage,key)+'"]');
@@ -2392,6 +2633,22 @@ function control(stage,key,spec){
       au.onended=stop;
       node.addEventListener('change',stop);
     }
+  }
+  if(spec.type==='path'&&node){
+    // 对话框在本机弹（服务就跑在这台机器上），选完把路径当普通取值写回去——
+    // 走的是与手填同一条 put()，所以校验、跨页同步、落盘全都照旧。
+    // 用户取消＝什么都没发生，不当成错误弹提示。
+    const pb=wrap.querySelector('[data-pick="'+id+'"]');
+    if(pb) pb.onclick=async()=>{
+      const old=pb.textContent;
+      pb.disabled=true; pb.textContent='选择中…';
+      let r=null;
+      try{r=await api('/api/pickfile',{key:key});}
+      finally{pb.disabled=false; pb.textContent=old;}
+      if(!r||!r.ok){toast((r&&r.error)||'打不开本机文件对话框','err');return}
+      if(r.cancelled) return;
+      put(key,r.path);
+    };
   }
   const isFont=!!(spec.font_pick&&spec.type==='enum');
   if(node&&!isFont){
@@ -2447,6 +2704,65 @@ let recalcTimer=null;
 function recalcSoon(){clearTimeout(recalcTimer);recalcTimer=setTimeout(()=>{if(SCRIPT.length)recalc()},700)}
 
 /* ---- 渲染 ---- */
+/* 卡内功能区：一张卡里常混着好几件事。LLM 那张卡既有「连到哪个后端、用哪个模型」
+   也有「生成参数」「超时」——只按类型分行，这三件事会被切成三段、彼此不相邻，
+   人看不出谁和谁是一组。所以在卡内再切一层：功能区在上（小标题），区内的项再按
+   类型分行。
+   这张表是「谁和谁一起」的唯一出处，顺序即卡里的顺序。规则两条：
+     ①一张卡只有一个功能区时不画小标题，跟从前逐字一样；
+     ②表里漏登记的点位掉进末尾的「其它」，不至于凭空消失（真正防漏的是
+       tests/test_config_keys 里那条与 PARAM_SPEC 的对账）。 */
+const ZONES=[
+  ['script','时长与规模',['script.target_minutes','script.segment_min_sents',
+                        'script.max_llm_rounds','script.map_max_episodes']],
+  ['script','切分与文体',['script.paradigm','script.compress_ratio',
+                        'script.style_preset','script.dialogue_form']],
+  ['script','取材与门禁',['script.shape_flags','script.gate_strict',
+                        'script.flag_title_words']],
+  ['gate','总时长容差',['gate.max_deviation_pct','gate.min_deviation_seconds']],
+  ['gate','单句长短',['gate.min_chars','gate.max_chars','gate.max_seconds_per_line']],
+  ['llm','连接',['llm.backend','llm.model','llm.base_url','llm.api_key']],
+  ['llm','生成参数与超时',['llm.temperature','llm.max_tokens','llm.input_ratio',
+                         'llm.idle_timeout','llm.timeout']],
+  ['tts','引擎与音色',['tts.engine','tts.voice_a','tts.voice_b',
+                     'tts.qwen3tts_voice_a','tts.qwen3tts_voice_b']],
+  ['tts','称呼与语速',['tts.name_a','tts.name_b','tts.speed_a','tts.speed_b']],
+  ['tts','本地语音服务',['tts.qwen3tts_host','tts.qwen3tts_port','tts.throttle_seconds',
+                      'tts.max_retries','tts.unload_llm_before_synth']],
+  ['audio','编码与响度',['audio.sample_rate','audio.bitrate_kbps','audio.channels',
+                       'audio.codec','audio.loudnorm_target']],
+  ['audio','停顿与降噪',['audio.pause_between_lines','audio.denoise']],
+  ['audio','片头尾与声明',['audio.intro_path','audio.outro_path',
+                        'audio.ai_disclosure_text','audio.ai_disclosure_path']],
+  ['bgm','来源与音量',['bgm.mode','bgm.preset','bgm.custom_path','bgm.volume']],
+  ['bgm','人声闪避',['bgm.ducking','bgm.duck_threshold','bgm.duck_ratio','bgm.fade_seconds']],
+  ['video','画幅与帧率',['video.width','video.height','video.fps','video.produce_vertical']],
+  ['video','编码与画面处理',['video.encoder_preset','video.crf','video.bg_dim']],
+  ['speaker_indicator','指示方式与颜色',['speaker_indicator.mode','speaker_indicator.color_a',
+                                   'speaker_indicator.color_b']],
+  ['speaker_indicator','立绘',['speaker_indicator.portrait_a','speaker_indicator.portrait_b']],
+  ['subtitle','版式与字号',['subtitle.preset','subtitle.font_size','subtitle.font_size_vertical']],
+  ['subtitle','边距与底框',['subtitle.margin_lr','subtitle.margin_v','subtitle.margin_v_vertical',
+                          'subtitle.outline','subtitle.bg_alpha']],
+  ['subtitle','角色字幕色',['subtitle.color_a','subtitle.color_b']]
+];
+const ZONE_OF={};
+ZONES.forEach(z=>{(z[2]||[]).forEach(k=>{ZONE_OF[k]={sec:z[0],label:z[1]}})});
+/* 把一张卡的点位按功能区归拢。没在表里登记的卡（整张卡只讲一件事）回落成一个
+   无名的区，标题也不画——与从前完全一样。 */
+function zoneList(sec,items){
+  const out=[], idx={};
+  const box=label=>{
+    if(!(label in idx)){idx[label]=out.length;out.push({label:label,items:[]})}
+    return out[idx[label]];
+  };
+  ZONES.forEach(z=>{if(z[0]===sec) box(z[1])});
+  items.forEach(it=>{
+    const z=ZONE_OF[it.key];
+    box(z&&z.sec===sec?z.label:'其它').items.push(it);
+  });
+  return out.filter(z=>z.items.length);
+}
 function orderSections(keys){
   const ord=(CFG.ui.section_order||[]);
   return keys.slice().sort((a,b)=>{
@@ -2458,14 +2774,45 @@ function orderSections(keys){
 }
 function secLabel(s){return (CFG.ui.section_labels||{})[s]||s}
 
+/* 控件按形态分桶，同形态的排在一起：滑杆一行、开关一行、下拉一行、输入框一行。
+   这是「一格一控件」之外的另一半规矩——只把格子做齐，滑杆照样会跟下拉隔着五个
+   格子，调数值时要在一整张卡上来回找。分桶之后，每一行是什么类控件，扫一眼就
+   知道该往哪一行看。
+   形态判定必须与 control() 里那几支 if 一一对应：判错了，桶里会混进另一种控件，
+   比不分桶更乱。 */
+function ctlKind(spec){
+  if(!spec) return 9;
+  if(spec.type==='bool') return 2;                       // 开关
+  if(spec.type==='enum'||spec.options_source) return 3;  // 下拉（含音色/模型/字体）
+  if(spec.type==='int'||spec.type==='float')
+    return (spec.min!==undefined&&spec.max!==undefined)?1:4;   // 滑杆 / 数字框
+  if(spec.type==='text') return 5;                       // 多行输入
+  return 4;                                              // 单行文本 / 路径
+}
+/* 稳定排序：同形态内保持原来的声明顺序——这次改的是排布，配置项的先来后到不动。 */
+function byKind(list){
+  return list.map((it,i)=>{return {it:it,i:i}})
+    .sort((a,b)=>(ctlKind(a.it)-ctlKind(b.it))||(a.i-b.i))
+    .map(x=>x.it);
+}
+/* 按形态铺进网格：一类一行（形态一变就另起一行，见样式里的 .kstart）。
+   一行填不满就空着，后面的控件不回头填空。 */
+function fillByKind(box,stage,list){
+  let prev=null;
+  byKind(list).forEach(spec=>{
+    const k=ctlKind(spec);
+    const node=control(stage,spec.key,spec);
+    if(k!==prev) node.classList.add('kstart');
+    prev=k;
+    box.appendChild(node);
+  });
+}
+
 function put2(target,keys){
   const box=(typeof target==='string')?el(target):target;
   if(!box) return;
   box.innerHTML=''; pruneReg();
-  keys.forEach(k=>{
-    const spec=specOf(k); if(!spec) return;
-    box.appendChild(control('quick',k,spec));
-  });
+  fillByKind(box,'quick',keys.map(k=>specOf(k)).filter(x=>x));
 }
 function specOf(key){
   for(const st in CFG.params){
@@ -2486,9 +2833,15 @@ function renderConfig(){
     card.className='card';
     card.innerHTML='<h2>'+esc(secLabel(sec))+'</h2>'+
       (CFG.ui.section_note[sec]?'<p class="note">'+esc(CFG.ui.section_note[sec])+'</p>':'');
-    const g=document.createElement('div'); g.className='grid';
-    (groups[sec]||[]).forEach(item=>g.appendChild(control('cfg',item.key,item)));
-    card.appendChild(g);
+    const zones=zoneList(sec,groups[sec]||[]);
+    zones.forEach(z=>{
+      // 只有一件事的卡不画小标题：多一行标题等于给一个不言自明的分区加注解
+      if(zones.length>1)
+        card.insertAdjacentHTML('beforeend','<div class="zhead">'+esc(z.label)+'</div>');
+      const g=document.createElement('div'); g.className='grid g4';
+      fillByKind(g,'cfg',z.items);
+      card.appendChild(g);
+    });
     // 语音引擎那张卡上多挂一块「本地环境」。它属于配置阶段：用户把引擎选成
     // Qwen3-TTS 的那一刻，缺的环境/依赖/模型就该在这一页补上，而不是等合成
     // 时才被告知「没装」——那时候人已经在等的另一件事上了。
@@ -2510,7 +2863,11 @@ function renderConfig(){
 function renderQuick(){
   // 称呼与语速跟脚本同时生效：称呼直接写进提示词，模型据此称呼两位说话人。
   // 放在这里是为了「想改名就在脚本页改得到」，不必翻到配置页去找。
+  // 对话形式与风格倾向同理：两者都是「写脚本那一刻才定的文体选择」，摆在这一排
+  // 改完直接点下面的「生成脚本」；藏在配置页里，改一次要切两次页，人会以为
+  // 「改了没生效」。它跟风格倾向是同一类东西，处置也必须一致。
   put2('quick-script',['script.target_minutes','script.style_preset',
+                       'script.dialogue_form',
                        'tts.name_a','tts.name_b','tts.speed_a','tts.speed_b']);
   put2('quick-render',['video.fps','video.produce_vertical','subtitle.preset','background.preset',
                        'animation.mode','audio.bitrate_kbps']);
@@ -2555,6 +2912,10 @@ function showTab(name,boot){
   if(boot&&name!=='config') return;
   if(name==='config') renderConfig();
   if(name==='project') loadProjects();
+  /* 脚本/合成两页切进来补一次重拉：页面之外发生的变化（另开窗口改了、
+     别的任务写完了稿）不刷新就永远看不见。勾选由 refreshEpisodes 保留。 */
+  if(name==='script') refreshEpisodes('s');
+  if(name==='render') refreshEpisodes('r');
 }
 function goTab(name){
   if(hashTab()!==name) location.hash=name;
@@ -2577,7 +2938,7 @@ function fmt(s){s=Math.round(s);return Math.floor(s/60)+':'+String(s%60).padStar
 async function loadConfig(){
   const c=await api('/api/config');
   if(!c.ok){toast('配置加载失败','err');return}
-  CFG=c; el('ver').textContent='v'+c.version; EMOTIONS=c.emotions||[];
+  CFG=c; el('ver').textContent='v'+c.version;
   renderQuick(); renderStandard(); fillStyleSelect(); renderGauge(null);
   if(TAB==='config') renderConfig();
   renderAudioWarn();
@@ -2919,16 +3280,18 @@ function renderScript(){
     '<td><select onchange="SCRIPT['+i+'].speaker=this.value;recalc()" style="width:100%">'+
       '<option value="A"'+(s.speaker==='A'?' selected':'')+'>A</option>'+
       '<option value="B"'+(s.speaker==='B'?' selected':'')+'>B</option></select></td>'+
+    '<td><select onchange="SCRIPT['+i+'].emotion=this.value" style="width:100%">'+
+      EMOTIONS.map(w=>'<option value="'+w+'"'+(s.emotion===w?' selected':'')+'>'+w+'</option>').join('')+
+      '</select></td>'+
     '<td><input type="text" value="'+esc(s.text)+'" onchange="SCRIPT['+i+'].text=this.value;recalc()" style="width:100%"></td>'+
-    '<td><select onchange="SCRIPT['+i+'].emotion=this.value;recalc()" style="width:100%">'+
-      EMOTIONS.map(e=>'<option'+(e===s.emotion?' selected':'')+'>'+esc(e)+'</option>').join('')+'</select></td>'+
     '<td class="num">'+(s.text||'').length+'</td>'+
     '<td class="num">'+(s.estimated_seconds!=null?s.estimated_seconds:'-')+'</td>'+
     '<td class="num">'+(s.actual_seconds!=null?s.actual_seconds:'-')+'</td></tr>').join('');
 }
 function recalc(){
   if(!SCRIPT.length) return;
-  api('/api/script/gate',{script:SCRIPT, project_id:(el('s-project')||{}).value||''}).then(r=>{
+  api('/api/script/gate',{script:SCRIPT, project_id:(el('s-project')||{}).value||'',
+      episode_no:(LOADED_EP||picked('s')[0]||'')}).then(r=>{
     if(!r.ok) return;
     SCRIPT=r.estimate.rows.map((row,i)=>Object.assign({},SCRIPT[i],
       {estimated_seconds:row.estimated_seconds,actual_seconds:row.actual_seconds}));
@@ -2939,6 +3302,7 @@ function recalc(){
 async function loadEpisodes(which){
   const wrap=el(which+'-eps-wrap');
   const pid=(el(which+'-project')||{}).value||'';
+  EPILOADED[which]=true;
   EPISEL[which].clear();
   /* 切回单集模式时收起选期表，顺手把上一次的期表与计数抹掉：整个收起却留着
      旧行，下次展开前若有一帧没重绘，show 出来的就是上一个项目的期。 */
@@ -2962,6 +3326,23 @@ async function loadEpisodes(which){
   const first = which==='s' ? items.find(x=>!x.has_script)
                             : items.find(x=>x.has_script&&!x.done);
   if(first) EPISEL[which].add(first.no);
+  renderPick(which);
+}
+/* 切页进来补一次数据刷新（showTab 用）：只重拉期表，**不动勾选**。
+   loadEpisodes 会清空选择并按默认重勾——拿来当切页刷新的话，切一次页
+   勾选就没一次。这里把仍存在的勾选原样保留（用户清过空或勾过自定义组合
+   都不顶掉），新出现的期不自动勾；这一页从没载入过才走默认勾选那条路。
+   只重绘选期表，正画布上已调出的稿子（SCRIPT）一概不碰。 */
+async function refreshEpisodes(which){
+  const pid=(el(which+'-project')||{}).value||'';
+  if(!pid||!EPILOADED[which]){ await loadEpisodes(which); return }
+  const prev=[...EPISEL[which]];
+  const r=await api('/api/scripts?project_id='+encodeURIComponent(pid));
+  if(!r||!r.ok) return;
+  let items=(r.items)||[];
+  if(which==='r') items=items.filter(x=>x.has_script);
+  EPISODES[which]=items;
+  EPISEL[which]=new Set(prev.filter(no=>items.some(x=>x.no===no)));
   renderPick(which);
 }
 function renderPick(which){
@@ -3103,7 +3484,7 @@ async function genScript(){
   el('gen-log').textContent=(fromMap||!pm.material.trim())?'按地图落点取素材…':'调用模型…';
   try{
     const r0=await api('/api/script/generate',{
-      material:pm.material, extra:cfgVal('script.extra_requirement')||'',
+      material:pm.material,
       preset:cfgVal('script.style_preset'), project_id:pid, episode_no:eps[0]||''});
     if(!r0.ok){el('gen-log').textContent='失败：'+(r0.error||'');
       el('gen-status').textContent='失败'; toast(r0.error||'起任务失败','err'); return}
@@ -3141,7 +3522,7 @@ async function watchScript(tid,no){
       el('gen-log').textContent=(r2.logs||[]).join('\n')+'\n失败：'+(r2.error||'');
       toast(r2.error||'生成失败','err'); return;
     }
-    SCRIPT=r2.script; EMOTIONS=CFG.emotions||[];
+    SCRIPT=r2.script;
     LOADED_EP=no;
     if(r2.title){el('gen-title').value=r2.title; el('r-title').value=r2.title; el('gen-title-wrap').style.display=''}
     el('gen-log').textContent=(r2.logs||[]).join('\n')+'\n'+
@@ -3205,8 +3586,7 @@ async function doRender(pid,eps,ack){
   if(pid&&eps.length>1){
     const rb=await api('/api/batch',Object.assign({kind:'render',project_id:pid,
       episodes:eps,do_video:swOn('sw-do_video'),
-      preset:cfgVal('script.style_preset'),
-      extra:cfgVal('script.extra_requirement')||''},ACK));
+      preset:cfgVal('script.style_preset')},ACK));
     if(!rb.ok){toast(rb.error,'err');return}
     el('btn-render').disabled=true;
     toast('开始合成 '+eps.length+' 期（串行，失败跳过）','ok');
@@ -3216,8 +3596,7 @@ async function doRender(pid,eps,ack){
   }
   if(pid){
     const rb=await api('/api/render',Object.assign({project_id:pid,episode_no:eps[0],
-      do_video:swOn('sw-do_video'),preset:cfgVal('script.style_preset'),
-      extra:cfgVal('script.extra_requirement')||''},ACK));
+      do_video:swOn('sw-do_video'),preset:cfgVal('script.style_preset')},ACK));
     if(!rb.ok){toast(rb.error,'err');return}
     CUR_JOB=rb.task_id; el('btn-render').disabled=true;
     el('btn-stop-r').style.display='';
@@ -3231,7 +3610,6 @@ async function doRender(pid,eps,ack){
   if(!SCRIPT.length){toast('尚无脚本，先到「脚本」页生成','err');return}
   const r=await api('/api/render',Object.assign({title:title,script:SCRIPT,
     material:el('material').value,preset:cfgVal('script.style_preset'),
-    extra:cfgVal('script.extra_requirement')||'',
     do_video:swOn('sw-do_video')},ACK));
   if(!r.ok){toast(r.error,'err');return}
   CUR_JOB=r.task_id; el('btn-render').disabled=true;
@@ -3493,14 +3871,17 @@ async function createProject(){
   const body={action:'create',name:name,plan_mode:mode,
     program_name:el('np-program').value.trim(),
     subtitle:el('np-subtitle').value.trim(),
+    audience:el('np-audience').value.trim(),
     planned_episodes:planned?parseInt(planned,10):null,
     first_episode:el('np-first').value.trim()||'1',
     style_preset:el('np-style').value,note:el('np-note').value.trim(),
-    paradigm:el('np-paradigm').value};
+    paradigm:el('np-paradigm').value,
+    focus_note:el('np-focus').value.trim()};
   const r=await api('/api/project',body);
   if(!r.ok){toast(r.error,'err');return}
   el('np-name').value=''; el('np-program').value=''; el('np-subtitle').value='';
-  el('np-planned').value=''; el('np-note').value='';
+  el('np-audience').value='';
+  el('np-planned').value=''; el('np-note').value=''; el('np-focus').value='';
   ACTIVE_PROJ=r.project.id; localStorage.setItem('pm_proj',ACTIVE_PROJ);
   await loadProjects();
   if(mode==='mapped'){
@@ -3710,15 +4091,19 @@ async function editParadigm(pid){
     opt+='<option value="'+esc(k)+'"'+(k===r.current?' selected':'')+'>'+
          esc(r.options[k].label)+'</option>';
   });
-  let h='<p class="note">素材类型决定排地图时的组织依据：切分单位、整合依据、'+
-        '重点判据、推进方式。与规划方式不同，它不产生产物，改完自己决定要不要重排。</p>';
+  let h='<p class="note">这两样都是排地图的组织依据，只影响分组（怎么切、怎么并），'+
+        '不影响写脚本。与规划方式不同，它们不产生产物，改完自己决定要不要重排。</p>';
   h+='<div class="f"><label>素材类型</label><select id="para-sel" onchange="paraDesc()">'+
      opt+'</select><div class="desc" id="para-desc" style="margin-top:6px"></div></div>';
+  h+='<div class="f"><label>重点方向 <span class="hint">可留空。填了与上面的组织依据一起进排图：'+
+     '侧重的部分合得细、多占期数，次要的合得粗</span></label>'+
+     '<textarea id="para-focus" rows="3" placeholder="如：多解析方法论，少讲技术细节与实现">'+
+     esc(r.focus_note||'')+'</textarea></div>';
   h+='<div class="btn-row" style="margin-top:12px">'+
      '<button class="btn" onclick="saveParadigm(\''+esc(pid)+'\',false)">只保存（保留旧地图）</button>'+
      '<button class="btn primary" onclick="saveParadigm(\''+esc(pid)+'\',true)">保存并重排地图</button>'+
      '</div>';
-  modalHtml('素材类型 · 可改',h,()=>{},'关闭',true);
+  modalHtml('排图依据 · 可改',h,()=>{},'关闭',true);
   paraDesc();
 }
 function paraDesc(){
@@ -3731,11 +4116,15 @@ function paraDesc(){
 }
 async function saveParadigm(pid, redo){
   const sel=el('para-sel'); if(!sel) return;
-  const r=await api('/api/project',{action:'update',id:pid,paradigm:sel.value});
+  const foc=el('para-focus');
+  const r=await api('/api/project',{action:'update',id:pid,paradigm:sel.value,
+    focus_note:foc?foc.value.trim():''});
   if(!r.ok){toast(r.error,'err');return}
   await loadProjects();
   closeModal();
-  toast('素材类型已更新','ok');
+  // 「只保存」是正当选择（旧地图不跟着变），但这两样都只在排图那一刻被读——
+  // 不说清，人会以为存了就已经生效。
+  toast(redo?'排图依据已更新，正在重排地图':'排图依据已保存（重排地图后才生效）','ok');
   if(redo) doPlanMap(pid);
 }
 async function openMap(pid){
@@ -3913,26 +4302,33 @@ async function setPlanMode(pid,mode){
   toast('规划方式定为「'+label+'」，此后不可更改','ok');
   if(mode==='mapped') openSources(pid);
 }
-/* 节目名与副标题是整档节目共用的身份，不是某一期的内容，所以挂在项目上：
-   改一次，往后每一期的画面（背景与封面）都自动带上同一份。
-   两个都可以留空——节目名留空即同项目名，副标题留空则画面上不印那一行。 */
+/* 节目名、副标题与受众是整档节目共用的身份，不是某一期的内容，所以挂在项目上：
+   改一次，往后每一期都带上同一份。三者都可以留空——节目名留空即同项目名，
+   副标题留空则画面上不印那一行，受众留空则片头里「面向…的听众」那一小句整个不出现。
+   生效时机分两种，说清楚免得人改完看不见变化：画面（背景与封面）是出片时现取的，
+   改完立刻生效；片头句是生成脚本时粘上去的，只有**之后生成的期**才用新值。 */
 function editIdentity(pid){
   const p=(PROJECTS||[]).find(x=>x.id===pid)||{};
   const html=
-    '<div class="dim" style="font-size:12px;margin-bottom:10px">这两个是整档节目共用的身份，'+
-    '改动对之后每一期的画面生效。</div>'+
+    '<div class="dim" style="font-size:12px;margin-bottom:10px">这三样是整档节目共用的身份。'+
+    '画面上的改动立刻生效；片头句要重生成那一期才会变。</div>'+
     '<div style="margin-bottom:10px"><div class="dim" style="font-size:12px;margin-bottom:4px">'+
     '节目名（留空即同项目名）</div>'+
     '<input type="text" id="ei-program" value="'+esc(p.program_name||'')+'"></div>'+
-    '<div><div class="dim" style="font-size:12px;margin-bottom:4px">'+
+    '<div style="margin-bottom:10px"><div class="dim" style="font-size:12px;margin-bottom:4px">'+
     '副标题（留空则画面不印这一行）</div>'+
-    '<input type="text" id="ei-subtitle" value="'+esc(p.subtitle||'')+'"></div>';
-  modalHtml('节目名 / 副标题',html,async()=>{
-    const program=el('ei-program').value.trim(), subtitle=el('ei-subtitle').value.trim();
+    '<input type="text" id="ei-subtitle" value="'+esc(p.subtitle||'')+'"></div>'+
+    '<div><div class="dim" style="font-size:12px;margin-bottom:4px">'+
+    '受众（片头「面向…的听众」里的那一句；留空则那一小句整个不出现。改完要重出那一期才会变）</div>'+
+    '<input type="text" id="ei-audience" value="'+esc(p.audience||'')+'"></div>';
+  modalHtml('节目名 / 副标题 / 受众',html,async()=>{
+    const program=el('ei-program').value.trim(), subtitle=el('ei-subtitle').value.trim(),
+          audience=el('ei-audience').value.trim();
     const r=await api('/api/project',{action:'update',id:pid,
-                                      program_name:program,subtitle:subtitle});
+                                      program_name:program,subtitle:subtitle,
+                                      audience:audience});
     if(!r.ok){toast(r.error||'保存失败','err');return}
-    toast('节目名 / 副标题已更新','ok'); loadProjects();
+    toast('节目名 / 副标题 / 受众已更新','ok'); loadProjects();
   },'保存');
 }
 /* ------------------------------------------------------------------ 角色音色
@@ -4088,4 +4484,11 @@ window.onload=async()=>{
 </body>
 </html>
 """
+
+# 语篇词表单源注入：脚本页情绪下拉的选项来自 config_manager 的 DISCOURSE_ORDER，
+# 就是**唯一的那一份词表**（生成侧的枚举、门禁的判据也读它，没有任何按风格收窄
+# 的第二步——收窄过两次，两次都导致「界面能选、门禁打回」）。词表改了这里自动跟，
+# 不存在两处各一份的账。
+PAGE = PAGE.replace('"__DISCOURSE_VOCAB__"',
+                    json.dumps(DISCOURSE_ORDER, ensure_ascii=False))
 

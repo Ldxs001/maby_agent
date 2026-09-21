@@ -462,57 +462,75 @@ class TestThinkingAndJson(unittest.TestCase):
 
 
 class TestInputBudget(unittest.TestCase):
-    """素材容量：参照系是**成稿脚本**，不由「最大输出 × 输入倍率」推。
+    """输入额度 = 最大输出 × 输入倍率：它答的是「这一次调用装不装得下」。
 
-    1:x 的 1 是撑满每期时长的脚本，x 是它消化的素材倍数——容量由业务线按
-    「成稿 × 档位 × 1.25」推导后传入（script_engine.material_capacity），
-    客户端只把字数折成 token（含估算余量）并提醒窗口自查。从前的
-    「输入额度 = 最大输出 × 倍率」参照系挂错了（素材额度跟输出预算无关），
-    整条链已删。不猜、不探、不兜底。
+    「这一期该讲多少料」由画地图按压比定死（成稿 × 档位 × 1.25），是另一个量，
+    参照系是成稿脚本、跟模型无关。两个量混成一个数，就会出现「内容明明合格、
+    却因上下文放不下而降级凝缩」的错配——所以两把尺各有各的用例，谁也不替代谁。
     """
 
-    def test_material_tokens_folds_chars_with_reserve(self):
+    def _client(self, ratio=1.0):
         c = LLMClient(backend="lm-studio", base_url="http://127.0.0.1:1/v1",
-                      model="m")
+                      model="m", input_ratio=ratio)
 
         def boom(*a, **k):
             raise AssertionError("折算不该碰网络")
 
         c._request = boom
+        return c
+
+    def test_material_tokens_folds_chars_with_reserve(self):
+        c = self._client()
         # 没有样本时折合比取最保守的 1.0：10000 字 → 10000 token
         # + max(1024, 10000×8%)=1024 余量。
         self.assertEqual(c.material_tokens(10000), 11024)
         self.assertEqual(c.material_tokens(0), 0)
 
-    def test_required_context_is_output_plus_material(self):
-        c = LLMClient(backend="lm-studio", base_url="http://127.0.0.1:1/v1",
-                      model="m")
-        self.assertEqual(c.required_context(8192, 10000), 8192 + 11024)
-        self.assertEqual(c.required_context(8192, 0), 8192)
-
     def test_learned_ratio_shrinks_the_token_demand(self):
-        c = LLMClient(backend="lm-studio", base_url="http://127.0.0.1:1/v1",
-                      model="m")
+        c = self._client()
         c._note_usage(1000, {"prompt_tokens": 750})
         self.assertAlmostEqual(c.tokens_per_char(), 0.75)
         # 10000 字 × 0.75 = 7500 token + max(1024, 7500×8%)=1024 余量。
         self.assertEqual(c.material_tokens(10000), 8524)
 
     def test_material_tokens_floor_at_zero(self):
-        c = LLMClient(backend="lm-studio", base_url="http://127.0.0.1:1/v1",
-                      model="m")
+        c = self._client()
         self.assertEqual(c.material_tokens(-5), 0, "负数没有任何下游读得懂")
 
-    def test_quota_note_carries_numbers_and_reminder(self):
-        c = LLMClient(backend="lm-studio", base_url="http://127.0.0.1:1/v1",
-                      model="m")
+    def test_input_budget_is_output_times_ratio(self):
+        """额度就是最大输出乘倍率——这是「一次装多少」的唯一算法源。"""
+        c = self._client(ratio=2.0)
+        self.assertEqual(c.input_budget_tokens(47872), 95744)
+        self.assertEqual(c.input_budget_tokens(0), 0)
+        self.assertEqual(self._client(ratio=0.0).input_budget_tokens(999), 0)
+
+    def test_budget_chars_discounts_overhead_and_the_reserve(self):
+        """按字符切批用的额度：两端同口径折 token，折回字符时倒扣余量（保守）。"""
+        c = self._client(ratio=2.0)
+        # 额度 20000；占位 1000 字 → 1000 + 1024 余量 = 2024 token，剩 17976；
+        # 折回字符时按 1.08 倒扣 → 16644。
+        self.assertEqual(c.budget_chars(10000, other_chars=1000), 16644)
+
+    def test_budget_chars_returns_zero_when_overhead_eats_it(self):
+        """额度被占位吃光返回 0：调用方据此报「未核」，不许硬塞素材。"""
+        c = self._client(ratio=1.0)
+        self.assertEqual(c.budget_chars(100, other_chars=10000), 0)
+
+    def test_quota_note_reports_what_we_feed_and_asks_nothing(self):
+        """日志只报「准备喂多少」，不对后端提要求——窗口多大不归程序管。"""
+        c = self._client(ratio=2.0)
         note = c.quota_note(8192, 10000)
-        self.assertIn("10000", note, "素材容量（字）必须在句子里")
-        self.assertIn("11024", note, "折合输入 token 必须在句子里")
-        self.assertIn("8192", note, "输出预算必须在句子里")
-        self.assertIn("请保证后端", note, "自查提醒必须在句子里")
-        self.assertNotIn("倍", note,
-                         "「最大输出的几倍」那套参照系不许再出现")
+        self.assertIn("16384", note, "输入额度（= 8192 × 2）必须在句子里")
+        self.assertIn("11024", note, "素材折合输入 token 必须在句子里")
+        self.assertIn("2.0", note, "倍率必须在句子里")
+        self.assertIn("不丢料", note, "放不下会切成多段喂完，这句要写明")
+        self.assertNotIn("窗口", note, "不许对后端窗口提要求：那是使用者自己的事")
+        self.assertNotIn("19216", note, "「输出 + 输入」那个窗口要求不该再出现")
+
+    def test_no_window_demand_is_left_in_the_client(self):
+        """程序不再回答「后端窗口要多大」——这个入口已经从客户端删掉。"""
+        self.assertFalse(hasattr(self._client(), "required_context"),
+                         "required_context 是「算窗口要求」用的，已整条删除")
 
     def test_usage_without_prompt_tokens_is_ignored(self):
         c = client()

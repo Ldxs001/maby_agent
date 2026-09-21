@@ -80,10 +80,15 @@ _EPISODE_ITEM = {
     "required": ["units", "title", "gist", "points"],
 }
 
+# `audience` 是**节目级**的一句，与期无关：它印在每一期的片头里，同一档节目
+# 每期逐字一致（见 INTRO_OUTRO 与 glue_intro_outro）。放在 episodes 前面——
+# 先定「这档节目给谁听」再分组，分组时的取舍才有依据；反过来先分完组再补一句
+# 受众，那句就成了事后追认，与分出来的图没有关系。
 MAP_SCHEMA = {
     "type": "object",
-    "properties": {"episodes": {"type": "array", "items": _EPISODE_ITEM}},
-    "required": ["episodes"],
+    "properties": {"audience": {"type": "string"},
+                   "episodes": {"type": "array", "items": _EPISODE_ITEM}},
+    "required": ["audience", "episodes"],
 }
 
 # 插入比排图多一个字段：插入点。**必须各用各的 schema** —— 约束解码按 schema
@@ -310,7 +315,10 @@ MAP_SYSTEM = """你为播客排播出计划（期数地图）。素材的结构�
 期数不由程序算定。合并的依据是内容，但合出来的每一期都受**分量的上下限**双重约束：
 一期的素材体量按清单里的字数合计，超出上限或低于下限的期都会被程序退回重排。
 下限尤其要紧——料不够的期，写的时候只能把写过的段落再背一遍凑数。每一期的标题、
-主旨与要点也由你给。期号与落点由程序填。只输出 JSON。"""
+主旨与要点也由你给。期号与落点由程序填。只输出 JSON。
+
+另外给一句 audience：**这档节目是给谁听的**。它印在每一期的片头里，同一档节目
+每期逐字一致——所以写的是这档节目面向的听众，不是某一期的听众。"""
 
 
 def _map_prompt(brief, block, want_eps, per_ep, target, ratio, feedback=None):
@@ -377,6 +385,14 @@ def _map_prompt(brief, block, want_eps, per_ep, target, ratio, feedback=None):
 不要打乱稿子自身的推进顺序。
 %s
 
+【另外给一项：受众】（与期无关，整档节目一句）
+
+audience：这档节目面向谁，**写成能直接填进「面向___的听众」的定语**。
+- 12 字以内，以名词或名词短语收尾，例：关注方法论与认知边界、做后端开发的中年人
+- 不带「面向」「的听众」「观众」这几个词——它们已经在句式里了，写进去会重复
+- 不写标点，不写「所有」「广大」这类说了等于没说的限定
+- 写的是这档节目对谁有用，不是某几期的听众；这一句会印在每一期的片头里
+
 【每期给四项】（缺一不可）
 
 - title：本期标题，不超过 20 字，要能独立成集
@@ -386,7 +402,8 @@ def _map_prompt(brief, block, want_eps, per_ep, target, ratio, feedback=None):
 
 【输出】（只输出 JSON 对象）
 
-{"episodes":[{"units":[1,2,3],"title":"标题","gist":"本期主旨",
+{"audience":"关注方法论与认知边界",
+ "episodes":[{"units":[1,2,3],"title":"标题","gist":"本期主旨",
  "points":["要点一","要点二"]}]}
 
 units 要**覆盖清单里的全部序号，每个序号恰好出现一次**——漏掉的单元不会有人
@@ -547,8 +564,9 @@ def _span(progress, lo, hi):
 def plan_map(base, pid, item, cfg, llm, log=None, force=False, progress=None):
     """排出期数地图。
 
-    流程见模块开头。返回 {"episodes", "warnings", "capacity", "planned",
-    "kind", "ratio", "unit_level"}。期号、落点、每期体量已由代码填好。
+    流程见模块开头。返回 {"audience", "episodes", "warnings", "capacity",
+    "planned", "kind", "ratio", "unit_level"}。期号、落点、每期体量已由代码
+    填好；`audience` 是整档节目的一句（印在每期片头里），不是某一期的。
     排图前做产能预检（素材撑不起计划的期数直接拦）；排完做压比体检，
     超压缩档红线（上限档位×1.25、下限 1.2）的带数字反馈整体重排至多
     MAP_RETRIES 次，凝缩全程复用，仍不达标落警告交人。
@@ -622,13 +640,24 @@ def plan_map(base, pid, item, cfg, llm, log=None, force=False, progress=None):
     for sid, ir in sources.items():
         probe.save(base, pid, sid, probe.stamp_condense(ir))
 
-    block = paradigms.prompt_block(kind)
+    # 人写的侧重（项目级「重点方向」）与卡上的重点判据一起进这一块。它是
+    # **增量**：没写时 `prompt_block` 的输出与从前逐字一致，老项目的排图口径
+    # 不会因为多了这条通道就悄悄变。写与不写都只影响分组粒度，不碰上下限。
+    focus_note = str((item or {}).get("focus_note") or "").strip()
+    block = paradigms.prompt_block(kind, extra_focus=focus_note)
+    if focus_note:
+        log("分组侧重（人写）：%s" % focus_note)
     brief = _units_text(units)
     if progress:
         progress("模型分组", 0.85)
     log("组织依据：%s；一期素材约 %d 字（压缩档 1:%d 参照）；期数由合并与切分的结果决定"
         % (paradigms.get(kind)["label"], per_ep, ratio))
     _oversize_warnings(units, per_ep, ratio, warnings)
+
+    # 受众只认**第一次给出的那一版**。重排是「分组重来」，受众与分组无关；跟着
+    # 每次回答一起变，会让同一档节目在重排之后换一句片头语，而两次调用给出的都
+    # 说得通——那时谁也说不清该用哪一个。第一次的值落库，此后由人在界面上改。
+    audience = [""]
 
     def _ask(feedback=None):
         raw, _meta = llm.chat(
@@ -639,7 +668,11 @@ def plan_map(base, pid, item, cfg, llm, log=None, force=False, progress=None):
             temperature=float(cfg.get("llm.temperature", 0.8)),
             max_tokens=int(cfg.get("llm.max_tokens", 8192)),
             json_schema=MAP_SCHEMA)
-        return _json_object(raw, "排地图").get("episodes")
+        data = _json_object(raw, "排地图")
+        got = str(data.get("audience") or "").strip()
+        if got and not audience[0]:
+            audience[0] = got
+        return data.get("episodes")
 
     def _build(rows):
         groups, _dropped = _clean_groups(rows, len(units), warnings)
@@ -688,7 +721,8 @@ def plan_map(base, pid, item, cfg, llm, log=None, force=False, progress=None):
         progress("落库", 0.98)
     log("地图排出 %d 期，覆盖 %d 个单元"
         % (len(episodes), sum(len(e["refs"]) for e in episodes)))
-    return {"episodes": episodes, "warnings": warnings, "capacity": per_ep,
+    return {"audience": audience[0],
+            "episodes": episodes, "warnings": warnings, "capacity": per_ep,
             "planned": n_eps, "kind": kind, "ratio": ratio,
             "unit_level": max([int(ir.get("unit_level") or 1)
                                for ir in sources.values()] or [1])}
@@ -863,7 +897,12 @@ def plan_insert(base, pid, item, cfg, llm, source_ids=None, log=None,
 
     _oversize_warnings(units, per_ep, ratio, warnings)
 
-    block = paradigms.prompt_block(kind)
+    # 与首次排图同一条通道：插入也是重分组，人写的侧重照样要进依据——
+    # 只在「首次排图」生效、插入时不认，等于同一档节目换一次料就换一套口径。
+    focus_note = str((item or {}).get("focus_note") or "").strip()
+    block = paradigms.prompt_block(kind, extra_focus=focus_note)
+    if focus_note:
+        log("分组侧重（人写）：%s" % focus_note)
     units_text = _units_text(units)
     if progress:
         progress("模型定插入点并分组", 0.55)

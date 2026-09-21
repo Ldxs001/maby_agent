@@ -279,7 +279,6 @@ def fonts_dir_of(font):
 
 # ------------------------------------------------------------------ 字形覆盖
 _NOTDEF_PROBE = "\ue05f"   # 私用区码位，字体几乎必然没有，用来复现 .notdef
-KIND_MARKS = ("▸", "◆", "·")   # 副标签前缀符号，按字体实际支持情况依次挑
 
 
 def glyph_ok(font, ch):
@@ -310,16 +309,6 @@ def assert_glyphs(font, text, where):
             family = os.path.basename(getattr(font, "path", "")) or "当前字体"
         raise AssetError("字体「%s」缺少字形：%s（出现在%s）。请换字体或去掉这些字符。"
                          % (family, " ".join(missing), where))
-
-
-def kind_line(font, kind):
-    """给副标签加前缀符号，挑字体真正支持的那个。"""
-    if not kind:
-        return ""
-    for m in KIND_MARKS:
-        if glyph_ok(font, m):
-            return "%s %s" % (m, kind)
-    return kind
 
 
 # ------------------------------------------------------------------ 工具
@@ -435,8 +424,7 @@ LAYOUT = {
     "sub_rule_thickness": 0.0028,
     # 间距比例：乘以下一个元素的字号（分隔线按上一个元素的字号）
     "gap_rule_to_text": 0.20,   # 分隔线 → 其下方文字
-    "gap_brand_to_kind": 1.30,  # 品牌字 → 副标签
-    "gap_kind_to_title": 0.00,  # 副标签 → 主标题（大字号自带行距已够）
+    "gap_brand_to_title": 1.30, # 品牌字 → 主标题（大字号自带行距已够）
     "gap_text_to_rule": 0.45,   # 主标题 → 其下方框线
     "gap_rule_to_sub": 0.17,    # 框线 → 副标题（框线贴着副标题，成组）
     "gap_para": 0.85,           # 同级段落之间
@@ -596,6 +584,10 @@ class _Flow:
         return self
 
     def pill(self, label, font, color, em=None, gap=0.0):
+        if not label:
+            # 与 text 同一条规矩：没有字就不落笔、也不推进游标。否则期数取不到
+            # 的时候画面上会留一个空框，看着像印漏了字。
+            return self
         self._advance(em, gap)
         top, h, w = _metrics(self.d, label, font)
         pad_x, pad_y = font.size * 0.85, font.size * 0.42
@@ -636,72 +628,150 @@ def _draw_sequence(flow, seq):
 # 画面上的字号一律按「角色」命名，不按位置。从前叫 f_big / f_mid，主标题换成
 # 节目名之后没人说得出 mid 到底是哪一行。基准是短边 1080，实际字号 = 基准 × scale。
 #
-# 层级（两种画面同一条）：主标题 = 节目名 ＞ 副标题 ＞ 期标题 ＞ 期号 ＞ 版权行。
+# 层级（两种画面同一条）：主标题 = 节目名 ＞ 副标题 ＞ 期标题 ＞ 期数 ＞ 标语 ＞ 版权行。
 # 最大的一档给节目名而不是期标题——播客卖的是系列品牌，不是这一期讲什么。
 # 期标题字数不定，长起来在最大档只能折行，一期一个样，摆上去就散。
-FONT_SIZES_COVER = {
-    "brand": 30,        # 品牌行（配置：厂牌）
-    "hero": 104,        # 主标题 = 节目名（项目）
-    "second": 44,       # 副标题（项目，可留空）
-    "episode": 32,      # 期标题（地图自动取）
-    "pill": 26,         # 第 N 期
-    "small": 20,        # 版权行
+#
+# 每一档给两个基准：封面一列、背景一列。品牌行与版权行两列不同，因为两张画面的
+# 骨架本来就不同——背景顶部对齐、下方留给声波，封面整块纵向居中，同一个数字摆在
+# 这两种骨架里看上去不是同一个大小。
+FONT_SIZES = {
+    # 角色:        (封面基准, 背景基准)
+    "brand":       (30, 34),      # 品牌行（配置·全局）
+    "hero":        (104, 104),    # 主标题 = 节目名（项目）
+    "second":      (44, 44),      # 副标题（项目，可留空）
+    "note":        (22, 22),      # 标语（配置·全局，可留空）
+    "episode":     (32, 32),      # 期标题（期）
+    "pill":        (26, 26),      # 期数
+    "small":       (20, 19),      # 版权行（配置·全局）
 }
 # 方图（1×1）左右只剩 1080，主标题照 104 排会顶到边，单独收一档。
-FONT_SIZES_COVER_SQUARE = {"hero": 88}
-FONT_SIZES_BG = {
-    "brand": 34, "kind": 22, "hero": 104, "second": 44,
-    "episode": 32, "note": 22, "small": 19,
-}
+COVER_SQUARE_OVERRIDES = {"hero": 88}
 
 
-def _font_set(font_path, sizes, scale, overrides=None):
-    """把角色→基准字号的表，换成角色→字体对象。"""
-    spec = dict(sizes)
+# ------------------------------------------------------------------ 画面元素清单
+# 画面上要印的每一行，出处只有这一张表。从前封面与背景各写一份元素序列，同一个
+# 元素在两处各描述一遍——改一处忘一处，两张画面就各印各的了。
+#
+# 每个字段的读法：
+#   key    取值键，对上 lines_text 里的键名
+#   label  这一行叫什么（报错与测试靠它认人）
+#   who    这行字**跟谁走**：全局 = 所有项目共用一份配置；项目 = 每个节目一套；
+#          期 = 每一期都不一样
+#   source 「跟谁」的展开，写清值从哪来（代码取的是 lines_text，这一列给人看）
+#   form   落笔形式：text 是普通的字，pill 是带圆角框的标识
+#   font   字号档（对 FONT_SIZES 的键）
+#   color  颜色档（对 accent / light / muted 三色）
+#   cover  印不印在封面上
+#   bg     印不印在背景上
+#
+# 封面跟项目、不跟期，所以期标题与期数不进封面；标语是整档节目的调性，两张画面都印。
+FRAME_LINES = (
+    # key           名称      跟谁    取值来源                    形式    字号档      颜色      封面   背景
+    ("brand",       "品牌行", "全局", "project.brand",          "text", "brand",   "accent", True,  True),
+    ("program",     "主标题", "项目", "project.program_name",   "text", "hero",    "accent", True,  True),
+    ("subtitle",    "副标题", "项目", "project.subtitle",       "text", "second",  "light",  True,  True),
+    ("tagline",     "标语",   "全局", "project.tagline",        "text", "note",    "light",  True,  True),
+    ("title",       "期标题", "期",   "本期地图里的标题",         "text", "episode", "light",  False, True),
+    ("episode_no",  "期数",   "期",   "项目进度（第 N 期）",      "pill", "pill",    "accent", False, True),
+    ("attribution", "版权行", "全局", "project.attribution",    "text", "small",   "muted",  True,  True),
+)
+
+
+def _font_set(font_path, scale, role, overrides=None):
+    """把角色→(封面基准, 背景基准) 的字号表，换成角色→字体对象。
+
+    `role` 取 "cover" 或 "bg"，决定取两列里的哪一列。
+    """
+    col = 0 if role == "cover" else 1
+    spec = {k: v[col] for k, v in FONT_SIZES.items()}
     spec.update(overrides or {})
     return {k: _font(font_path, max(1, int(v * scale))) for k, v in spec.items()}
 
 
-def _background_sequence(title, subtitle, lines_text, attribution,
-                         fonts, colors, w, scale):
-    """背景的元素序列。与封面共用 _Flow 与 _draw_sequence。
+# 顶部分隔线的粗细：两画幅基准不同——背景按画布宽、封面按品牌行字号。这不是
+# 笔误，是两张画面各自的尺寸集合决定的（封面要出 1×1 方图，同一比例挪到方图上
+# 会偏粗）。要合成一个基准是一句话的事，但那是改视觉，得先问。
+RULE_WEIGHT = {
+    "cover": lambda fonts, w: max(1, int(fonts["brand"].size * 0.06)),
+    "bg": lambda fonts, w: max(1, int(w * LAYOUT["rule_thickness"])),
+}
 
-    自上而下：品牌行 → 副标签 → 主标题（节目名）→ 副标题 → 期标题 → 标语 →
-    版权行。节目名取不到就整行不印（单集模式没有项目身份），期标题仍在自己
-    那一档——不许它顶到主标题位上，否则每期都在喊「这期讲什么」。
+
+def frame_sequence(role, lines_text, fonts, colors, w, preset=""):
+    """按画幅取要印的元素序列。`role` 取 "cover"（封面）或 "bg"（背景）。
+
+    两张画面共用这一份构造器：印哪几行由 FRAME_LINES 的两列开关决定，于是
+    「封面上有什么」不会再跟「背景上有什么」各说各话。
+
+    先后与间距写在这里而不进表——间距属于排版，不属于元素身份。一律按「某个
+    字号 × LAYOUT 里的比例」推进，基准取谁的档写在每一行上。
+
+    封面跟项目、不跟期，所以期标题与期数不进封面；背景跟期，两样都印。
     """
     accent, light, muted = colors
+    tone = {"accent": accent, "light": light, "muted": muted}
     L = LAYOUT
-    return [
-        {"k": "rule", "span": w * L["rule_span"], "color": accent,
-         "w": max(1, int(w * L["rule_thickness"])), "label": "顶部分隔线"},
-        *([{"k": "text", "text": lines_text.get("brand", ""), "font": fonts["brand"],
-            "color": accent, "spacing": 2, "gap": L["gap_rule_to_text"],
-            "label": "品牌行"}] if lines_text.get("brand") else []),
-        {"k": "text", "text": kind_line(fonts["kind"], lines_text.get("kind", "")),
-         "font": fonts["kind"], "color": light, "spacing": 3,
-         "em": fonts["brand"].size, "gap": L["gap_brand_to_kind"], "label": "副标签"},
-        {"k": "text", "text": lines_text.get("program", ""), "font": fonts["hero"],
-         "color": accent, "spacing": 2, "em": fonts["kind"].size,
-         "gap": L["gap_kind_to_title"], "label": "主标题"},
+    flag = 7 if role == "cover" else 8      # FRAME_LINES 里封面/背景那两列
+    rows = {row[0]: row for row in FRAME_LINES}
+
+    def want(key):
+        return bool(rows[key][flag])
+
+    def line(key, gap, em_role=None, font_role=None, spacing=1):
+        row = rows[key]
+        text = str(lines_text.get(key) or "")
+        if row[4] == "pill":
+            # 期数落成「第 N 期」：外框与文字是一体的标识，包装写在这里，不让
+            # 调用方自己拼好再交进来——否则「1」与「第 1 期」两种写法迟早各出现一次。
+            text = "第 %s 期" % text if text else ""
+        return {"k": "text" if row[4] == "text" else "pill",
+                "text": text,
+                "font": fonts[font_role or row[5]],
+                "color": tone[row[6]], "spacing": spacing,
+                "em": fonts[em_role].size if em_role else None,
+                "gap": gap, "label": row[1]}
+
+    # 极简档（只有封面有这个档）：不印品牌行与两条分隔线，其余照印。头两行因此
+    # 成了首元素，上方不该再留间距，所以这两个间距在极简档下归零。
+    bare = (role == "cover" and preset == "minimal")
+    # 「标题主导」档（只有封面有）：副标题与期标题的档位对调。封面不印期标题之后，
+    # 这一档剩下的效果就是副标题换一档字号。
+    swap = (role == "cover" and preset == "episode")
+
+    seq = []
+    if not bare:
+        seq.append({"k": "rule", "span": w * L["rule_span"], "color": accent,
+                    "w": RULE_WEIGHT[role](fonts, w), "label": "顶部分隔线"})
+    if want("brand") and not bare:
+        seq.append(line("brand", L["gap_rule_to_text"], em_role="brand",
+                        spacing=2))
+    if want("program"):
+        seq.append(line("program", 0.0 if bare else L["gap_brand_to_title"],
+                        em_role="brand", spacing=2))
+    if not bare:
         # 这条线是主标题的下沿，把品牌块与下面的本期信息分开。间距按主标题字号
         # 取一个固定比例，随后无论下一行多大都贴不上标题字。
-        {"k": "rule", "span": w * L["sub_rule_span"], "color": accent,
-         "w": max(1, int(w * L["sub_rule_thickness"])),
-         "em": fonts["hero"].size, "gap": L["gap_text_to_rule"],
-         "label": "主标题下框线"},
-        {"k": "text", "text": subtitle, "font": fonts["second"], "color": light,
-         "spacing": 1, "em": fonts["second"].size, "gap": L["gap_rule_to_sub"],
-         "label": "副标题"},
-        {"k": "text", "text": title, "font": fonts["episode"], "color": light,
-         "spacing": 1, "em": fonts["second"].size, "gap": L["gap_para"],
-         "label": "期标题"},
-        {"k": "text", "text": lines_text.get("tagline", ""), "font": fonts["note"],
-         "color": light, "em": fonts["episode"].size, "gap": L["gap_para"],
-         "label": "标语"},
-        {"k": "text", "text": attribution, "font": fonts["small"], "color": muted,
-         "em": fonts["note"].size, "gap": L["gap_para"], "label": "版权行"},
-    ]
+        seq.append({"k": "rule", "span": w * L["sub_rule_span"], "color": accent,
+                    "w": max(1, int(w * L["sub_rule_thickness"])),
+                    "em": fonts["hero"].size, "gap": L["gap_text_to_rule"],
+                    "label": "主标题下框线"})
+    if want("subtitle"):
+        f_role = "episode" if swap else None
+        seq.append(line("subtitle", 0.0 if bare else L["gap_rule_to_sub"],
+                        em_role=f_role or "second", font_role=f_role))
+    if want("title"):
+        seq.append(line("title", L["gap_para"], em_role="second"))
+    if want("episode_no"):
+        seq.append(line("episode_no", L["gap_note"], em_role="second"))
+    if want("tagline"):
+        seq.append(line("tagline", L["gap_para"], em_role="episode"))
+    if want("attribution"):
+        # 间距基准取「副标题」这一档，而不是上一个元素的字号：版权行上面可能是
+        # 标语（小字）也可能空着（于是它头顶就是期标题）。基准跟着上面变的话，
+        # 同一种排法会因为「有没有填标语」而给出两种间距。
+        seq.append(line("attribution", L["gap_para"], em_role="second"))
+    return seq
 
 
 def background_layout(size, seq, wave_em, max_w=None):
@@ -791,9 +861,13 @@ def check_watermark(path, min_pixels=None):
 
 
 # ------------------------------------------------------------------ 背景
-def make_background(preset, size, title, subtitle, lines_text, attribution,
-                    out_path, watermark=True, font_family=""):
+def make_background(preset, size, lines_text, out_path, watermark=True,
+                    font_family=""):
     """生成背景图（Pillow 直绘，不依赖浏览器渲染）。
+
+    印哪几行一律取自 `lines_text`（见 FRAME_LINES）——这里不再另收 title /
+    subtitle / attribution 一类的散参数：多一条入参就多一个「传了但没用上」
+    或「两处传得不一样」的口子，而那两处单看都挑不出毛病。
 
     `font_family` 是画面字体（配置项 `frame.font_family`）。留空即自动挑一款。
     封面与背景拿同一款，画面上的字才是一套。
@@ -813,11 +887,10 @@ def make_background(preset, size, title, subtitle, lines_text, attribution,
     d = ImageDraw.Draw(img)
 
     font_path = resolve_font(font_family)["path"]
-    fonts = _font_set(font_path, FONT_SIZES_BG, scale)
+    fonts = _font_set(font_path, scale, "bg")
 
     cx = w // 2
-    seq = _background_sequence(title, subtitle, lines_text, attribution,
-                               fonts, (accent, light, muted), w, scale)
+    seq = frame_sequence("bg", lines_text, fonts, (accent, light, muted), w)
     for it in seq:
         if it["k"] != "rule":
             assert_glyphs(it["font"], it["text"], "背景「%s」" % it["label"])
@@ -852,75 +925,14 @@ COVER_SIZES = {
 }
 
 
-def _cover_sequence(preset, title, subtitle, episode_no, program, lines_text,
-                    fonts, accent, light, muted, span, sub_span):
-    """封面的元素序列，与背景同构。
-
-    绘制与干跑共用同一份，因此居中量出的高度与实际落笔的高度必然一致。
-
-    层级与背景同一条：主标题 = 节目名 ＞ 副标题 ＞ 期标题 ＞ 期号 ＞ 版权行。
-    最大的一档给节目名，不给期标题——期标题字数不定，长起来只能折行，摆到
-    最大档一期一个样。节目名取不到（单集模式没有项目身份）就整行不印，期标题
-    仍在自己那一档，不许它顶上去。
-
-    三个档位各给一种排法。从前 book 与 episode 走的是同一条路（函数里只判了
-    一次 minimal），等于一个空开关，选了等于没选：
-
-    - book：品牌主导（默认）。副标题在上、期标题在下。
-    - episode：标题主导。副标题与期标题的档位对调，期标题升到副标题那一档，
-      仍小于节目名。
-    - minimal：不印品牌行与两条分隔线，其余同 book。
-    """
-    L = LAYOUT
-    w = span / L["rule_span"] if span else 0.0
-
-    def txt(text, font, color, spacing=0, em=None, gap=0.0, label=""):
-        return {"k": "text", "text": text, "font": font, "color": color,
-                "spacing": spacing, "em": em, "gap": gap, "label": label or text}
-
-    swap = (preset == "episode")
-    sub_role = "episode" if swap else "second"
-    ep_role = "second" if swap else "episode"
-
-    if preset == "minimal":
-        seq = [txt(program, fonts["hero"], accent, spacing=1, label="主标题")]
-        gap_to_sub = 0.0
-    else:
-        seq = [
-            {"k": "rule", "span": span, "color": accent,
-             "w": max(1, int(fonts["brand"].size * 0.06)), "label": "封面分隔线"},
-            txt(lines_text.get("brand", ""), fonts["brand"], accent, spacing=2,
-                gap=L["gap_rule_to_text"], label="品牌行"),
-            txt(program, fonts["hero"], accent, spacing=1,
-                em=fonts["brand"].size, gap=L["gap_brand_to_kind"], label="主标题"),
-            # 这条线是主标题的下沿，把品牌块与下面的本期信息分开，不是标题的
-            # 下划线。间距按主标题字号取固定比例，下一行多大都贴不上标题字。
-            {"k": "rule", "span": sub_span, "color": accent,
-             "w": max(1, int(w * L["sub_rule_thickness"])),
-             "em": fonts["hero"].size, "gap": L["gap_text_to_rule"],
-             "label": "主标题下框线"},
-        ]
-        gap_to_sub = L["gap_rule_to_sub"]
-
-    seq.append(txt(subtitle, fonts[sub_role], light, spacing=1,
-                   em=fonts[sub_role].size, gap=gap_to_sub, label="副标题"))
-    seq.append(txt(title, fonts[ep_role], light, spacing=1,
-                   em=fonts[sub_role].size, gap=L["gap_para"], label="期标题"))
-    if episode_no:
-        seq.append({"k": "pill", "text": "第 %s 期" % episode_no,
-                    "font": fonts["pill"], "color": accent, "gap": L["gap_note"]})
-    if lines_text.get("attribution"):
-        seq.append(txt(lines_text["attribution"], fonts["small"], muted,
-                       gap=L["gap_para"], label="版权行"))
-    return seq
-
-
-def make_covers(preset, title, subtitle, episode_no, program, lines_text, out_dir,
-                prefix="", font_family=""):
+def make_covers(preset, lines_text, out_dir, prefix="", font_family=""):
     """生成三尺寸封面。返回 {尺寸键: 路径}。
 
-    `prefix` 是文件名前缀（期号）——各期封面同处一个「封面」目录，不带前缀
-    就会后一期盖掉前一期，而两期封面本来就该并存。
+    印哪几行取自 `lines_text`（见 FRAME_LINES），与背景同一份构造器：封面跟
+    项目、不跟期，所以期标题与期数不进封面。
+
+    `prefix` 是文件名前缀（期号）——各封面同处一个「封面」目录，不带前缀就会
+    后一期盖掉前一期，而各期封面本来就该并存。
 
     整块纵向居中：先干跑量出块高，再从居中起点正式落笔。
     行距由字号推出，不再用固定像素——固定值在大字号下会把主副标题挤在一起。
@@ -937,15 +949,14 @@ def make_covers(preset, title, subtitle, episode_no, program, lines_text, out_di
     out = {}
     for key, (w, h) in COVER_SIZES.items():
         scale = min(w, h) / 1080.0
-        override = FONT_SIZES_COVER_SQUARE if key == "1x1" else None
-        fonts = _font_set(font_path, FONT_SIZES_COVER, scale, override)
+        override = COVER_SQUARE_OVERRIDES if key == "1x1" else None
+        fonts = _font_set(font_path, scale, "cover", override)
         img = _vgradient((w, h), cur["bg_top"], cur["bg_bottom"])
         d = ImageDraw.Draw(img)
         cx = w // 2
 
-        seq = _cover_sequence(preset, title, subtitle, episode_no, program,
-                              lines_text, fonts, accent, light, muted,
-                              w * L["rule_span"], w * L["sub_rule_span"])
+        seq = frame_sequence("cover", lines_text, fonts,
+                             (accent, light, muted), w, preset=preset)
         for it in seq:
             if it["k"] != "rule":
                 assert_glyphs(it["font"], it["text"],
@@ -1002,32 +1013,29 @@ def build_all(cfg, dirs, lines_text, log=None, prefix=""):
     # 画面上印什么，一律以 lines_text 为准。它由调用方一次备齐（见 pipeline），
     # 这里不再各自翻 cfg 兜底——兜底链多一环，就多一个「配置里填了却不生效」
     # 的死框：那一环永远够不着，而界面上那个框长得跟真的一样。
-    title = str(lines_text.get("title") or "").strip()
-    subtitle = str(lines_text.get("subtitle") or "").strip()
-    program = str(lines_text.get("program") or "").strip()
-    episode_no = str(lines_text.get("episode_no") or "").strip()
-    attribution = str(lines_text.get("attribution") or "").strip()
-    # 画面字体：背景与封面共用这一款。留空即 resolve_font 自动挑一款可用的。
+    #
+    # 印哪几行、从哪来、跟谁走，全在 FRAME_LINES 那一张表里；这里只管把材料
+    # 递进去，不再替某一张画面单独挑参数。
     font_family = cfg.get("frame.font_family", "")
 
     bg_h = make_background(cfg.get("background.preset", "ink"),
-                           (int(cfg.get("video.width", 1920)), int(cfg.get("video.height", 1080))),
-                           title, subtitle, lines_text, attribution,
+                           (int(cfg.get("video.width", 1920)),
+                            int(cfg.get("video.height", 1080))),
+                           lines_text,
                            os.path.join(bg_dir, "%sbg.png" % prefix),
                            font_family=font_family)
     log("背景图（横屏）已生成")
 
     bg_v = make_background(cfg.get("background.preset", "ink"),
-                           (int(cfg.get("video.height", 1080)), int(cfg.get("video.width", 1920))),
-                           title, subtitle, lines_text, attribution,
+                           (int(cfg.get("video.height", 1080)),
+                            int(cfg.get("video.width", 1920))),
+                           lines_text,
                            os.path.join(bg_dir, "%sbg_v.png" % prefix),
                            font_family=font_family)
     log("背景图（竖屏）已生成")
 
-    covers = make_covers(cfg.get("cover.preset", "book"),
-                         title, subtitle, episode_no, program,
-                         lines_text, cover_dir, prefix=prefix,
-                         font_family=font_family)
+    covers = make_covers(cfg.get("cover.preset", "book"), lines_text,
+                         cover_dir, prefix=prefix, font_family=font_family)
     log("封面三尺寸已生成")
 
     # AIGC 元数据隐式标识（显式水印已在绘制时叠加，两者互不替代）。

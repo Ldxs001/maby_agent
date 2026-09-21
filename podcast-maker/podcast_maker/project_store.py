@@ -242,7 +242,7 @@ def find(base, pid):
 def create(base, name, plan_mode, program_name="", planned_episodes=None,
            style_preset="", voice_a="", voice_b="", name_a="", name_b="",
            first_episode="1", note="", paradigm="", subtitle="",
-           qwen_voice_a="", qwen_voice_b=""):
+           qwen_voice_a="", qwen_voice_b="", audience="", focus_note=""):
     """立项。`plan_mode` 必填，且此后不可更改。返回项目 dict。
 
     `paradigm`（素材类型）是排地图的组织依据：立项时可指定，也可留空由
@@ -277,6 +277,12 @@ def create(base, name, plan_mode, program_name="", planned_episodes=None,
         # 副标题：印在主标题下面的那一行，也是整档节目固定的一句。
         # 它跟节目名一样归项目——同一个节目每一期的封面都写这句。
         "subtitle": (subtitle or "").strip(),
+        # 受众：片头「面向___的听众」里填的那个定语，整档节目一句、每期逐字一致。
+        # 排地图那一步会给出第一版（见 planner.MAP_SCHEMA），此后由人在界面上改；
+        # **人填过就以人为准，重排不覆盖**——与 planned_episodes 同一条纪律。
+        # 留空不是错误：模板会把「面向…的听众」整个子句收起来，片头退化成
+        # 「欢迎收听《X》。」，不会留下半句话。
+        "audience": (audience or "").strip(),
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         # 立项时定死，不列入 EDITABLE。
         "plan_mode": plan_mode,
@@ -291,6 +297,12 @@ def create(base, name, plan_mode, program_name="", planned_episodes=None,
         # 与 plan_mode 不同，它**可以改** —— 它不产生产物，只是下一次重排的依据；
         # 改完要显式选「重排地图」还是「保留旧地图」，不静默生效。
         "paradigm": para,
+        # 本档侧重：人给这档节目定的方向（自然语言），与范式卡的重点判据
+        # **同时**进排图提示词。它管的是分组粒度——侧重的内容可以分得更细、
+        # 次要的合得更粗——所以归排图，不进写脚本那一步。
+        # 空串表示人没写过：那时排图提示词与从前**逐字一致**，不让一句默认话
+        # 把老口径带偏（见 `paradigms.prompt_block` 的 `extra_focus`）。
+        "focus_note": (focus_note or "").strip(),
         "voice_a": voice_a or "", "voice_b": voice_b or "",
         # 本地引擎的音色：它决定「用哪个内置音色去录参考音频」。录出来的音频落在
         # 项目自己的「音色」目录里，此后整期读的都是那份文件，与这个字段无关了 ——
@@ -309,10 +321,10 @@ def create(base, name, plan_mode, program_name="", planned_episodes=None,
     return item
 
 
-EDITABLE = ("name", "program_name", "subtitle", "planned_episodes",
+EDITABLE = ("name", "program_name", "subtitle", "audience", "planned_episodes",
             "next_episode", "style_preset", "voice_a", "voice_b",
             "qwen_voice_a", "qwen_voice_b",
-            "name_a", "name_b", "note", "archived", "paradigm")
+            "name_a", "name_b", "note", "archived", "paradigm", "focus_note")
 
 # 项目设定盖过哪些全局配置。这个映射只能有一份：生成脚本与出片若各写一份，
 # 两边迟早不一致——比如生成时按全局节目名写片头句，出片时按项目节目名去验，
@@ -321,6 +333,9 @@ EDITABLE = ("name", "program_name", "subtitle", "planned_episodes",
 PROJECT_CONFIG_MAP = (
     ("program_name", "project.program_name"),
     ("subtitle", "project.subtitle"),
+    # 受众进通道：片头那句「面向___的听众」由脚本引擎在粘合时取用。同理于副标题
+    # ——整档节目固定一句，归项目，不归某一期。
+    ("audience", "project.audience"),
     ("style_preset", "script.style_preset"),
     ("voice_a", "tts.voice_a"),
     ("voice_b", "tts.voice_b"),
@@ -339,7 +354,8 @@ PROJECT_CONFIG_MAP = (
 # 值只可能来自项目（见 apply_to_config）。单集模式没有项目，就取到空，画面上
 # 少印那一行。把它们塞进配置点位的表里会误导人——配置页摆一个框，填了也照样
 # 被项目盖掉，那就是一开始那个「填了不生效」的死框换了个地方长出来。
-CONFIG_PASS_THROUGH = ("project.program_name", "project.subtitle")
+CONFIG_PASS_THROUGH = ("project.program_name", "project.subtitle",
+                       "project.audience")
 
 
 def apply_to_config(cfg, item):
@@ -533,8 +549,12 @@ def _clean_map(episodes):
     return rows
 
 
-def set_map(base, pid, episodes, note=""):
+def set_map(base, pid, episodes, note="", audience=None):
     """写入地图。`episodes` 有序，每项 `{no, title, points, refs}`。
+
+    `audience` 是排图时模型给的那一句受众（见 `planner.MAP_SCHEMA`）。**只在项目
+    里还空着的时候写入**：人改过就以人为准——重排一次把人的话顶掉，等于让人白填，
+    而片头每期都要用这一句。传 None（插入、补排等不产受众的路子）就整个不动它。
 
     只有 `mapped` 项目有地图。校验放在入口而不是出片时：地图的期号一旦
     重复或错位，按图取素材会取到别人的料，而产物表面上完全正常。
@@ -549,6 +569,9 @@ def set_map(base, pid, episodes, note=""):
         p["map"] = save_map(base, pid, note, rows)
         # 计划期数跟着地图走：地图排了几期就是几期，不必再手填一遍。
         p["planned_episodes"] = len(rows) or None
+        got = str(audience or "").strip()
+        if got and not (p.get("audience") or "").strip():
+            p["audience"] = got
         _write(base, data)
         return p
     raise ProjectError("项目不存在：%s" % pid)

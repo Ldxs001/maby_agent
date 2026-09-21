@@ -90,5 +90,57 @@ class TestApiReport(unittest.TestCase):
         self.assertEqual(sorted(ep["cover"].keys()), ["16x9", "1x1", "3x4"])
 
 
+class TestPickFile(unittest.TestCase):
+    """路径点位的「选择…」（`/api/pickfile`）。
+
+    这一条是把本机文件对话框借给浏览器用：服务与浏览器同机，请求跑到
+    ThreadingHTTPServer 的工作线程上，所以对话框交给子进程去开（Tk 只保证能在
+    主线程里建 root）。测试不真弹框——弹框会挂住跑测试的人；这里只核「命令拼得对、
+    入口守得住」。
+    """
+
+    def test_the_picker_script_compiles_and_asks_for_a_path(self):
+        src = web_ui._PICK_SCRIPT
+        compile(src, "<pick>", "exec")          # 语法错会在这里炸
+        self.assertIn("askopenfilename", src)
+        self.assertIn("filetypes", src)         # 不给过滤表，用户要在几千个文件里翻
+        self.assertIn("stdout.write", src)      # 选中的路径得回得来
+
+    def test_pick_kinds_are_usable_and_cover_what_the_config_asks_for(self):
+        from podcast_maker.config_manager import PARAM_SPEC
+        for name, kinds in web_ui.PICK_KINDS.items():
+            self.assertTrue(kinds, "%s 没有过滤表" % name)
+            for label, pats in kinds:
+                self.assertTrue(label.strip())
+                self.assertTrue(pats.split(), "%s 的 %s 没有扩展名" % (name, label))
+        asked = {s.get("pick") for s in PARAM_SPEC.values() if s["type"] == "path"}
+        self.assertTrue(asked <= set(web_ui.PICK_KINDS),
+                        "配置里要的 pick 类型后端没有：%s"
+                        % sorted(asked - set(web_ui.PICK_KINDS)))
+
+    def test_the_route_is_registered(self):
+        self.assertIn("/api/pickfile", web_ui.ROUTES_POST)
+
+    def test_only_path_points_may_open_the_dialog(self):
+        """别处调用一律拒绝——不然任意点位都能弹出一个本机对话框。"""
+        r = web_ui.api_pickfile({"key": "script.target_minutes"})
+        self.assertFalse(r["ok"])
+        self.assertIn("不是路径", r["error"])
+        r = web_ui.api_pickfile({"key": "no.such.key"})
+        self.assertFalse(r["ok"])
+
+    def test_cancel_is_not_an_error(self):
+        """用户把对话框关掉＝什么都没发生，不该回一个错误让前端弹红字。"""
+        orig = web_ui.pick_file
+        try:
+            web_ui.pick_file = lambda title, kind: {"ok": True, "path": "",
+                                                    "cancelled": True}
+            r = web_ui.api_pickfile({"key": "speaker_indicator.portrait_a"})
+            self.assertTrue(r["ok"])
+            self.assertTrue(r["cancelled"])
+        finally:
+            web_ui.pick_file = orig
+
+
 if __name__ == "__main__":
     unittest.main()

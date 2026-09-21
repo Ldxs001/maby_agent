@@ -432,6 +432,26 @@ class TestParadigm(Base):
             P.update(self.base, p["id"], {"paradigm": "随便写"})
         self.assertEqual(P.find(self.base, p["id"])["paradigm"], "")
 
+    def test_focus_note_is_kept_and_editable(self):
+        # 侧重是人给这档节目写的方向，归项目（与素材类型同一档）：立项时可写，
+        # 此后可改。留空是常态——空串就是「人没写过」，不是「人写了空话」。
+        note = "多解析方法论，少讲技术细节与实现"
+        p = P.create(self.base, "甲档", "mapped", focus_note=note)
+        self.assertEqual(P.find(self.base, p["id"])["focus_note"], note)
+
+        P.update(self.base, p["id"], {"focus_note": "只讲结论与边界"})
+        self.assertEqual(P.find(self.base, p["id"])["focus_note"], "只讲结论与边界")
+
+    def test_focus_note_defaults_to_empty(self):
+        p = P.create(self.base, "甲档", "mapped")
+        self.assertEqual(P.find(self.base, p["id"])["focus_note"], "")
+
+    def test_focus_note_is_stripped(self):
+        # 前后空白不算内容：排图提示词里拼的是这一段，留着空白只会在提示词里
+        # 凭空多出几行空行，读日志的人还以为人写了什么。
+        p = P.create(self.base, "甲档", "mapped", focus_note="  多讲方法论  \n")
+        self.assertEqual(P.find(self.base, p["id"])["focus_note"], "多讲方法论")
+
 
 class TestBranchNumber(Base):
     def test_single_letters(self):

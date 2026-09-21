@@ -180,11 +180,11 @@ def add_intro_outro(body, out_path, cfg, sample_rate, channels):
 
 def mix_bgm(voice_path, out_path, bgm_path, cfg):
     """叠加背景音乐。人声闪避开启时，人声起则音乐自动压低。"""
-    volume = float(cfg.get("bgm.volume", 0.18))
+    volume = float(cfg.get("bgm.volume", 0.50))
     fade = float(cfg.get("bgm.fade_seconds", 3.0))
     duck = bool(cfg.get("bgm.ducking", True))
-    thr = float(cfg.get("bgm.duck_threshold", 0.03))
-    ratio = float(cfg.get("bgm.duck_ratio", 8.0))
+    thr = float(cfg.get("bgm.duck_threshold", 0.25))
+    ratio = float(cfg.get("bgm.duck_ratio", 2.0))
     sr = int(cfg.get("audio.sample_rate", 44100))
     ch = int(cfg.get("audio.channels", 1))
 

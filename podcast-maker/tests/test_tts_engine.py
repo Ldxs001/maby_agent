@@ -359,42 +359,40 @@ class TestVoiceControls(unittest.TestCase):
         self.assertLess(self.serve.SAMPLE_KWARGS["temperature"], 0.6,
                         "库默认 0.9 是「每句重掷骰子」的档位，不能再退回去")
 
-    def test_synthesize_passes_the_emotion_through(self):
-        """脚本里的 emotion 要真的走到合成函数；丢了它，语气就是 0% 生效。
+    def test_synthesize_never_passes_emotion_through(self):
+        """v0.27.0 硬隔离：脚本行里的语篇标签**不许**进合成链。
 
-        音色档案（ref）走同一条路：本地引擎的音色由它决定，整期一个值、逐句透传 ——
-        断在哪一句，那一句就换了个人。所以这里连它一起断言。
+        2a 期实证 emotion 标签是生成侧的句型触发器（追问→99% 问句），但合成侧
+        消费它的 instruct 路径是 v0.9.0 判死的东西（Base+instruct 实测更差）。
+        脚本里带不带标签，合成行为必须一模一样——synth_line 连收都不收 emotion。
+
+        音色档案（ref）与档位（degree）仍走透传：断在哪一句，那一句就换了个人；
+        所以这里连它们一起断言。
         """
         cfg = {"tts.engine": "qwen3tts",
                "tts.qwen3tts_voice_a": "Vivian", "tts.qwen3tts_voice_b": "Serena",
                "tts.speed_a": 1.0, "tts.speed_b": 1.0,
                "tts.unload_llm_before_synth": False, "tts.max_retries": 1,
                "audio.sample_rate": 24000}
-        script = [{"speaker": "A", "text": "第一句", "emotion": "好奇"},
+        script = [{"speaker": "A", "text": "第一句", "emotion": "追问"},
                   {"speaker": "B", "text": "第二句", "emotion": "过渡"}]
         seen = []
 
-        def fake_line(text, voice, speed, cfg, emotion=None, degree=None, ref=None):
-            seen.append((voice, emotion, degree, ref))
+        def fake_line(text, voice, speed, cfg, degree=None, ref=None):
+            seen.append((voice, degree, (ref or {}).get("wav")))
             return b"wav"
 
         # 音色档案那一步会起子进程加载模型，测试里必须替掉：这里验的是「透传」，
         # 不是「录音」。替成两份假档案，顺带就能验 A/B 不会互相串。
         fake_refs = {"A": {"wav": "/x/A/ref.wav", "text": "甲"},
                      "B": {"wav": "/x/B/ref.wav", "text": "乙"}}
-        with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(tts_engine, "synth_line", side_effect=fake_line), \
-                mock.patch.object(tts_engine, "ensure_voice_profiles",
-                                  return_value=fake_refs), \
-                mock.patch.object(tts_engine, "probe_duration", return_value=1.0):
+        with tempfile.TemporaryDirectory() as tmp,                 mock.patch.object(tts_engine, "synth_line", side_effect=fake_line),                 mock.patch.object(tts_engine, "ensure_voice_profiles",
+                                  return_value=fake_refs),                 mock.patch.object(tts_engine, "probe_duration", return_value=1.0):
             tts_engine.synthesize(script, tmp, cfg, emotion_level="light")
-        # 档位也一并透传：写脚本按它填标签，合成按它拼措辞，中间断了就两头不一致。
-        self.assertEqual([(v, e, d) for v, e, d, _ in seen],
-                         [("Vivian", "好奇", "light"),
-                          ("Serena", "过渡", "light")])
-        self.assertEqual([r["wav"] if r else None for _, _, _, r in seen],
-                         ["/x/A/ref.wav", "/x/B/ref.wav"],
-                         "A 角与 B 角必须各拿自己那份参考音频")
+        # 档位透传不变；emotion 被硬隔离——synth_line 根本没有这个参数。
+        self.assertEqual(seen,
+                         [("Vivian", "light", "/x/A/ref.wav"),
+                          ("Serena", "light", "/x/B/ref.wav")])
 
     # ---- 角色音色档案 ----------------------------------------------------
     # 本地引擎走 Base 变体：音色不在模型里，而在项目自己那份参考音频里。这一段
@@ -646,12 +644,16 @@ class TestVoiceControls(unittest.TestCase):
         body = src.split("def _service_synth")[1].split("\ndef ")[0]
         self.assertIn('body["degree"] = degree', body)
 
-    def test_emotion_goes_into_the_request_body(self):
+    def test_emotion_never_enters_the_request_body(self):
+        """v0.27.0 硬隔离：请求体里永远没有 emotion 键，instruct 判据恒为假。"""
         with open(os.path.join(_ROOT, "podcast_maker", "tts_engine.py"),
                   encoding="utf-8") as fh:
             src = fh.read()
-        body = src.split("def _service_synth")[1].split("\ndef ")[0]
-        self.assertIn('body["emotion"] = emotion', body)
+        body = src.split("def _service_synth")[1].split(chr(10) + "def ")[0]
+        code = body.split('"""', 2)[2]
+        self.assertNotIn("emotion", code,
+                         "_service_synth 函数体里不得出现 emotion（文档字符串除外）")
+        self.assertIn('body["degree"] = degree', body)
 
     def test_log_line_carries_the_seed(self):
         """日志不带种子，用户说「那句不好听」就永远查不动。"""

@@ -32,8 +32,8 @@ from datetime import datetime
 from . import (aigc_label, assets_factory, audio_engine, duration_model, layout,
                paradigms, project_store)
 from . import script_engine
-from . import probe, source_store, subtitle_engine, tts_engine, video_engine
-from .config_manager import GATE_BY_KEY, VERSION
+from . import ingest, probe, source_store, subtitle_engine, tts_engine, video_engine
+from .config_manager import GATE_BY_KEY, INTRO_OUTRO, VERSION
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -339,7 +339,7 @@ def resolve_material(base, proj_item, episode_no, material, log=None):
         log("成稿规划：料源由地图落点决定，已忽略调用方递来的素材 %d 字"
             % len(material))
     text, mmeta = source_store.compose(base, proj_item.get("id") or "", refs)
-    log("按地图落点取素材 %d 字（%d 节，未截断）" % (mmeta["chars"], len(refs)))
+    log("按地图落点取素材 %d 字符（%d 节，未截断；原始字符，装箱折 token 用）" % (mmeta["chars"], len(refs)))
     return text, plan_row
 
 
@@ -397,6 +397,16 @@ def evidence_pack(base, proj_item, plan_row, log=None):
             seen.add(key)
             pack["sections"].append({
                 "source": sid, "anchor": title, "gist": gist,
+                # line 必须跟着带上：同名标题靠行号区分，丢了它取原文时会把
+                # 另一条同名小节捞出来——判据与原材料对不上号，比没有更坏。
+                "line": s.get("line"),
+                # chars 必须带上：它是凝缩那一步**顺手算出的**这一节的原文
+                # **有效字**——「这段原文念出来是多少字」。脚本侧摊字数配额要用它，
+                # 而配额问的是「这一段该写多长」：该写多长由**能念出来的料**有多少
+                # 定。三个数别混：有效字（这一节的料，与地图压比同一把尺）／原始
+                # 字符数（`loc.chars`，含排版符号与西文数字，装箱折 token 用它）／
+                # 摘要自己的字数（只描述凝缩写得多详略，已无消费者）。
+                "chars": s.get("chars"),
                 "points": [str(p).strip() for p in (s.get("points") or [])
                            if str(p).strip()]})
     if missed:
@@ -405,28 +415,208 @@ def evidence_pack(base, proj_item, plan_row, log=None):
     return pack
 
 
+def section_materials(base, proj_item, plan_row, log=None, sections=None):
+    """逐节取原文：按判据包里的每一节（source + anchor + line）分别 compose。
+
+    返回 (texts, secs)：texts[i] 是第 i+1 节的原文，secs 是本期的节清单
+    （与 `evidence_pack` 同一份，所以节号、顺序、来源都是同一套口径；调用方
+    手上已有判据包时直接传 `sections`，免得同一份再算一遍）。
+
+    装箱要知道「每节有多重」（按原文折 token），写作要按块取「本段那几节的
+    原文」——两者都从这里来。合起来一次 compose（现在的 `resolve_material`）
+    拿不到逐节的体量，所以必须分开取一次；节数不多（一期几节），代价可控。
+    """
+    log = log or (lambda m: None)
+    secs = sections if sections is not None else (
+        evidence_pack(base, proj_item, plan_row, log=log).get("sections") or [])
+    pid = (proj_item or {}).get("id") or ""
+    texts = []
+    for s in secs:
+        ref = {"source": s.get("source"), "anchor": s.get("anchor"),
+               "line": s.get("line")}
+        try:
+            text, _meta = source_store.compose(base, pid, [ref])
+        except (source_store.SourceError, ingest.IngestError) as e:
+            log("逐节取原文：第 %s 节取不到（%s）" % (s.get("anchor"), e))
+            text = ""
+        texts.append(text or "")
+    if secs:
+        log("逐节取原文：%d 节，合计 %d 字符（原始字符，装箱按这个重量折 token 定段）"
+            % (len(secs), sum(len(t) for t in texts)))
+    return texts, secs
+
+
+def section_material_of(texts, secs, log=None):
+    """构造「按段取原文」的回调：pieces → 这一段该喂的原文。
+
+    pieces 是装箱给的取材块，而**每个块恒为一整节**——切分单位统一到整节凝缩
+    之后，这里就只剩「把这几节原文按序拼起来」一件事：没有字符区间、没有行边界
+    对齐、没有半节。那三样都是「按位置切块」时代的产物，块不再从节中间切，它们
+    自然作废。
+
+    每节前加一行标签是**给写作者看的范围**：它必须知道手里这几段料出自哪几节，
+    段题目才写得准（题目若写成"讲第 3 节的全部内容"，而第 3 节没全给它，它就会
+    去写自己没拿到的部分）。
+    """
+    log = log or (lambda m: None)
+
+    def of(pieces):
+        out = []
+        for pc in pieces or []:
+            i = pc.get("sec")
+            if not isinstance(i, int) or not (1 <= i <= len(texts)):
+                continue
+            body = texts[i - 1] or ""
+            if not body.strip():
+                continue
+            name = ""
+            if 1 <= i <= len(secs):
+                name = str(secs[i - 1].get("anchor") or "")
+            out.append("【第 %d 节%s】\n%s"
+                       % (i, ("《%s》" % name) if name else "", body))
+        return "\n\n".join(out)
+
+    return of
+
+
+def _episode_order(no):
+    """期号的**播出顺序**键：主号升序，同一主号下支期（2a、2b）排在正期之后。
+
+    不能拿字符串比（"10" 会小于 "2"），也不能拿 `episodes` 的列表顺序当播出
+    顺序——插入的支期是按创建时间追加的，2a 的创建时间比第 3 期晚。回顾问的
+    是「上一期」，「上」必须是播出顺序上的上。
+    """
+    m = re.match(r"^(\d+)\s*([A-Za-z]*)$", str(no or "").strip())
+    if not m:
+        return (10 ** 9, str(no or ""))
+    return (int(m.group(1)), m.group(2).lower())
+
+
+def write_plan_file(root, no, gen):
+    """写一期的**旁挂规划档**，返回写了没写。
+
+    段主旨（段号／覆盖节号／配额）与正文分开存：正文那份是扁平句子数组，出片、
+    时长、字幕、视频、前端预览全按数组读它，加字段会一次踩掉所有这些读取方。
+    段主旨的用途只有一个——给下一期的「前期回顾」引用（读的那头是
+    `review_rows`，两者成对）。
+
+    **整篇路没有段清单，就不写**：写一份空壳只会让回顾读出一个空数组，
+    `review_rows` 那边照样降级成「不粘」，多一份空文件只是把「没有」伪装成
+    「有但为空」。缺这一份是合法状态，读不到按缺料处理，不报错。
+    """
+    segs = (gen or {}).get("segments") or []
+    if not segs:
+        return False
+    write_json(layout.plan_file(root, no),
+               {"episode_no": no,
+                "title": (gen or {}).get("title") or "",
+                "segments": segs})
+    return True
+
+
+def write_form_file(root, no, form_key):
+    """写一期的**旁挂文体档**（这一期用的对话形式），返回写了没写。
+
+    与正文分开存的理由见 `layout.form_file`。**写了就一定有值**——空值不写：
+    写一份空的，读的那头就分不清「这一期记的是空」和「这一期没有这一份」，
+    而两者该走的分支正好相反（前者按兜底判、后者回落当前配置）。
+
+    读的那头是 `episode_form`，两者成对：写在这里、判在 `web_ui.api_script_gate`。
+    """
+    key = str(form_key or "").strip()
+    if not key:
+        return False
+    write_json(layout.form_file(root, no),
+               {"episode_no": no, "form": key})
+    return True
+
+
+def episode_form(root, no):
+    """读一期的旁挂文体档，返回形式键；没有、坏了、空值一律返回 `""`。
+
+    返回空串是「这一期没记过形式」，调用方据此回落到当前配置——不是「用空形式
+    判」。所以这里**不做任何兜底**：兜底只能有一处（`paradigms.resolve_form`），
+    在这层先兜一次，读的人就再也分不清取到的是记下来的还是这里编的。
+    """
+    data = read_json(layout.form_file(root, no), None)
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("form") or "").strip()
+
+
+def review_rows(base, proj_item, episode_no, cfg, log=None):
+    """前期回顾：读上一期，组一句固定文本。返回**已经填好文本的句子列表**。
+
+    与片头尾同类：模型不参与，程序逐字拼（见 `script_engine.glue_intro_outro`），
+    位置在片头之后、正文之前。
+
+    两路引用：
+    - **期主旨**取地图行（`project_store.map_episodes` 里的 gist）——地图挂在项目
+      档案里，不读盘。**注意不是 `item["episodes"]`**：那是「已出片的期登记」，
+      只有期号与标题，没有主旨；照它取会永远取不到 gist，表现成「回顾从不出现」；
+    - **段主旨**取上一期的**旁挂规划档**（`layout.plan_file`）——它不在正文那份
+      json 里：正文是扁平句子数组，出片、时长、字幕、视频、前端预览都按数组读，
+      加字段会一次踩掉所有这些读取方。
+
+    **任一路缺就整句不粘**：第 1 期、本期不在地图上、上一期不在本项目、上一期
+    没留下段主旨——一律按「这句没有」处理，绝不留「上期我们聊了……」后面空着。
+    开关默认关（`intro_outro.review`）。
+    """
+    log = log or (lambda m: None)
+    if not cfg.get("intro_outro.review", False):
+        return []
+    if not proj_item:
+        return []
+    cur = str(episode_no or "").strip()
+    key = _episode_order(cur)
+    earlier = [e for e in project_store.map_episodes(proj_item)
+               if str(e.get("no") or "").strip()
+               and _episode_order(e.get("no")) < key]
+    if not earlier:
+        log("前期回顾：本期是第 1 期，或本期不在项目地图上——这一句不粘")
+        return []
+    prev = max(earlier, key=lambda e: _episode_order(e.get("no")))
+    root = layout.project_dir(base, proj_item.get("id") or "")
+    plan = read_json(layout.plan_file(root, prev.get("no")), None) or {}
+    topics = [str(s.get("topic") or "").strip()
+              for s in (plan.get("segments") or [])]
+    topics = [t for t in topics if t][:3]
+    title = str(prev.get("title") or "").strip()
+    gist = str(prev.get("gist") or "").strip()
+    missing = [n for n, v in (("上一期标题", title), ("上一期主旨", gist),
+                              ("上一期段主旨", topics)) if not v]
+    if missing:
+        log("前期回顾：%s 取不到，这一句不粘" % "、".join(missing))
+        return []
+    fill = {"prev_title": title, "prev_gist": gist,
+            "prev_topics": "、".join(topics)}
+    rows = [{"speaker": r["speaker"], "emotion": r["emotion"],
+             "text": str(r["text"]).format(**fill)}
+            for r in (INTRO_OUTRO.get("review") or [])]
+    log("前期回顾：引用第 %s 期《%s》的期主旨与 %d 条段主旨"
+        % (prev.get("no"), title, len(topics)))
+    return rows
+
+
 def build_lines_text(cfg, title, episode_no=""):
     """画面上要出现的字，一次备齐，背景与封面共用这一份。
 
-    谁是谁、从哪来，在这一处看得全：节目身份（品牌行 / 标语 / 版权行 /
-    节目名 / 副标题）来自项目与配置，本期信息（期标题 / 期号）来自地图与
-    项目进度。出片与「重生成资源」两处各拼一份的话，同一个封面在两处会长
-    出不同的字来。
+    哪些行要印、从哪来、跟谁走，出自 `assets_factory.FRAME_LINES` 那一张表，
+    这里按表取件：标「全局」的取自配置，标「项目」的已由 apply_to_config 叠好
+    （同样是配置键），标「期」的由调用方给——本期标题与期号。
 
-    画面上的层级也在这里定：`program`（节目名）是主标题，最大；`subtitle`
-    次之；`title`（期标题）再次。期标题字数不定，长起来只能折行，不占最大档。
+    出片与「重生成资源」两处各拼一份的话，同一个封面在两处会长出不同的字来。
     """
-    return {
-        "brand": cfg.get("project.brand", ""),
-        "kind": "PODCAST",
-        "tagline": cfg.get("project.tagline", ""),
-        "title": title,
-        "subtitle": cfg.get("project.subtitle", ""),
-        "attribution": cfg.get("project.attribution", ""),
-        "program": cfg.get("project.program_name", ""),
-        "episode_no": episode_no,
-        "bg_preset": cfg.get("background.preset", "ink"),
-    }
+    out = {"bg_preset": cfg.get("background.preset", "ink")}
+    for key, _label, _who, source, _form, _font, _color, _on_cover, _on_bg \
+            in assets_factory.FRAME_LINES:
+        if key == "title":
+            out[key] = title
+        elif key == "episode_no":
+            out[key] = episode_no
+        else:
+            out[key] = cfg.get(source, "")
+    return out
 
 
 def _ai_declaration(work, cfg, root, log):
@@ -457,7 +647,7 @@ def _ai_declaration(work, cfg, root, log):
 
 # ------------------------------------------------------------------ 主流程
 def run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
-                script=None, preset_key=None, extra="", llm=None,
+                script=None, preset_key=None, llm=None,
                 do_video=True, reuse=True, job=None, project_id="",
                 ack_script_issues=False):
     """跑完整条管线。返回 result dict。
@@ -473,7 +663,7 @@ def run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
     try:
         return _run_episode(cfg, calib, material, title,
                             episode_no=episode_no, project_dir=project_dir,
-                            script=script, preset_key=preset_key, extra=extra,
+                            script=script, preset_key=preset_key,
                             llm=llm, do_video=do_video, reuse=reuse, job=job,
                             project_id=project_id,
                             ack_script_issues=ack_script_issues)
@@ -483,7 +673,7 @@ def run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
 
 
 def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
-                 script=None, preset_key=None, extra="", llm=None,
+                 script=None, preset_key=None, llm=None,
                  do_video=True, reuse=True, job=None, project_id="",
                  ack_script_issues=False):
     """跑完整条管线。返回 result dict。
@@ -494,7 +684,7 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
     **这一段只管合成**：取稿、合成、出产物、验产物。脚本怎么写、过没过门禁，
     是脚本阶段的事（见 `script_engine.generate`）——这里不写稿，也不判稿。
 
-    material / llm / preset_key / extra 是脚本阶段的调用口径，合成端用不到，
+    material / llm / preset_key 是脚本阶段的调用口径，合成端用不到，
     留着只为调用方兼容；不要在这里拿它们做判断。
 
     ack_script_issues：界面上点过「仍然合成」，即已知脚本阶段留有未通过项。

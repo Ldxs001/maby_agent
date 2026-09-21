@@ -11,7 +11,7 @@
 - 能用算法完成的事写进代码，LLM 只做两头：解析输入、生成输出。
 - 所有可调项集中在 `podcast_maker/config_manager.py` 的表里，别处不得再定义。
 - 排版间距一律写成字号的倍数，位置由实测包围盒推出，禁止就地写数值。
-- 画面层级固定：主标题＝节目名（最大）＞ 副标题 ＞ 期标题 ＞ 期号 ＞ 版权行，背景与封面共用。节目名取自项目，期标题取自期数地图。
+- 画面元素清单只有一张表（`assets_factory.FRAME_LINES`）：每行标明它跟谁走（全局配置／项目／期）、值从哪来、印在封面还是背景；两张画面由同一个 `frame_sequence(role, …)` 按表取件。层级固定为 主标题＝节目名（最大）＞ 副标题 ＞ 期标题 ＞ 期数 ＞ 标语 ＞ 版权行。封面跟项目、不跟期，所以期标题与期数只在背景上。节目名取自项目，期标题取自期数地图。
 - 一切都是项目：成稿规划、逐期即兴、单集（`single`）三种规划方式并列，只出一集也立项，没有「不归属项目」的第二条路。
 - 画面字体与字幕字体是两个可选点位（`frame.font_family` / `subtitle.font_family`），同归「字体」卡片，都由自绘下拉渲染——原生 select 的选项不接受自定义字体。
 - 缺依赖、缺字形或参数不可达时报错停下，不静默降级。
@@ -32,7 +32,7 @@
 
 ## 模块
 
-- [podcast_maker/script_engine.py](podcast_maker/script_engine.py)：脚本生成、格式收束、片头尾写死、门禁、内容检、定点修补、锁文件
+- [podcast_maker/script_engine.py](podcast_maker/script_engine.py)：脚本生成、逻辑拆分（模型按内容分节成段）、按输入额度装箱（切分单位是整节凝缩）、格式收束、片头尾粘合（整期定稿那一刻一次）、门禁、内容检、定点修补、锁文件
 - [podcast_maker/duration_model.py](podcast_maker/duration_model.py)：字数 ↔ 时长换算、标准语速与音色校准
 - [podcast_maker/tts_engine.py](podcast_maker/tts_engine.py)：语音合成
 - [podcast_maker/audio_engine.py](podcast_maker/audio_engine.py)：拼接、混音、编码、参数校验
@@ -56,7 +56,7 @@
 - [tests/test_gates.py](tests/test_gates.py)：门禁判据、待复核语义、产物校验与开关一致
 - [tests/test_layout.py](tests/test_layout.py)：排版包围盒、间距规格、文字层级、画面字体换款即换图、字形覆盖、动画缩放曲线、压暗色彩域、声波包络不相交
 - [tests/test_config_keys.py](tests/test_config_keys.py)：配置点位静态对账、界面入口覆盖、枚举标签、类型归一
-- [tests/test_script_contract.py](tests/test_script_contract.py)：脚本契约、标题收束、片头尾写死、期数归属
+- [tests/test_script_contract.py](tests/test_script_contract.py)：脚本契约、逻辑拆分归一到防重排、按整节凝缩装箱、补字与压字提示词质控、标题收束、片头尾整期定稿一次粘合、期数归属
 - [tests/test_project_store.py](tests/test_project_store.py)：期号进位、规划方式与定死、单集出完即完结、期数地图、分支期号、归档、未归属产物
 - [tests/test_source_store.py](tests/test_source_store.py)：素材入库与索引完整性、章节清单、按落点取原文与截断记账
 - [tests/test_planner.py](tests/test_planner.py)：模型输出解析、落点逐字核对与清单标题边界、期号由代码编、插入点与分支编号分配

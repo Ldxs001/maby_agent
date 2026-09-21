@@ -49,13 +49,16 @@ from podcast_maker.config_manager import PARAM_SPEC               # noqa: E402
 
 LINES = {
     "brand": "COGITO · SCRIBO",
-    "kind": "PODCAST",
     "program": "我思故我写",
-    "title": "链与两头",
     "subtitle": "我思故我写 · 播客系列",
     "tagline": "能不能让代码干代码的活",
+    "title": "链与两头",
+    "episode_no": "3",
     "attribution": "wUwproject · CC BY-SA 4.0",
 }
+
+# 背景与封面共用同一组三色（accent / light / muted）。
+COLORS = ((201, 164, 92), (232, 237, 248), (150, 165, 195))
 
 CANVAS = [(1920, 1080), (1080, 1920), (1080, 1440), (1080, 1080)]
 
@@ -85,15 +88,12 @@ class TestBackgroundLayout(unittest.TestCase):
     def _seq(self, size, hero_size=None, titles_only=False):
         w, h = size
         scale = min(w, h) / 1080.0
-        fonts = AF._font_set(self.path, AF.FONT_SIZES_BG, scale)
+        fonts = AF._font_set(self.path, scale, "bg")
         if hero_size:
             fonts["hero"] = AF._font(self.path, hero_size)
         lines = ({"program": LINES["program"], "title": LINES["title"]}
                  if titles_only else LINES)
-        return AF._background_sequence(
-            lines.get("title", ""), lines.get("subtitle", ""), lines,
-            lines.get("attribution", ""), fonts,
-            ((201, 164, 92), (232, 237, 248), (150, 165, 195)), w, scale), fonts
+        return AF.frame_sequence("bg", lines, fonts, COLORS, w), fonts
 
     def _flow(self, size, hero_size=None, titles_only=False):
         seq, fonts = self._seq(size, hero_size, titles_only)
@@ -211,16 +211,12 @@ class TestCoverLayout(unittest.TestCase):
     def _flow(self, size, preset, hero_size=None):
         w, h = size
         scale = min(w, h) / 1080.0
-        over = (AF.FONT_SIZES_COVER_SQUARE if size == AF.COVER_SIZES["1x1"]
+        over = (AF.COVER_SQUARE_OVERRIDES if size == AF.COVER_SIZES["1x1"]
                 else None)
-        fonts = AF._font_set(self.path, AF.FONT_SIZES_COVER, scale, over)
+        fonts = AF._font_set(self.path, scale, "cover", over)
         if hero_size:
             fonts["hero"] = AF._font(self.path, hero_size)
-        seq = AF._cover_sequence(preset, LINES["title"], LINES["subtitle"], "03",
-                                 LINES["program"], LINES, fonts,
-                                 (201, 164, 92), (232, 237, 248), (150, 165, 195),
-                                 w * AF.LAYOUT["rule_span"],
-                                 w * AF.LAYOUT["sub_rule_span"])
+        seq = AF.frame_sequence("cover", LINES, fonts, COLORS, w, preset=preset)
         # 折行上限要和实绘一致：干跑不折、实绘折，量出的块高差一整行，
         # 居中位置就错位了。
         max_w = w * AF.LAYOUT["text_max_ratio"]
@@ -285,10 +281,8 @@ class TestTextHierarchy(unittest.TestCase):
 
     def test_hero_is_the_program_not_the_episode(self):
         """主标题位印的是节目名，期标题另起一行。"""
-        fonts = AF._font_set(self.path, AF.FONT_SIZES_BG, 1.0)
-        seq = AF._background_sequence(
-            LINES["title"], LINES["subtitle"], LINES, LINES["attribution"],
-            fonts, ((201, 164, 92), (232, 237, 248), (150, 165, 195)), 1920, 1.0)
+        fonts = AF._font_set(self.path, 1.0, "bg")
+        seq = AF.frame_sequence("bg", LINES, fonts, COLORS, 1920)
         hero = next(it for it in seq if it.get("label") == "主标题")
         episode = next(it for it in seq if it.get("label") == "期标题")
         self.assertEqual(hero["text"], LINES["program"])
@@ -297,10 +291,8 @@ class TestTextHierarchy(unittest.TestCase):
                            "期标题不该大过主标题")
 
     def test_background_hero_outranks_every_other_line(self):
-        fonts = AF._font_set(self.path, AF.FONT_SIZES_BG, 1.0)
-        seq = AF._background_sequence(
-            LINES["title"], LINES["subtitle"], LINES, LINES["attribution"],
-            fonts, ((201, 164, 92), (232, 237, 248), (150, 165, 195)), 1920, 1.0)
+        fonts = AF._font_set(self.path, 1.0, "bg")
+        seq = AF.frame_sequence("bg", LINES, fonts, COLORS, 1920)
         hero = next(it for it in seq if it.get("label") == "主标题")["font"].size
         for it in seq:
             if it["k"] != "text" or it.get("label") == "主标题":
@@ -309,46 +301,92 @@ class TestTextHierarchy(unittest.TestCase):
                 self.assertGreater(hero, it["font"].size,
                                    "「%s」没有小于主标题" % it.get("label"))
 
-    def test_cover_hero_outranks_the_episode_for_every_preset(self):
-        fonts = AF._font_set(self.path, AF.FONT_SIZES_COVER, 1.0)
+    def test_cover_hero_outranks_every_other_line(self):
+        """主标题是封面上最大的一档，且封面不印任何跟期的行。
+
+        封面跟项目、不跟期：期标题与期数都不该出现在封面上。这条被谁改回去，
+        画面上只是「又变回按期一人一张」，没有任何一处会报错——只能钉在这里。
+        """
+        fonts = AF._font_set(self.path, 1.0, "cover")
         for preset in ("book", "episode", "minimal"):
-            seq = AF._cover_sequence(preset, LINES["title"], LINES["subtitle"],
-                                     "03", LINES["program"], LINES, fonts,
-                                     (201, 164, 92), (232, 237, 248),
-                                     (150, 165, 195),
-                                     1920 * AF.LAYOUT["rule_span"],
-                                     1920 * AF.LAYOUT["sub_rule_span"])
-            sizes = {it["label"]: it["font"].size
-                     for it in seq if it["k"] == "text"}
+            seq = AF.frame_sequence("cover", LINES, fonts, COLORS, 1920,
+                                    preset=preset)
+            labels = [it.get("label") for it in seq]
+            hero = next(it for it in seq if it.get("label") == "主标题")
             with self.subTest(preset=preset):
-                self.assertEqual(
-                    next(it for it in seq if it.get("label") == "主标题")["text"],
-                    LINES["program"])
-                self.assertGreater(sizes["主标题"], sizes["期标题"],
-                                   "期标题不该大过主标题")
-                self.assertGreater(sizes["主标题"], sizes["副标题"],
-                                   "副标题不该大过主标题")
+                self.assertEqual(hero["text"], LINES["program"])
+                for it in seq:
+                    if it["k"] != "text" or it.get("label") == "主标题":
+                        continue
+                    self.assertGreater(hero["font"].size, it["font"].size,
+                                       "「%s」没有小于主标题" % it.get("label"))
+                self.assertNotIn("期标题", labels, "封面跟项目不跟期，不该印期标题")
+                self.assertNotIn("期数", labels, "封面跟项目不跟期，不该印期数")
 
     def test_every_preset_has_its_own_layout(self):
         """三个档位必须真的排出三种样子。
 
         从前 book 与 episode 走的是同一条分支（函数里只判过 minimal），
         配置里那个下拉选了等于没选——这种空开关只能靠比对形状来拦。
+        期标题退出封面之后，episode 档只剩副标题换一档字号，但仍与 book 不同。
         """
-        fonts = AF._font_set(self.path, AF.FONT_SIZES_COVER, 1.0)
+        fonts = AF._font_set(self.path, 1.0, "cover")
         shapes = {}
         for preset in ("book", "episode", "minimal"):
-            seq = AF._cover_sequence(preset, LINES["title"], LINES["subtitle"],
-                                     "03", LINES["program"], LINES, fonts,
-                                     (201, 164, 92), (232, 237, 248),
-                                     (150, 165, 195),
-                                     1920 * AF.LAYOUT["rule_span"],
-                                     1920 * AF.LAYOUT["sub_rule_span"])
+            seq = AF.frame_sequence("cover", LINES, fonts, COLORS, 1920,
+                                    preset=preset)
             shapes[preset] = tuple(
                 (it["k"], it.get("label"),
                  it["font"].size if it.get("font") else 0) for it in seq)
         self.assertEqual(len(set(shapes.values())), 3,
                          "档位之间排出了同一份结果：%s" % shapes)
+
+
+class TestFrameLines(unittest.TestCase):
+    """画面元素清单只有一张表，这里是它的钉子。
+
+    哪一行印在哪张画面上、从哪来、跟谁走，全在 `assets_factory.FRAME_LINES`。
+    从前封面与背景各写一份序列，同一个元素在两处各描述一遍——改一处忘一处，
+    两张画面就各印各的了。这组用例钉住表本身，也钉住两张画面各自的取值。
+    """
+
+    def test_every_row_says_who_it_follows(self):
+        for row in AF.FRAME_LINES:
+            with self.subTest(key=row[0]):
+                self.assertIn(row[2], ("全局", "项目", "期"),
+                              "「跟谁」只能是这三样之一")
+
+    def test_every_row_is_printed_somewhere(self):
+        for row in AF.FRAME_LINES:
+            with self.subTest(key=row[0]):
+                self.assertTrue(row[7] or row[8],
+                                "%s 两张画面都不印，那一行就是死的" % row[1])
+
+    def test_cover_keeps_the_project_lines_only(self):
+        """封面跟项目：跟期的两行（期标题、期数）不进封面。"""
+        cover = [r for r in AF.FRAME_LINES if r[7]]
+        self.assertNotIn("title", {r[0] for r in cover})
+        self.assertNotIn("episode_no", {r[0] for r in cover})
+        self.assertTrue(all(r[2] != "期" for r in cover),
+                        "封面上出现了跟期的行")
+
+    def test_background_takes_both_episode_lines(self):
+        """背景跟期：期标题与期数都要印。"""
+        bg = {r[0] for r in AF.FRAME_LINES if r[8]}
+        self.assertIn("title", bg)
+        self.assertIn("episode_no", bg)
+
+    def test_font_and_color_roles_are_known(self):
+        for row in AF.FRAME_LINES:
+            with self.subTest(key=row[0]):
+                self.assertIn(row[5], AF.FONT_SIZES, "字号档不在字号表里")
+                self.assertIn(row[6], ("accent", "light", "muted"),
+                              "颜色档不认识")
+
+    def test_the_two_pictures_are_built_by_one_constructor(self):
+        """两张画面必须出自同一个构造器：各写一份的话迟早各印各的。"""
+        self.assertFalse(hasattr(AF, "_cover_sequence"))
+        self.assertFalse(hasattr(AF, "_background_sequence"))
 
 
 class TestLayoutSpec(unittest.TestCase):
@@ -365,17 +403,11 @@ class TestLayoutSpec(unittest.TestCase):
             raise unittest.SkipTest("未找到中文字体")
 
     def _sequences(self):
-        scale = 1.0
-        bg = AF._background_sequence(
-            LINES["title"], LINES["subtitle"], LINES, LINES["attribution"],
-            AF._font_set(self.path, AF.FONT_SIZES_BG, scale),
-            ((201, 164, 92), (232, 237, 248), (150, 165, 195)), 1920, scale)
-        cover_fonts = AF._font_set(self.path, AF.FONT_SIZES_COVER, scale)
-        covers = [AF._cover_sequence(p, LINES["title"], LINES["subtitle"], "03",
-                                     LINES["program"], LINES, cover_fonts,
-                                     (201, 164, 92), (232, 237, 248), (150, 165, 195),
-                                     1920 * AF.LAYOUT["rule_span"],
-                                     1920 * AF.LAYOUT["sub_rule_span"])
+        bg = AF.frame_sequence("bg", LINES,
+                               AF._font_set(self.path, 1.0, "bg"), COLORS, 1920)
+        cover_fonts = AF._font_set(self.path, 1.0, "cover")
+        covers = [AF.frame_sequence("cover", LINES, cover_fonts, COLORS, 1920,
+                                    preset=p)
                   for p in ("book", "episode", "minimal")]
         return [bg] + covers
 
@@ -440,14 +472,13 @@ class TestGlyphCoverage(unittest.TestCase):
     def test_assert_glyphs_passes_on_plain_text(self):
         AF.assert_glyphs(self.font, "链与两头", "背景主标题")
 
-    def test_kind_line_picks_a_supported_mark(self):
-        line = AF.kind_line(self.font, "PODCAST")
-        self.assertTrue(line.endswith("PODCAST"))
-        self.assertTrue(AF.glyph_ok(self.font, line[0]),
-                        "选出来的前缀符号字体并不支持")
+    def test_the_badge_line_is_gone(self):
+        """副标签（▸ PODCAST）连同它的符号探测一并删掉了，别再回来。
 
-    def test_kind_line_without_text(self):
-        self.assertEqual(AF.kind_line(self.font, ""), "")
+        那一行只是把「这是播客」又说了一遍——收听的人不需要被告知自己在听播客。
+        """
+        self.assertFalse(hasattr(AF, "kind_line"))
+        self.assertFalse(hasattr(AF, "KIND_MARKS"))
 
 
 class TestAnimation(unittest.TestCase):
@@ -632,8 +663,7 @@ class TestFrameFont(unittest.TestCase):
     def _shoot(self, family, tag):
         out = os.path.join(self.dir, tag)
         os.makedirs(out, exist_ok=True)
-        r = AF.make_covers("book", LINES["title"], LINES["subtitle"], "1",
-                           LINES["program"], LINES, out, font_family=family)
+        r = AF.make_covers("book", LINES, out, prefix="1", font_family=family)
         with open(r["3x4"], "rb") as f:
             return f.read()
 

@@ -123,7 +123,7 @@ INPUT_RESERVE_MIN = 1024
 
 class LLMClient:
     def __init__(self, backend="lm-studio", base_url="", api_key="", model="",
-                 timeout=3600, idle_timeout=300):
+                 timeout=3600, idle_timeout=300, input_ratio=1.0):
         self.backend = backend or "lm-studio"
         opts = MODE_SPEC["llm.backend"]["options"].get(self.backend, {})
         self.base_url = (base_url or opts.get("default_base_url", "")).rstrip("/")
@@ -135,11 +135,13 @@ class LLMClient:
         # 会安静好几分钟才吐第一个字，这个数要按"预填充最长能有多久"来定，
         # 不是按"答一句话要多久"。
         self.idle_timeout = int(idle_timeout or 300)
-        # 输入额度不再由本类推算（从前的「最大输出 × 输入倍率」参照系挂错了——
-        # 素材容量的参照系是**成稿脚本**：1:x 的 1 是撑满每期时长的脚本，x 是
-        # 它能消化的素材倍数，容量由业务线按 probe.capacity 推导后传进来）。
-        # 本类只做两件事：把素材字数折成 token（含估算余量），把窗口要求换算
-        # 成具体数字提醒使用者自查。不猜、不探、没有兜底值。
+        # 输入额度 = 最大输出 × 输入倍率（`llm.input_ratio`）。它回答的是
+        # 「**这一次调用**装不装得下」，与「这一期该讲多少料」是两件事：
+        # 后者由画地图按压比定死（成稿 × 档位 × 1.25），跟模型无关；
+        # 前者跟模型有关——换个窗口更大的后端、调大最大输出，答案就变。
+        # 两个量各管各的，混成一个数就会出现「内容明明合格、却因上下文放不下
+        # 而降级」的错配。额度单位是 token，因为最后塞不塞得进去由 token 说了算。
+        self.input_ratio = max(0.0, float(input_ratio or 0.0))
         # 每字符折合多少 token。首次调用前没有样本，取最保守的 1.0；之后由后端
         # 回传的 prompt_tokens 反标（见 `_note_usage`）——比任何经验常数都准。
         self._ratio_samples = []
@@ -293,12 +295,22 @@ class LLMClient:
             % (self.idle_timeout, got))
 
     # ------------------------------------------------------------------ 预算
+    def input_budget_tokens(self, max_tokens):
+        """单次调用的**输入额度**（token）= 最大输出 × 输入倍率。
+
+        这是"这一次调用能装多少"的唯一答案。倍率由使用者自己定，**后端窗口
+        有多大不归程序管**：那是加载时才定下的数，问不出来（LM Studio 懒加载时
+        接口只会回"未加载"），够不够由使用者自己拿主意。倍数调小，原文会被多切
+        几块，不丢料；调大就一次喂更多——顶不顶得住由使用者按自己的后端定。
+        """
+        return int(int(max_tokens or 0) * self.input_ratio)
+
     def material_tokens(self, material_chars):
         """素材字数折成 token（含估算余量）。
 
-        字数由业务线传入（probe.capacity × 体检上限，参照系是成稿脚本），
-        本类不推算容量——只负责折算。折合比有波动，余量吸收它（见
-        `INPUT_RESERVE_FRAC`）。
+        字数由业务线传入，本类不推算容量——只负责折算。折合比有波动，
+        余量吸收它（见 `INPUT_RESERVE_FRAC`）。折算**只准偏保守**：估高了最多
+        浪费点额度，估低了直接顶爆后端。
         """
         chars = max(0, int(material_chars or 0))
         if chars <= 0:
@@ -306,30 +318,39 @@ class LLMClient:
         need = int(chars * self.tokens_per_char())
         return need + self._input_reserve(need)
 
-    def required_context(self, max_tokens, material_chars=0):
-        """这套分配要求后端窗口至少多大（token）：输出预算 + 素材需求。"""
-        out = int(max_tokens or 0)
-        return out + self.material_tokens(material_chars)
+    def budget_chars(self, max_tokens, other_chars=0):
+        """输入额度折回「还能喂多少**字符**的素材」。
+
+        给按字符切批的地方用（内容检分批）：额度与占位都走 `material_tokens`
+        的同一口径（含余量），折回时把余量倒着扣掉，所以这个值是保守的——
+        宁可少喂几千字，也不能把请求顶爆。额度被占位吃光时返回 0，调用方
+        据此报「未核」，不许把整份素材硬塞进去。
+        """
+        left = self.input_budget_tokens(max_tokens) - self.material_tokens(other_chars)
+        if left <= 0:
+            return 0
+        per = max(0.01, self.tokens_per_char()) * (1.0 + INPUT_RESERVE_FRAC)
+        return int(left / per)
 
     def _input_reserve(self, need):
         """素材折算里留给「估算误差」的部分：max(1024, 需求 × 8%)。"""
         return max(INPUT_RESERVE_MIN, int(need * INPUT_RESERVE_FRAC))
 
     def quota_note(self, max_tokens, material_chars=0):
-        """把素材需求与窗口要求换算成具体数字，任务开始时落进日志。
+        """把这一次的输入额度换算成具体数字，任务开始时落进日志。
 
-        参照系是**成稿脚本**：素材容量（字）由业务线按「成稿 × 档位 × 1.25」
-        推导后传入，这里不再出现「最大输出的几倍」——那套参照系从来就不该
-        存在。后端窗口是加载时才定下的数，程序不替使用者判断够不够——但要求
-        多少必须摆到台面上，而不是等后端爆出一句看不懂的错。
+        只报**准备喂多少**：额度 = 最大输出 × 输入倍率，素材按字数折成 token。
+        **不对后端提要求**——窗口有多大是使用者自己的事，程序既不探也不管
+        （懒加载时探也探不到，只会拿到模型文件的上限，照它算反而把请求顶爆）。
+        放不下不叫「窗口不够」，叫「这一段切开喂」：切几段由额度算，原文一字不丢。
         """
         out = int(max_tokens or 0)
+        budget = self.input_budget_tokens(out)
         mt = self.material_tokens(material_chars)
-        return ("本期素材容量 %d 字，折合输入约 %d token（含估算余量）；"
-                "输出预算 %d token。请保证后端上下文窗口 ≥ %d"
-                "（= 输出 %d + 输入 %d）。"
-                % (int(material_chars or 0), mt, out,
-                   self.required_context(out, material_chars), out, mt))
+        return ("单次输入额度 %d token（= 最大输出 %d × 输入倍率 %.1f）；"
+                "本次素材 %d 字折合输入约 %d token。放不下时按节切成多段分别"
+                "喂完（不丢料），想一次喂更多就调大 llm.input_ratio。"
+                % (budget, out, self.input_ratio, int(material_chars or 0), mt))
 
     def tokens_per_char(self):
         """每字符折合多少 token。有样本取中位数，没有则 1.0（最保守）。

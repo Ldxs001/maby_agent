@@ -36,6 +36,12 @@
    10. 门禁在接口层也拦得住（缺脚本的批合成、空脚本存盘、中止不存在的任务）
    11. 插入面板自带入库区；已进地图的素材默认不勾并标出；一份素材都没有时
        面板照样开得出来
+   12. 配置页的排布：一格一控件（不跨列）、一行里形态不混（滑杆／开关／下拉／
+       输入各占各的行）、行尾的空档不被后面的控件回头填上
+   13. 卡内功能区：一张卡讲几件事时，一件事一块网格、配一行小标题；只讲一件事的
+       卡不画标题
+   14. 路径类点位（片头音频、立绘 PNG、自备音乐…）都说明「本机绝对路径」并带
+       「选择…」按钮；点它——接口被拦下来时——选中的路径会写回服务端
 """
 
 import argparse
@@ -43,6 +49,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import urllib.request
 
 from playwright.sync_api import sync_playwright
@@ -73,6 +80,96 @@ JS_REG_COVER = r"""() => {
   const miss = dom.filter(n => !reg.has(n.id)).map(n => n.id);
   const extra = Array.from(reg).filter(id => !document.getElementById(id));
   return [dom.length, reg.size, miss.slice(0, 6), extra.slice(0, 6)];
+}"""
+
+# 配置页的排布规矩：一格一控件、一类控件一行。
+# 这两条只在浏览器里量得出来（列宽、行高、谁跟谁在同一水平线上都是布局算出来的），
+# Python 侧只能核对类名有没有发，量不出「两个开关后面紧跟的下拉有没有顶上来」。
+JS_GRID = r"""() => {
+  const kindOf = f => {
+    if (f.querySelector('input[type=range]')) return '滑杆';
+    if (f.querySelector('.sw')) return '开关';
+    if (f.querySelector('.fpick')) return '下拉';   // 字体是自绘下拉，不带 select
+    if (f.querySelector('select')) return '下拉';
+    if (f.querySelector('textarea')) return '多行';
+    if (f.querySelector('input[type=number]')) return '数字';
+    return '输入';
+  };
+  const bad = [];
+  document.querySelectorAll('#stage-config .card').forEach(card => {
+    const g = card.querySelector('.grid.g4');
+    if (!g) return;
+    const sec = ((card.querySelector('h2') || {}).textContent || '?').trim();
+    const items = Array.from(g.children).filter(n => n.classList.contains('f'))
+      .filter(n => n.offsetParent !== null);          // 收起的那套音色不参与
+    if (!items.length) return;
+    const tracks = getComputedStyle(g).gridTemplateColumns.split(' ').length;
+    const box = g.getBoundingClientRect();
+    const colw = box.width / tracks;                  // 含列间距：第 i 格左缘＝左起 i×colw
+    const rows = new Map();
+    items.forEach(f => {
+      const r = f.getBoundingClientRect();
+      const key = Math.round(r.top / 6);              // 同一行的顶几乎相等，留 6px 抵亚像素
+      if (!rows.has(key)) rows.set(key, []);
+      rows.get(key).push({f: f, left: r.left, w: r.width, k: kindOf(f),
+        label: ((f.querySelector('label span') || {}).textContent || '?').trim()});
+    });
+    Array.from(rows.values()).forEach(list => {
+      const kinds = Array.from(new Set(list.map(x => x.k)));
+      if (kinds.length > 1)
+        bad.push(sec + ' 一行里混了形态：' +
+          list.map(x => x.label + '(' + x.k + ')').join(' + '));
+      list.sort((a, b) => a.left - b.left);
+      let cursor = 0;
+      list.forEach(x => {
+        const col = Math.round((x.left - box.left) / colw);
+        if (col !== cursor)
+          bad.push(sec + ' ' + x.label + ' 落在第 ' + (col + 1) + ' 格，'
+            + '应第 ' + (cursor + 1) + ' 格——行尾的空档被后面的控件顶上来填了');
+        const span = Math.round(x.w / colw);
+        if (span > (x.k === '多行' ? 2 : 1))
+          bad.push(sec + ' ' + x.label + ' 跨了 ' + span + ' 列');
+        cursor += span;
+      });
+    });
+  });
+  return bad.slice(0, 8);
+}"""
+
+# 卡内功能区：一个功能区一块网格，多区才画小标题。少画一块网格＝那几项挤在别的区
+# 里；多画一行小标题而只有一块网格＝把简单卡片也套上了标题。
+JS_ZONE = r"""() => {
+  const bad = [];
+  document.querySelectorAll('#stage-config .card').forEach(card => {
+    const sec = ((card.querySelector('h2') || {}).textContent || '?').trim();
+    const grids = Array.from(card.querySelectorAll(':scope > .grid.g4'));
+    const heads = Array.from(card.querySelectorAll(':scope > .zhead'));
+    if (!grids.length) { bad.push(sec + ' 一块网格都没有'); return; }
+    if (heads.length && heads.length !== grids.length)
+      bad.push(sec + ' 小标题 ' + heads.length + ' 个 / 网格 ' + grids.length
+        + ' 块——两者必须一一对应');
+    if (!heads.length && grids.length > 1)
+      bad.push(sec + ' 有多块网格却没画小标题，人看不出这是两件事');
+  });
+  return bad.slice(0, 6);
+}"""
+
+# 路径类点位：占位符要说清「本机绝对路径」，旁边要有「选择…」。
+JS_PATHBTN = r"""() => {
+  const bad = [];
+  const nodes = Array.from(
+    document.querySelectorAll('#stage-config [id^=f_cfg_]'));
+  const paths = nodes.filter(n => n.tagName === 'INPUT'
+    && n.getAttribute('placeholder')
+    && n.getAttribute('placeholder').indexOf('本机绝对路径') === 0);
+  paths.forEach(n => {
+    const f = n.closest('.f');
+    const btn = f ? f.querySelector('[data-pick]') : null;
+    if (!btn) { bad.push(n.id + ':没有「选择…」按钮'); return; }
+    if (btn.textContent.replace(/\s/g, '').indexOf('选择') < 0)
+      bad.push(n.id + ':按钮文字不是「选择…」');
+  });
+  return [paths.length, bad.slice(0, 6)];
 }"""
 
 JS_ENUM = r"""() => {
@@ -276,6 +373,49 @@ def main():
 
         raw_en = pg.evaluate(JS_ENUM)
         check(not raw_en, "枚举下拉不是英文裸值", ", ".join(raw_en))
+
+        # 排布：一格一控件、一类控件一行、行尾空着不回头填
+        grid_bad = pg.evaluate(JS_GRID)
+        check(not grid_bad, "配置页一格一控件、一类控件一行",
+              "；".join(grid_bad))
+
+        # 排布第二层：卡内功能区（一张卡讲几件事时，一件事一块网格 + 一行小标题）
+        zone_bad = pg.evaluate(JS_ZONE)
+        check(not zone_bad, "卡内功能区一块网格配一行小标题", "；".join(zone_bad))
+
+        # 路径类点位：说清要什么 + 给「选择…」
+        n_path = sum(1 for sec in cfg["params"]["config"].values()
+                     for it in sec if it["type"] == "path")
+        pk = pg.evaluate(JS_PATHBTN)
+        check(pk[0] == n_path and not pk[1], "路径框都带「选择…」与占位符",
+              "认出 %d 个 / 配置里 %d 个；%s" % (pk[0], n_path,
+                                                "；".join(pk[1]) or "无异常"))
+
+        # 「选择…」的接线：按钮 → 接口 → 把路径写回该点位。真弹对话框会把跑冒烟的人
+        # 卡住（对话框等人点），所以这里把接口拦下来，只验接线与写回这一段。
+        pick_key = "speaker_indicator.portrait_a"
+        pick_id = "f_cfg_" + pick_key.replace(".", "__")
+        fake = os.path.join(tempfile.gettempdir(), "pm smoke 立绘.png")
+        with open(fake, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        before_pick = fetch(base + "/api/config")["values"].get(pick_key) or ""
+        pg.route("**/api/pickfile", lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"ok": True, "path": fake, "cancelled": False})))
+        try:
+            pg.evaluate("(id) => document.querySelector('[data-pick=\"' + id + '\"]')"
+                        ".click()", pick_id)
+            pg.wait_for_timeout(1500)
+            wrote = fetch(base + "/api/config")["values"].get(pick_key)
+            shown = pg.evaluate("(id) => (document.getElementById(id) || {}).value",
+                                pick_id)
+            check(wrote == fake and shown == fake,
+                  "「选择…」把选中的路径写回服务端",
+                  "服务端 %r / 控件 %r" % (wrote, shown))
+        finally:
+            pg.unroute("**/api/pickfile")
+            post(base + "/api/config", {"patch": {pick_key: before_pick}})
+            os.unlink(fake)
 
         # 此时项目/脚本/合成/配置四处容器都已渲染过，可以做全覆盖核对
         cov = pg.evaluate(JS_REG_COVER)

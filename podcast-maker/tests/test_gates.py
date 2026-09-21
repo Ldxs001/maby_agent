@@ -32,8 +32,8 @@ if ROOT not in sys.path:
 from podcast_maker import duration_model, script_engine as SE     # noqa: E402
 from podcast_maker.config_manager import ConfigManager  # noqa: E402
 
-# 情绪取脚本生成侧的默认值，不按词表排序去猜：词表一拆一改，猜出来的值就变了。
-EMO = SE.DEFAULT_EMOTION
+# emotion 字段已随脚本侧整体删除；旧测试数据里仍带这个键（多出的键没人读）。
+EMO = "平静"
 
 
 def _script(chars_per_line, n, speaker_alt=True):
@@ -42,38 +42,26 @@ def _script(chars_per_line, n, speaker_alt=True):
             for i in range(n)]
 
 
-class TestIntroOutro(unittest.TestCase):
-    """判据是结构特征（问候/收束语 + 节目名），不是逐字复述模板。"""
+class TestIntroOutroIsNotGatedAnymore(unittest.TestCase):
+    """片头尾撤出门禁了——它现在是程序在整期定稿那一刻逐字粘上去的。
 
-    def setUp(self):
-        self.cfg = ConfigManager().data()
-        self.cfg["project.program_name"] = "播客"
+    判据留在这里只有两种下场：恒真（模型没参与，没什么可验的），或者拿正文去
+    验首末句、每次都报「未命中」，然后让模型去改一句它压根没写过的句子。
+    所以这一组不是「改判据」，是**确认它真的不在了**：谁也拿不到那条门禁。
+    """
 
-    def _ok(self, first, last):
-        s = [{"speaker": "A", "text": first, "emotion": EMO},
-             {"speaker": "B", "text": last, "emotion": EMO}]
-        return SE.intro_outro_ok(s, self.cfg)
+    def test_no_gate_key_and_no_predicate(self):
+        from podcast_maker.config_manager import GATE_BY_KEY
+        self.assertNotIn("intro_outro", GATE_BY_KEY, "撤掉的门禁不该留在表里")
+        self.assertFalse(hasattr(SE, "intro_outro_ok"),
+                         "判据函数一并撤掉，免得有人再挂回门禁上")
 
-    def test_template_text_passes(self):
-        f, l = self._ok("欢迎收听《播客》，面向关注方法论与认知边界的听众。",
-                        "这里是《播客》，欢迎关注。")
-        self.assertTrue(f)
-        self.assertTrue(l)
-
-    def test_reworded_intro_still_passes(self):
-        """换个说法不该被判失败——那是把提示词当成了判据。"""
-        f, l = self._ok("大家好，欢迎来到《播客》。", "感谢收听《播客》，我们下期见。")
-        self.assertTrue(f)
-        self.assertTrue(l)
-
-    def test_missing_program_name_fails(self):
-        f, l = self._ok("我们聊聊代码和文章。", "今天就到这里。")
-        self.assertFalse(f)
-        self.assertFalse(l)
-
-    def test_greeting_without_program_fails(self):
-        f, _ = self._ok("欢迎收听今天的节目。", "这里是《播客》，欢迎关注。")
-        self.assertFalse(f)
+    def test_report_has_no_intro_outro_item(self):
+        """报告里也不该再有这一项——每一项都对应一个真的被执行过的判据。"""
+        cfg = ConfigManager().data()
+        cfg["project.program_name"] = "播客"
+        rep = SE.gate_generate(_script(20, 6), cfg)
+        self.assertNotIn("intro_outro", [i["key"] for i in rep["items"]])
 
 
 class TestTotalDuration(unittest.TestCase):
@@ -220,10 +208,16 @@ class TestContentCheckOwnership(unittest.TestCase):
         self.assertIn("用词", SE.CHECK6_SYSTEM)
         self.assertIn("回应", SE.CHECK6_SYSTEM)
 
-    def test_prompt_exempts_intro_outro_from_semantic(self):
-        """片头语/片尾语是结构写死的，语义检不得据此判素材缺失。"""
-        self.assertIn("首句与末句", SE.CHECK6_SYSTEM)
-        self.assertIn("不受本条约束", SE.CHECK6_SYSTEM)
+    def test_prompt_does_not_hole_out_the_fixed_lines(self):
+        """从前这里留着「首句与末句不受本条约束」那道口子。
+
+        口子必须堵上：片头尾现在要到整期定稿那一刻才粘，内容检面对的**就是正文本身**。
+        留着那句话，模型会去找一个不存在的豁免对象，甚至顺着它想象出两句固定
+        语来「核对」，把不存在的句子报成问题。
+        """
+        self.assertNotIn("首句与末句", SE.CHECK6_SYSTEM)
+        self.assertIn("不在这份稿子里", SE.CHECK6_SYSTEM,
+                      "得说清为什么不必留口子，否则下一个人还会加回去")
 
 
 class TestMissingKeyIsUnjudged(unittest.TestCase):
@@ -596,7 +590,7 @@ class TestBannedFeedbackIsActionable(unittest.TestCase):
 
     def test_rewrite_carries_the_previous_script(self):
         prev = "1. [A] 上一版第一句"
-        user = SE.build_user_prompt("素材", self.cfg, "", "要改的地方", prev)
+        user = SE.build_user_prompt("素材", self.cfg, "要改的地方", prev)
         self.assertIn(prev, user, "不给原稿，模型看不见第几句是什么，只能凭印象重写")
 
     def test_prompt_carries_the_substitute_too(self):
@@ -668,6 +662,85 @@ class TestReadableGate(unittest.TestCase):
         self.assertIn("✅", sys_prompt)
 
 
+class TestLineEndPunct(unittest.TestCase):
+    """句尾标点门禁：有没有归 py，对不对归语义。
+
+    判「末字符不是终止标点」一步盖住两种坏形：完全没标点（裸尾）、拿逗号顿号
+    这类句中标点收尾。收尾引号/括号先剥掉——「……这样的话。」标点在引号里。
+    问句收句号这类「符号用得对不对」py 不判，归提示词与回灌方向。
+    """
+
+    def setUp(self):
+        self.cfg = ConfigManager().data()
+        self.cfg["project.program_name"] = "播客"
+
+    def _item(self, texts):
+        s = _script(20, len(texts))
+        for i, t in enumerate(texts):
+            s[i]["text"] = t
+        rep = SE.gate_generate(s, self.cfg)
+        return next(i for i in rep["items"] if i["key"] == "line_end_punct")
+
+    def test_tail_helper(self):
+        # 命中：裸尾、句中标点收尾、收尾引号里没标点
+        self.assertEqual(SE.end_punct_tail("先扫描再进模型"), "型")
+        self.assertEqual(SE.end_punct_tail("先扫描，"), "，")
+        self.assertEqual(SE.end_punct_tail("他问“为什么”"), "么")
+        # 放行：三种终止标点、省略号、包裹符包住标点
+        self.assertIsNone(SE.end_punct_tail("大明于1368年立朝。"))
+        self.assertIsNone(SE.end_punct_tail("为什么这么说呢？"))
+        self.assertIsNone(SE.end_punct_tail("让暴风雨来得更猛烈些吧！"))
+        self.assertIsNone(SE.end_punct_tail("故事还没讲完……"))
+        self.assertIsNone(SE.end_punct_tail("「他说完就走了。」"))
+        self.assertIsNone(SE.end_punct_tail(""))
+
+    def test_bad_endings_are_caught(self):
+        item = self._item(["首要难题是如何拆解语言", "先扫描，再进模型，"])
+        self.assertFalse(item["ok"])
+        self.assertIn("第 1 句", item["detail"])
+        self.assertIn("第 2 句", item["detail"])
+
+    def test_punctuated_endings_pass(self):
+        item = self._item(["大明于1368年立朝。",
+                           "为什么这么说呢？",
+                           "「他说完就走了。」",
+                           "故事还没讲完……"])
+        self.assertTrue(item["ok"], item["detail"])
+
+    def test_semantic_type_is_not_judged(self):
+        # 问句收句号是「符号用得对不对」，归语义，py 不拦
+        item = self._item(["为什么这么说呢。"])
+        self.assertTrue(item["ok"], item["detail"])
+
+    def test_hit_feedback_names_line_and_direction(self):
+        item = self._item(["中" * 20, "先扫描，再进模型，"])
+        fb = SE._build_feedback([item])
+        self.assertIn("第 2 句", fb)
+        self.assertIn("只改", fb, "不说清是定点修补，模型会通篇重写")
+        self.assertIn("疑问收？", fb, "方向不给足，模型一律句号应付")
+
+    def test_patch_target_points_at_the_line(self):
+        s = _script(20, 3)
+        s[1]["text"] = "靠什么机制来运转呢"
+        rep = SE.gate_generate(s, self.cfg)
+        targets, refull, manual = SE.patch_targets(rep, 3)
+        self.assertIn(2, targets)
+        self.assertFalse(refull, "句尾标点自带句号，不该落进整篇重出")
+        self.assertIn("语义", targets[2][0])
+
+    def test_prompt_bears_the_rule(self):
+        """契约与句尾标点条款进整篇与分段两份提示词，一处都不许漏。"""
+        sys_prompt = SE.build_system_prompt(self.cfg, None, 800, 20)
+        self.assertIn("每句必须以标点符号收尾", sys_prompt)
+        self.assertIn("含碳12%的铁属于钢", sys_prompt)
+        self.assertIn("承接", sys_prompt)
+        card = SE.resolve_paradigm(None, self.cfg)
+        seg_prompt = SE._segment_system_prompt(
+            self.cfg, card, "science", 1, 3, 800, "段主旨", True)
+        self.assertIn("每句必须以标点符号收尾", seg_prompt)
+        self.assertIn("含碳12%的铁属于钢", seg_prompt)
+
+
 class TestDurationGateIsSoft(unittest.TestCase):
     """总时长偏差判的是估算值：只记账，不拦放行，也不回灌重写。
 
@@ -712,6 +785,9 @@ class TestSpeakerRunLimit(unittest.TestCase):
 
     def setUp(self):
         self.cfg = ConfigManager().data()
+        # 对话形式是界面上可改的一项：测试自己定死「按卡走」，否则用户在界面上
+        # 选过哪一项，这些用例就跟着变红——那是把他的配置当成了被测对象。
+        self.cfg["script.dialogue_form"] = ""
 
     def _run(self, speakers):
         return [{"speaker": s, "emotion": EMO, "text": "中" * 20}
@@ -723,96 +799,48 @@ class TestSpeakerRunLimit(unittest.TestCase):
 
     def test_aabb_passes(self):
         """A A B B A —— 一段完整的回答由同一个人说完，不该被判错。"""
-        item = self._item(self._run("AABBA"), {"max_run": 2})
+        item = self._item(self._run("AABBA"), {"form": "qa"})
         self.assertTrue(item["ok"], item["detail"])
 
     def test_run_over_the_limit_fails(self):
-        item = self._item(self._run("AAA"), {"max_run": 2})
+        item = self._item(self._run("AAA"), {"form": "qa"})
         self.assertFalse(item["ok"], item["detail"])
         self.assertIn("3", item["detail"])
 
-    def test_limit_comes_from_the_card(self):
-        """上限由范式卡给：对话录里被访者连说四句常态，同一份稿子在论证类下不过。"""
+    def test_limit_comes_from_the_form_not_the_card(self):
+        """上限由**对话形式**给：同一份稿子（B 连说四句）在一问一答下合法，
+        在闲聊漫谈下就超了——卡只决定默认用哪种形式。"""
         script = self._run("ABBBB")
-        self.assertTrue(self._item(script, {"max_run": 4})["ok"])
-        self.assertFalse(self._item(script, {"max_run": 2})["ok"])
+        self.assertTrue(self._item(script, {"form": "qa"})["ok"])
+        self.assertFalse(self._item(script, {"form": "chat"})["ok"])
+
+    def test_each_side_is_judged_by_its_own_cap(self):
+        """主讲＋捧哏：B 连说三句合法（上限 10），A 连说三句就超了（上限 1）。"""
+        self.assertTrue(self._item(self._run("ABBB"), {"form": "anchor"})["ok"])
+        self.assertFalse(self._item(self._run("AAAB"), {"form": "anchor"})["ok"])
 
     def test_gate_key_is_registered(self):
         from podcast_maker.config_manager import GATE_BY_KEY
         self.assertEqual(GATE_BY_KEY["ab_run_limit"]["stage"], "generate")
         self.assertEqual(GATE_BY_KEY["ab_run_limit"]["level"], "fail")
 
+    def test_the_whole_run_is_named_with_its_cap(self):
+        """点的是**整段**，不是超出的那几句：并句要把这一段并成一句。
 
-class TestEmotionLevelGate(unittest.TestCase):
-    """档位是硬约束：不写心情的文体里出现心情词，要拦下并指出是哪句。
+        只点超出的句子，模型没法知道这几句该并到哪一句里去——整段加上限一起给，
+        它才写得出一条合格的 absorb。
+        """
+        item = self._item(self._run("BAAAA"), {"form": "qa"})
+        self.assertFalse(item["ok"], item["detail"])
+        self.assertEqual(item["runs"], [{"speaker": "A", "lines": [2, 3, 4, 5],
+                                         "cap": 2}])
+        self.assertEqual(item["lines"], [2, 3, 4, 5])
 
-    放过去的后果不是「风格偏一点」：写脚本按不写心情写、合成按不贴说，可稿子
-    里那些心情词照样会被当成真的心情读出去——档位就白设了。拦下来还得给出
-    句号，否则定点修补接不上（问题自带句号才改得动）。
-    """
-
-    def setUp(self):
-        self.cfg = ConfigManager().data()
-
-    def _script(self, *emotions):
-        return [{"speaker": "AB"[i % 2], "emotion": e, "text": "中" * 20}
-                for i, e in enumerate(emotions)]
-
-    def _item(self, script, paradigm):
-        rep = SE.gate_generate(script, self.cfg, paradigm)
-        return next(i for i in rep["items"] if i["key"] == "emotion_level")
-
-    def test_none_level_passes_with_discourse_tags(self):
-        item = self._item(self._script("开场", "解释", "总结", "收束"),
-                          {"emotion_level": "none"})
-        self.assertTrue(item["ok"], item["detail"])
-
-    def test_plain_calm_is_not_a_mood_word(self):
-        """「平静」是默认底色、也是归并越界值的落点，不算心情词——
-        把它当成越界，归一化改出来的值又会被判越界，那一句就卡死了。"""
-        item = self._item(self._script("平静", "平静"), {"emotion_level": "none"})
-        self.assertTrue(item["ok"], item["detail"])
-
-    def test_none_level_blocks_a_mood_word_and_names_the_line(self):
-        item = self._item(self._script("平静", "感慨", "过渡"),
-                          {"emotion_level": "none"})
-        self.assertFalse(item["ok"])
-        self.assertIn("[2]", item["detail"])
-        self.assertEqual(item["lines"], [2])
-
-    def test_light_level_lets_mood_words_through(self):
-        item = self._item(self._script("感慨", "恍然"),
-                          {"emotion_level": "light"})
-        self.assertTrue(item["ok"], item["detail"])
-
-    def test_gate_is_registered_as_blocking(self):
-        from podcast_maker.config_manager import GATE_BY_KEY
-        self.assertEqual(GATE_BY_KEY["emotion_level"]["stage"], "generate")
-        self.assertEqual(GATE_BY_KEY["emotion_level"]["level"], "fail")
-
-
-class TestEnforceMaxRun(unittest.TestCase):
-    """后处理只在**超过**上限时动手，且不碰内容。"""
-
-    def _run(self, speakers):
-        return [{"speaker": s, "emotion": EMO, "text": "中" * 20}
-                for s in speakers]
-
-    def test_under_the_limit_is_left_alone(self):
-        script = self._run("AABBA")
-        self.assertEqual(SE.enforce_max_run(script, 2), [])
-        self.assertEqual([s["speaker"] for s in script], list("AABBA"))
-
-    def test_over_the_limit_is_flipped_and_recorded(self):
-        script = self._run("AAA")
-        self.assertEqual(SE.enforce_max_run(script, 2), [3])
-        self.assertEqual([s["speaker"] for s in script], ["A", "A", "B"])
-
-    def test_content_is_untouched(self):
+    def test_the_gate_names_it_without_touching_the_draft(self):
+        """门禁只判不改稿——翻说话人的那个后处理已在 v0.34.0 取下。"""
         script = self._run("AAAA")
-        before = [s["text"] for s in script]
-        SE.enforce_max_run(script, 2)
-        self.assertEqual([s["text"] for s in script], before)
+        SE.gate_generate(script, self.cfg, {"form": "qa"})
+        self.assertEqual([s["speaker"] for s in script], list("AAAA"))
 
 
 class TestSpeakerFallback(unittest.TestCase):
@@ -837,6 +865,31 @@ class TestSpeakerFallback(unittest.TestCase):
         out = SE.normalize_script(
             [{"text": "第一句够长了", "emotion": EMO}], self.cfg)
         self.assertEqual(out[0]["speaker"], "A")
+
+
+class TestEveryExampleTextCarriesTerminalPunct(unittest.TestCase):
+    """源码级钉子：script_engine 里所有提示词示例的 text 字面量必须带终止标点。
+
+    v0.28.0 改五份提示词时漏了输出格式示例的占位文本（「台词正文，只写要
+    念出来的话」裸尾两处），模型照形状抄出裸句。此钉子扫全部 "text": "…"
+    字面量；唯一放行是「错误：」示例——它本来就演示句尾没标点。
+    """
+
+    def test_no_bare_example_text_in_source(self):
+        import io as _io
+        import re as _re
+        src = _io.open(SE.__file__, encoding="utf-8").read()
+        bad = []
+        for m in _re.finditer(r'"text": "([^"]*)"', src):
+            sample = m.group(1)
+            if sample.endswith(("。", "！", "？", "…")):
+                continue
+            # 「错误：」示例故意裸尾，放行；其余一律不许
+            head = src[max(0, m.start() - 40):m.start()]
+            if "错误：" in head:
+                continue
+            bad.append(sample)
+        self.assertEqual(bad, [])
 
 
 if __name__ == "__main__":

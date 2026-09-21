@@ -122,6 +122,38 @@ def script_file(root, no):
     return os.path.join(script_dir(root), "%s.json" % safe_no(no))
 
 
+def plan_file(root, no):
+    """一期的**旁挂规划档**：段主旨、各段覆盖的节号、各段配额。
+
+    与 `script_file` 同目录、同号、只多一个后缀，刻意**不并进正文那一份**。
+    正文是扁平句子数组——出片、时长估算、字幕、视频、前端预览全按数组读它；
+    把它改成 `{lines, segments}` 会一次踩掉所有这些读取方，而它们对段边界
+    毫无兴趣。段主旨的用途只有一个：**给「前期回顾」引用**（见
+    `glue_intro_outro` 与 `pipeline.review_rows`）。单独一份，谁要谁来读。
+
+    缺这一份是**合法状态**：没跑过分段路的期、以及本功能上线前写的期都
+    没有。读不到就当"上一期没留下段主旨"，回顾按缺料降级，不报错。
+    """
+    return os.path.join(script_dir(root), "%s.plan.json" % safe_no(no))
+
+
+def form_file(root, no):
+    """一期的**旁挂文体档**：这一期生成时用的对话形式。
+
+    与 `script_file` 同目录、同号、另一个后缀，理由与 `plan_file` 相同——正文
+    是扁平句子数组，出片、时长、字幕、视频、前端预览全按数组读它，加字段会一次
+    踩掉所有这些读取方。
+
+    为什么必须**逐期**记：对话形式上头挂着「同一人连着说的上限」（`run. A/B`），
+    写的时候按一种形式写、回头重判按另一种形式判，同一条稿子会在两个地方一会儿
+    过一会儿不过。记在这一期自己身上，写、判、重写用的才是同一份。
+
+    缺这一份是**合法状态**：本功能上线前写的期没有。读不到就回落到当前配置，
+    与从前逐字一样（读的那头是 `pipeline.episode_form`，两者成对）。
+    """
+    return os.path.join(script_dir(root), "%s.form.json" % safe_no(no))
+
+
 def cover_dir(root):
     return os.path.join(root, DIR_COVER)
 

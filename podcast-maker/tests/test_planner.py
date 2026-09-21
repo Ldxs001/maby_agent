@@ -225,6 +225,31 @@ class TestPlanMap(Base):
         self.plan(llm=llm)
         self.assertEqual(llm.map_calls()["schema"], PLN.MAP_SCHEMA)
 
+    def test_focus_note_enters_the_grouping_brief(self):
+        """人写的侧重必须**走到排图提示词里**才算接线。
+
+        光在 `paradigms` 里拼出来没用：这一路要经 `plan_map` 从项目上取
+        `focus_note` 再交给 `prompt_block`，中间断一节，人写了什么都不会到
+        模型手上，而界面看着一切正常。
+        """
+        item = dict(self.item, focus_note="多解析方法论，少讲技术细节与实现")
+        llm = FakeLLM(groups_json([([1, 2, 3], "甲")]))
+        self.plan(item=item, llm=llm)
+        prompt = "\n".join(m["content"] for m in llm.map_calls()["messages"])
+        self.assertIn("**本档侧重**", prompt)
+        self.assertIn("多解析方法论，少讲技术细节与实现", prompt)
+
+    def test_no_focus_note_leaves_the_map_prompt_as_before(self):
+        # 人没写＝老口径：提示词里不该冒出一段空的侧重，也不该多出一句
+        # 粒度规则——那等于给所有老项目换了一套分组依据。
+        item = dict(self.item)
+        item.pop("focus_note", None)
+        llm = FakeLLM(groups_json([([1, 2, 3], "甲")]))
+        self.plan(item=item, llm=llm)
+        prompt = "\n".join(m["content"] for m in llm.map_calls()["messages"])
+        self.assertNotIn("本档侧重", prompt)
+        self.assertNotIn("少合几节", prompt)
+
     def test_probe_classification_is_a_separate_call(self):
         # 探查的分类与排图是两次调用，schema 与温度都不同。分类固定低温度，
         # 否则同一份素材两次探查给出两套结果，后面所有争论都无从对质。
@@ -594,6 +619,19 @@ class TestPlanInsert(Base):
         sug = PLN.plan_insert(self.base, self.pid, self.item, self.cfg, llm)
         self.assertEqual(sug["anchor_no"], "2")
         self.assertEqual([e["no"] for e in sug["episodes"]], ["2a", "2b"])
+
+    def test_focus_note_enters_the_insert_brief(self):
+        """插入也是重分组，人写的侧重照样要进依据。
+
+        只在「首次排图」认、插入时不认，等于同一档节目补一次料就换一套分组
+        口径——而两次产出的地图要拼在一起用，口径不一致当场看不出来。
+        """
+        item = dict(self.item, focus_note="多解析方法论，少讲技术细节")
+        llm = FakeLLM(self.insert_reply())
+        PLN.plan_insert(self.base, self.pid, item, self.cfg, llm)
+        prompt = "\n".join(m["content"] for m in llm.map_calls()["messages"])
+        self.assertIn("**本档侧重**", prompt)
+        self.assertIn("多解析方法论，少讲技术细节", prompt)
 
     def test_second_insert_continues_letters(self):
         P.insert_branches(self.base, self.pid, "2", [
