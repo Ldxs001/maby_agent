@@ -35,7 +35,8 @@ from datetime import datetime
 
 from . import audio_engine, duration_model, paradigms, probe
 from .config_manager import (BANNED_RULES, DISCOURSE_NEUTRAL, DISCOURSE_ORDER,
-                             GATE_BY_KEY, INTRO_OUTRO, PRESET_SPEC, STYLE_DIMS)
+                             GATE_BY_KEY, INTRO_OUTRO, PRESET_SPEC,
+                             PROGRAM_ONLY_TAGS, STYLE_DIMS)
 
 
 def material_capacity(cfg):
@@ -162,7 +163,7 @@ def _line_item_schema(vocab):
     }
 
 
-def _edit_item_schema(vocab):
+def _edit_item_schema(vocab, min_chars=None):
     """定点修补的 edit 条目：index+text 必填，emotion / absorb 可选。
 
     emotion 设为可选：edit 只在修被点名句子时出现，多数修补只动 text；
@@ -173,16 +174,61 @@ def _edit_item_schema(vocab):
     以内，而补丁不许拆句、不许凭空加句，就只剩「几句并成一句」这条路。它没给
     模型开「随便增删」的口子：`apply_patch` 会核被并的每一句都在点名清单里、
     都与这一句同一个人、并出来的字没有被吃掉。
+
+    `min_chars` 给「文本」加一个**最小长度**（`minLength`，后端数的是字符数）。
+    **只有定点修补这一路传它**（见 `patch_schema`）：修补在门禁与检查阶段跑、
+    改完直接落盘，一个残句没有下一道工序替它兜。写作阶段那三路（正文／补字／
+    压字）不传——它们的字数账是**总账**（本段配额），单句长短归门禁
+    `line_length` 判、且两个方向都有处方。
+
+    **不加最大长度**：实测后端对 `maxLength` 是**硬截断**（要求 40 字，返回恰好
+    40 字符、末字是逗号，话说了半句，还多带一条「句尾不是终止标点」要修），对
+    `minLength` 正常（56 字符的完整句，末字句号）。所以只上最小长度。
     """
+    text = {"type": "string"}
+    if min_chars and int(min_chars) > 0:
+        text["minLength"] = int(min_chars)
     return {
         "type": "object",
         "properties": {
             "index": {"type": "integer"},
             "emotion": {"type": "string", "enum": list(vocab)},
             "absorb": {"type": "integer"},
-            "text": {"type": "string"},
+            "text": text,
         },
         "required": ["index", "text"],
+    }
+
+
+def _insert_item_schema(vocab, min_chars=None):
+    """定点修补的 insert 条目：after + speaker + emotion + text 全必填。
+
+    **插入是唯一允许增行数的表达**（`absorb` 只许减行），且只为「承诺没闭合」
+    开：要补的是一句后文的回应，它本来就不存在，没法靠改某一句话变出来。硬塞进
+    已有句子只会把那句撑破，还会顺带撞上句长上限。
+
+    `speaker` 必填且只能是 A 或 B：闭合不只是内容对上，还得说清**这句回应由谁
+    来说**——只给一句没有说话人的话，等于没闭合。留空或写错人，读起来就成了
+    另一个人自问自答。
+
+    `after` 是插入锚点（插在第几句之后），必须是**被点名的句号**：不许在没被
+    点名的地方凭空加话。
+
+    `min_chars` 同 `_edit_item_schema`：只有定点修补这一路传（插进去的也必须是一句
+    完整的话），写作阶段的补字路不传。
+    """
+    text = {"type": "string"}
+    if min_chars and int(min_chars) > 0:
+        text["minLength"] = int(min_chars)
+    return {
+        "type": "object",
+        "properties": {
+            "after": {"type": "integer", "minimum": 1},
+            "speaker": {"type": "string", "enum": ["A", "B"]},
+            "emotion": {"type": "string", "enum": list(vocab)},
+            "text": text,
+        },
+        "required": ["after", "speaker", "emotion", "text"],
     }
 
 
@@ -619,11 +665,15 @@ def _dedupe_key(text):
 
 
 def dedupe_script(script, min_chars=DEDUPE_MIN_CHARS):
-    """程序硬去重：同一句长句在整篇里出现多次时，只留第一次。
+    """程序硬去重（**最后兜底**）：同一句长句在整篇里出现多次时，只留第一次。
 
-    这件事本该由提示词与规划防住，但不该只靠模型自觉：实测整篇生成 302 句里
-    有 129 句（43%）是把自己写过的整段又背了一遍。这类重复不是「改写」而是
-    「复播」——留着只会让成片多出一段时间在说同一件事，删掉没有任何信息损失。
+    正路已经改掉了「删」：段内每一轮收口前查重、把后出现的副本**就地换成新内容**
+    （见 `_replace_repeats`）——删会让字数塌下去，下一轮又补、补出来又是重复，没尽头。
+    这一刀只留给替换也没修干净的情形，所以它不再是主力，而是兜底。
+
+    但兜底也得有：这类重复不是「改写」而是「复播」，留着只会让成片多出一段时间在说
+    同一件事，删掉没有任何信息损失（实测整篇生成 302 句里有 129 句是把自己的话又背
+    了一遍）。
 
     程序删得掉，且不花一次模型调用，所以放在门禁之前：让时长、句数这些门禁
     对着**真实的稿子**判，而不是对着注水后的数字判——对注水稿判「达标」，正是
@@ -642,6 +692,38 @@ def dedupe_script(script, min_chars=DEDUPE_MIN_CHARS):
             seen.add(key)
         out.append(item)
     return out, dropped
+
+
+def find_repeats(script, low, high, min_chars=DEDUPE_MIN_CHARS):
+    """查出本段里「与别处重复、且自己是后出现的那一处」的句号。
+
+    判重范围是**整篇**，替换范围是**本段**——两件事必须分开：
+
+    - 范围整篇：段是逐段写的，写本段时前面几段已经定稿在手里。「第 2 段把第 1 段
+      的话又说了一遍」这种重复，只有把整篇摆在一起才看得见；只看本段，段与段之间
+      的复读永远是隐形的。补字轮从前就吃这个亏——它手里只有本段正文。
+    - 只报本段：前面几段这一轮不动（它们已经过了自己的轮次），本段才是可以改的
+      那一段。名单里的句号都是全篇口径，与门禁报的句号同一套。
+
+    每组重复只留**第一次出现**那一处，其后每一处都进名单：最早说过的那一句留着，
+    换掉后来重复的那些。判重口径与整期兜底（`dedupe_script`）同一把尺——同一个
+    `_dedupe_key`、同一个 `DEDUPE_MIN_CHARS`，两处不会一个判得出、一个判不出。
+
+    返回 `{要换掉的句号: 它跟哪一句重复}`（键升序看得见）。空字典＝这一段没有复读。
+    带上「跟哪一句重复」这一半，是因为提示词要说清「这一句跟第 N 句撞了」——只给一个
+    句号，模型不知道该躲开哪件事。
+    """
+    seen, hits = {}, {}
+    for i, item in enumerate(script or [], 1):
+        key = _dedupe_key((item or {}).get("text"))
+        if len(key) < min_chars:
+            continue
+        if key in seen:
+            if low <= i <= high:
+                hits[i] = seen[key]
+            continue
+        seen[key] = i
+    return hits
 
 
 def intro_outro_spec(cfg):
@@ -691,7 +773,8 @@ def glue_intro_outro(script, cfg, title="", log=None, review=None):
     2. **粘在门禁与修补之后**。生成过程里模型面对的只有正文，门禁、内容检、
        定点修补、字数核账看到的也只有正文。片头尾是固定结构，让格式门禁去掰它
        （比如「同一人连续句数」）只会把固定标识掰歪。所以粘合放在落盘与返回那
-       一刻（见 `generate` 与 `_generate_segmented`）。
+       一刻（见 `generate` 与 `_generate_segmented`），而且它**之后不再跑任何
+       格式工序**（v0.34.6 起只补时长）——模板里写什么标签，落到稿上就是什么。
     3. **没有可失败的判断**。句子是从模板逐字拼出来的，模型没参与，也就没有
        「它照没照做」可验。缺料各退一步：受众缺 → 那一小段消失；期标题缺 →
        「本期讲述…」整句不粘。粘出半句话比少粘一句坏得多。
@@ -699,10 +782,23 @@ def glue_intro_outro(script, cfg, title="", log=None, review=None):
     `log` 只用来把「哪一句因为缺料没粘」说出来，不影响结果。
 
     `review` 是**前期回顾**，一组已经填好文本的句子（由 `pipeline.review_rows`
-    读上一期的期主旨与段主旨组出来）。位置在**片头之后、正文之前**：它是「上期
-    讲到哪儿」的交代，得在正文开始前让听众听到，摆到正文后面就成尾声了。
-    这一层只管位置——开关开没开、上一期取不取得到，全是调用方的事，取不到就给
-    空，这里当没有。回顾与片头尾同类：模型没参与，也就没有「照没照做」可验。
+    读上一期的期主旨与段主旨组出来）。位置是**第 2 句**：紧跟片头第一句，在片头
+    其余句与正文之前——它是「上期讲到哪儿」的交代，得在开场之后紧接着让听众听到，
+    摆到正文后面就成尾声了。不分档位（标准档片头两句、简档一句，两种下回顾都落
+    第 2 句）。这一层只管位置——开关开没开、上一期取不取得到，全是调用方的事，
+    取不到就给空，这里当没有。回顾与片头尾同类：模型没参与，也就没有「照没照做」
+    可验。
+
+    **标签序列**（＝本函数产出的头尾固定结构；正文段仍是词表八词）：
+
+    | 片头档位 | 回顾 | 序列 |
+    |---|---|---|
+    | 标准（两句） | 开 | 开场／回顾／承接／正文…／收束 |
+    | 标准（两句） | 关 | 开场／承接／正文…／收束 |
+    | 简档（一句） | 开 | 开场／回顾／正文…／收束 |
+    | 简档（一句） | 关 | 开场／正文…／收束 |
+
+    **开场只有一个**（片头第二句挂的是 `DISCOURSE_NEUTRAL`，不是第二个「开场」）。
     """
     log = log or (lambda m: None)
     io = intro_outro_spec(cfg)
@@ -726,17 +822,48 @@ def glue_intro_outro(script, cfg, title="", log=None, review=None):
     body = [dict(l) for l in (script or [])]
     head = _render(io.get("intro"), "片头")
     tail = _render(io.get("outro"), "片尾")
-    # 前期回顾站在片头之后、正文之前。文本由调用方组好（`pipeline.review_rows`），
-    # 这里不填值、不判开关、不做降级——粘合只负责位置。空列表＝这一期没有回顾。
+    # 前期回顾站在**第 2 句**：紧跟片头第一句，插在片头其余句（标准档那句「承接」）
+    # 之前。文本由调用方组好（`pipeline.review_rows`），这里不填值、不判开关、
+    # 不做降级——粘合只负责位置。空列表＝这一期没有回顾，序列退回「片头＋正文＋
+    # 片尾」。片头只有一句（简档）时无「其余句」可插，回顾照样接在第 1 句之后。
     mid = [dict(r) for r in (review or [])]
     if mid:
-        log("前期回顾已粘上：%d 句，位置在片头之后" % len(mid))
-    log("片头尾已粘上：正文 %d 句，首 %d 句、尾 %d 句固定结构"
+        head = head[:1] + mid + head[1:] if len(head) > 1 else head + mid
+        log("前期回顾已粘上：%d 句，位置是第 2 句（片头第一句之后）" % len(mid))
+    log("片头尾已粘上：正文 %d 句，首 %d 句（含片头与前期回顾）、尾 %d 句固定结构"
         % (len(body), len(head), len(tail)))
-    # 补 estimated_seconds：片头尾与前期回顾都是新加进来的句子，时长模型还没量过
-    # 它们。normalize 是幂等的（正文那一遍量过的值一模一样），顺手把整篇统一量一遍——
-    # 字幕时间轴与总时长都读这个字段，缺了它那几句就成了 0 秒。
-    return normalize_script(head + mid + body + tail, cfg)
+    # 到这里就结束了：**粘合之后只剩补时长这一件事**。
+    # 从前这里跑的是整篇格式收束（`normalize_script`），顺手把时长量了；代价是
+    # 格式规则也一并套到程序自己拼的片头尾上——语篇词表一抬手，模板里写的
+    # 「开场 / 收束」就被洗成中性档，片头尾丢掉位置信息。所以粘合挪到收束**之后**，
+    # 这里改成只补时长（正文句的时长在正文收束时已经量过，值一模一样）。
+    # `head` 里已经含了前期回顾（插在第 2 句），所以这里只需头＋正文＋尾。
+    return _fill_line_seconds(head + body + tail, cfg)
+
+
+def _fill_line_seconds(lines, cfg):
+    """给还没有时长的句子补上 `estimated_seconds`，**其它字段一个不动**。
+
+    这是粘合之后唯一该做的事。片头尾与前期回顾是从模板逐字拼出来的新句子，
+    末尾少一个 `estimated_seconds`——不补就是 0 秒，字幕时间轴会错位、总时长
+    会少算。正文句在正文收束（`normalize_script`）时已经量过，这里判为「有」
+    就原样留着；补的时候与那一遍同一个口径（`duration_model.estimate_line`），
+    不接音色标定——脚本阶段的时长一律按标准语速估。
+
+    判据是「没有时长或为 0」：正常量出来最小也是 1 秒，0 只可能是没量过。
+    这里**不做**任何格式收束：speaker / emotion / text 都是模板与正文里已经规范
+    过的形态，跑一遍收束只会把表外的片头尾标签洗成中性档（v0.34.6 前就是这个
+    毛病）。
+    """
+    out = []
+    for item in lines or []:
+        row = dict(item)
+        if not row.get("estimated_seconds"):
+            row["estimated_seconds"] = int(round(
+                duration_model.estimate_line(row.get("text", ""),
+                                             row.get("speaker", "A"), cfg)))
+        out.append(row)
+    return out
 
 
 def _glued_draft(payload, cfg, log=None, review=None):
@@ -766,26 +893,56 @@ END_PUNCT = "。！？….!?"
 #: 判末字符前先剥掉的收尾包裹符：整句收在引号/括号上时（「……。」），
 #: 标点其实在包裹符里，剥到看见终止标点为止。
 END_PUNCT_CLOSERS = "」』\"'“”’）》〉】]"
+#: 紧挨终止标点前面**不许**出现的字符：花括号、方括号、尖括号、反斜杠这类
+#: 「给眼睛看的」结构符号，念不出来。半角全角都算。
+#: **故意不含 `%` `~` `@`**：「占比 15%。」是合法写法，加进去天天误报。
+END_PUNCT_JUNK = "{}[]<>\\｛｝［］＜＞"
 
 
 def end_punct_tail(text):
-    """句尾不是终止标点时返回惹事的那个尾字符，合规返回 None。
+    """句尾不是一个像样的终止标点时，返回惹事的那个字符；合规返回 None。
 
-    判「末字符不是终止标点」一步盖住两种坏形：完全没标点（收在汉字/字母上）、
-    拿逗号顿号这类句中标点收尾——不用分两种报法。
+    判两步，**两步都只看末位**：
+
+    1. 末字符须是终止标点。这一步盖住两种坏形：完全没标点（收在汉字/字母上）、
+       拿逗号顿号这类句中标点收尾。
+    2. **紧挨终止标点前面那一个字符**不许是结构符号（`END_PUNCT_JUNK`）。这一步
+       堵的是「补个标点就洗白」：`…{` 被第 1 步抓住、模型照处方补成 `…{。`，
+       末字符成了 `。`，第 1 步就过了——那个 `{` 只是从末位挪到倒数第二位，
+       照样念不出来，而它是唯一会被拦的机会。
+
+    判据用**黑名单**而不是白名单（「标点前面必须是中/英/数字」）：叠标点是合法的
+    中文写法，白名单会误伤「真的吗？！」（末字符 `！`，前一位是 `？`）和
+    「占比 15%。」（前一位是 `%`）。
+
+    不判句中：符号落在句子**中间**（既不在末位、也不在末位前一位）本函数管不着，
+    这是已知漏点（这条路一直做的是句末）。
     """
     t = str(text or "").strip().rstrip(END_PUNCT_CLOSERS)
     if not t:
         return None
-    return None if t[-1] in END_PUNCT else t[-1]
+    if t[-1] not in END_PUNCT:
+        return t[-1]
+    if len(t) >= 2 and t[-2] in END_PUNCT_JUNK:
+        return t[-2]
+    return None
 
 
-def gate_generate(script, cfg, paradigm=None):
+def gate_generate(script, cfg, paradigm=None, extra_tags=()):
     """生成阶段门禁（GATE_SPEC.stage == generate）。
 
     `paradigm` 是范式卡（`resolve_paradigm()` 的产物），连续句数上限取自它。
     与写脚本的提示词取同一个数——提示词说可以连说三句、门禁按两句卡，
     稿子会陷在「改了还是不过」的死循环里。
+
+    `extra_tags` 是**只给重判留的口子**，默认空＝与从前一字不差。页面重判读的是
+    落盘的成品稿，里面已经有程序粘上去的片头／回顾／片尾，标签是 `PROGRAM_ONLY_TAGS`
+    那三个词、不在语篇词表内，不放行就会在页面上被报成「词表外标签」。生成侧一律
+    不传——正文能写出的标签只有词表那八个（schema 枚举就是它），所以这个口子不会让
+    正文的门槛变松。
+
+    不管传没传 `extra_tags`，**粘合句都不进逐句判据**（见函数内 `glue_lines`）：
+    它们是程序逐字拼的固定结构，模型没参与、也改不动。
 
     不接 calib：脚本阶段的时长一律按标准语速估，与音色无关。
     """
@@ -793,6 +950,16 @@ def gate_generate(script, cfg, paradigm=None):
     lo = int(cfg.get("gate.min_chars", 8))
     hi = int(cfg.get("gate.max_chars", 40))
     max_sec = float(cfg.get("gate.max_seconds_per_line", 15))
+
+    # **程序粘合句**（片头／前期回顾／片尾）：标签取自 `PROGRAM_ONLY_TAGS`，由
+    # `glue_intro_outro` 逐字粘上，模型没参与。它们**不进任何逐句判据**——粘合是
+    # 纯字面拼接，没有「它照没照做」可验；判出来也修不了（定点修补是让模型改句子，
+    # 改完就不是固定结构了）。生成过程中门禁看到的稿子本来就没有它们（粘合发生在
+    # 门禁与修补**之后**），这条只在**重判**（页面复核盘上成品）时起作用。
+    # 拿标签认粘合句不会误伤正文：正文侧产不出这三个词（schema 枚举锁死词表八词、
+    # 解析层也校验词表）。**整篇量照算**（句数、总时长）——粘合句确实存在、要念。
+    glue_lines = {i + 1 for i, s in enumerate(script or [])
+                  if s.get("emotion") in PROGRAM_ONLY_TAGS}
 
     def add(key, ok, detail="", **extra):
         spec = GATE_BY_KEY.get(key, {"label": key, "level": "warn"})
@@ -807,7 +974,9 @@ def gate_generate(script, cfg, paradigm=None):
         items.append(item)
 
     add("json_valid", isinstance(script, list) and len(script) > 0,
-        "共 %d 句" % len(script))
+        "共 %d 句" % len(script)
+        + ("（其中 %d 句是程序粘合的片头／回顾／片尾，逐句判据已跳过）"
+           % len(glue_lines) if glue_lines else ""))
 
     missing = [i + 1 for i, s in enumerate(script)
                if not s.get("text") or not s.get("speaker")
@@ -817,9 +986,11 @@ def gate_generate(script, cfg, paradigm=None):
 
     # 语篇词表：emotion 只认 DISCOURSE_ORDER 里的八个词（`vocab_words()`）。
     # 枚举层已经拦了绝大多数越界，这里兜的是降级路（无约束解码）的漏网。
+    # `extra_tags` 见函数说明：只给重判，用来认程序粘上去的片头尾标签。
     vocab = vocab_words()
+    allowed = set(vocab) | set(extra_tags or ())
     off_vocab = [i + 1 for i, s in enumerate(script)
-                 if s.get("emotion") not in vocab]
+                 if i + 1 not in glue_lines and s.get("emotion") not in allowed]
     add("emotion_vocab", not off_vocab,
         ("词表外标签：%s（本篇可用：%s）"
          % ("、".join("第 %d 句「%s」" % (n, script[n - 1].get("emotion"))
@@ -838,18 +1009,34 @@ def gate_generate(script, cfg, paradigm=None):
     card = paradigm or resolve_paradigm(None, cfg)
     cap_a, cap_b = _run_caps(card, cfg)
     caps = {"A": cap_a, "B": cap_b}
-    runs, run_lines = [], []
-    start = 0
-    for i in range(1, len(script) + 1):
-        if i < len(script) and script[i]["speaker"] == script[start]["speaker"]:
+    # 粘合句**既不计入连说账、也当分隔符**：它不是模型写的，拿它当连说的一环等于
+    # 替模型背一个它没做的错；而它把前后两段正文分开，本来就该各算各的。做法是先把
+    # 稿子按粘合句切成若干「正文块」，每块内部各扫各的连续段，报的仍是全篇句号。
+    blocks, cur = [], []
+    for i, s in enumerate(script, 1):
+        if i in glue_lines:
+            if cur:
+                blocks.append(cur)
+                cur = []
             continue
-        who = script[start]["speaker"]
-        cap = caps.get(who, 1)
-        if i - start > cap:
-            lines = list(range(start + 1, i + 1))
-            runs.append({"speaker": who, "lines": lines, "cap": cap})
-            run_lines.extend(lines)
-        start = i
+        cur.append(i)
+    if cur:
+        blocks.append(cur)
+    runs, run_lines = [], []
+    for blk in blocks:
+        start = 0
+        for k in range(1, len(blk) + 1):
+            if (k < len(blk)
+                    and script[blk[k] - 1]["speaker"]
+                    == script[blk[start] - 1]["speaker"]):
+                continue
+            who = script[blk[start] - 1]["speaker"]
+            cap = caps.get(who, 1)
+            if k - start > cap:
+                lines = blk[start:k]
+                runs.append({"speaker": who, "lines": lines, "cap": cap})
+                run_lines.extend(lines)
+            start = k
     add("ab_run_limit", not runs,
         ("超限段：%s（A 连着说的上限 %d 句、B %d 句）"
          % ("、".join("第 %d–%d 句 %s 连说 %d 句"
@@ -863,9 +1050,11 @@ def gate_generate(script, cfg, paradigm=None):
         lines=run_lines, runs=runs)
 
     too_short = [{"line": i + 1, "chars": len(s["text"])}
-                 for i, s in enumerate(script) if len(s["text"]) < lo]
+                 for i, s in enumerate(script)
+                 if i + 1 not in glue_lines and len(s["text"]) < lo]
     too_long = [{"line": i + 1, "chars": len(s["text"])}
-                for i, s in enumerate(script) if len(s["text"]) > hi]
+                for i, s in enumerate(script)
+                if i + 1 not in glue_lines and len(s["text"]) > hi]
     segs = []
     if too_long:
         segs.append("过长 %s" % "、".join("第 %d 句（%d 字）" % (h["line"], h["chars"])
@@ -880,13 +1069,16 @@ def gate_generate(script, cfg, paradigm=None):
         too_short=too_short, too_long=too_long, lo=lo, hi=hi)
 
     over = [i + 1 for i, s in enumerate(script)
-            if duration_model.estimate_line(s["text"], s["speaker"], cfg) > max_sec]
+            if i + 1 not in glue_lines
+            and duration_model.estimate_line(s["text"], s["speaker"], cfg) > max_sec]
     add("line_duration", not over,
         "超时句：%s" % over[:6] if over else "全部 ≤ %.1f 秒" % max_sec,
         lines=over)
 
     hits = []
     for i, s in enumerate(script):
+        if i + 1 in glue_lines:
+            continue
         for r in BANNED_RULES:
             for w in r["words"]:
                 if w in s["text"]:
@@ -904,6 +1096,8 @@ def gate_generate(script, cfg, paradigm=None):
     # READABLE_RULE 同一条形状清单），命中给句号、给形状样例，走定点修补。
     bad_read = []
     for i, s in enumerate(script):
+        if i + 1 in glue_lines:
+            continue
         for h in unreadable_hits(s["text"]):
             bad_read.append({"line": i + 1, **h})
     add("readable_text", not bad_read,
@@ -917,23 +1111,37 @@ def gate_generate(script, cfg, paradigm=None):
     # 句尾标点：标点会被 TTS 当作停顿与语调的依据，整句缺了它合成出来就跟
     # 下一句连成一片。判据见 end_punct_tail——只判「有没有」，不判「对不对」；
     # 补什么符号由模型按语义定（提示词契约与回灌文案都带方向）。
+    # 两种坏形分开报（`kind`），回灌文案才能对症：
+    #   missing — 末位根本不是终止标点，该补一个；
+    #   junk    — 末位是终止标点，可紧挨它前面是个念不出来的结构符号，该去掉。
+    # 合成一种报法，模型只会照着补标点，那个符号就从末位挪到倒数第二位了事。
     bad_punct = []
     for i, s in enumerate(script):
-        tail = end_punct_tail(s.get("text"))
-        if tail is not None:
-            bad_punct.append({"line": i + 1, "tail": tail,
-                              "sample": str(s.get("text") or "")[-12:]})
+        if i + 1 in glue_lines:
+            continue
+        text = str(s.get("text") or "")
+        tail = end_punct_tail(text)
+        if tail is None:
+            continue
+        body = text.strip().rstrip(END_PUNCT_CLOSERS)
+        kind = "junk" if (body and body[-1] in END_PUNCT) else "missing"
+        bad_punct.append({"line": i + 1, "tail": tail, "kind": kind,
+                          "sample": text[-12:]})
     add("line_end_punct", not bad_punct,
-        ("命中 %d 处：%s" % (len(bad_punct),
-                          "、".join("第 %d 句以「%s」收尾" % (h["line"], h["tail"])
-                                    for h in bad_punct))) if bad_punct
+        ("命中 %d 处：%s"
+         % (len(bad_punct),
+            "、".join(("第 %d 句末尾混进念不出来的「%s」" if h["kind"] == "junk"
+                       else "第 %d 句没有终止标点（以「%s」收尾）")
+                      % (h["line"], h["tail"]) for h in bad_punct))) if bad_punct
         else "全部以终止标点收尾",
         hits=bad_punct)
 
     # 这里本来有一条 intro_outro：判首句像不像片头、末句像不像片尾。撤掉了——
-    # 片头尾现在由程序在**整期定稿那一刻**逐字粘上去（`glue_intro_outro`），门禁
-    # 看到的稿子里根本没有它们，判它只会恒为假，然后把一句模型没写过的句子交给它
-    # 去改。粘合是纯字面拼接，没有可失败的实验，也就不需要「验」。
+    # 片头尾现在由程序在**整期定稿那一刻**逐字粘上去（`glue_intro_outro`），生成
+    # 过程里门禁看到的稿子根本没有它们，判它只会恒为假，然后把一句模型没写过的
+    # 句子交给它去改。粘合是纯字面拼接，没有可失败的实验，也就不需要「验」。
+    # 重判（页面复核盘上成品）时它们确实在稿子里，但已由上面 `glue_lines` 那道
+    # 豁免挡在逐句判据之外——两侧口径一致：粘合句不进任何逐句判据。
 
     # 总时长按「软门禁」办：不达标照常写进报告，但不阻断放行、也不回灌重写。
     # 它是估算值不是实测值——真正的时长要等合成出来才作数；而估时口径是**标准语速**，
@@ -1236,11 +1444,19 @@ def gate_check6(script, cfg, llm=None, material="", dims=None, evidence=None):
     return report
 
 
-#: 内容检单项的输出契约。七条提示词里**只有这一条要求复杂结构**（第几句 /
-#: 原话 / 什么问题三件套），从前也只有它把输出形状全押在提示词的一段叮嘱上。
-#: 而定点修补完全依赖它给出句号——劝不住的代价是那一轮定不了点、只能交人工。
-#: 所以照样上约束解码：能定点的前提不是「求模型给落点」，是**结构上必须给**。
-_CHECK6_ITEM = {
+#: 内容检单项的输出契约。七条提示词里**只有这一条要求复杂结构**，从前也只有它把
+#: 输出形状全押在提示词的一段叮嘱上。而定点修补完全依赖它给出句号——劝不住的代价
+#: 是那一轮定不了点、只能交人工。所以照样上约束解码：能定点的前提不是「求模型给
+#: 落点」，是**结构上必须给**。
+#:
+#: 两项的**问题项键不一样**：语义检答「这一句有什么毛病」，承诺链检答「承诺是什么 /
+#: 怎么才算闭合 / 闭合位置在哪 / 这句闭合的话由谁来说」。共用一套键会逼承诺检去填
+#: 它答不了的字段，模型只会把 problem 写成一句空话。
+#:
+#: `line` 的取值下限写死 1：0 与越界在下游等于「没得修」（从前它们会被归成
+#: 「交人工」，而那一类会让循环当场早退、一次都不试）。探针实测本机后端认
+#: `minimum`，所以这是**硬约束**；程序侧另有 `_locate_line` 的 quote 反查兜底。
+_CHECK6_SEMANTIC_ITEM = {
     "type": "object",
     "properties": {
         "pass": {"type": "boolean"},
@@ -1249,11 +1465,36 @@ _CHECK6_ITEM = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "line": {"type": "integer"},
+                    "line": {"type": "integer", "minimum": 1},
                     "quote": {"type": "string"},
                     "problem": {"type": "string"},
                 },
-                "required": ["line", "problem"],
+                "required": ["line", "quote", "problem"],
+            },
+        },
+    },
+    "required": ["pass", "issues"],
+}
+
+#: 承诺链检：`line` 是提出承诺那一句；`close_after` 是**建议插在第几句之后**；
+#: `speaker` 只能填 A 或 B（脚本里的说话人代号，六种对话形式两侧都有数）。
+_CHECK6_PROMISE_ITEM = {
+    "type": "object",
+    "properties": {
+        "pass": {"type": "boolean"},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "line": {"type": "integer", "minimum": 1},
+                    "promise": {"type": "string"},
+                    "how": {"type": "string"},
+                    "speaker": {"type": "string", "enum": ["A", "B"]},
+                    "close_after": {"type": "integer", "minimum": 1},
+                },
+                "required": ["line", "promise", "how", "speaker",
+                             "close_after"],
             },
         },
     },
@@ -1261,14 +1502,26 @@ _CHECK6_ITEM = {
 }
 
 
-def check6_schema(dims=None):
+def check6_schema(dims=None, total=0):
     """内容检的输出契约。
 
     `dims` 限定只判某几项时，`required` 跟着缩到那几项——约束解码按 schema
     剪裁输出，schema 里还留着这一轮不判的键，模型就得给它压根没判过的项下结论。
+
+    `total` 是这份稿子有多少句，用来给问题项的 `line` 封顶（`maximum`）：句号
+    越界与句号缺失一样定不了点。不传就不封顶（只验结构的调用方）。
     """
     dims = tuple(dims) if dims else tuple(k for k, _ in CHECK6_DIMS)
-    props = {k: _CHECK6_ITEM for k, _ in CHECK6_DIMS if k in dims}
+    props = {}
+    for k, _ in CHECK6_DIMS:
+        if k not in dims:
+            continue
+        spec = copy.deepcopy(_CHECK6_SEMANTIC_ITEM if k == "semantic"
+                             else _CHECK6_PROMISE_ITEM)
+        if total:
+            spec["properties"]["issues"]["items"]["properties"]["line"][
+                "maximum"] = int(total)
+        props[k] = spec
     return {"type": "object", "properties": props, "required": list(props)}
 
 
@@ -1278,12 +1531,17 @@ CHECK6_SYSTEM = """你是播客脚本的审校者，回答只输出 JSON，不�
 {"semantic": {"pass": true, "issues": []},
  "promise": {"pass": true, "issues": []}}
 
-issues 里每一项都必须是一个对象，带三个键：
+两块的问题项**形状不一样**，别串用。
+
+语义检的问题项带三个键：
 {"line": 12, "quote": "那一句里的原话片段", "problem": "一句话说清哪里不对"}
 
-- line：出问题的是第几句（从 1 数起）。**找不出具体哪一句时填 0**——不许拿
-  第一句或最接近的一句顶替，填了假句号，改稿的人会去改一句没毛病的台词，
-  真正的问题原封不动，下一轮又原样报一遍。
+承诺链检的问题项带五个键，缺一不可：
+{"line": 8, "promise": "开头许了什么", "how": "后文回应到什么程度才算闭合",
+ "speaker": "A", "close_after": 20}
+
+- line：出问题的是第几句（从 1 数起，不能超过本文的总句数）。一条问题跨了好几句
+  时，填**其中最该改的那一句**——落点必须给得出：给不出，就没有人改得动它。
 - quote：那一句里的一小段原话，让人不翻全篇就能对上号。
 - problem：这一处到底哪里不对，别写成结论式的空话。
 
@@ -1296,37 +1554,77 @@ issues 里每一项都必须是一个对象，带三个键：
 - promise（承诺链检）：正文开头提出的疑问、设问或承诺，在后文有没有真的回应。判据是
   【本期计划】与【各节凝缩】——本期该讲的有没有讲到、开的口子有没有收。只管
   「开的口子收没收」，不管用词是否重复：对话体前后用词不同是正常的，
-  判断依据是那件事有没有被回答，不是字面有没有重现。若判为没回应，line 填
-  **提出那个承诺的句子**。
+  判断依据是那件事有没有被回答，不是字面有没有重现。
+
+判为没回应的，一次把「怎么补」答全，五个键缺一不可：
+- line：填**提出那个承诺的句子**。
+- promise：这个承诺**是什么**——一句话说清它许了听众什么。
+- how：**怎么才算闭合**——后文要回应到什么程度才算数。不许写成「应予以回应」
+  这类空话，要具体到该回应哪一件事。
+- speaker：**这句闭合的话由谁来说**，只能填 A 或 B。按这一处的接续关系定：
+  通常由另一方来接，同一个人把自己的话接着说完也成立。填了谁，这句就由谁念。
+- close_after：**建议闭合位置**——这句话插在第几句之后。选一个接得上、读下来
+  不突兀的位置。
+- **不许把承诺删掉或改没**：闭合靠补上回应，不是靠取消承诺。
 
 没有任何问题时 issues 是空数组。"""
 
 
-def _norm_issues(node, total):
+def _locate_line(node, total, script=None):
+    """定这一条问题落在第几句。
+
+    先信模型给的 `line`；它取不出、或不在 1..total 之内时，**拿 `quote` 去稿子里
+    反查**——问题本来就带着那一句的原话，句号是能算出来的（字符串比对，不花模型
+    调用）。从前这里一律归 0，而 0 在下游等于「没得修」。
+
+    绝不拿「最接近的一句」顶替：填了假句号，改稿的人会去改一句没毛病的台词，
+    真正的问题原封不动，下一轮又原样报一遍。
+    """
+    try:
+        line = int(node.get("line"))
+    except (TypeError, ValueError):
+        line = 0
+    if 1 <= line <= total:
+        return line
+    quote = re.sub(r"\s+", "", str(node.get("quote") or ""))
+    if quote and script:
+        texts = [re.sub(r"\s+", "", s.get("text") or "") for s in script]
+        for probe in (quote, quote[:12]):
+            if len(probe) < 4:
+                continue
+            for i, t in enumerate(texts):
+                if probe in t:
+                    return i + 1
+    return 0
+
+
+def _norm_issues(node, total, script=None):
     """把模型给的问题清单归一化成带落点的结构。
 
-    `line` 取不出、或不在 1..total 之内，一律归 0——「指不出哪一句」就老实说
-    指不出。拿假句号顶替比不填坏得多：定点修补会照着它去改一句没毛病的台词，
-    真正的问题原封不动，下一轮再报一遍，轮次全耗在原地打转。
+    落点由 `_locate_line` 定：模型给了有效句号就用它，给不出就拿 `quote` 反查。
+    两样都落空的才留 0，由 `patch_targets` 记「未修好」——**不早退、不重写**。
     """
     out = []
     for it in (node.get("issues") or []):
         if isinstance(it, dict):
-            try:
-                line = int(it.get("line"))
-            except (TypeError, ValueError):
-                line = 0
-            if not 1 <= line <= total:
-                line = 0
+            line = _locate_line(it, total, script)
             quote = str(it.get("quote") or "").strip()
             problem = str(it.get("problem") or it.get("text") or "").strip()
+            rec = {"line": line, "quote": quote, "problem": problem}
+            # 承诺项多出来的键原样带下去：定点修补要拿 promise / how /
+            # speaker / close_after 去补那句回应，在这里压成三键等于把
+            # 「补什么、谁来补、补在哪」在出口处丢掉，下游只能靠猜。
+            for k in ("promise", "how", "speaker", "close_after"):
+                v = it.get(k)
+                if v not in (None, ""):
+                    rec[k] = v
         else:
-            # 旧形态（一句人话）：没有句号，就是定不了点。兼容它不为好看，
+            # 旧形态（一句人话）：没有句号。兼容它不为好看，
             # 是为了后端降级、模型不守格式时不要整项变成「解析失败」。
-            line, quote, problem = 0, "", str(it).strip()
-        if not problem and not quote:
+            rec = {"line": 0, "quote": "", "problem": str(it).strip()}
+        if not rec["problem"] and not rec["quote"]:
             continue
-        out.append({"line": line, "quote": quote, "problem": problem})
+        out.append(rec)
     return out
 
 
@@ -1341,7 +1639,7 @@ def _issues_detail(issues):
     return "；".join(parts)
 
 
-def _parse_check6(text, dims, labels, total):
+def _parse_check6(text, dims, labels, total, script=None):
     """解析一批的核对结论。缺键按「未判定」记，绝不默认通过。
 
     缺键 = 模型没判这一项。默认通过会让「模型偷懒」在报告上变成绿灯，
@@ -1369,7 +1667,7 @@ def _parse_check6(text, dims, labels, total):
             out[key] = ("pending",
                         "%s未判定（模型未返回该项结论），交人工复核" % labels[key], [])
             continue
-        issues = _norm_issues(node, total)
+        issues = _norm_issues(node, total, script)
         out[key] = ("pass" if bool(node.get("pass")) else "fail",
                     _issues_detail(issues), issues)
     return out
@@ -1454,12 +1752,12 @@ def check6_llm(script, cfg, llm, material, dims=None, evidence=None):
                 # 这份 max_tokens，会思考的后端也要给够。原先在这一处固定给
                 # 2000，答案段一个字也轮不上，两项检查会一同落空。
                 max_tokens=max_tokens,
-                json_schema=check6_schema(dims),
+                json_schema=check6_schema(dims, len(script)),
             )
         except Exception as e:                                   # noqa: BLE001
             results.append(_unjudged(str(e), dims))
             continue
-        results.append(_parse_check6(raw, dims, labels, len(script)))
+        results.append(_parse_check6(raw, dims, labels, len(script), script))
 
     if len(results) == 1:
         return results[0]
@@ -1597,20 +1895,84 @@ PATCH_SCHEMA = {
             "type": "array",
             "items": _edit_item_schema(DISCOURSE_ORDER),
         },
+        # 插入（承诺闭合专用）：**唯一允许增行**的表达，见 `_insert_item_schema`。
+        "inserts": {
+            "type": "array",
+            "items": _insert_item_schema(DISCOURSE_ORDER),
+        },
     },
     "required": ["edits"],
 }
 
 
-def patch_schema(vocab=None):
-    """定点补丁的输出 schema：一条 edit 是 index / emotion(可选) / absorb(可选) / text。
+def patch_schema(vocab=None, cfg=None):
+    """定点补丁的输出 schema。
 
-    emotion 可选：多数修补只动 text；语篇标签错了（词表外、与句型不符）
-    也要有得改。absorb 可选，只给「同一人连着说超限」用——并句是减行数的唯一
-    合法表达。`vocab` 为本篇词表（`vocab_words()`），不传也按它开。
+    一条 edit 是 index / emotion(可选) / absorb(可选) / text；一条 insert 是
+    after / speaker / emotion / text（承诺闭合专用，见 `_insert_item_schema`）。
+    `vocab` 为本篇词表（`vocab_words()`），不传也按它开。
+
+    `cfg` 用来给这里两个 text 字段取**最小长度**（`gate.min_chars`）：修补在门禁与
+    检查阶段跑、改完直接落盘，一个残句没有下一道工序替它兜。**只加最小长度、不加
+    最大长度**（后端对上限是硬截断），见 `_edit_item_schema`。
     """
     schema = copy.deepcopy(PATCH_SCHEMA)
-    schema["properties"]["edits"]["items"] = _edit_item_schema(vocab or DISCOURSE_ORDER)
+    min_c = int((cfg or {}).get("gate.min_chars", 8))
+    schema["properties"]["edits"]["items"] = _edit_item_schema(
+        vocab or DISCOURSE_ORDER, min_chars=min_c)
+    schema["properties"]["inserts"]["items"] = _insert_item_schema(
+        vocab or DISCOURSE_ORDER, min_chars=min_c)
+    return schema
+
+
+def _replace_item_schema(vocab, min_chars=None, max_index=None):
+    """就地替换的 edit 条目：index + text 必填，emotion 可选。
+
+    与 `_edit_item_schema`（门禁那条路）只差一处，但很关键：**这里没有 `absorb`**。
+    替换是「同一个位置换一件新内容」，行数不许变——结构里写不出并句，就不用靠提示词
+    去劝，也不会出现「换着换着整段短了一截」这种没人管的账。
+
+    `min_chars` 给 text 加最小长度：替换在段内轮次里落地、改完直接进下一轮核账，
+    残句没有下一道工序替它兜。**不加最大长度**（后端对上限是硬截断，见
+    `_edit_item_schema`）——上限由落地判据守（`apply_replace`：超了就拒，不是截断）。
+
+    `max_index` 给句号一个硬上界（全篇句数）：约束解码实测吃硬约束，能少一轮
+    「越界了重来」。
+    """
+    text = {"type": "string"}
+    if min_chars and int(min_chars) > 0:
+        text["minLength"] = int(min_chars)
+    idx = {"type": "integer", "minimum": 1}
+    if max_index:
+        idx["maximum"] = int(max_index)
+    return {
+        "type": "object",
+        "properties": {
+            "index": idx,
+            "emotion": {"type": "string", "enum": list(vocab)},
+            "text": text,
+        },
+        "required": ["index", "text"],
+    }
+
+
+#: 就地替换的输出契约：只有 `edits`。结构里没有 inserts，所以「不许增行」不靠提示词
+#: 劝；也没有 absorb，所以「不许减行」同样写不出来。
+REPLACE_SCHEMA = {
+    "type": "object",
+    "properties": {"edits": {"type": "array", "items": {}}},
+    "required": ["edits"],
+}
+
+
+def replace_schema(cfg=None, vocab=None, max_index=None):
+    """就地替换的输出 schema。字数区间由落地判据守（`apply_replace`），这里只给
+    `text` 一个最小长度——与定点修补同一条理由：落地即定稿，没有下一道工序兜残句。
+    """
+    schema = copy.deepcopy(REPLACE_SCHEMA)
+    min_c = int((cfg or {}).get("gate.min_chars", 8))
+    schema["properties"]["edits"]["items"] = _replace_item_schema(
+        vocab or DISCOURSE_ORDER, min_chars=min_c, max_index=max_index)
     return schema
 
 
@@ -1620,10 +1982,21 @@ _PATCH_SYSTEM_TMPL = """你是播客脚本的定点修补者，回答只输出 J
 {"edits": [{"index": 58, "text": "改好后的整句文本。"}]}
 要并句时多带一个 absorb：
 {"edits": [{"index": 58, "text": "并好的一整句文本。", "absorb": 2}]}
+要补一句回应时改用 inserts：
+{"inserts": [{"after": 20, "speaker": "A", "emotion": "总结",
+              "text": "新加的那句回应。"}]}
 
 铁律：
-- **只允许替换**被点名句子的内容。不许新增句子，不许凭空删句；除问题清单点名
-  「连着说超限」的地方（靠 absorb 并句，见下）以外，全篇行数一个字都不能变。
+- 默认**只允许替换**被点名句子的内容，全篇行数一个字都不能变。有两处例外，都只在
+  问题清单**明确点名**时才用：「连着说超限」→ 用 `absorb` 并句（减行）；
+  「在第 N 句之后插入一句」→ 用 `inserts` 插一句（增行）。除此之外不许新增句子、
+  不许凭空删句。
+- 被点名「在第 N 句之后插入一句」的：用 inserts，一条就是一句新话，四个键都要给：
+    {"after": 20, "speaker": "B", "emotion": "总结", "text": "回应那句话的整句。"}
+  after 必须是问题清单点名的那一句；speaker 只能填 A 或 B（问题清单给了就照它填，
+  没给就按这一处该谁接着谁说定——**不许留空**：没有说话人的一句，念出来不知道是
+  谁在说）；emotion 从本篇词表中选一个合适的。**插入不是用来解决「连着说超限」的**
+  （那是 absorb 的事），也不许在同一处连插好几句来凑。
 - 只把**需要改的句子**写进 edits。没被点名的句子一个字都不许动，也不许出现在 edits 里。
 - text 必须是替换后的**完整整句**，不是片段；一句就是一句，不许把一句拆成两条
   edit（并句只许出现在被点名「连着说超限」的地方）。text 只装对话内容——语气/
@@ -1671,8 +2044,26 @@ def _patch_feedback(targets):
     return "\n".join(rows)
 
 
+def _reject_feedback(rejected):
+    """被拒条目的说明：下一轮喂回去，让「重发同一批」从盲重摇变成有依据的重试。
+
+    不把原因递回去，模型上一轮为什么栽（并句缩水、跨人并、并到篇外、越界）它就
+    一无所知，只能再猜一次——实测里一次补丁烧掉十六分钟、整批作废、下一轮原样
+    重发，那等于重摇一次骰子。
+    """
+    if not rejected:
+        return ""
+    rows = ["- 上一轮有 %d 条没落地，**这一轮别重犯**：" % len(rejected)]
+    for r in rejected[:12]:
+        rows.append("    第 %s 句：%s" % (r.get("index"), r.get("reason") or ""))
+    if len(rejected) > 12:
+        rows.append("    （另有 %d 条同类，按上面这些判据一并改）"
+                    % (len(rejected) - 12))
+    return "\n".join(rows)
+
+
 def build_patch_prompt(script, targets, feedback, material="", window=2,
-                       evidence=None):
+                       evidence=None, rejected_note=""):
     """拼定点修补的用户提示词。
 
     只给被点名句与它前后各 `window` 句，**不给全篇**。这不是省字那么简单：实测里
@@ -1682,6 +2073,10 @@ def build_patch_prompt(script, targets, feedback, material="", window=2,
 
     `material` 只在需要时才带：修「编造」这类内容问题，模型得知道素材支持什么；
     纯形式项（措辞、句长、单句时长）只跟这一句自己的字面有关，带上它就是白占上下文。
+
+    `rejected_note` 是**上一轮没落地的那几条、以及为什么**（见 `_reject_feedback`）。
+    只在重发时有值：这一轮的任务和上一轮往往一字不差，唯一的新信息就是「上次为什么
+    不行」，不带上它，这次重发就是重摇骰子。
 
     素材给多长由调用方按输入预算定（见 `fit_material`），这里不再自己截：
     截在拼提示词这一层，等于把「少了多少」藏进这一层，调用方与日志都看不见它。
@@ -1701,6 +2096,10 @@ def build_patch_prompt(script, targets, feedback, material="", window=2,
                      % material)
     parts.append("【要改的地方】（当前任务：按这里逐条改，只改点名的句）\n%s"
                  % feedback)
+    if rejected_note:
+        parts.append("【上一轮为什么没落地】（这是上次没能改上的条目和原因，"
+                     "**按这些判据重做**；不在下面的条目里、也没被点名的句子一律不动）\n%s"
+                     % rejected_note)
     parts.append("【相关段落】（被点名的句子，以及它们前后各 %d 句）\n%s"
                  % (window, "\n".join(rows)))
     parts.append("现在输出 JSON。")
@@ -1708,7 +2107,11 @@ def build_patch_prompt(script, targets, feedback, material="", window=2,
 
 
 def parse_patch(raw):
-    """从模型输出里取出 edits 数组。取不出就抛 ScriptError。"""
+    """从模型输出里取出 edits 与 inserts。两样都空就抛 ScriptError。
+
+    返回 `(edits, inserts)`：edits 是替换（行数不变，`absorb` 减行），inserts
+    是插入（增行）。插入只有「承诺闭合」用得上，所以多数补丁的 inserts 是空数组。
+    """
     text = (raw or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
@@ -1719,87 +2122,270 @@ def parse_patch(raw):
         data = json.loads(text[s:e + 1])
     except json.JSONDecodeError as exc:
         raise ScriptError("补丁输出的 JSON 无法解析：%s" % exc)
-    if not isinstance(data, dict) or not isinstance(data.get("edits"), list):
-        raise ScriptError("补丁输出里没有 edits 数组。")
-    if not data["edits"]:
-        raise ScriptError("补丁是空的：edits 数组里一条改动都没有。")
-    return data["edits"]
+    if not isinstance(data, dict):
+        raise ScriptError("补丁输出不是 JSON 对象。")
+    edits = data.get("edits")
+    inserts = data.get("inserts")
+    edits = [] if edits is None else edits
+    inserts = [] if inserts is None else inserts
+    if not isinstance(edits, list) or not isinstance(inserts, list):
+        raise ScriptError("补丁里的 edits / inserts 都必须是数组。")
+    if not edits and not inserts:
+        raise ScriptError("补丁是空的：edits 与 inserts 里一条改动都没有。")
+    return edits, inserts
 
 
-def apply_patch(script, edits, targets):
-    """把补丁落回原稿。默认只换字段、行数不变；**并句是唯一的例外**。
+def absorb_span(was, cfg=None):
+    """并句的字数可行域：返回 `(下限, 上限)`。
 
-    行数不变是这条路的根基：门禁报的「第 N 句」在补丁前后指的是同一行。唯一的例外
-    是「同一人连着说超限」——它只能靠并句解决（为什么必须减行，见 `_edit_item_schema`
-    的 `absorb`）。所以这里按**补丁前那一版的句号**逐行重建：被 `absorb` 并掉的句号
-    整行不出现，`targets` 里的「第 N 句」全程指补丁前那一句，编号不会漂。
+    **取值只有这一处**——判据（`apply_patch` 的保真校验）与处方（`patch_targets`
+    写给模型的数字）都调它。两处各算一遍，改了一处就会变成「提示词按一个区间写、
+    落地按另一个区间判」，模型照着提示词做还是被拒，而且看上去毫无异常。
+
+    为什么不是一个单一的百分比：
+
+    - 并句要删掉合并处的重复衔接（「对。」这类接话），所以允许比原来短——这是
+      「七成」的来处；
+    - 但**七成必须与「每句不超过单句上限」相容**，否则这一组永远无解。实测的形态
+      正是：两句合计 60 字，按七成要 42 字，而上限是 40 字——模型怎么写都被拒，
+      真机一整期一处都没落地（A 的上限只有 1 句，A 连说两句就得并成一句，最常见的
+      恰恰是这种情形）。
+
+    所以区间按两步定：
+
+    1. **常规**：`[单句上限 × 0.7, 单句上限]`（本机 28~40）。上限恒 ≤ 单句上限，
+       并出来的句子不会再被句长门禁打回，不会「并一次、报一次、再精简一次」。
+    2. **原句合计装不下这个下限时**（合计比下限还短）：退成 `[合计 × 0.7, 合计]`
+       ——合并两句总共才 20 字的短句，不该被要求写出 28 字。
+
+    再兜两处边界：下限不低于单句下限；原句合计连单句下限都不到时（两句「对。」），
+    上限抬到下限，**保证区间恒非空**——空的区间等于把这一组判死。
+    """
+    cfg = cfg or {}
+    hi = int(cfg.get("gate.max_chars", 40))
+    lo = int(round(hi * 0.7))
+    if was < lo:
+        lo, hi = int(round(was * 0.7)), int(was)
+    lo = max(lo, int(cfg.get("gate.min_chars", 8)))
+    hi = max(hi, lo)
+    return lo, hi
+
+
+def replace_span(was, cfg=None):
+    """就地替换的字数可行域：返回 `(下限, 上限)`。
+
+    **取值只有这一处**——落地判据（`apply_replace`）与提示词里写给模型的那个
+    `%d~%d` 都调它。两处各算一遍，就会出现「提示词按一个区间写、落地按另一个区间
+    判」，模型照着做还是被判没落地，还看不出原因。
+
+    算法与并句（`absorb_span`）同族，只差**上限**那一层：并句在「原句合计很短」时
+    会把上限收到合计（合并两句总共才 20 字，不该被要求写出 28 字）；替换不设这一层
+    ——以句换句，新句比原来那句长是好事，没必要封顶，只要不超单句上限。
+
+    下限取「原句的七成」且**封顶到「单句上限的七成」**：原句本身就是个正常句子
+    （≤上限），所以这个区间恒非空。为什么不是「逐字不低于原句」——那等于要求一个字
+    都不能少，模型少写两个字就被拒，落地率会掉得跟从前并句一样惨（那条路就是被
+    过严的判据卡死过一整期的）。
+    """
+    cfg = cfg or {}
+    hi = int(cfg.get("gate.max_chars", 40))
+    lo = min(int(round(was * 0.7)), int(round(hi * 0.7)))
+    lo = max(lo, int(cfg.get("gate.min_chars", 8)))
+    return min(lo, hi), hi
+
+
+def apply_patch(script, edits, targets, inserts=None, cfg=None):
+    """把补丁落回原稿。默认只换字段、行数不变；**并句与插入是两个例外**。
+
+    行数不变是这条路的根基：门禁报的「第 N 句」在补丁前后指的是同一行。两个例外
+    各有各的用途，都不是「随便增删」的口子：
+    - `absorb` 并句（**减行**）：只给「同一人连着说超限」，见 `_edit_item_schema`；
+    - `inserts` 插入（**增行**）：只给「承诺没闭合」，见 `_insert_item_schema`。
+
+    所以这里按**补丁前那一版的句号**逐行重建：被 `absorb` 并掉的句号整行不出现，
+    插入落在锚句之后，`targets` 里的「第 N 句」全程指补丁前那一句，编号不会漂。
 
     **只许改被点名的句。** 越界一律报错，不静默丢弃：模型顺手改了别的句子，等于把
     没毛病的地方重新摇一次骰子，而这正是这条路要根除的东西；悄悄放行它，下一轮
     若因此冒出新毛病，要跨过整整一个流程才查得到根源。
 
-    并句另有三条硬校验，缺一条就整份补丁作废、退回去整篇重出：被并的每一句都得在
-    点名清单里（没点名的说明它自己没毛病）、都得与并进的那句**同一个人**说的
-    （跨人并就是把一个人的话塞进另一个人嘴里）、并出来的字不许比原来几句加起来
-    少太多（并句只许删掉合并处的重复衔接，不许借并句吃掉内容）。
+    并句另有三条硬校验，缺一条这一组就不落地：被并的每一句都得在点名清单里
+    （没点名的说明它自己没毛病）、都得与并进的那句**同一个人**说的（跨人并就是把
+    一个人的话塞进另一个人嘴里）、并出来的字数得落在**可行区间**内（见
+    `absorb_span`——区间与「每句不超过单句上限」这条硬规定相容，从前那个「不低于
+    合计七成」的单一阈值在上限之下常常根本无解）。
+
+    **单条不合格只拒该条，其余照落**（返回 `(稿子, rejected)`）。从前是「全有或
+    全无」：一次点名四十多句，只要一条过不了校验，整份补丁作废、稿子一个字不动，
+    另外四十条白写——实测里一轮就这样白烧了十六分钟。现在分两类：
+
+    - **结构性**（条目不是对象、句号不是整数）→ 仍抛 `ScriptError`，整份退：
+      这种输出从根上不能用；
+    - **单条不合格**（越界、没点名、空文本、并句三条硬校验、两条互相冲突）
+      → **拒该条、记下原因**，其余照常落地。`rejected` 是 `[{index, reason}]`，
+      调用方拿它写日志，并在下一轮重发时喂回给模型——「重发同一批」从此是有
+      依据的重试，不是重摇骰子。
+
+    并句与冲突都是**成组**的：第 N 句并掉紧随的 M 句是一个整体，这一组里任何一条
+    不合格，整组一起拒（落一半等于把一段话截断）；某句被 A 条并走、又被 B 条单独
+    改，**涉及的两个条目一起拒**。
     """
     total = len(script)
     target_set = set(int(x) for x in targets)
     heads, swallowed, texts = {}, {}, {}
-    for e in edits:
+    rejected, ins_after = [], {}
+
+    def _drop_group(head):
+        """把已经接收的这一组（head 及它并掉的尾句）整组撤回。"""
+        for k, h in list(swallowed.items()):
+            if h == head:
+                del swallowed[k]
+        heads.pop(head, None)
+        texts.pop(head, None)
+
+    # 结构性校验走在前面：过了这一关，后面才敢直接读 e["index"]。这一类错误整份退
+    # ——条目的骨架都不成形，谈不上「其余照落」。
+    for e in (edits or []):
         if not isinstance(e, dict):
             raise ScriptError("补丁里有不是对象的条目：%r" % (e,))
         idx = e.get("index")
         if isinstance(idx, bool) or not isinstance(idx, int):
             raise ScriptError("补丁里的句号不是整数：%r" % (idx,))
+    for ins in (inserts or []):
+        if not isinstance(ins, dict):
+            raise ScriptError("补丁的 inserts 里有不是对象的条目：%r" % (ins,))
+        after = ins.get("after")
+        if isinstance(after, bool) or not isinstance(after, int):
+            raise ScriptError("inserts 里的 after 不是整数：%r" % (after,))
+
+    for e in (edits or []):
+        idx = int(e["index"])
         if not 1 <= idx <= total:
-            raise ScriptError("补丁句号越界：%d（全篇共 %d 句）" % (idx, total))
+            rejected.append({"index": idx,
+                             "reason": "句号越界（全篇共 %d 句）" % total})
+            continue
         if idx in heads or idx in swallowed:
-            raise ScriptError("第 %d 句在同一份补丁里出现两次——一条 edit 只管一句，"
-                              "它既不能自己改一遍又被别人并走。" % idx)
+            # 同一句被两条同时动了：涉及的两个条目一起拒——留下任何一条，改出来的
+            # 都不是模型想表达的那一版。
+            if idx in swallowed:
+                other = swallowed[idx]
+                _drop_group(other)
+                rejected.append({"index": other,
+                                 "reason": "它并掉的第 %d 句又被另一条单独动了，"
+                                           "两条一起拒" % idx})
+            else:
+                _drop_group(idx)
+                rejected.append({"index": idx,
+                                 "reason": "它和另一条动了同一句，两条一起拒"})
+            rejected.append({"index": idx,
+                             "reason": "第 %d 句在同一份补丁里被动了两次" % idx})
+            continue
         if idx not in target_set:
-            raise ScriptError("补丁改了没被点名的第 %d 句。定点修补只动被点名的句子，"
-                              "其余一律照抄。" % idx)
+            rejected.append({"index": idx,
+                             "reason": "这一句没被点名——定点修补只动被点名的句子，"
+                                       "其余一律照抄"})
+            continue
         text = re.sub(r"\s+", "", str(e.get("text") or "").strip())
         if not text:
-            raise ScriptError("补丁把第 %d 句改成了空文本。" % idx)
+            rejected.append({"index": idx, "reason": "这一条把整句改成了空文本"})
+            continue
 
         raw_absorb = e.get("absorb")
         absorb = 0 if raw_absorb is None else raw_absorb
         if isinstance(absorb, bool) or not isinstance(absorb, int) or absorb < 0:
-            raise ScriptError("第 %d 句的 absorb 只许是正整数（并掉紧随其后的几句）："
-                              "%r" % (idx, raw_absorb))
+            rejected.append({"index": idx,
+                             "reason": "absorb 只许是正整数（并掉紧随其后的几句）："
+                                       "%r" % (raw_absorb,)})
+            continue
         tail = [idx + k for k in range(1, absorb + 1)]
         if tail and tail[-1] > total:
-            raise ScriptError("第 %d 句要并掉 %d 句，已经并到篇外（全篇共 %d 句）。"
-                              % (idx, absorb, total))
+            rejected.append({"index": idx,
+                             "reason": "要并掉 %d 句，已经并到篇外（全篇共 %d 句）"
+                                       % (absorb, total)})
+            continue
+        bad = ""
         for k in tail:
             if k in heads or k in swallowed:
-                raise ScriptError("第 %d 句被同一份补丁并了两次。" % k)
+                # 这一句已经被另一条动过：两条一起拒（同上）。
+                other = k if k in heads else swallowed[k]
+                _drop_group(other)
+                rejected.append({"index": other,
+                                 "reason": "它动过的第 %d 句又要被并进第 %d 句，"
+                                           "两条一起拒" % (k, idx)})
+                bad = "第 %d 句已被另一条动过" % k
+                break
             if k not in target_set:
-                raise ScriptError("第 %d 句要并掉第 %d 句，可问题清单没点名第 %d 句。"
-                                  "门禁没点它就说明它自己没毛病——并句只许并"
-                                  "被点名的那一段。" % (idx, k, k))
+                bad = ("第 %d 句没被点名——门禁没点它就说明它自己没毛病，并句只许"
+                       "并被点名的那一段" % k)
+                break
             if script[k - 1]["speaker"] != script[idx - 1]["speaker"]:
-                raise ScriptError(
-                    "第 %d 句要把第 %d 句并进来，可这两句不是同一个人说的"
-                    "（%s / %s）——并句只许并同一人紧接着的句子。"
-                    % (idx, k, script[idx - 1]["speaker"],
-                       script[k - 1]["speaker"]))
+                bad = ("第 %d 句不是同一个人说的（%s / %s）——并句只许并同一人紧接着"
+                       "的句子"
+                       % (k, script[idx - 1]["speaker"], script[k - 1]["speaker"]))
+                break
+        if bad:
+            # 并句是成组的：这一组里任何一条不合格，**整组拒**——落一半等于把
+            # 一段话截断。
+            rejected.append({"index": idx,
+                             "reason": "这一组（第 %d 句并掉紧随的 %d 句）整组没"
+                                       "落地：%s" % (idx, absorb, bad)})
+            continue
         if tail:
             was = sum(len(re.sub(r"\s+", "", script[x - 1]["text"] or ""))
                       for x in [idx] + tail)
-            # 只拦「借并句吃掉内容」：并句本来就要删掉合并处的重复衔接（「对。」
-            # 这类接话），所以留出余量；整句整句地丢会被这里拦下。
-            if len(text) < was * 0.7:
-                raise ScriptError(
-                    "第 %d 句并出来的只有 %d 字，原来 %d 句加起来 %d 字——并句只许"
-                    "删掉合并处的重复衔接，意思一个都不许少。"
-                    % (idx, len(text), len(tail) + 1, was))
+            # 并后的字数区间由 `absorb_span` 一家给（判据与处方同源）：常规取
+            # 「单句上限的七成 ~ 单句上限」，原句合计装不下这个下限时退成
+            # 「合计的七成 ~ 合计」。上限恒 ≤ 单句上限，所以并出来的句子不会转身
+            # 又被句长门禁点名——从前那版只判「小于合计七成即拒」，而合计超过
+            # 57 字时七成已经越过 40 字上限，那一组从数学上就不可能落地。
+            lo_c, hi_c = absorb_span(was, cfg)
+            if not (lo_c <= len(text) <= hi_c):
+                rejected.append({
+                    "index": idx,
+                    "reason": "并出来的 %d 字，不在这一组要求的 %d~%d 字之内——并句"
+                              "只许删掉合并处的重复衔接，意思一个都不许少"
+                              % (len(text), lo_c, hi_c)})
+                continue
         heads[idx] = e
         texts[idx] = text
         for k in tail:
             swallowed[k] = idx
+
+    # 插入（承诺闭合）：只许插在**被点名的锚句**之后。行数因此增加，其后所有编号
+    # 后移——两段都在补丁之后重新判，会按新编号重新报，不会错位。
+    # 说话人必填，且不许拿插入去解决「连说超限」：那是并句的事（见 absorb）。
+    for ins in (inserts or []):
+        after = int(ins["after"])
+        if not 1 <= after <= total:
+            rejected.append({"index": after,
+                             "reason": "插入位置越界（全篇共 %d 句）" % total})
+            continue
+        if after not in target_set:
+            rejected.append({"index": after,
+                             "reason": "这个位置没被点名——插入只许落在被点名的位置"})
+            continue
+        if after in swallowed:
+            rejected.append({"index": after,
+                             "reason": "第 %d 句已被并走，不能再插在它后面" % after})
+            continue
+        speaker = str(ins.get("speaker") or "").strip().upper()
+        if speaker not in ("A", "B"):
+            rejected.append({"index": after,
+                             "reason": "speaker 只许是 A 或 B：%r"
+                                       % (ins.get("speaker"),)})
+            continue
+        emotion = ins.get("emotion")
+        if emotion not in DISCOURSE_ORDER:
+            rejected.append({"index": after,
+                             "reason": "emotion 不在本篇词表内：%r" % (emotion,)})
+            continue
+        text = re.sub(r"\s+", "", str(ins.get("text") or "").strip())
+        if not text:
+            rejected.append({"index": after, "reason": "插入的句子是空文本"})
+            continue
+        ins_after.setdefault(after, []).append(
+            {"speaker": speaker, "emotion": emotion, "text": text,
+             "estimated_seconds": 0})
 
     out = []
     for i, s in enumerate(script, 1):
@@ -1814,42 +2400,164 @@ def apply_patch(script, edits, targets):
             if heads[i].get("emotion") in DISCOURSE_ORDER:
                 row["emotion"] = heads[i]["emotion"]
         out.append(row)
-    return out
+        # 插入的句子紧跟在锚句之后；同一锚点要插几句时按模型给的先后顺序排。
+        out.extend(ins_after.get(i) or [])
+    return out, rejected
 
 
-def _needs_material(report):
+def apply_replace(script, edits, targets, cfg=None):
+    """就地替换：把点名的句子换成新内容，**行数不变**。
+
+    这是段内「查重 → 替换」那一步的落地口，与门禁那条定点路（`apply_patch`）分开
+    放：那条路还要管并句（减行）与插入（增行）两个例外，这条路只管一件事——**同一个
+    位置换一件新的事**。重复了 30 句，不是删掉 30 句（删完字数掉下来、下一轮又去补、
+    补出来又是重复，没尽头），而是把「后出现的那几处副本」就地换成新内容。
+
+    四条判据，缺一即拒：
+
+    1. **只动点名的句子**。点外一律拒——那几句没被查出重复，重写它们等于把没毛病的
+       地方重新摇一次骰子。
+    2. **换出来的新句不许与整篇任何其它一句重复**（就地再查一次重）。不查这一条，
+       换出来的可能还是复读，这一轮白跑。这是本路的专项判据，`apply_patch` 没有。
+    3. **字数守恒**：新句不低于原句的 **七成**（与并句同一把尺，见 `apply_patch` 的
+       保真判），上限是单句上限。换短了 → 段字数塌 → 轮末核账又报缺口 → 下一轮又去
+       补 → 又可能复读，正好绕回这条路要根除的东西。口径取「原句 × 0.7」且封顶到
+       「单句上限 × 0.7」——原句本来就是个正常句子（≤上限），所以区间恒非空。
+       这里**不用「逐字不低于」**：那等于要求一个字都不能少，模型少写两个字就被拒，
+       落地率会掉到跟从前并句一样惨（并句那条就是被过严的判据卡死的）。
+    4. 带 `emotion` 时必须在语篇词表内；不带就保留原标签。
+
+    返回 (新脚本, 被拒条目列表)。`rejected` 的每条都带可回灌给模型的原因——下一轮
+    重发同批补丁时，模型看见的是「为什么没落地」。
+    """
+    cfg = cfg or {}
+    max_c = int(cfg.get("gate.max_chars", 40))
+    vocab = list(vocab_words())
+    target_set = set()
+    for x in (targets or []):
+        try:
+            target_set.add(int(x))
+        except (TypeError, ValueError):
+            continue
+    total = len(script or [])
+    out = [dict(l) for l in (script or [])]
+    done, rejected = set(), []
+
+    for e in (edits or []):
+        idx = e.get("index")
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            rejected.append({"index": idx, "reason": "index 必须是整数句号"})
+            continue
+        if not 1 <= idx <= total:
+            rejected.append({"index": idx,
+                             "reason": "句号越界（全篇共 %d 句）" % total})
+            continue
+        if idx not in target_set:
+            rejected.append({"index": idx,
+                             "reason": "这一句没被点名——替换只动被点名的句子，"
+                                       "其余一律照抄"})
+            continue
+        if idx in done:
+            rejected.append({"index": idx,
+                             "reason": "第 %d 句在同一份补丁里被动了两次" % idx})
+            continue
+        text = re.sub(r"\s+", "", str(e.get("text") or "").strip())
+        if not text:
+            rejected.append({"index": idx, "reason": "这一条把整句改成了空文本"})
+            continue
+        was = len(re.sub(r"\s+", "", str(script[idx - 1].get("text") or "")))
+        # 字数区间与提示词里给模型的数字**同源**（`replace_span`）。
+        floor, _ceil = replace_span(was, cfg)
+        if len(text) < floor:
+            rejected.append({
+                "index": idx,
+                "reason": "换出来的只有 %d 字、原来那一句 %d 字——替换是**同长度换"
+                          "内容**，字数不许塌（塌下去这一段的账就少了，下一轮又得"
+                          "补字）。请重写这一句：%d~%d 字"
+                          % (len(text), was, floor, max_c)})
+            continue
+        if len(text) > max_c:
+            rejected.append({"index": idx,
+                             "reason": "换出来 %d 字、超过单句上限 %d 字：请压进 %d~%d 字"
+                                       % (len(text), max_c, floor, max_c)})
+            continue
+        key = _dedupe_key(text)
+        clash = 0
+        if len(key) >= DEDUPE_MIN_CHARS:
+            for j, item in enumerate(out, 1):
+                if j != idx and _dedupe_key(item.get("text")) == key:
+                    clash = j
+                    break
+        if clash:
+            rejected.append({"index": idx,
+                             "reason": "换出来的这一句跟第 %d 句重复了——换完还得是"
+                                       "新内容，不是把复读挪到别处。请讲一件前文还"
+                                       "没讲过的事" % clash})
+            continue
+        emotion = e.get("emotion")
+        if emotion is not None:
+            emotion = str(emotion).strip()
+            if emotion and emotion not in vocab:
+                rejected.append({"index": idx,
+                                 "reason": "语篇标签 %r 不在本篇词表内（可用：%s）"
+                                           % (emotion, "/".join(vocab))})
+                continue
+        row = dict(out[idx - 1])
+        row["text"] = text
+        if emotion:
+            row["emotion"] = emotion
+        out[idx - 1] = row
+        done.add(idx)
+
+    return out, rejected
+
+
+def _needs_material(report, want=None):
     """这一轮要修的问题里有没有内容类的。
 
     内容类（语义检、承诺链检）的修法要看素材，才知道什么能说什么不能说。
+    `want` 同 `patch_targets`：只看本次真的要修的那几项——检查段与门禁段各修各的，
+    门禁段修形式项时把素材递进去纯属白占上下文。
     """
-    for it in report.get("items") or []:
-        if it.get("ok") or it.get("soft") or it.get("advisory"):
-            continue
-        if (it.get("key") or "").startswith("check_"):
-            return True
-    return False
-
-
-def patch_targets(report, total):
-    """把门禁不通过项分成三类：能定点的、只能重出的、交人工的。
-
-    能定点的定义窄得只有一条：**问题自带句号**。形式门禁全都自带（它本来就是逐句
-    判的）；内容检要模型自己给，给了才算。
-
-    返回 (targets, refull, manual)：
-      targets — {句号: [问题说明]}，交给模型定点改
-      refull  — 只能整篇重出的：结构坏了（JSON 不合法、字段残缺），补丁无从下手
-      manual  — 定不了点的，交人工复核，**不动稿子**
-
-    「定不了点」只有一种成因：内容检自己指不出是哪一句。这时候让模型重写整篇，
-    等于把已经好的两百句一起摇一次骰子，还会把它自己都说不清的问题原样带回来。
-    不动稿子、交人看，比假装修一遍诚实。
-    """
-    targets, refull, manual = {}, [], []
     for it in report.get("items") or []:
         if it.get("ok") or it.get("soft") or it.get("advisory"):
             continue
         key = it.get("key") or ""
+        if want is not None and not want(key):
+            continue
+        if key.startswith("check_"):
+            return True
+    return False
+
+
+def patch_targets(report, total, want=None, cfg=None):
+    """把不通过项分成两类：能定点的、定不了点的。
+
+    能定点的定义窄得只有一条：**问题自带句号**。形式门禁全都自带（它本来就是逐句
+    判的）；内容检要模型自己给，给了才算；给不出就靠 `quote` 反查（见 `_norm_issues`）。
+
+    两段（检查段、门禁段）**没有任何重写权限**：对一份可用稿子，动作只有「判」和
+    「定点修」两件。结构坏了（稿子为空）是**生成步骤**的事，不由这里处置——从前
+    这里把「结构坏了」归成「只能整篇重出」、把「指不出句号」归成「交人工」，而
+    后者会让循环当场早退、一次都不试。两条路都不对：前者越权重写，后者等于不修。
+
+    `want` 是**本次要修哪几项**的过滤器（`key -> bool`）。两段各自成环、各修各的
+    判据：检查段只修内容项（`check_` 开头）、门禁段只修形式项——让一段去修另一段
+    的判据，改完又没人复判，报告上的结论就跟稿子两张皮。不给（None）＝全都算，
+    与从前一致。
+
+    返回 (targets, unfixed)：
+      targets — {句号: [问题说明]}，交给模型定点改
+      unfixed — 定不了点、也没能反查回来的项：记一笔**不早退、不重写**，
+                其余项照修
+    """
+    targets, unfixed = {}, []
+    for it in report.get("items") or []:
+        if it.get("ok") or it.get("soft") or it.get("advisory"):
+            continue
+        key = it.get("key") or ""
+        if want is not None and not want(key):
+            continue
         if key == "banned_words":
             for h in it.get("hits") or []:
                 targets.setdefault(int(h["line"]), []).append(
@@ -1865,11 +2573,21 @@ def patch_targets(report, total):
         elif key == "line_end_punct":
             # 句尾标点自带句号，同走定点：有没有归 py，补什么符号归这句话的
             # 语义——方向在问题说明里给足，不给模型就一律句号应付。
+            # 两种坏形两条处方：缺终止标点的补一个；结构符号混在末位的把它去掉。
+            # 后者若也照「补标点」办，`…{` 会变成 `…{。`——末位一合规，那个符号
+            # 就再没人查了。
             for h in it.get("hits") or []:
-                targets.setdefault(int(h["line"]), []).append(
-                    "句尾没有终止标点（以「%s」收尾）：按这句话的语义补一个合适的"
-                    "句尾标点——疑问收？、感叹收！、陈述收。"
-                    % h.get("tail", ""))
+                tail = h.get("tail", "")
+                if h.get("kind") == "junk":
+                    targets.setdefault(int(h["line"]), []).append(
+                        "句尾终止标点前面紧挨着念不出来的符号「%s」：把那个符号"
+                        "从这一句里去掉（它不该被念进台词），终止标点留着。"
+                        % tail)
+                else:
+                    targets.setdefault(int(h["line"]), []).append(
+                        "句尾没有终止标点（以「%s」收尾）：按这句话的语义补一个"
+                        "合适的句尾标点——疑问收？、感叹收！、陈述收。"
+                        % tail)
         elif key == "line_length":
             lo, hi = int(it.get("lo", 8)), int(it.get("hi", 40))
             for h in it.get("too_long") or []:
@@ -1884,7 +2602,7 @@ def patch_targets(report, total):
             for ln in it.get("lines") or []:
                 targets.setdefault(int(ln), []).append(
                     "这一句念出来超过单句时长上限：精简它的字数")
-        elif key in ("check_semantic", "check_promise"):
+        elif key == "check_semantic":
             located = False
             for iss in it.get("issues") or []:
                 ln = int(iss.get("line") or 0)
@@ -1894,11 +2612,41 @@ def patch_targets(report, total):
                     # 实测里只把检查结论原样贴出来（「语义检：素材里没有这个数据」），
                     # 模型会把它当成一份报告而不是一条指令，连续两次都跳过这一句没改。
                     targets.setdefault(ln, []).append(
-                        "%s：%s。改成素材支持的说法，去掉素材里没有的事实、数据或来源"
-                        % (it.get("label", "内容检"),
-                           iss.get("problem") or "内容在素材里找不到依据"))
+                        "语义检：%s。改成素材支持的说法，去掉素材里没有的事实、"
+                        "数据或来源"
+                        % (iss.get("problem") or "内容在素材里找不到依据"))
             if not located:
-                manual.append(it)
+                unfixed.append(it)
+        elif key == "check_promise":
+            located = False
+            for iss in it.get("issues") or []:
+                ln = int(iss.get("line") or 0)
+                if not (1 <= ln <= total):
+                    continue
+                located = True
+                # 要补的是**后文那句回应**，报出来的却是开头提出承诺的那一句。
+                # 所以这里点名两处：承诺句（明令不许删）＋建议闭合位置（插入锚点）。
+                # 修法是 `inserts`（在锚句之后插一句），不是 `edits` 改哪一句——
+                # 补回应本来就是一句新话，硬塞进已有句子只会把那句撑破。
+                close_after = int(iss.get("close_after") or 0)
+                if not (1 <= close_after <= total):
+                    close_after = total      # 给不出位置就补在末尾，不至于没处落
+                speaker = str(iss.get("speaker") or "").strip().upper()
+                if speaker not in ("A", "B"):
+                    speaker = ""             # 填错就当没给，由插入提示词按上下文定
+                targets.setdefault(ln, []).append(
+                    "第 %d 句开了口子、后文没有回应它（承诺：%s；回应到什么程度"
+                    "才算闭合：%s）：**这一句不许删、也不许改小**。"
+                    % (ln, iss.get("promise") or "开头提出的问题",
+                       iss.get("how") or "把这件事讲清楚"))
+                targets.setdefault(close_after, []).append(
+                    "要把上面那个承诺回应上：**在第 %d 句之后插入一句**（用 inserts，"
+                    "不是改这一句）%s。"
+                    % (close_after,
+                       "，由 %s 来说" % speaker if speaker else
+                       "，由谁来说按这一处的接续关系定"))
+            if not located:
+                unfixed.append(it)
         elif key == "ab_run_limit":
             # 连说超限自带句号，走定点，修法是**并句**不是换人。程序从前在这里直接
             # 翻说话人（v0.34.0 取下的 `enforce_max_run`），翻出来的是「A 问、A 自己
@@ -1910,22 +2658,38 @@ def patch_targets(report, total):
                 lines = [int(x) for x in rn.get("lines") or []]
                 if not lines:
                     continue
+                # 并后的字数区间：与落地判据**同源**（`absorb_span`）。从前
+                # 这条判据只写在程序里、提示词一个字都没提，模型不知道有这条规矩，
+                # 只会按「合并＝精简」写——真机一整期 15 处一处都没落地。
+                lo_c, hi_c = absorb_span(10 ** 9, cfg)   # 大数＝取常规区间
                 tip = ("第 %d–%d 句都是 %s 说的，连着说了 %d 句，超过上限"
                        "（%s 最多连着说 %d 句）：把这 %d 句**并成 %d 句以内**。写法是把"
                        "并好的整段放进这一段的第一句、带上 absorb，absorb 是并掉的"
                        "句数（至少 %d）：{\"index\": %d, \"text\": \"并好的一整句。\", "
                        "\"absorb\": %d}。**说话人一个字都不许动**——换人是拿格式代替"
-                       "语义；并句只删掉合并处的重复衔接，意思一个都不许少。"
+                       "语义。**并出来的字数必须落在 %d~%d 字之间**（这是硬判据："
+                       "不在区间里这一组整组不落地；你并掉的那几句若加起来比 %d 字"
+                       "还少，区间就退成「那几句合计的七成 ~ 合计」）；并句只删掉"
+                       "合并处的重复衔接，意思一个都不许少。"
                        % (lines[0], lines[-1], who, len(lines), who, cap,
                           len(lines), cap, len(lines) - cap, lines[0],
-                          len(lines) - cap))
+                          len(lines) - cap, lo_c, hi_c, lo_c))
                 for ln in lines:
                     targets.setdefault(ln, []).append(tip)
-        elif key in ("json_valid", "fields_complete"):
-            refull.append(it)
+        elif key == "emotion_vocab":
+            # 语篇词表自带句号、代码判的，跟措辞禁忌同一条路：定点改。
+            # 换成词表里的哪一个由这句话的语义定（词表只有一份，见 `vocab_words`）。
+            # 从前它掉进 `else` 被当成「交人工」——一个自己带句号的项，不该走那条路。
+            for ln in it.get("lines") or []:
+                targets.setdefault(int(ln), []).append(
+                    "这句的语篇标签不在本篇词表内（可用：%s）：从词表里换一个"
+                    "与这句话相称的——它在对话里干什么活就选哪个"
+                    % "/".join(it.get("vocab") or vocab_words()))
         else:
-            manual.append(it)
-    return targets, refull, manual
+            # 只可能是「稿子结构坏了」（json_valid / fields_complete）：那是**生成
+            # 步骤**的问题。门禁段不重写，记一笔、不早退——轮次照走，其余项照修。
+            unfixed.append(it)
+    return targets, unfixed
 
 
 def _find_item(report, key):
@@ -1935,18 +2699,22 @@ def _find_item(report, key):
     return None
 
 
-def dims_to_recheck(prev_report):
+def dims_to_recheck(prev_report, dims=None):
     """这一轮改完，内容检哪几项需要重判。
 
     只重判**上一轮没过、或压根没判过**的那几项。上一轮已经判过、且判通过的那一项，
     本轮改的又是措辞、句长这类形的事，没有理由把同一段上下文再喂一遍——真出了问题，
     形式门禁那一轮已经先把它拦下了。贵的东西（走模型）按需跑，便宜的东西（走代码）
     每轮全跑，这是这一段的成本纪律。
+
+    `dims` 是**本次该判的项**（承诺链检必判；语义检开着时才算）。不按它收窄的话，
+    语义检一关掉，它永远是 `None`、每轮都被算成「要重判」，开关就白设了。
     """
+    dims = tuple(dims) if dims else tuple(k for k, _ in CHECK6_DIMS)
     if not prev_report:
-        return set(k for k, _ in CHECK6_DIMS)
+        return set(dims)
     need = set()
-    for key, _label in CHECK6_DIMS:
+    for key in dims:
         item = _find_item(prev_report, "check_" + key)
         if item is None or not item.get("ok"):
             need.add(key)
@@ -2011,23 +2779,82 @@ def merge_check(report, content, cfg, carry=None):
 # 逐期即兴与单集走整篇。mapped 但各节凝缩不可得（还没排图、凝缩版本对不上）时
 # 退回整篇一路，并落日志说明。
 
-SEGMENT_MIN_SENTS = 15      # 软句数下限的兜底默认：正式值走 script.segment_min_sents
-SEGMENT_TOL_FRAC = 0.15     # 段字数容差（比例）——与总时长门禁同一把尺
-SEGMENT_TOL_MIN_CHARS = 60  # 段字数容差（绝对）：短段免碎核，与比例取大
-SEGMENT_RETRIES = 2         # 单段超容差的修正轮上限（少了插入、多了压删，都不是重写）
-PLAN_RETRIES = 2            # 规划打回上限，仍不过就按「一节一段」程序硬分
-SEGMENT_MAX_COUNT = 30      # 段数上限：防规划轮把稿子切碎成渣
-SEGMENT_FIXED_CHARS = 400   # 段提示词固定文案的字符数（算素材额度用，量级即可）
+#: 段级参数的兜底默认。**每一根都能在配置页改**（`script.segment_*` 与
+#: `script.plan_rounds`），常量只在那几个键缺席时顶上——一个数写死在源码里，
+#: 人就调不动它。
+SEGMENT_MIN_SENTS = 15       # 软句数下限：软引导的句数下限，也是碎段合并阈值的一因子
+SEGMENT_TOL_FRAC = 0.15      # 段字数容差（比例）——与总时长门禁同一把尺
+SEGMENT_FIX_ROUNDS = 5       # 单段超容差的修正轮上限（少了插入、多了压删，都不是重写）
+SEGMENT_PARSE_RETRIES = 2    # 「输出坏了重发」的轮上限：整篇出货重试与段级解析重试共用
+PLAN_RETRIES = 2             # 规划打回上限，仍不过就按「一节一段」程序硬分
+SEGMENT_FIXED_CHARS = 400    # 段提示词固定文案的字符数（算素材额度用，量级即可）
 
 
-def _segment_window(quota):
-    """本段验收区间 (lower, upper)：配额 ± max(15%, 60 字)，与核账同一把尺。
+def _tol_frac(cfg):
+    """段字数容差的比例。配置里是**整数百分数**（15 就是 15%），常量是小数。"""
+    v = (cfg or {}).get("script.segment_tol_frac")
+    if v is None:
+        return SEGMENT_TOL_FRAC
+    return max(0.01, float(v) / 100.0)
+
+
+def _segment_fix_rounds(cfg):
+    """一段超容差后还能修几次（少了插入、多了压删，共用这一份预算）。"""
+    return int((cfg or {}).get("script.segment_fix_rounds", SEGMENT_FIX_ROUNDS))
+
+
+def _segment_parse_rounds(cfg):
+    """输出坏了重发几次。全项目**只有这一个数**：整篇出货重试、段级解析重试共用。"""
+    return int((cfg or {}).get("script.segment_parse_rounds",
+                               SEGMENT_PARSE_RETRIES))
+
+
+def _plan_rounds(cfg):
+    """规划打回上限；仍不过就按各段首节的凝缩主旨代填。"""
+    return int((cfg or {}).get("script.plan_rounds", PLAN_RETRIES))
+
+
+def _quota_floor(cfg):
+    """段配额的地板：**软句数下限 × 每句最少字**＝提示词开始说做不到的话的那条线。
+
+    地板只管一件事：提示词里那句「约 N 句」不许与配额矛盾。「约 N 句」的算式带一个
+    软句数下限（`script.segment_min_sents`，默认 15），所以配额低于「15 句 × 每句
+    最少字（`gate.min_chars`，默认 8）」时，提示词会一边要它写 15 句、一边只给它不足
+    120 字的额度——两句话打架，模型怎么答都是错。120 就是这条线，本机落在这个量级，
+    正常一期碰不到。
+
+    **不是碎段合并那把尺**（那一把是 `软句数下限 × 期望句长`，本机 360）。两把尺管
+    两件事，值不同才对：
+
+    - 碎段合并判「这一段的料够不够**单开一段**」——产能问题，尺要取**常态**值（模型
+      写一句话的常态产量是期望句长），不够就并进邻居；
+    - 地板判「摊到的配额有没有低到**提示词自相矛盾**」——尺只取到**下界**（每句最少
+      字），越过这条线才拦。
+
+    从前两处共用「× 期望句长」，等于拿产能尺当地板：配额是按料摊的（见
+    `_section_quotas`），料少的地方配额本来就该少，抬到 360 就是给一部分段**偷偷改了
+    压比**——同一期里邻居还按原压比写，这几段忽然要拿更少的料写更多的字。本机目标
+    6585 字、地板 360 时，写作段数超过 18 个就会触发。
+    """
+    min_sents = int((cfg or {}).get("script.segment_min_sents", SEGMENT_MIN_SENTS))
+    min_chars = int((cfg or {}).get("gate.min_chars", 8))
+    return int(round(min_sents * min_chars))
+
+
+def _segment_window(quota, cfg=None):
+    """本段验收区间 (lower, upper)：配额 ± max(配额 × 容差比例, 地板 × 容差比例)。
 
     单一出口：核账判停（调用处 `tol`）与提示词里的【验收窗口】都从这里取数，
     两处永远一致——提示词给模型报的窗口若和程序实际收稿的窗口对不上，
     模型按假窗口收工就会被真窗口打回，白烧调用。
+
+    **容差下限是地板的派生量**（`_quota_floor × 容差比例`，本机 120 × 15% = 18）。
+    从前它是个独立常数（配置点 `script.segment_tol_min_chars`，本机 60），那个 60
+    没有算式出处，还让「各段容差之和 = 全篇容差」这笔账对不上。改用地板的派生量后，
+    全篇各段容差之和恰是 15% × 全篇配额（配额本身低于地板的段除外）。
     """
-    tol = max(int(quota * SEGMENT_TOL_FRAC), SEGMENT_TOL_MIN_CHARS)
+    frac = _tol_frac(cfg)
+    tol = max(int(quota * frac), int(round(_quota_floor(cfg) * frac)))
     return int(quota) - tol, int(quota) + tol
 
 
@@ -2184,13 +3011,13 @@ def _lines_hard_cap(cfg, quota):
     """schema 层的失控刹车：本段**合法**输出的句数上界。
 
     约束解码下模型能把数组无限写下去，写到上限才被语法强制收尾，所以必须有封顶。
-    上限按本段配额现算，不写死：段字数容差是 ±SEGMENT_TOL_FRAC、最短句是
+    上限按本段配额现算，不写死：段字数容差是 ±`script.segment_tol_frac`、最短句是
     min_chars，那么任何「还在容差内」的输出都不可能超过
     `配额 × (1+容差) ÷ 最短句` 句。取这个数就永不误伤，而它只管防无限写——
     控长归字数核账，两件事不混。
     """
     min_c = int(cfg.get("gate.min_chars", 8))
-    return max(1, int(math.ceil(float(quota) * (1.0 + SEGMENT_TOL_FRAC)
+    return max(1, int(math.ceil(float(quota) * (1.0 + _tol_frac(cfg))
                                 / max(1, min_c))))
 
 
@@ -2321,7 +3148,7 @@ def _sec_pieces(sec_no, n_chars):
             "start": 0, "end": n_chars, "chars": n_chars}
 
 
-def _groups_asis(secs, sec_chars, target_chars, groups=None):
+def _groups_asis(secs, sec_chars, target_chars, groups=None, cfg=None):
     """不装箱时的落法：**按给定分组直接落段**，组内各节保持原序；没分组就一节一段。
 
     没有输入额度能力（假模型 / 将来别的客户端），或拿不到逐节体量时用它——量不出
@@ -2342,7 +3169,7 @@ def _groups_asis(secs, sec_chars, target_chars, groups=None):
                                            if k - 1 < len(sec_chars) else 0)
                                for k in sec_nos],
                     "quota": sum(qs[k - 1] for k in sec_nos)})
-    return _finish_quotas(out, target_chars)
+    return _finish_quotas(out, cfg, target_chars)
 
 
 #: 逻辑拆分的重试上限。它只分「哪几节成一段」，产出的东西很少，一次打回
@@ -2556,12 +3383,14 @@ def _merge_tiny_groups(secs, groups, target_chars, cfg, log=None):
     """碎段合并：配额低于阈值的逻辑段，并进配额较小的相邻段。**纯算术，模型不参与。**
 
     动机：小节扎堆时会出一批 60~145 有效字的段——一次完整调用写三句话，
-    烧时间、多接缝，而且「约 N 句」的软引导在配额过小时自相矛盾（15 句 × 每句
-    最少 8 字 = 120 字 > 配额 60 字）。
+    烧时间、多接缝，形态也难维持。
 
     阈值 = `script.segment_min_sents` × 期望句长，**全部现算不写死**：软句数
-    下限与期望句长是它的两个因子，改配置它就跟着变。段配额 ≥ 阈值时，
-    「约 N 句」的引导才与配额自洽——这个阈值正好是引导不说谎的下限。
+    下限与期望句长是它的两个因子，改配置它就跟着变。乘的是**期望句长**（模型写一
+    句话的常态产量）——这把尺判的是「这一段的料够不够**单开一段**」，是**产能**
+    判据，所以取常态值。从前这里多写了一句「这个阈值正好是引导不说谎的下限」，
+    那是错的：引导不说谎的下限是乘**每句最少字**（15 × 8 = 120），不是乘期望句长
+    （15 × 24 = 360）——差三倍。配额地板是另一把尺，见 `_quota_floor`。
 
     位置在**装箱之前**：合并只改「哪几节归同一段」（节顺序不变），装箱按
     容量再切是它的兜底——合并段超容时桶照旧按整节切开，`written` 按实际
@@ -2638,7 +3467,7 @@ def pack_segments(secs, sec_chars, llm, cfg, fixed_chars=0, target_chars=0, log=
         # 没有额度能力的后端、或拿不到逐节体量：不做容量判断，**照逻辑分组直接落段**
         # （没有分组信息才退成一节一段）。没有重量就没法判断"装不装得下"，但分组
         # 是语义结论——把量不出重量当成"分组作废"的理由，等于白分一次。
-        return _groups_asis(secs, sec_chars, target_chars, groups)
+        return _groups_asis(secs, sec_chars, target_chars, groups, cfg)
 
     quotas = _section_quotas(secs, target_chars)
     max_tokens = int(cfg.get("llm.max_tokens", 8192))
@@ -2696,18 +3525,34 @@ def pack_segments(secs, sec_chars, llm, cfg, fixed_chars=0, target_chars=0, log=
         if cur:
             written += tok_of(sum(quotas[s - 1] for s in cur))
             rows.append(row_of(cur))
-    return _finish_quotas(rows, target_chars)
+    return _finish_quotas(rows, cfg, target_chars)
 
 
-def _finish_quotas(groups, target_chars):
-    """段层补余数与下限：配额合计精确等于目标，且每段不低于最小可写段。"""
+def _finish_quotas(groups, cfg, target_chars):
+    """段层补余数与地板：配额合计对着目标，且每段不低于「提示词不说谎」的下限。
+
+    地板取 `_quota_floor`（软句数下限 × **每句最少字**）。配额是**按料摊的**
+    （`_section_quotas`）：料多的地方多写、料少的地方少写，这就是对的结果，不需要
+    谁去救。地板唯一要拦的是「配额低到提示词那句『约 N 句』自己打自己的脸」。所以
+    这把尺比碎段合并那把（× 期望句长，本机 360）**小得多**（本机 120）——大了就不是
+    拦，而是给一部分段偷偷改压比。
+
+    抬地板会让合计**超过**目标（从前只补齐、没回头重算，是根不熔断的保险丝），
+    所以抬完把超出部分从**最大的一段**扣回来；扣到它会低于地板就作罢——总数宁可
+    贵一点，也不让某一段小到提示词说不出话。
+    """
     if not groups:
         return groups
+    floor = _quota_floor(cfg)
     diff = int(target_chars) - sum(g["quota"] for g in groups)
     k = max(range(len(groups)), key=lambda i: groups[i]["quota"])
     groups[k]["quota"] += diff
     for g in groups:
-        g["quota"] = max(SEGMENT_TOL_MIN_CHARS, int(g["quota"]))
+        g["quota"] = max(floor, int(g["quota"]))
+    over = sum(g["quota"] for g in groups) - int(target_chars)
+    if over > 0:
+        k = max(range(len(groups)), key=lambda i: groups[i]["quota"])
+        groups[k]["quota"] -= min(over, max(0, groups[k]["quota"] - floor))
     return groups
 
 
@@ -2783,8 +3628,11 @@ def segment_schema(quota=None, cfg=None, vocab=None):
         "required": ["lines"],
     }
     if not quota or quota <= 0:
-        # 调用方没给配额（如只校验结构）：按「一个最小可写段」开刹车兜底。
-        quota = SEGMENT_TOL_MIN_CHARS * 10
+        # 调用方没给配额（如只校验结构）：按「一个最小可写段」开刹车兜底。尺取
+        # `_quota_floor`（软句数下限 × 每句最少字）——那正是「一段最少写多少」的
+        # 定义。从前这里写 `_tol_min_chars(cfg) * 10`，那个 ×10 的倍数在代码与配置
+        # 里都找不到出处，算出来的句数上限（本机 87 句）也跟真配额派生不出关系。
+        quota = _quota_floor(cfg)
     schema["properties"]["lines"]["maxItems"] = _lines_hard_cap(cfg or {}, quota)
     return schema
 
@@ -2952,7 +3800,7 @@ def _segment_system_prompt(cfg, card, preset_key, index, total, quota,
 
 def _segment_user_prompt(project, evidence, group, quota, written_chars,
                          target_chars, fit, prev_text, feedback,
-                         pieces=None, noted_fit=None):
+                         pieces=None, noted_fit=None, cfg=None):
     """noted_fit：插好【※取材注意】行的展示版素材；缺省回落 fit。
 
     压比（【本段用量】）**永远吃 fit 原版**——标记行是 py 写的指令，不是
@@ -2993,7 +3841,7 @@ def _segment_user_prompt(project, evidence, group, quota, written_chars,
     # 由核账与补写轮闭环兜底，提示词喊口号只会诱发为凑数复读。
     mat_chars = (int(round(duration_model.effective_chars(fit)))
                  if fit and fit.strip() else 0)
-    low, high = _segment_window(quota)
+    low, high = _segment_window(quota, cfg)
     if mat_chars > 0 and quota > 0:
         ratio = mat_chars / float(quota)
         if ratio >= 1.0:
@@ -3004,7 +3852,7 @@ def _segment_user_prompt(project, evidence, group, quota, written_chars,
                     "把素材讲透讲满，不编造素材之外的事实。")
         lines.append("【本段用量】素材约 %d 字，本段配额约 %d 字——素材约为配额的 %.1f 倍。%s"
                      % (mat_chars, int(quota), ratio, task))
-    lines.append("【验收窗口】程序按 %d~%d 字收稿，超出会被打回继续补写或压紧。"
+    lines.append("【验收窗口】本段按 %d~%d 字验收——把字数控制在这个区间之内。"
                  % (low, high))
     lines.append("")
     lines.append("【本期素材】")
@@ -3046,6 +3894,24 @@ def _numbered_rows(seg_lines, offset):
                      for k, ln in enumerate(seg_lines, 1))
 
 
+def _clip_script_rows(script, width=24):
+    """把整篇正文压成「够认脸」的形态：每句只留前 `width` 字。
+
+    给额度紧张时的替换提示词用。它的【已写脚本】块本该给全篇正文（主人定的规矩：
+    「我要看到所有已写的」），但小额度后端装不下几千字的正文。压缩之后句号、说话人、
+    语篇标签、句子大意都还在——够模型判断「这件事已经讲过了」；细节本来就该回
+    【本段原文】里取，不靠这块。
+    """
+    rows = []
+    for n, ln in enumerate(script or [], 1):
+        text = re.sub(r"\s+", "", str(ln.get("text") or ""))
+        if len(text) > width:
+            text = text[:width] + "…"
+        rows.append("%d. [%s·%s] %s" % (n, ln.get("speaker", ""),
+                                        ln.get("emotion", ""), text))
+    return "\n".join(rows)
+
+
 def _insert_hard_cap(cfg, need):
     """插入条数的失控刹车：这次要补的字数，最多能由多少句凑出来。
 
@@ -3054,7 +3920,7 @@ def _insert_hard_cap(cfg, need):
     这么多条，取它永不误伤；它只管防无限写，控长归字数核账，两件事不混。
     """
     min_c = int((cfg or {}).get("gate.min_chars", 8))
-    return max(1, int(math.ceil(abs(int(need)) * (1.0 + SEGMENT_TOL_FRAC)
+    return max(1, int(math.ceil(abs(int(need)) * (1.0 + _tol_frac(cfg))
                                 / max(1, min_c))))
 
 
@@ -3130,33 +3996,17 @@ def trim_schema(n_lines=0, vocab=None):
     return schema
 
 
-_INSERT_SYSTEM_TMPL = """你是播客脚本的补写者，回答只输出 JSON，不要任何其它文字。
+def _norepeat_block():
+    """「禁止重复已写内容」的判据与正反例——补写与就地替换**共用同一份**。
 
-任务：本段的字数不够，你要**新增**对话句子把它补够。**已经写好的句子一个字都不许改**。
+    两处都要这条纪律：补写要它（补出来的必须是新东西），就地替换更要它（替换本来
+    就是因为重复才发生的）。抄成两份就会出现一处改了、另一处还是旧的，模型在两个
+    环节听到两种规矩。插入与替换各自特有的条条（只许新增、after 的语义、行数不变）
+    不在这里面，留在各自的模板里。
 
-输出格式：
-{"inserts": [{"after": 58, "speaker": "A", "emotion": "解释", "text": "新增的整句文本。"}]}
-
-铁律：
-- **只许新增**。不许修改已有句子，不许删除已有句子。
-- after：新句插在第几句**之后**，填正文里给出的那个句号。插在本段最前面，就填本段
-  第一句的**前一句**句号；插在本段末尾，就填本段最后一句的句号。同一个位置要连插
-  几句，把这几个条目按你想要的先后顺序依次排在一起。
-- speaker：只能填 A 或 B。看着插入位置的上下文定——这句话夹在谁的话后面、该由
-  谁来说，只有你看得见。
-  **两人怎么接：%s**
-  **连着说的上限：A 最多连着说 %d 句、B 最多连着说 %d 句**（上限不是目标，谁都不许超过它）。
-  %s
-- emotion：只填语篇标签，标这句在对话里干什么活，每句必填、**从本篇词表中选**
-  （词表只有这一份，照抄下面列出的词，不在此列的一律不许编）：
-%s
-- text：新句的完整文本，%d–%d 字。text 只装对话内容——语气/情绪描写（「小美
-  疑惑地说」这类）、说话人标记、任何标签都不进 text，text 里的每个字都会被念出来。
-  每句必须以标点符号收尾，符号按语义选：疑问收「？」、感叹收「！」、陈述收「。」。
-- 新增的每一句都要能在【素材】里找到依据。**不许编造**素材之外的事实、数字、结论。
-- 插进去之后读起来必须是一段连贯的对话：接得上前面那句，也接得住后面那句。
-  补的是话，不是注解——别写成「此外还需说明」这类书面插入语。
-- **不许把已有的话换个说法再说一遍。** 判据看**意思**，不看措辞——换个词、换个
+    一份提示词只管它自己那一步的事：这块里没有字数、没有落点、没有流程。
+    """
+    return """- **禁止重复已有的脚本内容。** 判据看**意思**，不看措辞——换个词、换个
   句式、换个角度去问或去答，只要说的是同一件事，就是重复。照下面的例子判：
 
   【这些算重复】
@@ -3189,15 +4039,45 @@ _INSERT_SYSTEM_TMPL = """你是播客脚本的补写者，回答只输出 JSON�
     → 不重复。补的是另一条分支的情况。
 
   一句话判据：把两句并排放进听众耳朵里听一遍——听到「同一件事又说了一遍」就是
-  重复，听到「新东西」就不是。**换个说法不改变这个判断。**
+  重复，听到「新东西」就不是。**换个说法不改变这个判断。**"""
+
+
+_INSERT_SYSTEM_TMPL = """你是播客脚本的补写者，回答只输出 JSON，不要任何其它文字。
+
+任务：本段的字数不够，你要**新增**对话句子把它补够。**已经写好的句子一个字都不许改**。
+
+输出格式：
+{"inserts": [{"after": 58, "speaker": "A", "emotion": "解释", "text": "新增的整句文本。"}]}
+
+铁律：
+- **只许新增**。不许修改已有句子，不许删除已有句子。
+- after：新句插在第几句**之后**，填正文里给出的那个句号。插在本段最前面，就填本段
+  第一句的**前一句**句号；插在本段末尾，就填本段最后一句的句号。同一个位置要连插
+  几句，把这几个条目按你想要的先后顺序依次排在一起。
+- speaker：只能填 A 或 B。看着插入位置的上下文定——这句话夹在谁的话后面、该由
+  谁来说，只有你看得见。
+  **两人怎么接：%s**
+  **连着说的上限：A 最多连着说 %d 句、B 最多连着说 %d 句**（上限不是目标，谁都不许超过它）。
+  %s
+- emotion：只填语篇标签，标这句在对话里干什么活，每句必填、**从本篇词表中选**
+  （词表只有这一份，照抄下面列出的词，不在此列的一律不许编）：
+%s
+- text：新句的完整文本，%d–%d 字。text 只装对话内容——语气/情绪描写（「小美
+  疑惑地说」这类）、说话人标记、任何标签都不进 text，text 里的每个字都会被念出来。
+  每句必须以标点符号收尾，符号按语义选：疑问收「？」、感叹收「！」、陈述收「。」。
+- 新增的每一句都要能在【素材】里找到依据。**不许编造**素材之外的事实、数字、结论。
+- 插进去之后读起来必须是一段连贯的对话：接得上前面那句，也接得住后面那句。
+  补的是话，不是注解——别写成「此外还需说明」这类书面插入语。
+%s
 - **每一句都得带进正文里还没有的东西**：新事实、新数字、新步骤、新角度都算。
   【素材】里有、而正文还没讲到的，优先补那些。一个信息点写成一句就够，最多写成
-  一组一问一答（**一组，不是两组、也不是两问**），同一个点不许写两遍。挑不出
-  新东西时，**把已经提到的点讲得更细**，也胜过重说一遍。
+  一组一问一答（**一组，不是两组、也不是两问**），同一个点不许写两遍。
 - 分几处插入时，**各处彼此也不许重复**，更不许跟别处已经补过的话重复；
   同一个人不许连着追问同一件事——那读起来像结巴。
-- 各句字数合计要接近本次要补的字数，**不要明显超出**；但**复读不算补字**，
-  凑不够就往细节里写，不许把说过的话再摆一遍。
+- 各句字数合计要接近本次要补的字数，**不要明显超出**。**禁止重复已有的脚本内容**
+  ——凑不够就换没讲到的点讲得更细（新数字、新步骤、新角度、另一条分支的情况），
+  把一件事讲透，而不是把说过的话再摆一遍。复读不算补字：程序会把重复查出来、
+  就地换掉，那一轮等于白补。
 - 你写的新句**同样要过措辞禁忌**：
 %s"""
 
@@ -3226,11 +4106,74 @@ def insert_system(card=None, cfg=None):
         paradigms.example_block(_form_key(card, cfg), indent="  "),
         _vocab_block(),
         int(cfg.get("gate.min_chars", 8)), int(cfg.get("gate.max_chars", 40)),
+        _norepeat_block(),
         format_banned_rules())
     # 站位与对话形式与写脚本那一处同源：选了形式就顶掉卡上的站位说明。
     base += "\n\n【两位主持人】（既定阵容，不由你指定）\n" + _hosts_text(
         card, cfg, cfg.get("script.dialogue_form") or "")
     base += ("\n\n【风格倾向】（与本次补写的内容无关的通用背景；与上面的铁律"
+             "冲突时以铁律为准）\n" + _style_block(preset))
+    base += "\n\n" + READABLE_RULE
+    return base
+
+
+_REPLACE_SYSTEM_TMPL = """你是播客脚本的改写者，回答只输出 JSON，不要任何其它文字。
+
+任务：名单里点名的句子**跟前面的内容重复了**。你要就地把它们换掉——**位置不动、
+行数不动、说话人不动**，只把内容换成正文里还没讲过的东西。
+
+输出格式：
+{"edits": [{"index": 58, "text": "换好后的整句文本。"}]}
+
+铁律：
+- **只许改名单里点名的句子**。没被点名的句子一个字都不许动，也不许出现在 edits 里。
+- **行数一个字都不能变**：不许新增句子、不许删句、不许把两句并成一句。一句话就是
+  一条 edit，不许把一句拆成两条。
+- 说话人不在你的职责内，**不要输出 speaker 这个键**——换人是拿格式代替语义，把 A 的
+  一句话翻给 B，读起来就成了另一个人自问自答。
+  **两人怎么接：%s**
+  **连着说的上限：A 最多连着说 %d 句、B 最多连着说 %d 句**（上限不是目标，谁都不许超过它）。
+  %s
+- emotion：只有名单点名要改语篇标签时才带上；从本篇词表中选（词表只有这一份，
+  不在此列的一律不许编）：
+%s
+- text：换好后的**完整整句**，不是片段；%d–%d 字。text 只装对话内容——语气/情绪
+  描写（「小美疑惑地说」这类）、说话人标记、任何标签都不进 text，text 里的每个字
+  都会被念出来。每句必须以标点符号收尾，符号按这句话的语义定：疑问收「？」、感叹
+  收「！」、陈述收「。」——不许一律补句号应付。
+- **先读名单再动笔**：名单里每一条都写明了「这一句跟第 N 句重复」。那件事已经讲过
+  了，你要讲的是**另一件事**——回【本段原文】里找还没进过正文的点；挑不出新东西
+  就换一条角度（补数字、补步骤、补反例、补另一条分支），而不是换个说法重说一遍。
+%s
+- 你换出来的句子**同样要过措辞禁忌**：
+%s"""
+
+
+def replace_system(card=None, cfg=None):
+    """段内「查重 → 替换」那一步的系统提示词。
+
+    与补写（`insert_system`）**共用同一份纪律**：两人怎么接、形状示范、连句上限、
+    语篇词表、句长区间、措辞禁忌、主持人阵容、可朗读规则，连「禁止重复」那整套判据
+    也是同一个 `_norepeat_block()`。差别只在**动作**——那边是「新增一句、已有句子
+    一个字不许动」，这边是「原地换掉点名的那一句、行数不动」。各自的模板只写各自的
+    动作，纪律一个字不另写：几份提示词各按一个口径要求，模型在不同轮次听到的就是
+    两种规矩（插入这一处从前就是另写一份硬编码，人把上限调到 30、它还在按 40 补）。
+    """
+    cfg = cfg or {}
+    card = card or {}
+    preset = (PRESET_SPEC.get(cfg.get("script.style_preset", "argument"))
+              or PRESET_SPEC["argument"])
+    cap_a, cap_b = _run_caps(card, cfg)
+    base = _REPLACE_SYSTEM_TMPL % (
+        paradigms.rhythm_text(_form_key(card, cfg)), cap_a, cap_b,
+        paradigms.example_block(_form_key(card, cfg), indent="  "),
+        _vocab_block(),
+        int(cfg.get("gate.min_chars", 8)), int(cfg.get("gate.max_chars", 40)),
+        _norepeat_block(),
+        format_banned_rules())
+    base += "\n\n【两位主持人】（既定阵容，不由你指定）\n" + _hosts_text(
+        card, cfg, cfg.get("script.dialogue_form") or "")
+    base += ("\n\n【风格倾向】（与本次替换的内容无关的通用背景；与上面的铁律"
              "冲突时以铁律为准）\n" + _style_block(preset))
     base += "\n\n" + READABLE_RULE
     return base
@@ -3253,30 +4196,45 @@ _TRIM_SYSTEM_TMPL = """你是播客脚本的压缩者，回答只输出 JSON，�
 - drops：要整句删掉的句号。**删之前先在脑子里走一遍上下文**：删掉之后，前后两句话
   还接得上吗？接不上就别删，改成把措辞压紧。
 - 保语义：只去掉多余的话，**不许把有用的事实、数据、结论一起删掉**。
-- 减到差不多就停，**别减过头**——减多了下一轮还得再补回来，白烧一次调用。
+- %s
 - 你改出来的句子**同样要过措辞禁忌**：
 %s"""
 
 
-def trim_system(cfg=None):
+def trim_system(cfg=None, low=0, high=0):
     """段内压字数的系统提示词。
 
     句长区间同 `patch_system`：从配置读。压紧那一步最容易把人调的窄区间顶破
     ——它按「压到 8–40 里」减，减完落在 35 字，而人把上限设成了 30，一次
     调用白烧。
+
+    `low` / `high` 是本段的验收区间（`_segment_window` 算的）。把两个数摆出来，
+    「减到差不多就停」才有一个能照着做的意思——含糊的「差不多」等于没给标准。
     """
     lo = int((cfg or {}).get("gate.min_chars", 8))
     hi = int((cfg or {}).get("gate.max_chars", 40))
-    return _TRIM_SYSTEM_TMPL % (lo, hi, format_banned_rules())
+    if low and high:
+        rule = ("减进任务里给的验收区间就算完成（本段区间是 %d–%d 字），减到区间内"
+                "即停，**不许减到区间以下**。" % (int(low), int(high)))
+    else:
+        rule = "减进任务里给的验收区间就算完成，减到区间内即停，**不许减到区间以下**。"
+    return _TRIM_SYSTEM_TMPL % (lo, hi, rule, format_banned_rules())
 
 
 def build_insert_prompt(seg_lines, need, quota, offset, material="", evidence=None,
-                        noted_material=None, raw_material=None, topic=None):
+                        noted_material=None, raw_material=None, topic=None,
+                        prev_rows="", cfg=None):
     """拼段内补字数的用户提示词。
 
     给的是**本段全文**，不是窗口。插在哪儿要看整段的起承转合：可能插在两句之间，
     也可能在本段末尾再接一拍——只给上下两句，它看不见该往哪儿塞。段本来就不长
     （几十句），一次给全撑不爆上下文。
+
+    `prev_rows`：**本段之前**已经写好的正文（带全篇句号）。首写那一轮本来就看得见
+    全篇已写正文（`prev_text`），补字这一轮从前只给本段——于是模型手里有九千字原文、
+    有本段这几十句，**独独不知道前面几段讲过什么**，提示词却要它「挑正文还没讲到的
+    点」：它只能撞。实测第 2 期那 33 句复读就是这么来的。主人一句话定的规矩：
+    「虽然问题发生在本段，虽然原文素材只给本段的，但是我要看到所有已写的」。
 
     raw_material / topic：本段对应的**原文**与**段主旨**——写脚本那一轮给过的
     上下文，插入这一轮同样要给。插入句的细节依据在原文里，只给凝缩（material）
@@ -3298,10 +4256,15 @@ def build_insert_prompt(seg_lines, need, quota, offset, material="", evidence=No
     if material:
         parts.append("【素材】（新增句子的依据在这里；不要照抄它的句子）\n%s"
                      % (noted_material or material))
+    if prev_rows and str(prev_rows).strip():
+        parts.append("【已写脚本（前文）】（本段**之前**已经写好的正文，编号是它在"
+                     "全篇里的句号。**这些句子一个字都不许改**；它们同时是「已经讲过"
+                     "什么」的清单——新增的句子不许跟这里任何一句重复）\n%s"
+                     % prev_rows)
     parts.append("【本段已有正文】（编号是它在全篇里的句号。"
                  "**这些句子一个字都不许改**）\n%s" % _numbered_rows(seg_lines, offset))
     first, last = offset + 1, offset + len(seg_lines)
-    low, high = _segment_window(quota)
+    low, high = _segment_window(quota, cfg)
     parts.append("【任务】本段目前 %d 字，验收区间 %d~%d 字，**还差 %d 字**。"
                  "请依据上面的素材新增对话句子，把缺的 %d 字补足。\n"
                  "插在哪儿由你判断：可以插在本段任意两句之间，也可以接在本段末尾；"
@@ -3322,7 +4285,140 @@ def build_insert_prompt(seg_lines, need, quota, offset, material="", evidence=No
     return "\n\n".join(parts)
 
 
-def build_trim_prompt(seg_lines, over, quota, offset, evidence=None):
+def build_replace_prompt(script, hits, material="", noted_material=None,
+                         raw_material=None, topic=None, evidence=None,
+                         script_rows=None, cfg=None):
+    """拼「就地替换」的用户提示词（段内轮次的「查重 → 替换」那一步）。
+
+    `script` 是**整篇**正文，不只本段。替换这件事的发生原因就是「这一句跟前面某句
+    撞了」——要它写出新的，就得让它同时看见两样东西：**撞到的那一句**长什么样、
+    **整篇已经讲过什么**。只给本段等于把「别重复」交给猜，而它猜的结果就是换个说法
+    再讲一遍（实机形态）。
+
+    `hits` 是 `find_repeats` 的返回：`{要换掉的句号: 它跟哪一句重复}`。每一条都带上
+    区间数字（`replace_span` 现算，与落地判据同源）——模型不知道区间，只会按「改写
+    ＝写短点」的直觉写，然后被判没落地。
+
+    素材只给**本段**（`raw_material`）：这一段该讲哪一块原文是画地图时定死的，范围
+    之外的细节写出来就是编造。与补字那一轮同一条规矩。
+    """
+    parts = []
+    ev = _evidence_block(evidence)
+    if ev:
+        parts.append(ev)
+    if topic and str(topic).strip():
+        parts.append("【本段主旨】%s" % str(topic).strip())
+    if raw_material and str(raw_material).strip():
+        parts.append("【本段原文】（本段覆盖的那部分原文；换出来的新句依据在这里，"
+                     "范围之外的细节不要写）\n%s" % raw_material)
+    if material:
+        parts.append("【素材】（同一块内容的凝缩版，供你快速找点）\n%s"
+                     % (noted_material or material))
+    parts.append("【已写脚本】（**整篇**已经写好的正文，编号是它在全篇里的句号。"
+                 "**除了【要换掉的句子】里点名的那几句，一个字都不许改**。它同时就是"
+                 "「已经讲过什么」的清单——说一句「重复了」，指的就是跟这里的某一句"
+                 "撞上了）\n%s"
+                 % (script_rows if script_rows is not None
+                    else _numbered_rows(script, 0)))
+    rows = []
+    for idx in sorted(hits or {}):
+        first = int(hits[idx])
+        src = script[idx - 1]
+        was = len(re.sub(r"\s+", "", str(src.get("text") or "")))
+        lo, hi = replace_span(was, cfg)
+        rows.append("第 %d 句（%s 说）——与第 %d 句重复：\n"
+                    "  原来写的是：%s\n"
+                    "  换成新的：**%d~%d 字**，讲一件前文还没讲过的事"
+                    % (idx, src.get("speaker", ""), first,
+                       str(src.get("text") or ""), lo, hi))
+    parts.append("【要换掉的句子】\n%s" % "\n".join(rows))
+    parts.append("【任务】上面每一句都**原地**换成新内容：句子位置不变、说话人不变、"
+                 "全篇行数一个字都不变。\n"
+                 "换出来的必须讲一件**前文还没讲过**的事——先把【已写脚本】通读一遍，"
+                 "在脑子里列出「已经讲过的话」清单，再回【本段原文】里挑还没进去的点。\n"
+                 "每一条 edit 只填 `index` 与换好后的整句 `text`（带标点）。")
+    parts.append("现在输出 JSON。")
+    return "\n\n".join(parts)
+
+
+def _replace_repeats(seg_lines, script, llm, cfg, vocab, card=None,
+                     evidence=None, raw_material=None, material=None,
+                     noted_material=None, topic=None, log=None):
+    """查重 → 就地替换：把本段里跟前面重复的句子换成新内容，返回新的本段正文。
+
+    这是段内每一轮收口前的最后一道工序（主人定的顺序：补字 → 查重 → 替换 → 计算）。
+    放在这儿而不是等整期跑完再统一处理，因为**补字正是复读的源头**：模型为凑字数会把
+    讲过的话再摆一遍，补完立刻查、就地换掉，下一轮的开头「计算」看到的才是干净稿。
+    从前只有整期跑完那一刀去重，而删完**没有任何补字环节**——缺口只在删完才现形，
+    补字的窗口早关了（真机第 2 期：4915 字，配额的 81.6%，报告还说料不够）。
+
+    **就地替换而不是删**：重复 30 句就删 30 句，这一段字数塌下去，下一轮又去补、补出来
+    又是重复，没尽头。换成新内容，行数与字数都守得住，也不会把同一个人挨到一起。
+
+    查重范围是**整篇**、替换范围是**本段**：段是逐段写的，写本段时前面几段已经定稿在
+    `script` 里；「第 2 段把第 1 段的话又说了一遍」只有整篇摆在一起才看得见（这正是
+    补字轮从前的盲区——它手里只有本段正文）。
+
+    一律**不抛异常**：模型调不动、输出坏了、条目没过判据，都在这里记一笔、原样返回。
+    轮次由调用方管，这一步不许把整段按停。
+    """
+    log = log or (lambda m: None)
+    if llm is None or not seg_lines:
+        return seg_lines
+    offset = len(script or [])
+    combined = list(script or []) + list(seg_lines)
+    hits = find_repeats(combined, offset + 1, offset + len(seg_lines))
+    if not hits:
+        return seg_lines                     # 没重复就一个调用都不花
+    log("段：查重发现 %d 处与前文重复（%s），就地替换…"
+        % (len(hits), "、".join("第 %d 句" % i for i in sorted(hits)[:6])))
+    system = replace_system(card, cfg)
+    rows = _numbered_rows(combined, 0)
+    budget_of = getattr(llm, "input_budget_tokens", None)
+    tok_of = getattr(llm, "material_tokens", None)
+    if budget_of is not None and tok_of is not None:
+        hold = (len(system) + len(raw_material or "") + len(material or "")
+                + len(rows) + SEGMENT_FIXED_CHARS)
+        if tok_of(hold) > budget_of(int(cfg.get("llm.max_tokens", 8192))):
+            # 装不下就压前文：每句留前 24 字，句号与人还在，够判「讲过没有」。
+            # 静默超预算发出去是不行的——小额度后端会直接顶爆。
+            rows = _clip_script_rows(combined)
+            log("段：替换提示词装不下全篇正文，前文压成每句前 24 字")
+    user = build_replace_prompt(combined, hits, material=material,
+                                noted_material=noted_material,
+                                raw_material=raw_material, topic=topic,
+                                evidence=evidence, script_rows=rows, cfg=cfg)
+    try:
+        raw, meta = llm.chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            temperature=float(cfg.get("llm.temperature", 0.8)),
+            max_tokens=int(cfg.get("llm.max_tokens", 8192)),
+            json_schema=replace_schema(cfg, vocab=vocab,
+                                       max_index=len(combined)))
+    except Exception as e:                  # noqa: BLE001
+        log("段：替换这一轮跑不动（%s），这一轮不改稿" % e)
+        return seg_lines
+    if isinstance(meta, dict) and meta.get("degraded"):
+        log("段：替换的约束解码已降级")
+    try:
+        edits, _inserts = parse_patch(raw)
+    except ScriptError as e:
+        log("段：替换输出没法解析（%s），这一轮不改稿" % e)
+        return seg_lines
+    out, rejected = apply_replace(combined, edits, sorted(hits), cfg)
+    if rejected:
+        log("段：%d 条替换没落地（%s）"
+            % (len(rejected), "；".join(
+                "第 %s 句：%s" % (r.get("index"), r.get("reason"))
+                for r in rejected[:2])))
+    fresh = out[offset:]
+    if fresh and len(fresh) == len(seg_lines):
+        return fresh
+    return seg_lines                        # 出了预料外的形状就原样退回
+
+
+def build_trim_prompt(seg_lines, over, quota, offset, evidence=None, cfg=None):
     """拼段内压字数的用户提示词。
 
     **不带素材**：要减的话都在草稿里——压紧措辞是就着现成的字改，整句删掉是判断
@@ -3335,7 +4431,7 @@ def build_trim_prompt(seg_lines, over, quota, offset, evidence=None):
         parts.append(ev)
     parts.append("【本段正文】（编号是它在全篇里的句号）\n%s"
                  % _numbered_rows(seg_lines, offset))
-    low, high = _segment_window(quota)
+    low, high = _segment_window(quota, cfg)
     parts.append("【任务】本段目前 %d 字，验收区间 %d~%d 字，**多了 %d 字**。"
                  "请压紧措辞、或把没必要的话整句拿掉，把字数减进验收区间（目标 %d 字）。\n"
                  "哪几句该压、哪几句该删，由你判断——哪句是赘述、哪句在重复前一句、"
@@ -3378,10 +4474,17 @@ def apply_insert(seg_lines, inserts, offset, cfg=None):
     `offset` 是本段之前已有的句数，段内第 k 句的全篇句号 = offset + k；
     `after = offset` 表示插在本段最前面（即接在上一段的末句之后）。
     越界一律报错不静默丢弃：插错位置会把话塞进别的段落，比不补更坏。
+
+    **这里不判句长**（v0.36.0 起）。句长是**全篇一把尺**的量，门禁 `line_length`
+    两个方向都有处方（过长→精简措辞、过短→就地补内容），补字阶段替它把关的代价
+    是把「一条坏句」放大成「整段停摆」——真机第 2 期就是这么停的（一条 7 字句让
+    40+ 条新增整批作废，配额缺口 1872 字一次都没再试）。**结构类校验全部保留**
+    （越界／非对象／非整数／空文本／speaker 非 A-B／emotion 非词表）：它们错了会
+    塞错段、进错人嘴，必须拦。`cfg` 参数留着只为调用处签名不变。
+
+    段内失败也不该在这里「交卷」：抛错由调用方接住、算作这一轮没改动，轮次照跑
+    （见 `_generate_segmented` 里补字那一段的 except）。
     """
-    cfg = cfg or {}
-    min_c = int(cfg.get("gate.min_chars", 8))
-    max_c = int(cfg.get("gate.max_chars", 40))
     n = len(seg_lines)
     buckets = {}
     for it in inserts:
@@ -3402,9 +4505,6 @@ def apply_insert(seg_lines, inserts, offset, cfg=None):
         text = re.sub(r"\s+", "", str(it.get("text") or "").strip())
         if not text:
             raise ScriptError("新增里有空文本。")
-        if not min_c <= len(text) <= max_c:
-            raise ScriptError("新增的第 %d 句 %d 字，不在 %d~%d 字门禁内。"
-                              % (after + 1, len(text), min_c, max_c))
         buckets.setdefault(after - offset, []).append(
             {"speaker": sp, "emotion": emo, "text": text})
     out = list(buckets.get(0, []))
@@ -3419,10 +4519,10 @@ def apply_trim(seg_lines, edits, drops, offset, cfg=None):
 
     只改和删，不许新增：`edits` 替换整句、`drops` 整句拿掉。同一句不许既改又删
     （那说明它自己没想清是压还是删）；也不许把本段删光（段没了，后面的账就无从对起）。
+
+    **这里不判句长**（v0.36.0 起），同 `apply_insert`：句长归门禁 `line_length`
+    管，压字阶段只管「少了多少字」这一笔账。`cfg` 参数留着只为调用处签名不变。
     """
-    cfg = cfg or {}
-    min_c = int(cfg.get("gate.min_chars", 8))
-    max_c = int(cfg.get("gate.max_chars", 40))
     n = len(seg_lines)
     lo, hi = offset + 1, offset + n
     drop_set = set()
@@ -3451,9 +4551,6 @@ def apply_trim(seg_lines, edits, drops, offset, cfg=None):
         text = re.sub(r"\s+", "", str(e.get("text") or "").strip())
         if not text:
             raise ScriptError("压字数把第 %d 句改成了空文本。" % idx)
-        if not min_c <= len(text) <= max_c:
-            raise ScriptError("压完后第 %d 句 %d 字，不在 %d~%d 字门禁内。"
-                              % (idx, len(text), min_c, max_c))
         seen.add(idx)
         edit_map[idx] = {"text": text}
         if e.get("emotion") in DISCOURSE_ORDER:
@@ -3528,7 +4625,7 @@ def _segments_plan(llm, cfg, project, evidence, groups, log, should_stop):
     system = _segment_plan_system(n)
     user = _segment_plan_user(project, secs, groups)
     title, fb = "", ""
-    for attempt in range(PLAN_RETRIES + 1):
+    for attempt in range(_plan_rounds(cfg) + 1):
         if should_stop and should_stop():
             break
         u = user if not fb else (
@@ -3561,7 +4658,8 @@ def _segments_plan(llm, cfg, project, evidence, groups, log, should_stop):
         fb = err or "规划不合法。"
         log("规划打回（第 %d 次）：%s" % (attempt + 1, fb))
     # 兜底：段主旨取本段首节的凝缩主旨。段边界与配额都不动——那是程序算好的。
-    log("规划 %d 次仍未通过，段段主旨按各段首节的凝缩主旨代填" % (PLAN_RETRIES + 1))
+    log("规划 %d 次仍未通过，段段主旨按各段首节的凝缩主旨代填"
+        % (_plan_rounds(cfg) + 1))
     for g in groups:
         i = (g.get("sections") or [1])[0]
         gist = str((secs[i - 1].get("gist") if 1 <= i <= len(secs) else "") or "")
@@ -3631,6 +4729,10 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
     # 本篇语篇词表：schema 枚举、解析校验两处同源（只有一份）
     # （提示词侧由 _segment_system_prompt 内部按同一函数现算）。
     seg_vocab = vocab_words()
+    # 三个轮次全部走配置，一处都不写死：段内修正轮（少了插入、多了压删，
+    # 共用一份预算）、解析重发轮（输出坏了重发）、规划打回轮（见 `_segments_plan`）。
+    fix_rounds = _segment_fix_rounds(cfg)
+    parse_rounds = _segment_parse_rounds(cfg)
     secs = evidence.get("sections") or []
     if not secs:
         return None
@@ -3645,7 +4747,7 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
     # 装箱要把「每次调用必带的固定开销」先量出来：一段的提示词长度量级 + 固定
     # 占位。段与段之间这点差异是几十字，不必逐段精算。
     probe_system = _segment_system_prompt(cfg, card, preset_key, 1, 1,
-                                          SEGMENT_TOL_MIN_CHARS, "（段主旨）",
+                                          _quota_floor(cfg), "（段主旨）",
                                           is_first=True)
     fixed_chars = len(probe_system) + SEGMENT_FIXED_CHARS
     budget = (llm.input_budget_tokens(int(cfg.get("llm.max_tokens", 8192)))
@@ -3709,12 +4811,15 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
         remaining_planned = quota0 + sum(it[3] for it in queue)
         quota = quota0
         if done > 0 and remaining_planned > 0:
-            quota = max(SEGMENT_TOL_MIN_CHARS,
+            # 地板只防提示词自相矛盾（`_quota_floor`＝软句数下限 × 每句最少字）：
+            # 再摊出来的配额不许低到「约 N 句」说不通。它比碎段合并那把尺小得多，
+            # 正常一期碰不到，所以不会把前面段写超的账硬摊给后面段。
+            quota = max(_quota_floor(cfg),
                         int(round(quota0 * (int(target_chars) - written)
                                   / float(remaining_planned))))
         topic = g.get("topic") or ""
-        attempt, best, best_gap = 0, None, None
-        low, high = _segment_window(quota)
+        attempt, parse_try, best, best_gap = 0, 0, None, None
+        low, high = _segment_window(quota, cfg)
         tol = high - int(quota)
         seg_lines, feedback, resplit = None, None, False
         while True:
@@ -3743,7 +4848,11 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                                           for pc in pieces) or 1
                         for n, one in enumerate(sub):
                             share = sum(int(pc.get("chars") or 0) for pc in one)
-                            q = max(SEGMENT_TOL_MIN_CHARS, int(round(
+                            # 每批的配额 = 本段配额 × 本批料的字 ÷ 本段料的字，
+                            # 兜的是**有效字**——不是 token（token 只用于上面判
+                            # 「要不要分批、按哪切」那一件事）。下界取 `_quota_floor`
+                            # （一个最小可写段），与容差下限同一把尺。
+                            q = max(_quota_floor(cfg), int(round(
                                 quota0 * share / float(total_chars))))
                             queue.insert(n, [i, g, one, q])
                         log("段 %d：本段原文折合 %d token 超可用 %d，"
@@ -3759,7 +4868,7 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                                             target_chars, fit, prev_text,
                                             feedback, pieces=pieces,
                                             noted_fit=_apply_sec_notes(
-                                                fit, sec_flags))
+                                                fit, sec_flags), cfg=cfg)
                 log("段 %d/%d：调用模型…（配额 %d 有效字，取材 %s，段主旨：%s）"
                     % (i, total_groups, quota, _piece_desc({"pieces": pieces}, secs),
                        topic[:30]))
@@ -3773,10 +4882,12 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                 try:
                     seg_lines = _parse_segment_lines(raw, vocab=seg_vocab)
                 except ScriptError as e:
-                    attempt += 1
-                    if attempt > SEGMENT_RETRIES:
+                    # 解析失败有**自己的一份预算**（`script.segment_parse_rounds`）：
+                    # 它是「输出坏了」，跟「字数不对」不是一回事，不该挤占修正轮次。
+                    parse_try += 1
+                    if parse_try > parse_rounds:
                         raise ScriptError("第 %d 段连续 %d 次输出无法解析：%s"
-                                          % (i, SEGMENT_RETRIES + 1, e))
+                                          % (i, parse_rounds + 1, e))
                     feedback = ("本段输出没法解析（%s）。请只输出本段的 lines JSON。"
                                 % e)
                     log("段 %d：%s" % (i, feedback))
@@ -3807,9 +4918,20 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                 body = sum(len(l["text"]) for l in seg_lines) + len(seg_lines) * 24
                 if gap0 < 0:
                     psystem = insert_system(card, cfg)
+                    # 【已写脚本（前文）】：补字这一轮从前只给本段，前几段一个字都不给。
+                    # 模型手里有九千字原文、有本段这几十句，**独独不知道前面讲过什么**，
+                    # 提示词却要它「挑正文还没讲到的点」——它只能撞。主人定的规矩：
+                    # 问题发生在本段，但**所有已写的**都要让它看见。
+                    prev_rows = _numbered_rows(script, 0) if script else ""
+                    # 占位要把提示词里**真实出现的块**都算上：【本段原文】是全量喂的、
+                    # 【已写脚本（前文）】也是全量喂的。从前只算了 fit 那一遍，等于按
+                    # 不含原文的预算去裁素材——超预算用额度，本机额度大所以没露出来，
+                    # 小额度后端会直接顶爆。加进来之后 fit 会自动降级成凝缩：预算里装
+                    # 不下两份全文，留一份原文就够（凝缩只作快速找点的索引）。
+                    other_chars = (len(psystem) + body + SEGMENT_FIXED_CHARS
+                                   + len(seg_mat) + len(prev_rows))
                     fit, _note = fit_material(
-                        llm, seg_mat, cfg,
-                        other_chars=len(psystem) + body + SEGMENT_FIXED_CHARS,
+                        llm, seg_mat, cfg, other_chars=other_chars,
                         evidence=evidence, log=log)
                     log("段 %d：少 %d 有效字，新增句子插入…" % (i, abs(gap0)))
                     raw, meta = llm.chat(
@@ -3818,7 +4940,8 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                              seg_lines, -gap0, quota, len(script), material=fit,
                              evidence=evidence,
                              noted_material=_apply_sec_notes(fit, sec_flags),
-                             raw_material=seg_mat, topic=topic)}],
+                             raw_material=seg_mat, topic=topic,
+                             prev_rows=prev_rows, cfg=cfg)}],
                         temperature=float(cfg.get("llm.temperature", 0.8)),
                         max_tokens=int(cfg.get("llm.max_tokens", 8192)),
                         json_schema=insert_schema(-gap0, cfg, vocab=seg_vocab))
@@ -3829,23 +4952,28 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                         inserts = parse_insert(raw)
                         fixed = apply_insert(seg_lines, inserts, len(script), cfg)
                     except ScriptError as e:
-                        # 新增没落地就收工：稿子一个字没动，退回上一版不算损失。
-                        log("段 %d：新增没法落地（%s），取最接近配额的一版继续" % (i, e))
-                        break
-                    added = int(round(sum(duration_model.effective_chars(l["text"])
-                                          for l in fixed))
-                                - sum(duration_model.effective_chars(l["text"])
-                                      for l in seg_lines))
-                    log("段 %d：插进 %d 句 / %d 有效字"
-                        % (i, len(fixed) - len(seg_lines), added))
-                    seg_lines = fixed
+                        # 这一轮作废，但**不收工**：轮次预算是给「改到进容差」的，
+                        # 不是「一次失败即终点」——从前这里 break，真机第 2 期就是
+                        # 被它按停的（缺口 1872 字后面一轮都没跑）。稿子一个字没动，
+                        # 落到底部的核账就是「这一轮没改动」，轮次照减。
+                        fixed = None
+                        log("段 %d：新增没法落地（%s），这一轮不改稿" % (i, e))
+                    if fixed is not None:
+                        added = int(round(sum(duration_model.effective_chars(l["text"])
+                                              for l in fixed))
+                                    - sum(duration_model.effective_chars(l["text"])
+                                          for l in seg_lines))
+                        log("段 %d：插进 %d 句 / %d 有效字"
+                            % (i, len(fixed) - len(seg_lines), added))
+                        seg_lines = fixed
                 else:
-                    psystem = trim_system(cfg)
+                    psystem = trim_system(cfg, low, high)
                     log("段 %d：多 %d 有效字，压紧删减…" % (i, gap0))
                     raw, meta = llm.chat(
                         [{"role": "system", "content": psystem},
                          {"role": "user", "content": build_trim_prompt(
-                             seg_lines, gap0, quota, len(script), evidence=evidence)}],
+                             seg_lines, gap0, quota, len(script), evidence=evidence,
+                             cfg=cfg)}],
                         temperature=float(cfg.get("llm.temperature", 0.8)),
                         max_tokens=int(cfg.get("llm.max_tokens", 8192)),
                         json_schema=trim_schema(len(seg_lines), vocab=seg_vocab))
@@ -3856,10 +4984,23 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                         edits, drops = parse_trim(raw)
                         fixed = apply_trim(seg_lines, edits, drops, len(script), cfg)
                     except ScriptError as e:
-                        log("段 %d：压字数没法落地（%s），取最接近配额的一版继续" % (i, e))
-                        break
-                    log("段 %d：压 %d 句 / 删 %d 句" % (i, len(edits), len(drops)))
-                    seg_lines = fixed
+                        # 同补字那一路：这一轮不改稿，但不收工，轮次照减。
+                        fixed = None
+                        log("段 %d：压字数没法落地（%s），这一轮不改稿" % (i, e))
+                    if fixed is not None:
+                        log("段 %d：压 %d 句 / 删 %d 句" % (i, len(edits), len(drops)))
+                        seg_lines = fixed
+                if not seg_lines:
+                    break
+                # 补字与压字都做完，接着**查重 → 替换**，然后才轮末「计算」。
+                # 主人定的顺序：第一轮「写作、计算」；后 N 轮「补字、查重、替换、计算」。
+                # 补字是复读的唯一源头，补完立刻查、就地换掉，下一轮开头「计算」看到的
+                # 就是干净稿。没查出重复时这一步不花任何模型调用（见 `_replace_repeats`）。
+                seg_lines = _replace_repeats(
+                    seg_lines, script, llm, cfg, seg_vocab, card=card,
+                    evidence=evidence, raw_material=seg_mat, material=fit,
+                    noted_material=_apply_sec_notes(fit, sec_flags),
+                    topic=topic, log=log)
                 if not seg_lines:
                     break
 
@@ -3871,9 +5012,9 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
             if abs(gap) <= tol:
                 break
             attempt += 1
-            if attempt > SEGMENT_RETRIES:
+            if attempt > fix_rounds:
                 log("段 %d：修 %d 轮仍差 %d 有效字，取最接近配额的一版继续"
-                    % (i, SEGMENT_RETRIES, abs(best_gap)))
+                    % (i, fix_rounds, abs(best_gap)))
                 break
         if resplit:
             continue
@@ -3912,20 +5053,31 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
 
 # ------------------------------------------------------------------ 主流程
 def generate(material, cfg, llm, preset_key=None,
-             max_rounds=None, log=None, project=None, should_stop=None,
+             gate_rounds=None, check_rounds=None, log=None, project=None,
+             should_stop=None,
              draft_sink=None, evidence=None, segmented=False,
              sec_chars=None, material_of=None, sec_flags=None, review=None):
-    """生成脚本并过门禁。返回 dict。
+    """生成脚本并过检查与门禁。返回 dict。
 
-    第 1 轮整篇写；之后**能定点就定点**——只把门禁点名的句子交给模型改，全篇行数
-    一个字不动。省的不只是 token：整篇重出会把没毛病的两百句重新摇一次骰子，
-    改好的地方又带进新毛病，轮次全耗在打地鼠上。
+    **三段串行，各管各的事**（顺序是定死的）：
 
-    哪些问题能定点，取决于它带不带句号（见 `patch_targets`）。带句号的定点改；
-    结构坏了（JSON 不合法、字段残缺）只能整篇重出；内容检自己指不出句号的，
-    不重写也不硬猜，原样交人工。
+    1. **出货段**——只拿一份可用稿子（分段初稿，或整篇现写）。不判内容、不判形式；
+       产物不可用（输出拆不开 / 一句可用内容都没有）在本段重试，用尽就报错停下。
+    2. **检查段**（内容检）——承诺链检必判、语义检按开关，判 ＋ 定点修，最多
+       `check_rounds` 轮；过了或修满都往下走（不早退）。
+    3. **门禁段**（形式门禁）——代码判九项，判 ＋ 定点修，最多 `gate_rounds` 轮；
+       过了或修满都落盘。
 
-    重试上限内不通过 → **把最后一版连同未通过的结论一并返回**，不抛错。脚本阶段
+    顺序为什么要紧：内容检的补丁会**插入新句**（加行，可能顶破连说上限），所以形式
+    判定必须排在它后面，结论才是对着最终稿的。反过来排（门禁在前）就会出现「报告绿、
+    稿子坏」——中间改过的形式没人复核，报告上还是旧结论。
+
+    三段的定点修补都**不重写**：只把点名的句子交给模型改，全篇行数一个字不动。省的不
+    只是 token：整篇重出会把没毛病的两百句重新摇一次骰子，改好的地方又带进新毛病，
+    轮次全耗在打地鼠上。能定点的判据是「问题带不带句号」（见 `patch_targets`）；带
+    句号的定点改，指不出句号的记一笔「未修好」、不重写也不硬猜。
+
+    轮次用尽仍不通过 → **把最后一版连同未通过的结论一并返回**，不抛错。脚本阶段
     到此为止：稿子和问题都落盘，人拿去改、或者直接出片，都是下一步的事。
 
     产出含 title —— 标题与正文同一次生成，不再让用户到合成页补。
@@ -3962,7 +5114,20 @@ def generate(material, cfg, llm, preset_key=None,
     preset_key = preset_key or cfg.get("script.style_preset", "argument")
     # 本篇语篇词表：整篇路与定点修补共用（新增/压紧在分段路里各自取）。
     whole_vocab = vocab_words()
-    max_rounds = int(max_rounds if max_rounds is not None else cfg.get("script.max_llm_rounds", 3))
+    # 轮次是**两段各自的一条预算**，不是「一个数管两种检查」：检查段（内容检）修到过、
+    # 或修满 check_rounds；然后才进门禁段（形式门禁），再修到过、或修满 gate_rounds。
+    # 两段互不侵占对方的轮次；出货段不吃这两份预算（它有自己那个「输出坏了重发」的数）。
+    # 段序见函数说明——检查在前、门禁在后的理由写在「门禁段」那一段的注释里。
+    gate_rounds = int(gate_rounds if gate_rounds is not None
+                      else cfg.get("script.gate_rounds", 3))
+    check_rounds = int(check_rounds if check_rounds is not None
+                       else cfg.get("script.check_rounds", 3))
+    # 内容检这一次判哪几项：承诺链检必判；语义检是开关、默认关。关掉时它既不出现在
+    # 请求里，也不算「待重判」（见 `dims_to_recheck`）。
+    # 这里只装**项的代号**（"semantic"/"promise"），不带中文名——`gate_check6` 与
+    # `dims_to_recheck` 都拿它去拼 `check_<代号>`、做 `key in dims`，塞元组进去当场崩。
+    check_dims = (["promise"] if not cfg.get("script.check_semantic", False)
+                  else [k for k, _ in CHECK6_DIMS])
     log = log or (lambda m: None)
 
     # 两个量各报各的，一期只报这一次。别混：
@@ -4059,10 +5224,20 @@ def generate(material, cfg, llm, preset_key=None,
         % (target_seconds, target_chars, line_count,
            duration_model.STANDARD_K, duration_model.STANDARD_CPM))
 
-    feedback = None
-    prev_lines = None   # 上一版正文（编号口径与门禁报的句号一致），整篇重出时对照用
-    last = None
-    content_seen = None   # 上一次内容检的结论，决定这一轮重判哪几项
+    prev_lines = None   # 上一版正文（编号口径与门禁报的句号一致），定点修补的上下文用
+    last = None         # 最后一版产物；出货段全败时拿它报错
+    # 「输出坏了重发」的轮次：全项目只有这一个数——整篇出货重试与分段解析重试共用
+    # 它（见 `_segment_parse_rounds`），任何一处都不许自己写死一个数。
+    parse_rounds = _segment_parse_rounds(cfg)
+    # 两段各自只看自己那一摊：检查段管内容项（`check_` 开头）、门禁段管形式项。
+    # 让一段去修另一段的判据，改完又没人复判，报告上的结论就跟稿子两张皮。
+    content_keys = set("check_" + k for k in check_dims)
+
+    def is_content(key):
+        return key in content_keys
+
+    def is_form(key):
+        return not key.startswith("check_")
 
     def _finish(payload):
         """整期定稿：**粘一次**片头尾 → 落盘 → 返回。粘合全篇只在这儿发生。
@@ -4071,8 +5246,8 @@ def generate(material, cfg, llm, preset_key=None,
         逐字拼出来的东西，没有「模型照没照做」可验（见 `glue_intro_outro`）。
         所以中间各轮落的盘一律是**裸正文**（过程稿），只有整期定稿这一刻才粘。
 
-        两个出口都走这里：门禁过了从这里定稿；轮次用尽也从兜底的 `return` 定稿
-        ——不管改成功没改成功，交到手上的那一份都带片头尾。
+        唯一出口：三段跑完（不管改成功没改成功）都从这里定稿——片头尾不是「通过」
+        的奖励，是每一期都该有的固定结构。
 
         定稿这一份**必须落盘**：出片读的是盘上那份（`draft_sink` 写的位置），
         界面拿的是返回值。只粘不落，盘上留着的就是上一轮的裸正文，看的和念的
@@ -4083,40 +5258,304 @@ def generate(material, cfg, llm, preset_key=None,
             draft_sink(glued)
         return glued
 
-    for attempt in range(max_rounds + 1):
+    # ============================== 出货段：正文生成 ==============================
+    #
+    # 只干一件事：拿出一份**可用稿子**——内容对不对、形式合不合规都不判。它没有
+    # 轮次表：产物不可用（输出拆不开 / 一句可用内容都没有）时在本段重试，次数吃
+    # 「输出坏了重发」那个数，用尽就报错，不往下走。
+    #
+    # 独立成段是两段顺序调换逼出来的：检查段排在门禁段前面，它一进来就要判稿，
+    # 而从前出货挂在门禁段第 1 轮里——那时候还没有任何一段跑过。
+    if pre_draft is not None:
+        # 分段初稿已到手：这一路只做检查与修补，不再整篇生成。
+        script = pre_draft["script"]
+        title = pre_draft["title"]
+        plan = pre_draft["planned_episodes"]
+        raw, meta = "", {}          # 分段路没有「原始整篇输出」，按 0 记
+        pre_draft = None
+    else:
+        parsed, feedback = None, None
+        for k in range(parse_rounds + 1):
+            if k and should_stop and should_stop():
+                break
+            # 素材按这次调用的余量裁：系统提示、上一版正文都占地方，先量再定能给
+            # 素材多少字。放不下就改用凝缩，并把这件事写进日志——静默少喂会让
+            # 模型在缺依据的情况下硬写，产物上看不出少了什么。
+            fit, _note = fit_material(
+                llm, material, cfg,
+                other_chars=len(system) + len(prev_lines or "")
+                            + WRITE_FIXED_CHARS,
+                evidence=evidence, log=log)
+            user = build_user_prompt(fit, cfg, feedback, prev_lines)
+            # 这一行在调用之前写。生成一轮要十几分钟，日志里若只有「模型返回」
+            # 那一行，整轮期间界面上是上一次留下的字——看着像卡住了。
+            log("生成第 %d 次：调用模型…" % (k + 1))
+            raw, meta = llm.chat(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": user}],
+                temperature=float(cfg.get("llm.temperature", 0.8)),
+                max_tokens=int(cfg.get("llm.max_tokens", 8192)),
+                json_schema=script_schema(vocab=whole_vocab))
+            if meta.get("degraded"):
+                log("生成第 %d 次：约束解码已降级" % (k + 1))
+            log("生成第 %d 次：%s" % (k + 1, _call_telemetry(meta)))
+
+            try:
+                parsed = parse_script(raw)
+            except ScriptError as e:
+                log("生成第 %d 次：输出解析不出稿子（%s），重试" % (k + 1, e))
+                parsed = None
+                last = {"error": str(e)}
+                feedback = "输出不是合法 JSON 对象。请只输出 JSON 对象本身。"
+                continue
+            script = normalize_script(parsed["lines"], cfg)
+            if not script:
+                # 解析出来了、但一句可用内容都没有：等于没有稿子，同样重试。
+                log("生成第 %d 次：解析出的稿子一句可用内容都没有，重试" % (k + 1))
+                parsed = None
+                last = {"error": "稿子为空"}
+                continue
+            break
+        if parsed is None:
+            raise ScriptError("脚本生成失败：连续 %d 次都没能产出可用稿子"
+                              % (parse_rounds + 1))
+        # 返回行只报正文有效字（按归一化后的正文逐句求和，与配额同尺）。
+        # 数数必须排在归一化之后：原始条目可能被模型省掉 text 键，直接取
+        # `l["text"]` 会在缺键时整轮崩掉，而空 text 的条目本就该丢弃。
+        # 这一行同时是界面判断「出货段跑到第几次」的信号。
+        log("生成第 %d 次：模型返回正文 %d 有效字"
+            % (k + 1, int(round(sum(duration_model.effective_chars(l["text"])
+                                    for l in script)))))
+        title = parsed["title"] or title_from_lines(script)
+        # 地图已定期标题时以地图为准：本期讲什么在排地图那一步就定了。
+        # 让模型每次重新命名，同一期会在计划与产物里挂上两个不同的名字。
+        if project and project.get("title"):
+            title = project["title"]
+        # 项目已定的总期数以人为准。提示词里请模型原样回填，但它漏填或改口
+        # 都不该改变结果——人定的事挂在模型的自觉上，进度迟早对不上账。
+        plan = parsed["planned_episodes"]
+        if project and project.get("planned_episodes"):
+            plan = int(project["planned_episodes"])
+
+    # **最后兜底**：正常路径不该走到这里。段内每一轮收口前都有「查重 → 就地替换」
+    # （见 `_replace_repeats`），重复在那一步就换成新内容了；这一刀留给替换也没修干净
+    # 的情形——模型给不出可用的替换件、轮次用尽，或逐期即兴那条路本来就不走段循环。
+    # 仍然放在门禁与落盘之前、两条路共用：重复的内容不该进成片，也不该让时长门禁
+    # 对着注水后的句数判「达标」（对注水稿判「达标」正是当年那次事故的样子）。
+    script, dropped = dedupe_script(script)
+    if dropped:
+        log("兜底去重：替换轮没清干净，删掉 %d 句仍与前文完全重复的内容" % dropped)
+        # 删句会让原本被重复段隔开的同一个人挨到一起，可能冒出新的连说超限。
+        # 这里不掰：门禁会把整段点出来、交模型并句——程序翻的话，翻出来的是一句
+        # 口气对不上、甚至根本不属于这个人的话。
+
+    def _side_notes(report):
+        """把「去重」与「没有标题」这两笔账加进报告。
+
+        它们不是门禁判出来的，但必须进最终报告；报告每一轮都是新算的，所以每
+        重建一次就补一遍（不会重复累加）。
+        """
+        if dropped:
+            # 删得掉不等于没发生：这一笔要留痕，人才知道「替换轮没清干净」。
+            # **不许再把责任推给素材**——料的账在画地图那一步已经按压比算过，这里
+            # 再写一句「素材撑不满」，就会和刚判过「这一期料富余」的压比体检打架，
+            # 而人只看得见后面这句话，方向被带偏。照实说：在哪一步没清掉、为什么。
+            # 记成 soft 项：稿子已经被程序改干净了，没有理由再拦人。
+            report["items"].append({
+                "key": "no_repeat", "label": "重复凑数", "level": "warn",
+                "judge": "code", "ok": False, "soft": True,
+                "detail": "有 %d 句仍与前文完全重复（同一段被复播），替换轮没把它们"
+                          "换成新内容，已由程序**兜底删除**。重复内容不会进成片。"
+                          "**这不是素材不够**——多半是那一轮没给出可用的替换件、"
+                          "或轮次用尽；料的账在画地图时已按压比算过。" % dropped})
+        if not title:
+            report["items"].append({
+                "key": "title_present", "label": "本期标题", "level": "fail",
+                "judge": "code", "ok": False,
+                "detail": "模型未产出标题，正文也无法推出可用标题。"})
+        return report
+
+    # ============================== 检查段：内容检 ==============================
+    #
+    # 形状与门禁段一样——判 ＋ 定点修，只是判的人从代码换成了模型：承诺链检必判、
+    # 语义检按开关。修到过、或修满 `check_rounds` 都往下走（**不早退**：形式还没
+    # 判，内容没过不等于稿子不能用）。
+    #
+    # 排在门禁段**前面**：内容检的判据（承诺收没收、跟素材对不对得上）会被措辞
+    # 改动带偏，先判完再动形式，最后那一轮形式判定就不会把内容结论弄陈旧。
+    # 反过来的残留风险已知并备案：门禁段的并句与换措辞发生在内容检之后（并句有
+    # 「保真 ≥ 原句七成」的硬校验、换措辞是同句换说法，两者都不删内容）。
+    content_items = []
+    # 检查段实际跑过的轮数。落盘那份 json 里的「第几轮」**跨段连续**：检查段先跑、
+    # 门禁段接在它后面，两段各自从 1 数起的话，界面上的「第 N 轮」会从检查段的第 3
+    # 轮跳回门禁段的第 1 轮——门禁段的 1 把前面几轮遮掉，看起来像全程只跑了一轮。
+    check_used = 0
+    if llm is not None:
+        content_seen = None      # 上一次内容检的结论，决定这一轮重判哪几项
+        retry_patch, retry_note = None, ""
+        for attempt in range(check_rounds):
+            check_used = attempt + 1
+            if attempt and should_stop and should_stop():
+                log("收到中止：检查第 %d 轮不跑了，带着当前稿子收工" % (attempt + 1))
+                break
+            patch = None
+            if attempt:
+                if retry_patch is not None:
+                    patch, retry_patch = retry_patch, None
+                else:
+                    targets, unfixed = patch_targets(content_seen, len(script),
+                                                     want=is_content, cfg=cfg)
+                    # 与门禁段同一条规矩：定不了点的记一笔「未修好」，不早退、
+                    # 不重写。静默丢掉这一笔，报告里就只剩「没过」，人看不出是
+                    # 模型指不出句号。
+                    if unfixed:
+                        log("检查第 %d 轮：%d 个检查项指不出具体句子（%s），不重写"
+                            "也不硬猜，记「未修好」"
+                            % (attempt + 1, len(unfixed),
+                               "、".join(p["label"] for p in unfixed)))
+                    patch = targets
+                    if not patch:
+                        log("检查第 %d 轮：没有可定点修的项，转门禁" % (attempt + 1))
+                        break
+            if patch:
+                log("检查第 %d 轮：定点修补 %d 句…" % (attempt + 1, len(patch)))
+                fb = _patch_feedback(patch)
+                # 修补的素材同样按这次调用的余量裁：提示词里还有系统提示、要改的
+                # 条目、被点名句的前后文，它们都占地方。素材放不下就用凝缩顶
+                # （见 fit_material），并在日志里说明。
+                psystem = patch_system(cfg)
+                fit, _note = fit_material(
+                    llm,
+                    material if _needs_material(content_seen, is_content) else "",
+                    cfg,
+                    other_chars=len(psystem) + len(fb) + len(prev_lines or "")
+                                + PATCH_FIXED_CHARS,
+                    evidence=evidence, log=log)
+                praw, pmeta = llm.chat(
+                    [{"role": "system", "content": psystem},
+                     {"role": "user", "content": build_patch_prompt(
+                         script, patch, fb, material=fit, evidence=evidence,
+                         rejected_note=retry_note)}],
+                    temperature=float(cfg.get("llm.temperature", 0.8)),
+                    max_tokens=int(cfg.get("llm.max_tokens", 8192)),
+                    json_schema=patch_schema(vocab=whole_vocab, cfg=cfg))
+                retry_note = ""
+                if pmeta.get("degraded"):
+                    log("检查第 %d 轮：约束解码已降级" % (attempt + 1))
+                log("检查第 %d 轮：%s" % (attempt + 1, _call_telemetry(pmeta)))
+                try:
+                    edits, inserts = parse_patch(praw)
+                    script, rejected = apply_patch(script, edits, patch, inserts, cfg)
+                except ScriptError as e:
+                    # 补丁没落地**不重写**：这一轮的稿子一个字没动，退回上一版不算
+                    # 损失；而重写是把整段重摇一遍、还有概率依旧修不好。改为**下一轮
+                    # 重发同一批补丁**，并把这次为什么整份退一并说清——不说，下一轮
+                    # 就是重摇骰子。次数计入本段轮次。
+                    log("检查第 %d 轮：补丁没法落地（%s），下一轮重发同一批补丁"
+                        % (attempt + 1, e))
+                    retry_patch = patch
+                    retry_note = "上一轮这份补丁整份没落地：%s" % e
+                    continue
+                script = normalize_script(script, cfg)
+                log("检查第 %d 轮：模型返回正文 %d 有效字"
+                    % (attempt + 1,
+                       int(round(sum(duration_model.effective_chars(l["text"])
+                                     for l in script)))))
+                if rejected:
+                    # 拒了哪几条、为什么：进日志，也留在 `retry_note` 里给下一轮的
+                    # 提示词——下一轮的任务多半一模一样，唯一的新信息就是它。
+                    retry_note = _reject_feedback(rejected)
+                    log("检查第 %d 轮：%d 条补丁没落地（%s），其余已改上"
+                        % (attempt + 1, len(rejected),
+                           "；".join("第 %s 句：%s"
+                                     % (r.get("index"), r.get("reason"))
+                                     for r in rejected[:2])))
+                prev_lines = "\n".join("%d. [%s] %s"
+                                       % (n + 1, s["speaker"], s["text"])
+                                       for n, s in enumerate(script))
+
+            # 内容检：只判本次该判的项（承诺链检必判；语义检开着时才加上）。
+            # 重判范围取「上一轮没过、或压根没判过」的那几项——上一轮已判通过的，
+            # 本轮改的又是措辞这类形的事，不必把同一段上下文再喂一遍。
+            dims = (dims_to_recheck(content_seen, check_dims) if content_seen
+                    else set(check_dims))
+            if dims:
+                content = gate_check6(script, cfg, llm=llm, material=material,
+                                      dims=dims, evidence=evidence)
+            else:
+                content = {"items": []}
+            report = merge_check({"items": []}, content, cfg, carry=content_seen)
+            content_seen = report
+            content_items = list(report["items"])
+            if report.get("soft"):
+                log("检查提示（不阻断）：%s"
+                    % "、".join("%s %s" % (p["label"], p.get("detail", ""))
+                                for p in report["soft"]))
+            problems = [i for i in report["items"]
+                        if not i["ok"] and not i.get("soft") and not i.get("advisory")]
+            if attempt == 0:
+                # 首轮既不出货也不修补（出货归出货段），从前日志上看像跳了一轮。
+                log("检查第 1 轮：判定完成（%s）"
+                    % ("通过" if report["passed"] else
+                       "未过 %d 个检查项" % len(problems)))
+            if report["passed"]:
+                log("检查通过（第 %d 轮）" % (attempt + 1))
+                break
+
+            # 没过：这一轮落的是**过程稿**——裸正文，片头尾不粘（见 `_finish`）。
+            if draft_sink is not None and attempt < check_rounds - 1:
+                draft_sink({"script": script, "title": title,
+                            "planned_episodes": plan, "segments": segments,
+                            "report": report, "raw_chars": len(raw),
+                            "degraded": meta.get("degraded", False),
+                            "attempt": attempt + 1})
+            if problems:
+                log("检查未过：%d 个检查项（%s）"
+                    % (len(problems), "、".join(p["label"] for p in problems[:6])))
+            feedback = _build_feedback(problems)
+
+    # ============================== 门禁段：形式门禁 ==============================
+    #
+    # 动作只有两件：判（代码）＋ 定点修（模型）。**没有重写权限**——稿子不可用是
+    # 出货段的事，进到这里的一定是可用稿。修到过、或修满 `gate_rounds` 都落盘退出。
+    #
+    # 排在**最后**：形式结论因此永远是对着最终稿判的。从前它跑在最前面，而中间
+    # 检查段的补丁会插入新句（加行，可能冒出连说超限）——改完没人复核形式，报告上
+    # 门禁那几项还是旧结论，「报告绿、稿子坏」的静默放行就是这么来的。
+    retry_patch, retry_note = None, ""
+    for attempt in range(gate_rounds + 1):
         if attempt and should_stop and should_stop():
             # 已经有一版完整稿子在手，收工。写了一半的那次调用本来就掐不断，
-            # 但「下一轮」是新的一次生成，没有再开一次的理由。
-            log("收到中止：第 %d 轮不跑了，带着第 %d 轮的稿子收工" % (attempt + 1, attempt))
+            # 但「下一轮」是新的一次调用，没有再开一次的理由。
+            log("收到中止：门禁第 %d 轮不跑了，带着当前稿子收工" % (attempt + 1))
             break
 
-        # 第 1 轮整篇写；之后能定点就定点，结构坏了（JSON 不合法、字段残缺）
-        # 才回头整篇重出。定不了点的（内容检指不出句号）既不重写也不硬猜，交人工。
         patch = None
-        if attempt and last and "script" in last:
-            targets, refull, manual = patch_targets(last["report"],
-                                                    len(last["script"]))
-            if refull:
-                log("第 %d 轮：稿子结构坏了（%s），只能整篇重出"
-                    % (attempt + 1, "、".join(p["label"] for p in refull)))
-            elif targets:
-                patch = targets
+        if attempt:
+            if retry_patch is not None:
+                patch, retry_patch = retry_patch, None
             else:
-                if manual:
-                    log("第 %d 轮：剩下的问题指不出是哪一句（%s），不重写，交人工复核"
-                        % (attempt + 1, "、".join(p["label"] for p in manual)))
-                break
+                targets, unfixed = patch_targets(last["report"], len(script),
+                                                 want=is_form, cfg=cfg)
+                if unfixed:
+                    log("门禁第 %d 轮：%d 个检查项指不出具体句子（%s），不重写也不"
+                        "硬猜，记「未修好」"
+                        % (attempt + 1, len(unfixed),
+                           "、".join(p["label"] for p in unfixed)))
+                if targets:
+                    patch = targets
+                else:
+                    log("门禁第 %d 轮：没有可定点修的项，收工" % (attempt + 1))
+                    break
 
         changed = None
         if patch:
-            log("第 %d 轮：定点修补 %d 句…" % (attempt + 1, len(patch)))
+            log("门禁第 %d 轮：定点修补 %d 句…" % (attempt + 1, len(patch)))
             fb = _patch_feedback(patch)
-            # 修补的素材同样按这次调用的余量裁：提示词里还有系统提示、要改的
-            # 条目、被点名句的前后文，它们都占地方。素材放不下就用凝缩顶
-            # （见 fit_material），并在日志里说明。
             psystem = patch_system(cfg)
             fit, _note = fit_material(
-                llm, material if _needs_material(last["report"]) else "", cfg,
+                llm,
+                material if _needs_material(last["report"], is_form) else "", cfg,
                 other_chars=len(psystem) + len(fb) + len(prev_lines or "")
                             + PATCH_FIXED_CHARS,
                 evidence=evidence, log=log)
@@ -4124,154 +5563,57 @@ def generate(material, cfg, llm, preset_key=None,
                 [{"role": "system", "content": psystem},
                  {"role": "user", "content": build_patch_prompt(
                      last["script"], patch, fb, material=fit,
-                     evidence=evidence)}],
+                     evidence=evidence, rejected_note=retry_note)}],
                 temperature=float(cfg.get("llm.temperature", 0.8)),
                 max_tokens=int(cfg.get("llm.max_tokens", 8192)),
-                json_schema=patch_schema(vocab=whole_vocab))
-            log("第 %d 轮：%s" % (attempt + 1, _call_telemetry(meta)))
+                json_schema=patch_schema(vocab=whole_vocab, cfg=cfg))
+            retry_note = ""
             if meta.get("degraded"):
-                log("第 %d 轮：约束解码已降级" % (attempt + 1))
+                log("门禁第 %d 轮：约束解码已降级" % (attempt + 1))
+            log("门禁第 %d 轮：%s" % (attempt + 1, _call_telemetry(meta)))
             try:
-                edits = parse_patch(raw)
-                script = apply_patch(last["script"], edits, patch)
+                edits, inserts = parse_patch(raw)
+                script, rejected = apply_patch(last["script"], edits, patch, inserts, cfg)
             except ScriptError as e:
-                # 补丁没落地就整篇重出：这一轮的稿子一个字没动，退回上一版不算损失。
-                # 不拿「半份补丁」凑合——那会让「改了几处、漏了哪几处」说不清。
-                log("第 %d 轮：补丁没法落地（%s），改回整篇重出" % (attempt + 1, e))
-                patch = None
-            else:
-                script = normalize_script(script, cfg)
-                # 补丁路的返回行同样只报正文有效字（补完后的全稿求和），
-                # 且保留「第 N 轮 … 模型返回」形态供 web_ui 推进轮次进度。
-                log("第 %d 轮：模型返回正文 %d 有效字"
-                    % (attempt + 1,
-                       int(round(sum(duration_model.effective_chars(l["text"])
-                                     for l in script)))))
-                title = last["title"]
-                plan = last["planned_episodes"]
-                changed = len({e["index"] for e in edits})
-                # 模型会漏改：实测里点名 7 句、它只回了 6 句，没回的那句原样留着。
-                # 不把它当成失败——半份补丁也是净收益，漏掉的那句下一轮门禁会再
-                # 报一次，接着补就是。但必须说出来，否则「为什么还是没过」会变成一个
-                # 没人知道的悬案。
-                if changed < len(patch):
-                    log("第 %d 轮：只补到 %d 句，还差 %d 句没回（下一轮再补）"
-                        % (attempt + 1, changed, len(patch) - changed))
-
-        if not patch and pre_draft is not None:
-            # 分段初稿已到手：这一轮只做门禁与后续修补，不再整篇生成。
-            script = pre_draft["script"]
-            title = pre_draft["title"]
-            plan = pre_draft["planned_episodes"]
-            # 公共尾巴记 raw_chars/degraded：分段路没有「原始整篇输出」，按 0 记。
-            raw, meta = "", {}
-            pre_draft = None
-        elif not patch:
-            # 整篇重出：第 1 轮走这里，之后是结构坏了或补丁落不了地。
-            # 素材按这次调用的余量裁：系统提示、上一版正文都占地方，
-            # 先量再定能给素材多少字。放不下就改用凝缩，并把这件事写进日志——
-            # 静默少喂会让模型在缺依据的情况下硬写，产物上看不出少了什么。
-            fit, _note = fit_material(
-                llm, material, cfg,
-                other_chars=len(system) + len(prev_lines or "")
-                            + WRITE_FIXED_CHARS,
-                evidence=evidence, log=log)
-            user = build_user_prompt(fit, cfg, feedback, prev_lines)
-            # 这一行在调用之前写。生成一轮要十几分钟，日志里若只有「模型返回」那一行，
-            # 整轮期间界面上是上一次留下的字——看着像卡住了。
-            log("第 %d 轮：调用模型…" % (attempt + 1))
-            raw, meta = llm.chat(
-                [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=float(cfg.get("llm.temperature", 0.8)),
-                max_tokens=int(cfg.get("llm.max_tokens", 8192)),
-                json_schema=script_schema(vocab=whole_vocab))
-            if meta.get("degraded"):
-                log("第 %d 轮：约束解码已降级" % (attempt + 1))
-            log("第 %d 轮：%s" % (attempt + 1, _call_telemetry(meta)))
-
-            try:
-                parsed = parse_script(raw)
-            except ScriptError as e:
-                last = {"error": str(e)}
-                feedback = "输出不是合法 JSON 对象。请只输出 JSON 对象本身。"
+                # 补丁没落地**不重写**：这一轮的稿子一个字没动，退回上一版不算损失；
+                # 而重写是把整篇重摇一遍、还有概率依旧修不好。改为**下一轮重发同一
+                # 批补丁**，并把这次为什么整份退一并说清。次数计入本段轮次。
+                log("门禁第 %d 轮：补丁没法落地（%s），下一轮重发同一批补丁"
+                    % (attempt + 1, e))
+                retry_patch = patch
+                retry_note = "上一轮这份补丁整份没落地：%s" % e
                 continue
-
-            # 返回行只报正文有效字（解析出的 lines 逐句求和，与配额同尺）；
-            # 这一行同时是 web_ui 轮次进度的推进信号，必须保留「第 N 轮 … 模型返回」形态。
-            log("第 %d 轮：模型返回正文 %d 有效字"
+            script = normalize_script(script, cfg)
+            # 返回行同样只报正文有效字（补完后的全稿求和），且保留「模型返回」形态
+            # 供界面推进轮次进度。
+            log("门禁第 %d 轮：模型返回正文 %d 有效字"
                 % (attempt + 1,
                    int(round(sum(duration_model.effective_chars(l["text"])
-                                 for l in parsed["lines"])))))
-            script = normalize_script(parsed["lines"], cfg)
-            # 连说超限不在这里掰：正文的归属由门禁点名、交模型并句（见 `patch_targets`
-            # 里的 ab_run_limit）。片头尾也不参与——它们要到整期定稿那一刻才粘
-            # （见 `glue_intro_outro`）。
-            title = parsed["title"] or title_from_lines(script)
-            # 地图已定期标题时以地图为准：本期讲什么在排地图那一步就定了。
-            # 让模型每次重新命名，同一期会在计划与产物里挂上两个不同的名字。
-            if project and project.get("title"):
-                title = project["title"]
-            # 项目已定的总期数以人为准。提示词里请模型原样回填，但它漏填或改口
-            # 都不该改变结果——人定的事挂在模型的自觉上，进度迟早对不上账。
-            plan = parsed["planned_episodes"]
-            if project and project.get("planned_episodes"):
-                plan = int(project["planned_episodes"])
+                                 for l in script)))))
+            title = last["title"]
+            plan = last["planned_episodes"]
+            refused = {r.get("index") for r in rejected}
+            changed = len({e["index"] for e in edits} - refused)
+            # 模型会漏改：实测里点名 7 句、它只回了 6 句，没回的那句原样留着。
+            # 不把它当成失败——半份补丁也是净收益，漏掉的那句下一轮门禁会再
+            # 报一次，接着补就是。但必须说出来，否则「为什么还是没过」会变成一个
+            # 没人知道的悬案。
+            if changed < len(patch):
+                log("门禁第 %d 轮：只补到 %d 句，还差 %d 句没回（下一轮再补）"
+                    % (attempt + 1, changed, len(patch) - changed))
+            if rejected:
+                retry_note = _reject_feedback(rejected)
+                log("门禁第 %d 轮：%d 条补丁没落地（%s），其余已改上"
+                    % (attempt + 1, len(rejected),
+                       "；".join("第 %s 句：%s" % (r.get("index"), r.get("reason"))
+                                 for r in rejected[:2])))
+            prev_lines = "\n".join("%d. [%s] %s" % (n + 1, s["speaker"], s["text"])
+                                   for n, s in enumerate(script))
 
-        # 硬去重：模型凑数时会把写过的整段再背一遍（实测 302 句里 129 句是重复）。
-        # 放在门禁与落盘之前、两条路共用——重复的内容不该进成片，也不该让时长
-        # 门禁对着注水后的句数判「达标」。
-        script, dropped = dedupe_script(script)
-        if dropped:
-            log("去重：删掉 %d 句与前文完全重复的内容（重复段不进成片）" % dropped)
-            # 删句会让原本被重复段隔开的同一个人挨到一起，可能冒出新的连说超限。
-            # 这里不掰：门禁会把整段点出来、交模型并句——程序翻的话，翻出来的是一句
-            # 口气对不上、甚至根本不属于这个人的话。
-
-        # 记下这一版的正文。编号必须取这一版定型后的序号（含片头尾写死与连续句
-        # 翻转的结果）——门禁报的「第 58 句」就是按这个序号数的，拿别的版本去
-        # 对，模型会改错行。
-        prev_lines = "\n".join("%d. [%s] %s" % (i + 1, s["speaker"], s["text"])
-                               for i, s in enumerate(script))
-
-        report = gate_generate(script, cfg, card)
-        if dropped:
-            # 删得掉不等于没发生：凑过数这件事要留痕，人才知道这一期的素材其实
-            # 撑不满目标时长——不然只是成片悄悄短了一截。记成 soft 项：稿子已经
-            # 被程序改干净了，没有理由再拦人，也没有理由再烧一轮重写。
-            report["items"].append({
-                "key": "no_repeat", "label": "重复凑数", "level": "warn",
-                "judge": "code", "ok": False, "soft": True,
-                "detail": "有 %d 句与前文完全重复（同一段被复播），已由程序删除；"
-                          "重复内容不会进成片，但这说明素材撑不满目标时长——"
-                          "请补充素材或调低每期时长。" % dropped})
-            report["soft"] = [i for i in report["items"]
-                              if not i["ok"] and i.get("soft")]
-        if not title:
-            report["items"].append({
-                "key": "title_present", "label": "本期标题", "level": "fail",
-                "judge": "code", "ok": False,
-                "detail": "模型未产出标题，正文也无法推出可用标题。"})
-            report["fails"] = [i for i in report["items"]
-                               if not i["ok"] and i["level"] == "fail"]
-            report["passed"] = False
-
-        # 内容检（语义检 / 承诺链检）接在这里，图的就是这一刻：脚本还没落盘、
-        # 没进合成，打回重写只是重跑一次生成。等产物出来再检，片子已经渲染完，
-        # 检出来也改不动——那才是「检了等于没检」。
-        # 形式项全过了才跑：一份字数都不达标的稿子，先改形式，不值得为它花一次调用。
-        # 重判范围只取「上一轮没过或没判过」的那几项——已经判通过的那一项，本轮改的
-        # 又是措辞、句长这类形的事，没有理由把同一段上下文再喂一遍。没重判的那一项
-        # 由 merge_check 从上一轮带过来，报告里不会凭空少一行。
-        if report["passed"] and llm is not None:
-            dims = (dims_to_recheck(content_seen) if content_seen
-                    else set(k for k, _ in CHECK6_DIMS))
-            if dims:
-                content = gate_check6(script, cfg, llm=llm, material=material,
-                                      dims=dims, evidence=evidence)
-                report = merge_check(report, content, cfg, carry=content_seen)
-            else:
-                report = merge_check(report, {"items": []}, cfg, carry=content_seen)
-            content_seen = report
+        # 形式判定重新跑一遍（**每一轮都是对着当下这一版稿子判的**），再把这之前
+        # 内容检的结论并回来——内容那几项归检查段，这里不重判、也不改它的结论。
+        report = merge_check(_side_notes(gate_generate(script, cfg, card)),
+                             {"items": content_items}, cfg)
 
         last = {"script": script, "title": title,
                 "planned_episodes": plan,
@@ -4279,46 +5621,53 @@ def generate(material, cfg, llm, preset_key=None,
                 # 旁挂规划档。正文那份 json 一个字段都不加（见 layout.plan_file）。
                 "segments": segments,
                 "report": report, "raw_chars": len(raw),
-                "degraded": meta.get("degraded", False), "attempt": attempt + 1}
+                "degraded": meta.get("degraded", False),
+                # 轮号**跨段连续**：接在检查段实际跑过的轮数后面（见 `check_used`）。
+                # 两段各自从 1 数起会让界面看到轮号回跳。
+                "attempt": check_used + attempt + 1}
         if changed is not None:
             last["patched_lines"] = changed
-        if report["passed"]:
-            log("门禁通过（第 %d 轮）" % (attempt + 1))
-            return _finish(last)
 
-        # 没过：这一轮落的是**过程稿**——裸正文，片头尾不粘。
-        #
-        # 每轮写完就落盘：稿子在手，后面哪一轮卡住、被中止、进程崩了，都不至于从头
-        # 再来。但落的是「写到这儿的正文」，不是成品——整期还没定稿，片头尾挂上去
-        # 等于给半成品盖上成品的样子；下一轮定点修补按句号改句子，粘合版还会让句号
-        # 整体后移两位。每轮粘一遍，日志上也会跟着冒一串「片头尾已粘上」，读的人
-        # 分不清是粘重了还是落了几次盘。粘合只在整期定稿那一刻做一次（见 `_finish`）。
-        #
-        # 最后一轮不落：紧接着的兜底出口会把定稿落上去，同一份文件写两遍是白写。
-        if draft_sink is not None and attempt < max_rounds:
-            draft_sink(last)
-
-        # 回灌只给「够格拦人」的项。soft 项（总时长）不拦人，也就不该拿去让模型
-        # 重写：它既测不出也控不住，围着它改只会把内容改坏。advisory 项是模型自己
-        # 没给出结论的，把「交人工复核」这种话递给写作模型毫无意义。
         if report.get("soft"):
             log("门禁提示（不阻断）：%s"
                 % "、".join("%s %s" % (p["label"], p.get("detail", ""))
                             for p in report["soft"]))
         problems = [i for i in report["items"]
                     if not i["ok"] and not i.get("soft") and not i.get("advisory")]
+        if attempt == 0:
+            # 首轮只判定、不出货也不修补（出货归出货段），从前日志上看像跳了一轮；
+            # 而「%d 处」曾被读成「%d 句」——量词统一成「检查项」，句数一律说「句」。
+            log("门禁第 1 轮：判定完成（%s）"
+                % ("通过" if report["passed"] else
+                   "未过 %d 个检查项" % len(problems)))
+        if report["passed"]:
+            log("门禁通过（第 %d 轮）" % (attempt + 1))
+            break
+
+        # 没过：这一轮落的是**过程稿**——裸正文，片头尾不粘。
+        #
+        # 每轮写完就落盘：稿子在手，后面哪一轮卡住、被中止、进程崩了，都不至于从头
+        # 再来。但落的是「写到这儿的正文」，不是成品——整期还没定稿，片头尾挂上去
+        # 等于给半成品盖上成品的样子；下一轮定点修补按句号改句子，粘合版还会让句号
+        # 整体后移两位。粘合只在整期定稿那一刻做一次（见 `_finish`）。
+        if draft_sink is not None:
+            draft_sink(last)
+
+        # 回灌只给「够格拦人」的项。soft 项（总时长）不拦人，也就不该拿去让模型
+        # 重写：它既测不出也控不住，围着它改只会把内容改坏。advisory 项是模型自己
+        # 没给出结论的，把「交人工复核」这种话递给写作模型毫无意义。
         if problems:
-            log("门禁未过：%d 处（%s）"
+            log("门禁未过：%d 个检查项（%s）"
                 % (len(problems), "、".join(p["label"] for p in problems[:6])))
         feedback = _build_feedback(problems)
 
     if last and "script" in last:
-        # 门禁没过也要粘、也要落盘：片头尾不是「门禁通过」的奖励，是每一期都该有的
-        # 固定结构（见 glue_intro_outro）。轮次用尽时手上这一版就是这一期的定稿——
-        # 改成功没改成功，都由它出片。最后一轮的裸正文没落（见循环里那处说明），
-        # 定稿这一落正好把它补上。
+        # 没过也要粘、也要落盘：片头尾不是「通过」的奖励，是每一期都该有的固定结构
+        # （见 glue_intro_outro）。轮次用尽时手上这一版就是这一期的定稿——改成功
+        # 没改成功，都由它出片。
         return _finish(last)
     raise ScriptError("脚本生成失败：%s" % (last or {}).get("error", "未知原因"))
+
 
 
 def _feedback_banned(p):

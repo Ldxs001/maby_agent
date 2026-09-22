@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 [username-redacted]
+# Copyright 2026 wUwproject
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -199,14 +199,16 @@ class TestIntroOutroGluedAtSave(unittest.TestCase):
                  "text": "第 %d 句正文内容示例文字。" % i} for i in range(n)]
 
     def test_head_and_tail_are_added_and_the_body_survives(self):
-        script, cfg = self.body(), self.cfg()
+        # 正文先过一遍收束：**真实链路就是这样**（粘合发生在正文收束之后），
+        # 而粘合自身不再替正文做任何格式加工——所以这里比的是「句子还在、
+        # 还在原位、逐字不变」。（从前这条拿 normalize 之后的文本当参照，
+        # 那是把「粘合内部会跑一遍收束」当成了前提。）
+        cfg = self.cfg()
+        script = S.normalize_script(self.body(), cfg)
         out = S.glue_intro_outro(script, cfg, title="零依赖拆解与渐进")
         self.assertEqual(len(out), len(script) + 3)
-        # 粘合会跑一遍 normalize（给新粘上的句子补 estimated_seconds），正文也
-        # 一并走一遍——它是幂等的，已经 normalize 过的正文原样回来。所以这里拿
-        # normalize 之后的正文去比：比的是「句子还在、还在原位」，不是空白符。
         self.assertEqual([l["text"] for l in out[2:-1]],
-                         [l["text"] for l in S.normalize_script(script, cfg)],
+                         [l["text"] for l in script],
                          "正文一句不改、一句不删，整体往后挪两位")
         self.assertEqual(out[0]["text"],
                          "欢迎收听《播客》，面向关注方法论与认知边界的听众。")
@@ -262,32 +264,57 @@ class TestIntroOutroGluedAtSave(unittest.TestCase):
         self.assertEqual(out[-1]["text"], "这里是《播客》，欢迎关注。")
 
     def test_glued_lines_carry_their_own_discourse_tags(self):
-        """片头尾的语篇标签在模板里写死，且**都在词表内**，不靠 normalize 兜底。
+        """片头尾标签在模板里写死：片头首句「开场」、片尾「收束」，不靠 normalize 兜底。
 
-        「开场 / 收束」已从词表除名（v0.34.1）：片头尾由程序粘，正文没有哪句
-        该背这两个标签；模板改用中性档「承接」，保证粘出来的整份文件重判时
-        不会吃到「词表外标签」。
+        这几个词**不在**语篇词表内（v0.34.1 起除名）——它们只归程序：模板写什么，
+        落到稿上就是什么。从前 glue 内部还会再跑一遍全稿收束，表外标签会被洗成
+        中性档「承接」；v0.34.6 把粘合挪到收束之后，这一洗不再发生（顺序本身由
+        `test_glue_runs_after_the_format_tightening` 单独钉住）。
+
+        **片头第二句用的是词表内的中性档「承接」**（v0.36.0 起）：它是「接开场的
+        话头往下讲本期」，不是第二个开场——目标序列里只有一个开场。
         """
         out = S.glue_intro_outro(self.body(), self.cfg(), title="甲")
-        self.assertEqual(out[0]["emotion"], "承接")
+        self.assertEqual(out[0]["emotion"], "开场")
         self.assertEqual(out[1]["emotion"], "承接")
-        self.assertEqual(out[-1]["emotion"], "承接")
+        self.assertEqual(out[-1]["emotion"], "收束")
         brief = S.glue_intro_outro(self.body(),
                                    self.cfg(**{"intro_outro.preset": "brief"}),
                                    title="甲")
-        self.assertEqual(brief[0]["emotion"], "承接")
-        self.assertEqual(brief[-1]["emotion"], "承接")
+        self.assertEqual(brief[0]["emotion"], "开场")
+        self.assertEqual(brief[-1]["emotion"], "收束")
 
-    def test_removed_tags_are_out_of_vocab_everywhere(self):
-        """「开场 / 收束」全链路除名：词表、释义表、片头尾模板都不得再出现。"""
-        from podcast_maker.config_manager import DISCOURSE_ORDER, INTRO_OUTRO
-        self.assertNotIn("开场", DISCOURSE_ORDER)
-        self.assertNotIn("收束", DISCOURSE_ORDER)
-        self.assertNotIn("开场", S.DISCOURSE_HELP)
-        self.assertNotIn("收束", S.DISCOURSE_HELP)
-        blob = json.dumps(INTRO_OUTRO, ensure_ascii=False)
-        self.assertNotIn("开场", blob)
-        self.assertNotIn("收束", blob)
+    def test_program_only_tags_are_out_of_vocab_but_used_by_the_templates(self):
+        """「开场／回顾／收束」只归程序：词表与释义表里**不许有**，模板里**必须有**。
+
+        两头同时钉住——词表是「模型可填什么」的唯一一份表（模型枚举、正文门禁、
+        界面下拉都读它），这三个词不属于它；而模板必须用它们，否则片头又退回
+        中性档、把「这是开场／这是回顾」这个位置信息丢掉。模板里的值只能来自
+        `PROGRAM_ONLY_TAGS` 或语篇词表，不许各写一份字面量。
+
+        **片头第二句是唯一用词表词的固定句**（v0.36.0 起）：它挂 `DISCOURSE_NEUTRAL`
+        「承接」——接开场的话头往下讲本期，不是第二个开场。所以判据是「取自程序
+        专用词或语篇词表」，而不是「全在 PROGRAM_ONLY_TAGS 里」。
+        """
+        from podcast_maker.config_manager import (DISCOURSE_ORDER, INTRO_OUTRO,
+                                                   PROGRAM_ONLY_TAGS)
+        for w in PROGRAM_ONLY_TAGS:
+            self.assertNotIn(w, DISCOURSE_ORDER, "词表里不该有 %r" % w)
+            self.assertNotIn(w, S.DISCOURSE_HELP, "释义表里不该有 %r" % w)
+        used = [row["emotion"] for preset in ("standard", "brief")
+                for side in ("intro", "outro")
+                for row in INTRO_OUTRO[preset][side]]
+        self.assertTrue(used, "片头尾模板不该是空的")
+        for w in used:
+            self.assertIn(w, list(PROGRAM_ONLY_TAGS) + list(DISCOURSE_ORDER),
+                          "片头尾模板只许用程序专用词或语篇词表里的词，实际用了 %r" % w)
+        # 三个程序专用词都得真用上：开场（片头首句）、回顾（前期回顾）、收束（片尾）
+        in_use = used + [INTRO_OUTRO["review"][0]["emotion"]]
+        for w in PROGRAM_ONLY_TAGS:
+            self.assertIn(w, in_use, "程序专用词 %r 没有任何模板在用" % w)
+        # 片头第二句用的是词表内的中性档，**不是**第二个「开场」
+        self.assertEqual(INTRO_OUTRO["standard"]["intro"][1]["emotion"],
+                         S.DISCOURSE_NEUTRAL)
 
     def test_blank_program_name_falls_back_instead_of_rendering_empty(self):
         """节目名留空时若原样使用空串，片头会变成「欢迎收听《》」。"""
@@ -302,6 +329,48 @@ class TestIntroOutroGluedAtSave(unittest.TestCase):
         for line in out:
             self.assertGreater(line["estimated_seconds"], 0)
 
+    def test_gluing_does_not_change_the_body_seconds(self):
+        """补时长只补**新粘的句子**：正文句的 estimated_seconds 逐句不变。
+
+        口径必须与正文那一遍收束完全一致（同一个 estimate_line、不接音色标定），
+        否则字幕时间轴会在接缝处跳一下。
+        """
+        cfg = self.cfg()
+        script = S.normalize_script(self.body(), cfg)
+        before = [l["estimated_seconds"] for l in script]
+        out = S.glue_intro_outro(script, cfg, title="甲")
+        self.assertEqual([l["estimated_seconds"] for l in out[2:-1]], before)
+        self.assertTrue(all(l["estimated_seconds"] > 0 for l in out))
+
+    def test_glue_runs_after_the_format_tightening(self):
+        """粘合在**格式收束之后**：片头尾的标签是表外的字，且原样保留。
+
+        这条钉的是**顺序**本身，防复发靠它、不靠记得。若 glue 内部还跑一遍全稿
+        收束（v0.34.6 之前的样子），它手里那把尺子（语篇词表）会把表外标签一律洗成
+        中性档「承接」——下面的反证把这一点焊死：同一份稿子交付之后再过一遍收束，
+        片头尾标签确实会变成「承接」，所以「片头还是开场」只可能来自「粘合在收束
+        之后」这一个原因。
+        """
+        from podcast_maker.config_manager import PROGRAM_ONLY_TAGS
+        cfg = self.cfg()
+        # 正文先过一遍收束（真实链路的顺序）。这一步不能省：`normalize_script`
+        # 除了洗标签，还会把文本里的空白压掉——喂没洗过的正文进来，「收束只动标签、
+        # 不动文本」这条断言比的就不是同一件事了。
+        body = S.normalize_script(self.body(), cfg)
+        out = S.glue_intro_outro(body, cfg, title="甲")
+        self.assertEqual(out[0]["emotion"], "开场")
+        self.assertEqual(out[-1]["emotion"], "收束")
+        self.assertNotIn(out[0]["emotion"], S.vocab_words(),
+                         "片头标签必须是词表外的程序专用词，否则这条钉子失效")
+        washed = S.normalize_script(out, cfg)
+        self.assertEqual(washed[0]["emotion"], "承接", "反证：收束确实会洗掉表外标签")
+        self.assertEqual(washed[-1]["emotion"], "承接", "反证：收束确实会洗掉表外标签")
+        # 收束只动标签，不动文本——片头尾与正文逐字不变
+        self.assertEqual([l["text"] for l in washed], [l["text"] for l in out])
+        self.assertEqual(PROGRAM_ONLY_TAGS, ("开场", "回顾", "收束"),
+                         "程序专用词三个：开场（片头首句）／回顾（前期回顾）"
+                         "／收束（片尾）")
+
     def test_same_body_always_glues_the_same_way(self):
         """同样的正文与配置，粘出来逐字一样——各期一致靠的就是这条。"""
         cfg, script = self.cfg(), self.body()
@@ -311,30 +380,65 @@ class TestIntroOutroGluedAtSave(unittest.TestCase):
     # ---- 前期回顾：与片头尾同类（程序拼、不进轮），位置在片头之后、正文之前 ----
 
     def test_review_sits_right_after_the_head(self):
-        """回顾的位置：**片头之后、正文之前**。
+        """回顾的位置：**第 2 句**——紧跟片头第一句，在片头其余句与正文之前。
 
-        它是「上期讲到哪儿」的交代，得在正文开始前让听众听到；摆到正文后面就
-        成尾声的一部分了。所以粘合顺序是 片头 → 回顾 → 正文 → 片尾。
+        它是「上期讲到哪儿」的交代，得在开场之后紧接着让听众听到；摆到正文后面就
+        成尾声的一部分了。所以粘合顺序是 开场 → 回顾 → 片头其余句 → 正文 → 片尾。
+        **不分档位**：标准档片头两句、简档一句，两种下回顾都落在第 2 句
+        （简档那种见 `test_review_follows_a_brief_head_too`）。
         """
-        rows = [{"speaker": "B", "emotion": "承接",
+        rows = [{"speaker": "B", "emotion": "回顾",
                  "text": "上期《甲》聊的是乙——讲了丙、丁、戊等。"}]
-        out = S.glue_intro_outro(self.body(), self.cfg(), title="己", review=rows)
-        self.assertEqual(len(out), len(self.body()) + 4, "片头 2 + 回顾 1 + 片尾 1")
-        self.assertEqual(out[2]["text"], "上期《甲》聊的是乙——讲了丙、丁、戊等。")
+        cfg = self.cfg()
+        # 同上游：正文进 glue 之前已经收束过（这里显式走一遍，模拟真实链路）
+        body = S.normalize_script(self.body(), cfg)
+        out = S.glue_intro_outro(body, cfg, title="己", review=rows)
+        self.assertEqual(len(out), len(body) + 4, "片头 2 + 回顾 1 + 片尾 1")
+        self.assertEqual(out[0]["emotion"], "开场", "开场在第 1 句")
+        self.assertEqual(out[1]["text"], "上期《甲》聊的是乙——讲了丙、丁、戊等。")
+        self.assertEqual(out[1]["emotion"], "回顾")
+        self.assertEqual(out[2]["emotion"], "承接", "片头第二句退到回顾之后")
         # 正文整体后挪三位，一句不改、一句不删
         self.assertEqual([l["text"] for l in out[3:-1]],
-                         [l["text"] for l in S.normalize_script(self.body(),
-                                                                self.cfg())],
+                         [l["text"] for l in body],
                          "回顾只往中间加，正文零损失")
 
     def test_review_follows_a_brief_head_too(self):
-        """精简档片头只有一句，回顾照样紧跟在它后面。"""
+        """精简档片头只有一句，回顾照样紧跟在它后面（落第 2 句）。"""
         cfg = self.cfg(**{"intro_outro.preset": "brief"})
-        rows = [{"speaker": "B", "emotion": "承接", "text": "上期《甲》讲的是乙。"}]
+        rows = [{"speaker": "B", "emotion": "回顾", "text": "上期《甲》讲的是乙。"}]
         out = S.glue_intro_outro(self.body(), cfg, title="己", review=rows)
         self.assertEqual([l["text"] for l in out[:2]],
                          ["欢迎收听《播客》，面向关注方法论与认知边界的听众。",
                           "上期《甲》讲的是乙。"])
+
+    def test_the_four_tag_sequences(self):
+        """四种标签序列（片头档位 × 回顾开关），逐一钉住；**开场始终只有一个**。
+
+        | 片头档位 | 回顾 | 序列 |
+        |---|---|---|
+        | 标准（两句） | 开 | 开场／回顾／承接／正文…／收束 |
+        | 标准（两句） | 关 | 开场／承接／正文…／收束 |
+        | 简档（一句） | 开 | 开场／回顾／正文…／收束 |
+        | 简档（一句） | 关 | 开场／正文…／收束 |
+        """
+        body = self.body()
+        rows = [{"speaker": "B", "emotion": "回顾", "text": "上期《甲》讲的是乙。"}]
+        cases = [
+            ("standard", rows, ["开场", "回顾", "承接"]),
+            ("standard", None, ["开场", "承接"]),
+            ("brief", rows, ["开场", "回顾"]),
+            ("brief", None, ["开场"]),
+        ]
+        for preset, review, head_tags in cases:
+            cfg = self.cfg(**{"intro_outro.preset": preset})
+            out = S.glue_intro_outro(body, cfg, title="己", review=review)
+            label = "%s + 回顾%s" % (preset, "开" if review else "关")
+            tags = [l["emotion"] for l in out]
+            self.assertEqual(tags[:len(head_tags)], head_tags, label)
+            self.assertEqual(tags[-1], "收束", label)
+            self.assertEqual(len(out), len(body) + len(head_tags) + 1, label)
+            self.assertEqual(tags.count("开场"), 1, "%s：开场只有一个" % label)
 
     def test_no_review_means_not_a_single_line_more(self):
         """没给回顾（开关关、或上一期取不到）时，输出与从前逐字一致。"""
@@ -346,9 +450,97 @@ class TestIntroOutroGluedAtSave(unittest.TestCase):
 
     def test_review_lines_get_their_own_seconds(self):
         """粘进来的回顾句也要有 estimated_seconds，否则字幕上它是 0 秒。"""
-        rows = [{"speaker": "B", "emotion": "承接", "text": "上期《甲》讲的是乙。"}]
+        rows = [{"speaker": "B", "emotion": "回顾", "text": "上期《甲》讲的是乙。"}]
         out = S.glue_intro_outro(self.body(), self.cfg(), title="己", review=rows)
-        self.assertGreater(out[2]["estimated_seconds"], 0)
+        self.assertGreater(out[1]["estimated_seconds"], 0)
+
+
+class TestGluedLinesSkipThePerLineGates(unittest.TestCase):
+    """程序粘合句（片头／回顾／片尾）不进任何逐句判据（v0.36.0）。
+
+    它们是程序逐字拼的固定结构，模型没参与、也改不动——判出来也没法定点修
+    （修补是让模型改句子，改完就不是固定结构了）。生成过程里门禁本来也看不到
+    它们（粘合发生在门禁与修补**之后**），这条主要作用于**重判**（页面复核盘上
+    成品稿）。整篇量（句数、总时长）照算：粘合句确实存在、确实要念。
+    """
+
+    CFG = {"project.program_name": "播客"}
+    TAGS = ("开场", "回顾", "收束")
+
+    @staticmethod
+    def _script():
+        """夹在两段正文中间的三个程序粘合句；粘合句那一条**五样都犯**。
+
+        犯的是：超长（216 字）、超时、含禁用词「一定」、含念不出来的形状
+        （网址）、句尾没有终止标点。正文两句规规矩矩，用来当反证。
+        """
+        return [
+            {"speaker": "A", "emotion": "开场", "text": "欢迎收听《播客》。"},
+            {"speaker": "B", "emotion": "回顾",
+             "text": "上期聊的是 一定 " + "字" * 210 + " 见 https://example.com"},
+            {"speaker": "A", "emotion": "承接", "text": "本期要讲三件事情。"},
+            {"speaker": "B", "emotion": "解释", "text": "这一句正文有四十二个字。"},
+            {"speaker": "B", "emotion": "收束", "text": "这里是《播客》，欢迎关注。"},
+        ]
+
+    @staticmethod
+    def _item(rep, key):
+        return next(i for i in rep["items"] if i["key"] == key)
+
+    def test_every_per_line_gate_skips_them(self):
+        rep = S.gate_generate(self._script(), self.CFG, extra_tags=self.TAGS)
+        for key in ("line_length", "line_duration", "banned_words",
+                    "readable_text", "line_end_punct", "emotion_vocab"):
+            self.assertTrue(self._item(rep, key)["ok"],
+                            "%s 不该报粘合句：%s" % (key, self._item(rep, key)["detail"]))
+        # 整篇量照算：粘合句确实在稿子里、也要念
+        self.assertIn("共 5 句", self._item(rep, "json_valid")["detail"])
+        self.assertIn("3 句是程序粘合的", self._item(rep, "json_valid")["detail"])
+        self.assertIn("预估", self._item(rep, "total_duration")["detail"],
+                      "总时长照算——粘合句也在稿子里、也要念")
+
+    def test_the_body_next_to_them_is_still_judged(self):
+        """反证：正文侧同类问题照报——豁免只认程序标签，不认位置。"""
+        script = self._script()
+        script[3] = {"speaker": "B", "emotion": "解释", "text": "一定" + "字" * 57}
+        rep = S.gate_generate(script, self.CFG, extra_tags=self.TAGS)
+        self.assertEqual([h["line"] for h in self._item(rep, "line_length")["too_long"]],
+                         [4])
+        self.assertEqual([h["line"] for h in self._item(rep, "banned_words")["hits"]],
+                         [4])
+        # 第 5 句（收束）是粘合句，所以句尾标点这项只有正文第 4 句会犯
+        self.assertEqual([h["line"] for h in self._item(rep, "line_end_punct")["hits"]],
+                         [4])
+
+    def test_body_with_off_vocab_tag_is_still_reported(self):
+        """正文写出词表外的标签照报（真情绪词不在语篇词表里）。"""
+        script = self._script()
+        script[2] = {"speaker": "A", "emotion": "平静", "text": "本期要讲三件事情。"}
+        rep = S.gate_generate(script, self.CFG, extra_tags=self.TAGS)
+        item = self._item(rep, "emotion_vocab")
+        self.assertFalse(item["ok"])
+        self.assertEqual(item["lines"], [3])
+
+    def test_ab_run_limit_treats_them_as_separators(self):
+        """粘合句既不计入连说账、也当分隔符：前后两段正文各算各的。
+
+        卡的是同一人（A）连着说的上限 2 句（`paradigms` 里的 interview 卡）：
+        两个正文块各 2 句 A，都不超限；要是拿粘合句当连说的一环，就成了 5 连。
+        """
+        script = [
+            {"speaker": "A", "emotion": "开场", "text": "欢迎收听《播客》。"},
+            {"speaker": "A", "emotion": "解释", "text": "字" * 20},
+            {"speaker": "A", "emotion": "解释", "text": "字" * 20},
+            {"speaker": "A", "emotion": "回顾", "text": "上期聊的是这个。"},
+            {"speaker": "A", "emotion": "解释", "text": "字" * 20},
+            {"speaker": "A", "emotion": "解释", "text": "字" * 20},
+            {"speaker": "A", "emotion": "收束", "text": "这里是《播客》。"},
+        ]
+        card = PG.get("interview")
+        rep = S.gate_generate(script, self.CFG, card, extra_tags=self.TAGS)
+        item = self._item(rep, "ab_run_limit")
+        self.assertTrue(item["ok"], item["detail"])
+        self.assertEqual(item["lines"], [])
 
 
 class FakeLLM(object):
@@ -481,7 +673,11 @@ class TestStopBetweenRounds(unittest.TestCase):
         self.cfg.update({"script.gate_strict": False,
                          "gate.min_deviation_seconds": 9999,
                          "project.program_name": "播客",
-                         "script.max_llm_rounds": 3})
+                         "script.gate_rounds": 3,
+                         "script.check_rounds": 3,
+                         # 语义检默认关：这两组测试盯的是「内容检挂在环上」，
+                         # 不开它检查段只判承诺检、一轮就过，轮次预算用不起来。
+                         "script.check_semantic": True})
 
     def _payload(self):
         lines = [{"speaker": "A" if i % 2 == 0 else "B", "emotion": "平静",
@@ -505,15 +701,16 @@ class TestStopBetweenRounds(unittest.TestCase):
     def test_without_stop_it_uses_the_whole_round_budget(self):
         """对照组：没人叫停就把轮次预算用完，免得"少开一轮"变成一直只跑一轮。
 
-        预算用完不等于整篇重出四遍——只有第 1 轮整篇写，之后每轮都只是定点修补。
+        预算用完不等于整篇重出好几遍——整篇写只有出货段那一次，之后每轮都只是定点修补。
         """
         llm = ScriptedLLM(self._payload(), [SEM_FAIL_AT_3] * 8,
                           patch_replies=['{"edits": [{"index": 3, "text": '
                                          '"改过之后的一句示例文本内容。"}]}'] * 8)
         S.generate("素材内容示例", self.cfg, llm)
-        self.assertEqual(len(llm.users) + llm.patch_calls, 4,
-                         "上限 3 轮重试 → 一共开 4 轮")
-        self.assertEqual(len(llm.users), 1, "只有第 1 轮是整篇写")
+        self.assertEqual(len(llm.users), 1, "整篇写只有出货段那一次")
+        # 检查段跑满 check_rounds：首轮只检不修，之后每轮一次定点修补 ⇒ 少一次。
+        self.assertEqual(llm.patch_calls, 3 - 1,
+                         "检查轮次用满 ⇒ 首检 + 定点修补各就各位")
 
 
 class TestContentCheckInGenerateLoop(unittest.TestCase):
@@ -528,7 +725,11 @@ class TestContentCheckInGenerateLoop(unittest.TestCase):
         self.cfg.update({"script.gate_strict": False,
                          "gate.min_deviation_seconds": 9999,
                          "project.program_name": "播客",
-                         "script.max_llm_rounds": 3})
+                         "script.gate_rounds": 3,
+                         "script.check_rounds": 3,
+                         # 语义检默认关：这两组测试盯的是「内容检挂在环上」，
+                         # 不开它检查段只判承诺检、一轮就过，轮次预算用不起来。
+                         "script.check_semantic": True})
 
     def _payload(self, tag=""):
         lines = [{"speaker": "A" if i % 2 == 0 else "B", "emotion": "平静",
@@ -573,8 +774,8 @@ class TestContentCheckInGenerateLoop(unittest.TestCase):
         self.assertTrue(any(i["key"] == "check_semantic" and not i["ok"]
                             for i in gen["report"]["items"]))
 
-    def test_unlocated_problem_is_not_rewritten_but_handed_over(self):
-        """内容检指不出是哪一句 → 不动稿子，交人工，不整篇重写。
+    def test_unlocated_problem_is_not_rewritten_but_recorded(self):
+        """内容检指不出句号、quote 也反查不到 → 记「未修好」，不早退、不重写。
 
         让模型为一句它自己都说不清的问题重写两百句，只是重新摇一次骰子，
         还会把已经好的句子一起改坏。
@@ -587,7 +788,7 @@ class TestContentCheckInGenerateLoop(unittest.TestCase):
         self.assertEqual(len(llm.users), 1, "定不了点就不该整篇重出")
         self.assertEqual(llm.patch_calls, 0, "定不了点也不该开定点修补")
         self.assertFalse(gen["report"]["passed"])
-        self.assertTrue(any("指不出是哪一句" in m for m in logs), logs)
+        self.assertTrue(any("记「未修好」" in m for m in logs), logs)
 
     def test_unjudged_does_not_block(self):
         """模型没给结论 = 未判定，不该按「有问题」把脚本打回。"""
@@ -850,7 +1051,9 @@ class TestPatchContract(unittest.TestCase):
 
     这条路的价值全在这三条上。行数一变，门禁报的「第 N 句」就跟人对不上了；
     顺手改没点名的句子，等于把没毛病的地方重新摇一次骰子——那正是从前整篇
-    重出最贵的地方。所以它们都是硬约束，越界就报错，不静默丢弃。
+    重出最贵的地方。所以它们都是硬约束：**不合格的条目一律拒掉**、记进
+    `rejected`（下一轮带着原因重发），既不静默丢弃，也不连累同一份补丁里
+    其余合格的条目。
     """
 
     def test_schema_has_no_way_to_add_lines_or_to_swap_speakers(self):
@@ -865,7 +1068,9 @@ class TestPatchContract(unittest.TestCase):
 
     def test_apply_patch_replaces_in_place(self):
         script = S.normalize_script(_lines(6), _cfg())
-        out = S.apply_patch(script, [{"index": 3, "text": "换过之后的一句新台词文本"}], {3})
+        out, rejected = S.apply_patch(
+            script, [{"index": 3, "text": "换过之后的一句新台词文本"}], {3})
+        self.assertEqual(rejected, [], "这一条是合格的，不该被拒")
         self.assertEqual(len(out), len(script), "行数一个字都不能变")
         self.assertEqual(out[2]["text"], "换过之后的一句新台词文本")
         self.assertEqual(out[1]["text"], script[1]["text"], "没点名的句子照抄")
@@ -874,33 +1079,56 @@ class TestPatchContract(unittest.TestCase):
     def test_apply_patch_ignores_the_speaker_the_model_echoes(self):
         script = S.normalize_script(_lines(4), _cfg())
         now = script[1]["speaker"]
-        out = S.apply_patch(script, [{"index": 2, "speaker": "B" if now == "A" else "A",
-                                      "text": "换过之后的一句新台词文本"}], {2})
+        out, _rejected = S.apply_patch(
+            script, [{"index": 2, "speaker": "B" if now == "A" else "A",
+                      "text": "换过之后的一句新台词文本"}], {2})
         self.assertEqual(out[1]["speaker"], now, "说话人不采纳模型给的")
+
+    def _rejected(self, script, edits, targets, inserts=None):
+        """跑一遍补丁，返回被拒的那几条（`apply_patch` 的第二个返回值）。
+
+        单条不合格**只拒该条**：从前是整份作废，一轮点名四十多句只要有一条过
+        不了校验，另外四十条白写——实测一轮就这样白烧了十六分钟。
+        """
+        _out, rejected = S.apply_patch(script, edits, targets, inserts)
+        return rejected
 
     def test_same_line_twice_is_a_split_in_disguise(self):
         script = S.normalize_script(_lines(6), _cfg())
-        with self.assertRaises(ScriptError) as ctx:
-            S.apply_patch(script, [{"index": 3, "text": "改过一次的台词文本"},
-                                   {"index": 3, "text": "又改一次的台词文本"}], {3})
-        self.assertIn("两次", str(ctx.exception))
+        rejected = self._rejected(script, [{"index": 3, "text": "改过一次的台词文本"},
+                                           {"index": 3, "text": "又改一次的台词文本"}], {3})
+        self.assertIn("两次", "；".join(r["reason"] for r in rejected))
 
-    def test_line_out_of_range_raises(self):
+    def test_line_out_of_range_is_rejected(self):
         script = S.normalize_script(_lines(4), _cfg())
-        with self.assertRaises(ScriptError) as ctx:
-            S.apply_patch(script, [{"index": 9, "text": "改过一次的台词文本"}], {9})
-        self.assertIn("越界", str(ctx.exception))
+        rejected = self._rejected(script, [{"index": 9, "text": "改过一次的台词文本"}], {9})
+        self.assertIn("越界", rejected[0]["reason"])
 
-    def test_touching_an_unflagged_line_raises(self):
+    def test_touching_an_unflagged_line_is_rejected(self):
         script = S.normalize_script(_lines(6), _cfg())
-        with self.assertRaises(ScriptError) as ctx:
-            S.apply_patch(script, [{"index": 5, "text": "改过一次的台词文本"}], {3})
-        self.assertIn("没被点名", str(ctx.exception))
+        rejected = self._rejected(script, [{"index": 5, "text": "改过一次的台词文本"}], {3})
+        self.assertIn("没被点名", rejected[0]["reason"])
 
-    def test_blank_text_raises(self):
+    def test_blank_text_is_rejected(self):
         script = S.normalize_script(_lines(4), _cfg())
-        with self.assertRaises(ScriptError):
-            S.apply_patch(script, [{"index": 2, "text": "   "}], {2})
+        rejected = self._rejected(script, [{"index": 2, "text": "   "}], {2})
+        self.assertIn("空文本", rejected[0]["reason"])
+
+    def test_one_bad_edit_does_not_sink_the_whole_batch(self):
+        """逐条落地：一份补丁里好条照落，坏条只拒它自己。
+
+        这是这条路的钱袋子。实测里一轮点名四十六句，其中一条越界就整份退，
+        另外四十五条一个字都没改上，而下一轮重发的还是同一批——同一件事烧两遍。
+        """
+        script = S.normalize_script(_lines(6), _cfg())
+        out, rejected = S.apply_patch(
+            script,
+            [{"index": 3, "text": "换过之后的一句新台词文本"},
+             {"index": 99, "text": "越界的那一条"}],
+            {3, 99})
+        self.assertEqual([r["index"] for r in rejected], [99], "只拒越界那条")
+        self.assertEqual(out[2]["text"], "换过之后的一句新台词文本",
+                         "好条照落——不连累")
 
     def _same_speaker(self, n=3, who="A"):
         return S.normalize_script(
@@ -913,19 +1141,19 @@ class TestPatchContract(unittest.TestCase):
         script = self._same_speaker(3)
         merged = ("本地推理最大的好处是数据不出门，合同病历这类东西"
                   "发出去就等于复制到别人的机房里。")
-        out = S.apply_patch(script,
-                            [{"index": 1, "text": merged,
-                              "absorb": 2}], {1, 2, 3})
+        out, rejected = S.apply_patch(script,
+                                      [{"index": 1, "text": merged,
+                                        "absorb": 2}], {1, 2, 3})
+        self.assertEqual(rejected, [])
         self.assertEqual(len(out), 1, "三句并成一句")
         self.assertEqual(out[0]["text"], merged)
         self.assertEqual(out[0]["speaker"], "A", "并句不该换人")
 
     def test_absorb_cannot_swallow_a_line_nobody_flagged(self):
         script = self._same_speaker(3)
-        with self.assertRaises(ScriptError) as ctx:
-            S.apply_patch(script, [{"index": 1, "text": "并好之后的一整句台词文本",
-                                    "absorb": 1}], {1})
-        self.assertIn("没点名", str(ctx.exception))
+        rejected = self._rejected(script, [{"index": 1, "text": "并好之后的一整句台词文本",
+                                            "absorb": 1}], {1})
+        self.assertIn("没被点名", rejected[0]["reason"])
 
     def test_absorb_cannot_merge_across_speakers(self):
         """跨人并就是把一个人的话塞进另一个人嘴里。"""
@@ -933,17 +1161,16 @@ class TestPatchContract(unittest.TestCase):
             [{"speaker": "A", "emotion": "承接", "text": "第 1 句台词内容够长够取标题。"},
              {"speaker": "B", "emotion": "承接", "text": "第 2 句台词内容够长够取标题。"}],
             _cfg())
-        with self.assertRaises(ScriptError) as ctx:
-            S.apply_patch(script, [{"index": 1, "text": "并好之后的一整句台词文本",
-                                    "absorb": 1}], {1, 2})
-        self.assertIn("同一个人", str(ctx.exception))
+        rejected = self._rejected(script, [{"index": 1, "text": "并好之后的一整句台词文本",
+                                            "absorb": 1}], {1, 2})
+        self.assertIn("同一个人", rejected[0]["reason"])
 
     def test_absorb_cannot_eat_the_content(self):
         """并句只许删掉合并处的重复衔接，不许借并句把内容吃掉。"""
         script = self._same_speaker(2)
-        with self.assertRaises(ScriptError) as ctx:
-            S.apply_patch(script, [{"index": 1, "text": "太短", "absorb": 1}], {1, 2})
-        self.assertIn("意思一个都不许少", str(ctx.exception))
+        rejected = self._rejected(script, [{"index": 1, "text": "太短", "absorb": 1}], {1, 2})
+        self.assertIn("意思一个都不许少", rejected[0]["reason"])
+
 
     def test_parse_patch_rejects_empty_and_garbage(self):
         for bad in ('{"edits": []}', "这次我直接给你重写一遍：好，那我们开始。", "{}"):
@@ -952,11 +1179,34 @@ class TestPatchContract(unittest.TestCase):
 
     def test_parse_patch_accepts_a_code_fence(self):
         raw = '```json\n{"edits": [{"index": 2, "text": "改过之后的一句台词"}]}\n```'
-        self.assertEqual(len(S.parse_patch(raw)), 1)
+        edits, inserts = S.parse_patch(raw)
+        self.assertEqual(len(edits), 1)
+        self.assertFalse(inserts, "没给插入项就是空数组")
+
+    def test_rejected_edits_go_back_into_the_next_prompt(self):
+        """被拒的原因要递回下一轮：同一批补丁重发时，模型得知道上次为什么不行。
+
+        不递回去，「重发」就退化成重摇骰子——而这条路一次调用要跑十几分钟，
+        重摇的代价是整整一轮。
+        """
+        note = S._reject_feedback([{"index": 3, "reason": "句号越界（全篇共 4 句）"}])
+        self.assertIn("句号越界", note)
+        p = S.build_patch_prompt(S.normalize_script(_lines(4), _cfg()),
+                                 {3: ["过长"]}, "第 3 句：太长", rejected_note=note)
+        self.assertIn("上一轮为什么没落地", p)
+        self.assertIn("句号越界", p, "原因原样进了提示词")
+        plain = S.build_patch_prompt(S.normalize_script(_lines(4), _cfg()),
+                                     {3: ["过长"]}, "第 3 句：太长")
+        self.assertNotIn("上一轮为什么没落地", plain, "没有拒收就不该出现这一段")
+
 
 
 class TestPatchTargets(unittest.TestCase):
-    """哪些问题能定点、哪些只能重出、哪些该交人工——分成三类，各有各的去处。"""
+    """哪些问题能定点、哪些定不了点——两类各有各的去处。
+
+    定得了的交模型定点改；定不了的记一笔「未修好」。门禁段与检查段对一份可用稿子
+    都没有重写权限，所以这里没有第三类「只能整篇重出」。
+    """
 
     def _form_report(self):
         script = S.normalize_script(_lines(6), _cfg())
@@ -969,9 +1219,9 @@ class TestPatchTargets(unittest.TestCase):
         script[2]["text"] = "短"
         script[4]["text"] = "长" * 44
         report = S.gate_generate(script, cfg, S.resolve_paradigm(None, cfg))
-        targets, refull, manual = S.patch_targets(report, len(script))
+        targets, unfixed = S.patch_targets(report, len(script))
         self.assertEqual(sorted(targets), [3, 5])
-        self.assertFalse(refull and manual)
+        self.assertFalse(unfixed)
         self.assertTrue(any("不许拆句" in w for w in targets[5]))
 
     def test_banned_word_comes_back_with_the_substitute(self):
@@ -979,7 +1229,7 @@ class TestPatchTargets(unittest.TestCase):
         script = S.normalize_script(_lines(6), cfg)
         script[1]["text"] = "所有" + script[1]["text"]
         report = S.gate_generate(script, cfg, S.resolve_paradigm(None, cfg))
-        targets, _refull, _manual = S.patch_targets(report, len(script))
+        targets, _unfixed = S.patch_targets(report, len(script))
         self.assertEqual(sorted(targets), [2])
         self.assertTrue(any("所有" in w for w in targets[2]))
 
@@ -987,37 +1237,37 @@ class TestPatchTargets(unittest.TestCase):
         report = {"items": [{"key": "check_semantic", "label": "语义检（LLM）",
                              "ok": False, "detail": "第 7 句：编造",
                              "issues": [{"line": 7, "quote": "原话", "problem": "编了数据"}]}]}
-        targets, refull, manual = S.patch_targets(report, 20)
+        targets, unfixed = S.patch_targets(report, 20)
         self.assertEqual(sorted(targets), [7])
-        self.assertFalse(refull or manual)
+        self.assertFalse(unfixed)
         # 方向要给全：只贴检查结论的话，模型会当成报告而不是指令。
         self.assertTrue(any("去掉素材里没有" in w for w in targets[7]),
                         targets[7])
 
-    def test_unlocated_content_issue_goes_to_a_human(self):
+    def test_unlocated_content_issue_is_recorded_not_rewritten(self):
+        """指不出句号、quote 也反查不到 → 记「未修好」，不早退、不重写。"""
         report = {"items": [{"key": "check_semantic", "label": "语义检（LLM）",
                              "ok": False, "detail": "未指出句号：整篇偏题",
                              "issues": [{"line": 0, "quote": "", "problem": "整篇偏题"}]}]}
-        targets, refull, manual = S.patch_targets(report, 20)
-        self.assertFalse(targets, "没有落点就不该交给模型")
-        self.assertFalse(refull, "也不该整篇重出")
-        self.assertEqual(len(manual), 1, "该交人工")
+        targets, unfixed = S.patch_targets(report, 20)
+        self.assertFalse(targets, "没有落点就不该交给模型去猜")
+        self.assertEqual(len(unfixed), 1, "定不了点的记一笔「未修好」")
 
-    def test_broken_structure_can_only_be_regenerated(self):
+    def test_broken_structure_is_not_touched_here(self):
+        """结构坏了（稿子为空）归生成步骤：门禁段既不重写也不硬猜。"""
         report = {"items": [{"key": "json_valid", "label": "JSON 合法",
                              "ok": False, "detail": "共 0 句"}]}
-        targets, refull, manual = S.patch_targets(report, 0)
+        targets, unfixed = S.patch_targets(report, 0)
         self.assertFalse(targets)
-        self.assertEqual(len(refull), 1)
-        self.assertFalse(manual)
+        self.assertEqual(len(unfixed), 1, "门禁段没有重写权限：记一笔交生成/人")
 
     def test_soft_and_advisory_items_are_left_alone(self):
         report = {"items": [
             {"key": "total_duration", "label": "总时长偏差", "ok": False, "soft": True},
             {"key": "check_promise", "label": "承诺链检（LLM）", "ok": False,
              "advisory": True}]}
-        targets, refull, manual = S.patch_targets(report, 20)
-        self.assertFalse(targets or refull or manual)
+        targets, unfixed = S.patch_targets(report, 20)
+        self.assertFalse(targets or unfixed)
 
 
 class TestRecheckScope(unittest.TestCase):
@@ -1054,8 +1304,17 @@ class TestCheck6OutputShape(unittest.TestCase):
     def test_prompt_demands_line_quote_and_problem(self):
         for token in ("line", "quote", "problem"):
             self.assertIn(token, S.CHECK6_SYSTEM)
-        self.assertIn("填 0", S.CHECK6_SYSTEM,
-                      "指不出哪一句时要明说填 0，不许拿别的句子顶替")
+        # 落点不许是 0：给不出句号就没人改得动它，所以要求「填最该改的那一句」，
+        # 而不是教模型拿 0 糊过去（0 曾是早退暗道的入口）。
+        self.assertIn("其中最该改的那一句", S.CHECK6_SYSTEM)
+        self.assertNotIn("填 0", S.CHECK6_SYSTEM)
+
+    def test_prompt_demands_the_full_promise_bundle(self):
+        """承诺检一次答全四件套：承诺是什么 / 怎么闭合 / 谁来说 / 补在哪。"""
+        for token in ("promise", "how", "speaker", "close_after"):
+            self.assertIn(token, S.CHECK6_SYSTEM)
+        self.assertIn("只能填 A 或 B", S.CHECK6_SYSTEM)
+        self.assertIn("不许把承诺删掉或改没", S.CHECK6_SYSTEM)
 
     def test_structured_issues_survive(self):
         payload = ('{"semantic": {"pass": false, "issues": ['
@@ -1069,7 +1328,7 @@ class TestCheck6OutputShape(unittest.TestCase):
         self.assertIn("第 4 句", detail)
 
     def test_out_of_range_line_becomes_zero_not_a_guess(self):
-        """句号越界一律归 0：拿假句号去定点，改的是没毛病的那句。"""
+        """越界又没原话可反查 → 留 0，不拿假句号去定点（改的是没毛病的那句）。"""
         payload = ('{"semantic": {"pass": false, "issues": ['
                    '{"line": 99, "quote": "", "problem": "说不清"}]},'
                    ' "promise": {"pass": true, "issues": []}}')
@@ -1082,6 +1341,60 @@ class TestCheck6OutputShape(unittest.TestCase):
         out = S.check6_llm(_lines(4), _cfg(), _LLM(payload), "素材")
         self.assertEqual(out["semantic"][2][0]["line"], 0)
         self.assertIn("第3句编了数据", out["semantic"][2][0]["problem"])
+
+    def test_locate_line_prefers_the_models_number(self):
+        """模型给了有效句号就用它；没有才轮到反查，两样都落空才留 0。"""
+        script = _lines(4)
+        self.assertEqual(S._locate_line({"line": 2, "quote": "随便"}, 4, script), 2)
+        self.assertEqual(S._locate_line({"line": 0, "quote": "第 3 句台词内容"},
+                                        4, script), 4)
+        self.assertEqual(S._locate_line({"line": 0, "quote": "查无此句"},
+                                        4, script), 0)
+
+    def test_quote_lookup_recovers_the_line_number(self):
+        """模型漏给句号、只给了原话 → 拿 quote 反查，落点照样回得来。
+
+        这是「不许填 0」的兜底：句号是算得出来的（字符串比对，不花模型调用），
+        所以即便模型漏了数字，这一句也不会掉进「没得修」。
+        """
+        payload = ('{"semantic": {"pass": false, "issues": ['
+                   '{"line": 0, "quote": "第 2 句台词内容", "problem": "编了数据"}]},'
+                   ' "promise": {"pass": true, "issues": []}}')
+        out = S.check6_llm(_lines(4), _cfg(), _LLM(payload), "素材")
+        self.assertEqual(out["semantic"][2][0]["line"], 3, "反查回到第 3 句")
+
+    def test_quote_lookup_works_when_the_number_is_out_of_range(self):
+        """越界加原话：同样反查回来，不算「指不出」。"""
+        payload = ('{"semantic": {"pass": false, "issues": ['
+                   '{"line": 99, "quote": "第 1 句台词内容", "problem": "编了数据"}]},'
+                   ' "promise": {"pass": true, "issues": []}}')
+        out = S.check6_llm(_lines(4), _cfg(), _LLM(payload), "素材")
+        self.assertEqual(out["semantic"][2][0]["line"], 2)
+
+    def test_quote_lookup_that_finds_nothing_stays_unlocated(self):
+        """原话在稿子里找不到 → 留 0（未指出句号），不猜「最像的那一句」。"""
+        payload = ('{"semantic": {"pass": false, "issues": ['
+                   '{"line": 0, "quote": "这句话稿子里根本没有", "problem": "说不清"}]},'
+                   ' "promise": {"pass": true, "issues": []}}')
+        out = S.check6_llm(_lines(4), _cfg(), _LLM(payload), "素材")
+        self.assertEqual(out["semantic"][2][0]["line"], 0)
+
+    def test_located_by_quote_still_reaches_the_patch_list(self):
+        """反查回的句号照样进定点清单——不因为模型没给数字就放弃这一句。
+
+        反查发生在归一化那一步（`_norm_issues`），所以这里必须走真实链路：
+        先过 `check6_llm` 拿到已回填句号的 issues，再交给 `patch_targets`。
+        """
+        payload = ('{"semantic": {"pass": false, "issues": ['
+                   '{"line": 0, "quote": "第 2 句台词内容", "problem": "编了数据"}]},'
+                   ' "promise": {"pass": true, "issues": []}}')
+        script = _lines(4)
+        out = S.check6_llm(script, _cfg(), _LLM(payload), "素材")
+        report = {"items": [{"key": "check_semantic", "ok": False,
+                             "issues": out["semantic"][2]}]}
+        targets, unfixed = S.patch_targets(report, len(script))
+        self.assertEqual(sorted(targets), [3])
+        self.assertFalse(unfixed)
 
     def test_dims_limits_what_is_judged(self):
         payload = '{"semantic": {"pass": true, "issues": []}}'
@@ -1136,7 +1449,9 @@ class TestDraftSink(unittest.TestCase):
         self.cfg.update({"script.gate_strict": False,
                          "gate.min_deviation_seconds": 9999,
                          "project.program_name": "播客",
-                         "script.max_llm_rounds": 2})
+                         "script.gate_rounds": 3,
+                         "script.check_rounds": 2,
+                         "script.check_semantic": True})
 
     def _payload(self):
         lines = [{"speaker": "A" if i % 2 == 0 else "B", "emotion": "平静",
@@ -1147,19 +1462,25 @@ class TestDraftSink(unittest.TestCase):
     def test_sink_is_called_after_every_round(self):
         """每轮写完都有一份落盘：中途卡住或被中止，手上还有稿子。
 
-        落的是**过程稿**（裸正文）。最后一轮的裸落由定稿那一次顶替——定稿同样
-        往同一个位置写，同一份文件写两遍是白写（见 `_finish`）。所以落盘次数
-        等于轮数，不是轮数加一。
+        落的是**过程稿**（裸正文）。检查段与门禁段各自在「本轮没过」之后落一份
+        （末轮不落——定稿那一份顶它，同一份文件写两遍是白写，见 `_finish`），
+        所以落盘份数 = 两段各一份过程稿 + 定稿一份。从前只有门禁一段在轮，
+        段序调换（v0.36.0：出货 → 检查 → 门禁）后落盘点也跟着变成两处。
         """
         seen = []
         llm = ScriptedLLM(self._payload(), [SEM_FAIL_AT_3] * 8,
                           patch_replies=['{"edits": [{"index": 3, "text": '
                                          '"改过之后的一句示例文本内容。"}]}'] * 8)
         S.generate("素材内容示例", self.cfg, llm, draft_sink=seen.append)
-        self.assertEqual(len(seen), len(llm.users) + llm.patch_calls,
-                         "每开一轮就该落一次盘")
+        self.assertEqual(len(seen), 3, "检查段 1 份 + 门禁段 1 份 + 定稿 1 份")
         self.assertTrue(all("script" in g and "report" in g for g in seen))
-        self.assertEqual([g["attempt"] for g in seen], [1, 2, 3])
+        rounds = [int(g.get("attempt", 0)) for g in seen]
+        self.assertTrue(all(r >= 1 for r in rounds), "每份都记着它是第几轮落的")
+        self.assertEqual(rounds, sorted(rounds),
+                         "轮号只许往前走、不许回跳——回跳说明两段各自从 1 数起，"
+                         "界面上的「第 N 轮」会从检查段的第 3 轮掉回第 1 轮")
+        self.assertLess(rounds[0], rounds[1],
+                        "门禁段的轮号接在检查段跑过的轮数后面，不从头再数一遍")
 
     def test_glue_runs_once_per_episode(self):
         """整期只粘一次：几轮改下来，片头尾只在定稿那一刻挂上去。
@@ -1237,6 +1558,60 @@ class TestDraftSink(unittest.TestCase):
             int(round(S.duration_model.estimate_line(
                 first["text"], first["speaker"], self.cfg))),
             "首句时长要按写死之后的文本算")
+
+
+class TestStageOrder(unittest.TestCase):
+    """三段串行的顺序（v0.36.0）：**出货 → 检查 → 门禁**。
+
+    顺序不是风格问题，它决定了报告上的结论对不对着最终稿：形式门禁排最后，中间
+    检查段的补丁插入新句（加行，可能冒出连说超限）之后，形式还会被重新判一遍；
+    反过来的排法（门禁在前）里，中间改完没人复核形式，报告上留着旧稿的结论——
+    「报告绿、稿子坏」的静默放行就是这么来的。
+    """
+
+    def setUp(self):
+        self.cfg = ConfigManager().data()
+        self.cfg.update({"script.gate_strict": False,
+                         "gate.min_deviation_seconds": 9999,
+                         "project.program_name": "播客",
+                         "script.gate_rounds": 3,
+                         "script.check_rounds": 2,
+                         "script.check_semantic": True})
+
+    def _payload(self):
+        lines = [{"speaker": "A" if i % 2 == 0 else "B", "emotion": "平静",
+                  "text": "第 %d 句正文内容示例文字。" % i} for i in range(12)]
+        return json.dumps({"title": "链与两头", "planned_episodes": 7,
+                           "lines": lines}, ensure_ascii=False)
+
+    def test_the_three_stages_run_in_this_order(self):
+        """源码里的段序就是运行时的段序：出货最先、门禁最后。
+
+        钉的是「别改回去」。段序在 `generate()` 里由三段的分节注释划开，这里按
+        它们在源码里出现的先后核对——比跑一遍生成便宜，也能挡住顺手重排。
+        """
+        with open(S.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        marks = ["出货段：正文生成", "检查段：内容检", "门禁段：形式门禁"]
+        pos = [src.index(m) for m in marks]
+        self.assertEqual(pos, sorted(pos),
+                         "三段必须按 %s 这个顺序排" % " → ".join(marks))
+
+    def test_the_gate_report_carries_the_content_findings(self):
+        """门禁段排在最后，它的报告要**同时**带形式结论与检查段的内容结论。
+
+        交出去的报告只有门禁段这一份。内容检的结论不并回来，报告上就只剩形式
+        那几项——人看不到内容检判了什么，等于白判一次。
+        """
+        seen = []
+        llm = ScriptedLLM(self._payload(), [SEM_FAIL_AT_3] * 8,
+                          patch_replies=['{"edits": [{"index": 3, "text": '
+                                         '"改过之后的一句示例文本内容。"}]}'] * 8)
+        gen = S.generate("素材内容示例", self.cfg, llm, draft_sink=seen.append)
+        keys = {i["key"] for i in gen["report"]["items"]}
+        self.assertTrue([k for k in keys if k.startswith("check_")],
+                        "内容检的结论要并回报告：%s" % sorted(keys))
+        self.assertIn("line_end_punct", keys, "形式门禁的结论也在同一份里")
 
 
 class TestContentCheckSchema(unittest.TestCase):
@@ -1428,7 +1803,9 @@ class TestBatchCheck(unittest.TestCase):
 class _SegmentedLLM(object):
     """分段生成路径的假模型：规划 / 分段 / 补字插入 / 压字删减 / 定点修补 / 内容检。
 
-    分段开启时**不该**再走整篇生成——script_calls 就是盯这件事的。
+    分段开启时**不该**再走整篇生成——script_calls 就是盯这件事的。段内那一步
+    「查重 → 就地替换」也走同一个出口，所以这里单独认领（replace_calls），
+    否则它会被记成整篇调用，把上面那条断言误伤掉。
 
     「补字」与「压字」两条路没有现成 payload 时现场造：
       - 少了 → 按提示词里的「少了 N 字」造插入项，每句顶到句长上限，插在本段末尾；
@@ -1441,7 +1818,7 @@ class _SegmentedLLM(object):
 
     def __init__(self, plan_payloads, segment_payloads, content_replies=None,
                  script_payloads=None, patch_payloads=None, insert_payloads=None,
-                 trim_payloads=None, logic_payloads=None):
+                 trim_payloads=None, replace_payloads=None, logic_payloads=None):
         self.plan_payloads = list(plan_payloads)
         self.segment_payloads = list(segment_payloads)
         self.content_replies = list(content_replies or [])
@@ -1449,6 +1826,7 @@ class _SegmentedLLM(object):
         self.patch_payloads = list(patch_payloads or [])
         self.insert_payloads = list(insert_payloads or [])
         self.trim_payloads = list(trim_payloads or [])
+        self.replace_payloads = list(replace_payloads or [])
         # 逻辑拆分的回答。不给就自动回「一节一段」——等价于不合并，段数只由节数
         # 定，绝大多数测试想要的正是这个稳定形态。要验合并的场景显式给。
         self.logic_payloads = list(logic_payloads or [])
@@ -1459,11 +1837,13 @@ class _SegmentedLLM(object):
         self.patch_calls = 0
         self.insert_calls = 0
         self.trim_calls = 0
+        self.replace_calls = 0
         self.logic_calls = 0
         self.segment_users = []
         self.patch_users = []
         self.insert_users = []
         self.trim_users = []
+        self.replace_users = []
         self.logic_users = []
         self.budgets = []
 
@@ -1508,6 +1888,16 @@ class _SegmentedLLM(object):
             if self.patch_payloads:
                 return self.patch_payloads.pop(0), {}
             return self._auto_patch(user), {}
+        if "改写者" in system:
+            # 段内「查重 → 就地替换」那一轮。它走的也是 `llm.chat`，与整篇生成同一个
+            # 出口——不在这儿认领掉，它就会掉进下面的整篇分支，把「分段时不走整篇
+            # 生成」那条断言误伤掉（错的是桩，不是主体）。
+            self.replace_calls += 1
+            user = messages[-1].get("content") or ""
+            self.replace_users.append(user)
+            if self.replace_payloads:
+                return self.replace_payloads.pop(0), {}
+            return self._auto_replace(user), {}
         if "审校" in system:
             self.content_calls += 1
             if self.content_replies:
@@ -1585,6 +1975,27 @@ class _SegmentedLLM(object):
         return json.dumps({"edits": [{"index": n, "text": "乙" * 19 + "。"} for n in idxs]},
                           ensure_ascii=False)
 
+    @staticmethod
+    def _auto_replace(user):
+        """按「要换掉的句子」那一块造一份替换件：每句换成一个唯一的新句。
+
+        - 长度取提示词给的区间**下限**（提示词里那个数与落地判据同源，都出自
+          `replace_span`）；
+        - 每句带一个递增序号：既保证各条互不相同，也不会跟全篇任何一句撞上——
+          落地时会**就地再查一次重**，两条一样的替换件有一条会被拒。
+        """
+        rows = re.findall(r"第 (\d+) 句（.*?）——与第 (\d+) 句重复：", user)
+        if not rows:
+            raise AssertionError("替换提示词里没点名任何要换掉的句子")
+        spans = re.findall(r"\*\*(\d+)~(\d+) 字\*\*", user)
+        edits = []
+        for k, (idx, _first) in enumerate(rows, 1):
+            lo = int(spans[k - 1][0]) if k - 1 < len(spans) else 12
+            num = str(k)
+            body = "改" * max(0, lo - 1 - len(num)) + num + "。"
+            edits.append({"index": int(idx), "text": body})
+        return json.dumps({"edits": edits}, ensure_ascii=False)
+
 
 def _evidence():
     return {"gist": "总主旨", "points": ["要点一"],
@@ -1609,8 +2020,26 @@ def _plan_payload(title="测试标题", n=2):
 
 
 def _seg_payload(n):
-    lines = [{"speaker": "A" if i % 2 == 0 else "B", "emotion": "承接",
-              "text": "甲" * 30 + "。"} for i in range(n)]
+    """造一个 n 句的段，**每句 31 字（30 字正文 + 句尾标点），句句不同**。
+
+    长度必须稳稳停在 31 字：几个测试按字数核账（如 10 句 310 字、压字后 395 字），
+    桩数据一改长度，那些断言跟着漂——测的就不是主体了。
+
+    「句句不同」也是必须的：段内现在有「查重 → 就地替换」这一步（补字之后立刻查、
+    把后出现的副本换成新内容）。十句一字不差的桩数据会被判成十处复读、拉起替换轮，
+    而真机里一段根本不会输出十句完全一样的台词——桩自己造了一个流程里不会出现的
+    场景，测出来的东西就不算数了。序号同时保证归一化后仍互不相同。
+    """
+    lines = []
+    marks = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥"
+    for i in range(n):
+        # 用**汉字**做区分标记，一个 ASCII 字符都不掺：核账走的是
+        # `duration_model.effective_chars`（汉字 / 标点 / 西文各有各的折合），
+        # 掺一个数字进去，段的有效字就跟着变，压字量、总字数那些断言全漂。
+        head = marks[i % len(marks)] + marks[(i // len(marks)) % len(marks)]
+        body = head + "甲" * (30 - 2)                      # 恰好 30 字
+        lines.append({"speaker": "A" if i % 2 == 0 else "B", "emotion": "承接",
+                      "text": body + "。"})
     return json.dumps({"lines": lines}, ensure_ascii=False)
 
 
@@ -1732,7 +2161,7 @@ class TestSegmentQuotas(unittest.TestCase):
         侧 `dedupe_script` 只删「归一化后一字不差」的句子，措辞不同的拦不住。
         """
         s = S.insert_system()
-        self.assertIn("换个说法再说一遍", s, "同义改写必须被点名禁止")
+        self.assertIn("禁止重复已有的脚本内容", s, "同义改写必须被点名禁止")
         self.assertIn("带进正文里还没有", s, "每句要带新信息点")
         self.assertIn("各处彼此也不许重复", s, "多处插入之间也要排重")
         self.assertIn("复读不算补字", s)
@@ -1823,20 +2252,54 @@ class TestSegmentQuotas(unittest.TestCase):
         self.assertEqual(len(tail), 3, "只增不减")
 
     def test_insert_rejects_out_of_range_and_bad_speaker(self):
-        """落点越界、说话人非法、句长出门禁一律报错，不静默丢弃。"""
+        """落点越界、说话人非法、缺语篇标签、空文本一律报错，不静默丢弃。
+
+        **句长不在这份清单里**（v0.36.0 起）：那一条由下面那条
+        `test_insert_does_not_judge_line_length` 单独钉住。
+        """
         cfg = {"gate.min_chars": 8, "gate.max_chars": 40}
-        seg = [{"speaker": "A", "emotion": "", "text": "字" * 20}]
+        seg = [{"speaker": "A", "emotion": "承接", "text": "字" * 20}]
         with self.assertRaises(S.ScriptError):
-            S.apply_insert(seg, [{"after": 99, "speaker": "A",
+            S.apply_insert(seg, [{"after": 99, "speaker": "A", "emotion": "承接",
                                   "text": "字" * 20}], 5, cfg)
         with self.assertRaises(S.ScriptError):
-            S.apply_insert(seg, [{"after": 5, "speaker": "C",
+            S.apply_insert(seg, [{"after": 5, "speaker": "C", "emotion": "承接",
                                   "text": "字" * 20}], 5, cfg)
-        with self.assertRaises(S.ScriptError):
-            S.apply_insert(seg, [{"after": 5, "speaker": "A", "text": "字"}], 5, cfg)
-        with self.assertRaises(S.ScriptError):
+        with self.assertRaises(S.ScriptError):          # 缺 emotion
+            S.apply_insert(seg, [{"after": 5, "speaker": "A",
+                                  "text": "字" * 20}], 5, cfg)
+        with self.assertRaises(S.ScriptError):          # emotion 不在词表
             S.apply_insert(seg, [{"after": 5, "speaker": "A", "emotion": "好奇",
                                   "text": "字" * 20}], 5, cfg)
+        with self.assertRaises(S.ScriptError):          # 空文本
+            S.apply_insert(seg, [{"after": 5, "speaker": "A", "emotion": "承接",
+                                  "text": "   "}], 5, cfg)
+
+    def test_insert_does_not_judge_line_length(self):
+        """**句长不在这里判**（v0.36.0 起）：7 字句与 50 字句都照常落地。
+
+        句长归门禁 `line_length`，两个方向都有处方。补字阶段替它把关的代价是把
+        「一条坏句」放大成「整段停摆」——真机第 2 期一条 7 字句让 40+ 条新增整批
+        作废，那一段的配额缺口 1872 字后面一轮都没再试。结构类校验一条没少，
+        见上一条测试。
+        """
+        cfg = {"gate.min_chars": 8, "gate.max_chars": 40}
+        seg = [{"speaker": "A", "emotion": "承接", "text": "字" * 30}]
+        batch = [{"after": 1, "speaker": "A", "emotion": "承接",
+                  "text": "七个字的短句"},
+                 {"after": 1, "speaker": "B", "emotion": "解释", "text": "字" * 50}]
+        out = S.apply_insert(seg, batch, 0, cfg)
+        self.assertEqual(len(out), 3, "两条都落地——不再整批作废")
+        self.assertEqual([l["text"] for l in out[1:]],
+                         ["七个字的短句", "字" * 50], "同一落点的按传入顺序插")
+
+    def test_trim_does_not_judge_line_length(self):
+        """压字这条路同样只算字数账、不判句长。"""
+        cfg = {"gate.min_chars": 8, "gate.max_chars": 40}
+        seg = [{"speaker": "A", "emotion": "承接", "text": "字" * 30},
+               {"speaker": "B", "emotion": "承接", "text": "字" * 30}]
+        out = S.apply_trim(seg, [{"index": 1, "text": "五个字"}], [], 0, cfg)
+        self.assertEqual(out[0]["text"], "五个字")
 
     def test_insert_and_trim_contracts_are_mirror_images(self):
         """补字契约里没有 index（改不了已有句子）；压字契约里没有 after（加不了新句）。"""
@@ -1857,6 +2320,49 @@ class TestSegmentQuotas(unittest.TestCase):
         trim = S.trim_schema(7)
         self.assertEqual(trim["properties"]["edits"]["maxItems"], 7)
         self.assertEqual(trim["properties"]["drops"]["maxItems"], 7)
+
+    def test_only_the_patch_schema_puts_a_floor_on_text(self):
+        """**只有定点修补**的文本字段带最小长度（v0.36.0）。
+
+        修补在门禁与检查阶段跑、改完直接落盘，一个残句没有下一道工序替它兜；
+        写作阶段那三路（正文／补字／压字）不带——它们的字数账是**总账**（本段
+        配额），单句长短归门禁判。四份共用同一个字段生成器（`_edit_item_schema`
+        / `_insert_item_schema`），差别只在传不传 `min_chars`。
+        """
+        cfg = {"gate.min_chars": 8}
+        patched = S.patch_schema(vocab=None, cfg=cfg)
+        floor = {"type": "string", "minLength": 8}
+        self.assertEqual(patched["properties"]["edits"]["items"]["properties"]["text"],
+                         floor, "修补的替换句")
+        self.assertEqual(patched["properties"]["inserts"]["items"]["properties"]["text"],
+                         floor, "修补的插入句")
+        # 写作阶段三路：正文、补字、压字，都不带
+        bare = {"type": "string"}
+        self.assertEqual(S.script_schema()["properties"]["lines"]["items"]
+                         ["properties"]["text"], bare)
+        self.assertEqual(S.insert_schema(600, cfg)["properties"]["inserts"]["items"]
+                         ["properties"]["text"], bare)
+        self.assertEqual(S.trim_schema(5)["properties"]["edits"]["items"]
+                         ["properties"]["text"], bare)
+
+    def test_the_text_floor_follows_the_configured_min_chars(self):
+        """最小长度是配置项（`gate.min_chars`），不是写死的 8。"""
+        ps = S.patch_schema(vocab=None, cfg={"gate.min_chars": 12})
+        self.assertEqual(ps["properties"]["edits"]["items"]["properties"]["text"],
+                         {"type": "string", "minLength": 12})
+
+    def test_no_max_length_anywhere(self):
+        """**只加最小长度、不加最大长度**：后端对上限是硬截断。
+
+        实测两次对照：要求 40 字时返回恰好 40 字符、末字是逗号（话说了半句，
+        还多带一条「句尾不是终止标点」要修）；只给最小长度时返回 56 字符的完整句、
+        末字句号。所以四份 schema 里都不许出现 `maxLength`。
+        """
+        cfg = {"gate.min_chars": 8, "gate.max_chars": 40}
+        for blob in (S.script_schema(), S.segment_schema(900, cfg),
+                     S.insert_schema(600, cfg), S.trim_schema(5),
+                     S.patch_schema(vocab=None, cfg=cfg)):
+            self.assertNotIn("maxLength", json.dumps(blob, ensure_ascii=False))
 
     def test_trim_rejects_conflict_and_wipeout(self):
         """同一句不许既改又删；也不许把整段删光——段没了账就无从对起。"""
@@ -2206,13 +2712,48 @@ class TestPacking(unittest.TestCase):
         """没有额度能力的后端（假模型 / 将来别的客户端）：不装箱，一节一段。
 
         不合并也不切块——最保守的落法，也是从前规划反复不过时的硬分兜底。
+        配额照旧按料摊，**合计精确等于目标**；地板只防提示词自相矛盾，正常体量
+        碰不到它（地板多小、为什么不是碎段合并那把尺，见下一条）。
         """
         class _Dumb(object):
             pass
+        cfg = {"llm.max_tokens": 8192}
         groups = S.pack_segments(_secs(3), [10, 20, 30], _Dumb(),
-                                 {"llm.max_tokens": 8192}, target_chars=1000)
+                                 cfg, target_chars=1000)
         self.assertEqual([g["sections"] for g in groups], [[1], [2], [3]])
-        self.assertEqual(sum(g["quota"] for g in groups), 1000)
+        self.assertEqual(sum(g["quota"] for g in groups), 1000,
+                         "配额按料摊完合计精确等于目标——地板不插手正常体量")
+        self.assertTrue(all(g["quota"] >= S._quota_floor(cfg) for g in groups),
+                        "每段仍不低于地板（保险丝在，只是没咬到）")
+
+    def test_quota_floor_only_stops_the_prompt_from_lying(self):
+        """地板是「提示词不说谎」的线，**不是碎段合并那把尺**——两把尺差三倍。
+
+        提示词里写「约 N 句」，N 的算式带软句数下限：配额低于「N × 每句最少字」时，
+        它一边要模型写 15 句、一边只给不足 120 字的额度，两句话打架。地板取这条线
+        （软句数下限 × **每句最少字**）。碎段合并那把尺乘的是**期望句长**（模型写一句
+        话的常态产量），判的是「这一段的料够不够单开一段」——产能问题，该取常态值。
+        从前两处共用一个数，等于拿产能尺当地板：按料摊出来的配额被抬高三倍，同一期里
+        这几段忽然换了压比。
+        """
+        cfg = {"script.segment_min_sents": 15, "gate.min_chars": 8,
+               "gate.max_chars": 40}
+        self.assertEqual(S._quota_floor(cfg), 15 * 8)
+        self.assertLess(S._quota_floor(cfg), 15 * S._expected_line_chars(cfg),
+                        "地板必须比碎段合并那把尺小——一样大就是偷偷改压比")
+        self.assertEqual(S._quota_floor({"script.segment_min_sents": 20,
+                                         "gate.min_chars": 10}), 200,
+                         "两个因子都现读配置，改了就跟着变")
+
+    def test_floor_bites_a_tiny_segment_and_the_total_still_holds(self):
+        """地板真咬到某一段时，超出的那点从**最大的一段**扣回来，合计仍等于目标。"""
+        cfg = {"script.segment_min_sents": 15, "gate.min_chars": 8}
+        groups = [{"sections": [1], "quota": 50}, {"sections": [2], "quota": 950}]
+        S._finish_quotas(groups, cfg, 1000)
+        self.assertEqual(groups[0]["quota"], 120, "50 字被抬到地板 120")
+        self.assertEqual(sum(g["quota"] for g in groups), 1000,
+                         "抬完从最大段扣回，合计咬住目标——不会凭空多要字数")
+
 
     def test_backend_without_budget_api_still_keeps_the_logical_groups(self):
         """量不出重量，不等于分组作废：不装箱时**照逻辑分组落段**。
@@ -2513,6 +3054,49 @@ class TestSegmentedGeneration(unittest.TestCase):
             self.assertNotIn("【素材】", user, "压字数不带素材")
             self.assertIn("多了", user)
 
+    def test_a_batch_that_fails_to_land_does_not_stop_the_segment(self):
+        """补字整批落地失败**不再收工**：这一轮不改稿、轮次照减，下一轮接着改。
+
+        真机第 2 期就是被这条按停的：一条 7 字句让 40+ 条新增整批作废（校验在
+        `apply_insert` 里），紧接着 `break` 出循环——那一段的配额缺口 1872 字
+        后面一轮都没再试，5 轮预算只跑了 1 轮。现在落地失败只作废这一轮。
+        """
+        # 第一次补字回一份 after 越界的批量（`apply_insert` 必抛），之后交给
+        # 假模型的自动补字（合法）——它要能跑起来，就说明轮次没被那次失败掐死。
+        broken = json.dumps({"inserts": [{"after": 999, "speaker": "A",
+                                          "emotion": "承接",
+                                          "text": "补" * 39 + "。"}]},
+                            ensure_ascii=False)
+        llm = _SegmentedLLM([_plan_payload(n=2)], [_seg_payload(3), _seg_payload(4)],
+                            insert_payloads=[broken])
+        cfg = self._cfg()
+        card = S.resolve_paradigm(None, cfg)
+        logs = []
+        _t, _p, script, _s = S._generate_segmented(
+            llm, cfg, "素" * 400, _evidence(), card, "argument",
+            None, 900, logs.append, None, None)
+        self.assertGreaterEqual(llm.insert_calls, 2,
+                                "落地失败后还要再试一轮，不是一次失败即终点")
+        self.assertTrue(any("这一轮不改稿" in m for m in logs),
+                        "日志要说清是落地失败：%r" % (logs,))
+        self.assertGreater(len(script), 3, "下一轮的补字真落地了")
+
+    def test_the_trim_side_also_survives_a_failed_landing(self):
+        """压字那一侧同样：落地失败只作废这一轮，不收工。"""
+        broken = json.dumps({"edits": [{"index": 999, "text": "短"}]},
+                            ensure_ascii=False)
+        llm = _SegmentedLLM([_plan_payload(n=2)], [_seg_payload(40), _seg_payload(4)],
+                            trim_payloads=[broken])
+        cfg = self._cfg()
+        card = S.resolve_paradigm(None, cfg)
+        logs = []
+        S._generate_segmented(llm, cfg, "素" * 400, _evidence(), card,
+                              "argument", None, 900, logs.append, None, None)
+        self.assertGreaterEqual(llm.trim_calls, 2,
+                                "压字落地失败后还要再试一轮")
+        self.assertTrue(any("压字数没法落地" in m for m in logs),
+                        "日志要说清是压字落地失败：%r" % (logs,))
+
     def test_every_call_uses_config_budget(self):
         """预算一律按配置走：任何一次调用都不许自己夹一个更小的值。
 
@@ -2786,10 +3370,10 @@ class TestSegmentUsageAndWindow(unittest.TestCase):
     EVIDENCE = {"sections": [{"anchor": "第一节", "gist": "概要",
                               "points": ["要点一"]}]}
 
-    def _user(self, fit="字" * 100):
+    def _user(self, fit="字" * 100, cfg=None):
         return S._segment_user_prompt(
             {"project": {"name": "示例节目"}}, self.EVIDENCE,
-            {"sections": [1]}, 3444, 0, 6585, fit, "", "")
+            {"sections": [1]}, 3444, 0, 6585, fit, "", "", cfg=cfg)
 
     def test_usage_row_present_with_ratio_and_direction(self):
         """素材富余时给压比与方向句，方向句到「细节取用密度要够」为止。"""
@@ -2816,16 +3400,45 @@ class TestSegmentUsageAndWindow(unittest.TestCase):
         self.assertIn("【验收窗口】", p)
 
     def test_window_matches_accounting_tolerance(self):
-        """提示词报的窗口必须与程序核账同一把尺：±max(15%, 60)。"""
+        """提示词报的窗口必须与程序核账同一把尺。"""
         p = self._user()
-        tol = max(int(3444 * S.SEGMENT_TOL_FRAC), S.SEGMENT_TOL_MIN_CHARS)
-        self.assertIn("【验收窗口】程序按 %d~%d 字收稿" % (3444 - tol, 3444 + tol), p)
+        cfg = {}
+        tol = max(int(3444 * S._tol_frac(cfg)),
+                  int(round(S._quota_floor(cfg) * S._tol_frac(cfg))))
+        self.assertIn("【验收窗口】本段按 %d~%d 字验收" % (3444 - tol, 3444 + tol), p)
+
+    def test_window_follows_the_configured_tolerance(self):
+        """容差是配置项：人把比例调大，三处提示词报的窗口都得跟着变。
+
+        钉的是「提示词与核账同源」。这三处（段提示词、补写、压紧）从前都走
+        常量兜底、不读配置——配置改大之后核账按新容差收稿、提示词还报旧窗口，
+        模型按假窗口收工照样挨打，那正是这套窗口存在的理由。
+
+        下限现在是**地板的派生量**（`_quota_floor × 比例`，本机 120 × 25% = 30）：
+        在这个量级的配额上咬不到，所以三处报的数只由比例那一项定。
+        """
+        cfg = {"script.segment_tol_frac": 25}
+        floor_tol = int(round(S._quota_floor(cfg) * 0.25))
+        tol = max(int(3444 * 0.25), floor_tol)   # 3444 的 25% = 861
+        self.assertIn("【验收窗口】本段按 %d~%d 字验收" % (3444 - tol, 3444 + tol),
+                      self._user(cfg=cfg))
+        seg = [{"speaker": "A", "text": "字" * 30}]
+        quota = 1839
+        q_tol = max(int(quota * 0.25), floor_tol)
+        self.assertIn("验收区间 %d~%d 字" % (quota - q_tol, quota + q_tol),
+                      S.build_insert_prompt(seg, 628, quota, 57,
+                                            material="素材正文", cfg=cfg))
+        self.assertIn("验收区间 %d~%d 字" % (quota - q_tol, quota + q_tol),
+                      S.build_trim_prompt(seg, 261, quota, 0, cfg=cfg),
+                      "压紧轮的窗口也要跟着配置走")
 
     def test_insert_and_trim_prompts_carry_window(self):
         """补写/压紧轮也要给验收区间——模型得知道改到哪算过关。"""
         seg = [{"speaker": "A", "text": "字" * 30}]
         quota, need = 1839, 628
-        tol = max(int(quota * S.SEGMENT_TOL_FRAC), S.SEGMENT_TOL_MIN_CHARS)
+        cfg = {}
+        tol = max(int(quota * S._tol_frac(cfg)),
+                  int(round(S._quota_floor(cfg) * S._tol_frac(cfg))))
         low, high = quota - tol, quota + tol
         pi = S.build_insert_prompt(seg, need, quota, 57, material="素材正文")
         self.assertIn("验收区间 %d~%d 字" % (low, high), pi)
@@ -2835,9 +3448,19 @@ class TestSegmentUsageAndWindow(unittest.TestCase):
         self.assertIn("把字数减进验收区间", pt)
 
     def test_window_helper_single_source(self):
-        """_segment_window 是容差的唯一出口：核账与提示词同源。"""
-        low, high = S._segment_window(100)
-        self.assertEqual((low, high), (40, 160))   # tol = max(15, 60) = 60
+        """_segment_window 是容差的唯一出口：核账与提示词同源，且吃配置。
+
+        容差 = max(配额 × 比例, 地板 × 比例)，地板＝`_quota_floor`（软句数下限 ×
+        每句最少字 = 120）。下限那一项只在**小配额**上咬得到：配额 100 时比例项
+        只有 15，抬到 18；配额 874 时比例项 131，早盖过下限。
+        """
+        self.assertEqual(S._segment_window(100), (82, 118),
+                         "tol = max(15, 120×15% = 18) = 18")
+        self.assertEqual(S._segment_window(874), (743, 1005),
+                         "tol = max(131, 18) = 131")
+        self.assertEqual(S._segment_window(1000, {"script.segment_tol_frac": 50}),
+                         (500, 1500), "比例调大，窗口跟着变——不是写死的 15%")
+
 
 
 class TestMergeTinySegments(unittest.TestCase):

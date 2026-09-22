@@ -98,7 +98,8 @@ class TestReviewRows(unittest.TestCase):
                          "上期《第一期标题》聊的是第一期主旨——"
                          "讲了甲段主旨、乙段主旨等。")
         self.assertEqual(rows[0]["speaker"], "B")
-        self.assertEqual(rows[0]["emotion"], "承接")
+        self.assertEqual(rows[0]["emotion"], "回顾",
+                         "回顾是程序专有标签（v0.36.0 起），不再挂词表内的「承接」")
 
     def test_missing_topics_drop_the_whole_line(self):
         """上一期没留下旁挂（没跑过分段路、或本功能上线前写的期）→ 整句不粘。

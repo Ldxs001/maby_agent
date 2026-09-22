@@ -918,6 +918,14 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
         f.write(srt)
     result["subtitle"] = srt_path
 
+    # LRC 与 SRT 同源同一次生成。音频平台（喜马拉雅一类）的字幕位走的是歌词
+    # 渲染，只认 LRC、不认 SRT——从 SRT 反解要多绕一圈，还得依赖 SRT 先存在，
+    # 并且照 SRT 的断行搬过去会切出「半句配一个时间戳」。
+    lrc_path = ep["subtitle_lrc"]
+    with open(lrc_path, "w", encoding="utf-8") as f:
+        f.write(subtitle_engine.build_lrc(script, cfg, timings))
+    result["subtitle_lrc"] = lrc_path
+
     font = assets_factory.resolve_font(cfg.get("subtitle.font_family", ""))
     font_dir = assets_factory.fonts_dir_of(font)
 
@@ -967,6 +975,7 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
 
     assets = {"video": video_h, "video_vertical": video_v, "audio": mp3,
               "article": article_path, "subtitle": srt_path,
+              "subtitle_lrc": lrc_path,
               "bg": built["bg_h"], "covers": built.get("covers", {})}
 
     # 内容检（语义 / 承诺链）不在这里跑。它与其余生成阶段门禁同属脚本阶段，

@@ -135,5 +135,79 @@ class TestTimeline(unittest.TestCase):
         self.assertEqual(S.rescale_timings([], 10.0, 10.0), (1.0, False))
 
 
+class TestLrc(unittest.TestCase):
+    """LRC 与 SRT 同一份时间轴：只取起始时间、两位百分秒、一行一条。
+
+    音频平台（喜马拉雅一类）的字幕位走歌词渲染，只认 LRC——这份产物就是给
+    它的。所以下面盯的都是「平台认不认」的硬规格，不是好看不好看。
+    """
+
+    SCRIPT = [{"text": "第一句。", "speaker": "A"},
+              {"text": "第二句。", "speaker": "B"}]
+    TIMINGS = [{"start": 0.0, "end": 3.0}, {"start": 62.72, "end": 70.0}]
+
+    def test_time_is_hundredths_not_milliseconds(self):
+        """秒后两位百分秒。写成三位毫秒（SRT 那种）平台不认。"""
+        self.assertEqual(S.fmt_lrc_time(62.72), "01:02.72")
+        self.assertEqual(S.fmt_lrc_time(0), "00:00.00")
+
+    def test_time_carries_instead_of_truncating(self):
+        """59.999 必须先进位成 01:00.00，不能拆成 00:59.99。"""
+        self.assertEqual(S.fmt_lrc_time(59.999), "01:00.00")
+
+    def test_minutes_may_exceed_59(self):
+        """一小时以上照常两位分钟，不做进时——LRC 没有小时位。"""
+        self.assertEqual(S.fmt_lrc_time(3600), "60:00.00")
+
+    def test_negative_clamps_to_zero(self):
+        self.assertEqual(S.fmt_lrc_time(-3), "00:00.00")
+
+    def test_one_line_per_sentence_with_start_only(self):
+        out = S.build_lrc(self.SCRIPT, {}, self.TIMINGS)
+        self.assertEqual(out.split("\n"),
+                         ["[00:00.00]第一句。", "[01:02.72]第二句。"])
+        self.assertNotIn("-->", out)
+
+    def test_keeps_full_sentence_instead_of_wrapping(self):
+        """LRC 一行就是一条：照画面宽度断开会切出「半句配一个时间戳」。"""
+        long_text = "这句话比画面字幕一行放得下的字数长得多，但歌词位不需要断行。" * 3
+        out = S.build_lrc([{"text": long_text}], {}, [{"start": 1.0, "end": 2.0}])
+        self.assertEqual(len(out.split("\n")), 1)
+        self.assertTrue(out.endswith(long_text))
+
+    def test_text_newline_does_not_split_entry(self):
+        """句内换行会把一条劈成两条，第二条连时间戳都没有。"""
+        out = S.build_lrc([{"text": "上行\n下行"}], {}, [{"start": 0.0, "end": 1.0}])
+        self.assertEqual(out, "[00:00.00]上行 下行")
+
+    def test_missing_timings_do_not_drop_lines(self):
+        """句数与时间轴长度不必相等，缺的按时长 0 处理，一行都不能少。"""
+        out = S.build_lrc(self.SCRIPT, {}, [{"start": 1.0, "end": 2.0}])
+        self.assertEqual(len(out.split("\n")), 2)
+        self.assertTrue(out.split("\n")[1].startswith("[00:00.00]"))
+
+    def test_name_switch_is_shared_with_ass(self):
+        """名字只有一条判据：版式带名，或姓名指示选了「字幕色区分」。"""
+        base = {"tts.name_a": "小美", "tts.name_b": "大美"}
+        self.assertEqual(S.build_lrc(self.SCRIPT, base, self.TIMINGS).split("\n")[0],
+                         "[00:00.00]第一句。")
+
+        named = dict(base, **{"subtitle.preset": "dual_named"})
+        self.assertEqual(S.build_lrc(self.SCRIPT, named, self.TIMINGS).split("\n"),
+                         ["[00:00.00]小美：第一句。", "[01:02.72]大美：第二句。"])
+
+        styled = dict(base)
+        styled["speaker_indicator.mode"] = "style"
+        self.assertEqual(S.build_lrc(self.SCRIPT, styled, self.TIMINGS).split("\n")[1],
+                         "[01:02.72]大美：第二句。")
+
+    def test_ass_and_lrc_read_one_judgement(self):
+        """两处各写一遍判据就迟早各说各话——这条钉住它只有一份。"""
+        self.assertTrue(S.speaker_name_shown({"subtitle.preset": "dual_named"}))
+        self.assertTrue(S.speaker_name_shown({"speaker_indicator.mode": "style"}))
+        self.assertFalse(S.speaker_name_shown({}))
+        self.assertFalse(S.speaker_name_shown({"subtitle.preset": "single"}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

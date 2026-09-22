@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "0.34.4"
+VERSION = "0.39.0"
 
 
 # ============================================================================
@@ -82,6 +82,8 @@ def bitrate_ceiling(sample_rate, codec="mp3"):
 # 「开场 / 收束」已从词表除名（v0.34.1）：片头尾由程序在定稿那一刻粘上
 # （glue_intro_outro），正文里没有哪一句该背这两个标签——留在词表里，
 # 等于给模型一个用不上的选项，还占下拉一行。
+# **这两个词本身没有消失**：片头尾标签由 `PROGRAM_ONLY_TAGS` 提供（只归程序，
+# 与本词表无关）。本词表仍是唯一那份「模型可填什么」的表。
 EMOTION_VOCAB = [
     "平静", "好奇", "疑惑", "恍然", "肯定", "感慨", "轻松",
 ]
@@ -108,6 +110,24 @@ EMOTION_TAGS = [
     "平静", "好奇", "追问", "疑惑", "恍然", "解释",
     "强调", "肯定", "感慨", "比喻", "铺垫", "总结", "过渡", "轻松",
 ]
+
+#: 程序粘合句专用的三个语篇标签。**只归程序**：模板里写死、粘合时由程序带上；
+#: 不发给模型（输出 schema 的枚举是 `DISCOURSE_ORDER`）、不进语篇词表。它们出现
+#: 的地方有两处：① **重判**（页面把盘上那份成品整份拿回来复核）经
+#: `gate_generate(..., extra_tags=...)` 放行，见 `web_ui.api_script_gate`；
+#: ② **脚本页的标签下拉**（选项＝语篇词表 ＋ 本表，见 `web_ui.PAGE` 的注入）——
+#: 盘上稿子里有这三个词，下拉里没有的话，那一格就没有任何选项能被选中，浏览器
+#: 会显示第一项，看着像「数据错了」。
+#:
+#: v0.34.1 曾把开场/收束从词表除名、模板改写中性档「承接」，那是因为粘合之后还
+#: 压着一道全稿收束、表外标签会被洗掉。v0.34.6 把粘合移到收束**之后**（glue 内部
+#: 不再跑收束、只补时长），模板写什么就落什么，这几个词于是只活在程序侧。
+#:
+#: 「回顾」是 v0.36.0 加进来的第三词：前期回顾句与片头尾同类（程序逐字拼、
+#: 模型没参与），挂在词表内的「承接」上等于把「这是回顾」这个位置信息丢掉。
+PROGRAM_ONLY_TAGS = ("开场", "回顾", "收束")
+#: 模板里引用的三个名字——解构自上面那唯一出处，不许再各写一份字面量。
+INTRO_TAG, REVIEW_TAG, OUTRO_TAG = PROGRAM_ONLY_TAGS
 
 
 # ============================================================================
@@ -194,35 +214,46 @@ KINSOKU_TAIL = set("一第每各某")
 # 条数一变句子形状就变，听感上像两套模板。
 # ============================================================================
 INTRO_OUTRO = {
-    # 标签一律用词表内的中性档「承接」：片头尾是程序拼的，不进生成、不进门禁，
-    # 但它们落在稿子上就要守稿子的词表——词表外标签会被重判（UI 重判读全份
-    # 文件）当缺陷报出来。「开场 / 收束」已在 v0.34.1 从词表除名。
+    # 标签分工（v0.36.0 定型；四种序列见 `glue_intro_outro`）：
+    #   片头第一句 = 开场（`INTRO_TAG`）；片头**其余句** = 词表内的中性档
+    #   `DISCOURSE_NEUTRAL`「承接」——第二句是「接开场的话头，往下讲本期」，
+    #   是承接不是第二个开场；两句都挂「开场」会得出「开场、开场」，而目标序列里
+    #   **只有一个开场**。挂中性档还顺带省掉一个例外：它本来就是词表里的词，
+    #   生成侧、门禁、下拉一路天然都认。
+    #   前期回顾 = 回顾（`REVIEW_TAG`）；片尾 = 收束（`OUTRO_TAG`）。
+    # 开场/回顾/收束只归程序：模板里写死、粘合时带上，不进语篇词表。粘合发生在
+    # **全稿格式收束之后**——v0.34.6 起 glue 内部不再跑收束、只补时长，所以模板
+    # 写什么就落什么，不受语篇词表管；它们唯一被认的地方是重判那条放行路。
     "standard": {
         "intro": [
-            {"speaker": "A", "emotion": "承接",
+            {"speaker": "A", "emotion": INTRO_TAG,
              "text": "欢迎收听《{program}》{audience_clause}。"},
-            {"speaker": "B", "emotion": "承接",
+            {"speaker": "B", "emotion": DISCOURSE_NEUTRAL,
              "text": "本期讲述{title}{names_clause}。"},
         ],
         "outro": [
-            {"speaker": "B", "emotion": "承接",
+            {"speaker": "B", "emotion": OUTRO_TAG,
              "text": "这里是《{program}》，欢迎关注。"},
         ],
     },
     "brief": {
         "intro": [
-            {"speaker": "A", "emotion": "承接",
+            {"speaker": "A", "emotion": INTRO_TAG,
              "text": "欢迎收听《{program}》{audience_clause}。"},
         ],
         "outro": [
-            {"speaker": "B", "emotion": "承接",
+            {"speaker": "B", "emotion": OUTRO_TAG,
              "text": "这里是《{program}》，欢迎关注。"},
         ],
     },
-    # 前期回顾：不随档位变（所以不在 standard / brief 里面），粘在片头之后、
-    # 正文之前。开关见 PARAM_SPEC 的 `intro_outro.review`，默认关。
+    # 前期回顾：不随档位变（所以不在 standard / brief 里面），位置是**第 2 句**
+    # ——紧跟片头第一句，见 `glue_intro_outro`。开关见 PARAM_SPEC 的
+    # `intro_outro.review`，默认关。
+    # 标签用程序专有的「回顾」（v0.36.0 起）：它跟片头尾同类——程序逐字拼、
+    # 模型没参与，也就没有「它照没照做」可验。挂词表内的「承接」会把「这是回顾」
+    # 这个位置信息丢掉，还让它混进正文标签里。
     "review": [
-        {"speaker": "B", "emotion": "承接",
+        {"speaker": "B", "emotion": REVIEW_TAG,
          "text": "上期《{prev_title}》聊的是{prev_gist}——讲了{prev_topics}等。"},
     ],
 }
@@ -517,6 +548,30 @@ PARAM_SPEC = {
                                         "阈值的一因子（阈值 = 本值 × 期望句长）。"
                                         "低于阈值的相邻段会并进配额较小的邻居，"
                                         "避免一次调用只写三句话"),
+    "script.segment_tol_frac": _p("int", 15, "script", "段字数容差（%）",
+                                  min=1, max=50, step=1, unit="%",
+                                  views=("script",),
+                                  help="一段写多长算合格：配额 ±max(配额×本比例, "
+                                       "最小可写段字数×本比例)。落在区间内即收工，"
+                                       "不再修"),
+    "script.segment_fix_rounds": _p("int", 5, "script", "段内修正轮次",
+                                    min=1, max=50, step=1, unit="轮",
+                                    views=("script",),
+                                    help="一段写完发现字数对不上配额，最多还能修几次"
+                                         "（少了插入新句、多了压紧删减，共用这一份预算；"
+                                         "整段重写不存在）。轮数用完就取最接近配额的一版"
+                                         "继续"),
+    "script.segment_parse_rounds": _p("int", 2, "script", "输出坏了重发轮次",
+                                      min=1, max=10, step=1, unit="轮",
+                                      views=("script",),
+                                      help="模型输出拆不开（不是内容不对，是格式坏了）"
+                                           "时重发几次；整篇出货重试与分段解析重试共用"
+                                           "这一个数。用尽仍拆不开就报错停下"),
+    "script.plan_rounds": _p("int", 2, "script", "规划打回轮次",
+                             min=1, max=10, step=1, unit="轮",
+                             views=("script",),
+                             help="分段生成时，规划轮（给各段起名、写段主旨）最多打回"
+                                  "几次；仍不通过就按各段首节的凝缩主旨代填"),
     "script.shape_flags": _p("bool", True, "script", "取材标记",
                              views=("script",),
                              help="素材里含网址、代码、公式、表格、路径、清单等"
@@ -531,9 +586,22 @@ PARAM_SPEC = {
     "script.gate_strict": _p("bool", True, "script", "门禁严格模式",
                              views=("script",),
                              help="开启后 warn 级条目也不放行"),
-    "script.max_llm_rounds": _p("int", 3, "script", "回灌重试上限",
-                                min=0, max=5, step=1, views=("script",),
-                                help="每轮都会重跑一次内容检（语义/承诺链），轮数越多越慢"),
+    "script.gate_rounds": _p("int", 3, "script", "门禁轮次上限",
+                             min=1, max=5, step=1, unit="轮", views=("script",),
+                             help="形式门禁最多判几轮（含第 1 轮判定）：它排在最后一道，"
+                                  "修满仍不通过就带着问题落盘交人，不在这里空转。"
+                                  "轮数越多越慢"),
+    "script.check_rounds": _p("int", 3, "script", "检查轮次上限",
+                              min=1, max=5, step=1, unit="轮", views=("script",),
+                              help="内容检（承诺链检；语义检开着时一并判）最多跑几轮"
+                                   "（含第 1 次检查）：修满仍不通过就转门禁段，"
+                                   "不在这里空转。轮数越多越慢"),
+    "script.check_semantic": _p("bool", False, "script", "语义检（逐字核素材）",
+                                views=("script",),
+                                help="开启后，内容检逐句核每条台词能否在素材原文里找到"
+                                     "依据；素材装不下时按调用额度分批核，是全链最贵的"
+                                     "一项检查。默认关：只判承诺链检，不带素材、一次"
+                                     "调用判完"),
     "script.map_max_episodes": _p("int", 60, "script", "地图期数上限",
                                   min=1, max=500, step=1, views=("script",),
                                   help="成稿规划排地图时最多排多少期；项目已定计划期数时以项目为准"),
@@ -891,7 +959,7 @@ GATE_SPEC = {
          "judge": "speaker / emotion / text 齐备且非空", "level": "fail",
          "stage": "generate"},
         {"key": "emotion_vocab", "label": "语篇词表",
-         "judge": "emotion 只能填本篇风格倾向收窄后的语篇词（含承接）",
+         "judge": "emotion 只能填语篇词表里的词（承接/追问/解释/强调/比喻/铺垫/过渡/总结）",
          "level": "fail", "stage": "generate"},
         {"key": "ab_run_limit", "label": "同一人连续句数",
          "judge": "同一人连着说的句数 ≤ 对话形式给的上限（A / B 各一条）",

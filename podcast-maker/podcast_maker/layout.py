@@ -27,7 +27,7 @@
       封面/      各期封面（`<期号>_16x9.png` 等三尺寸）
       背景/      各期背景图与背景音乐
       音视频/    各期成片与音频（`<期号>.mp4` / `<期号>_v.mp4` / `<期号>.mp3`）
-      字幕/      各期字幕（`<期号>.srt`）
+      字幕/      各期字幕（`<期号>.srt` 通用字幕、`<期号>.lrc` 音频平台歌词）
       图文/      各期公众号图文（`<期号>.md`）
       报告/      各期校验报告与清单（`<期号>.json`）
       过程/      本期中间文件（逐句语音、混音件、ass），按期分子目录
@@ -225,6 +225,9 @@ def episode_files(root, no):
         "video": os.path.join(av_dir(root), "%s.mp4" % n),
         "video_vertical": os.path.join(av_dir(root), "%s_v.mp4" % n),
         "subtitle": os.path.join(sub_dir(root), "%s.srt" % n),
+        # 音频平台的字幕走歌词位，只认 LRC——与 SRT 同一份时间轴另落一份，
+        # 名字同源同目录，改期号不会两处对不上。
+        "subtitle_lrc": os.path.join(sub_dir(root), "%s.lrc" % n),
         "article": os.path.join(article_dir(root), "%s.md" % n),
         "report": os.path.join(report_dir(root), "%s.json" % n),
         "manifest": os.path.join(report_dir(root), "%s.manifest.json" % n),

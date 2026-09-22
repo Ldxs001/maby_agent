@@ -42,6 +42,8 @@
        卡不画标题
    14. 路径类点位（片头音频、立绘 PNG、自备音乐…）都说明「本机绝对路径」并带
        「选择…」按钮；点它——接口被拦下来时——选中的路径会写回服务端
+   15. 批任务跑着的时候，开工按钮与中止按钮跟任务状态走：跑着就摁不动、收工才
+       恢复（轮询一次就交差的话，按钮在任务刚起步时就亮了，看着像已经收工）
 """
 
 import argparse
@@ -741,6 +743,9 @@ def main():
         # 真浏览器里答出来，而服务端一期活都不干、落盘一个字节都不动。
         # 桩里另接了单期接口：多期若从那儿漏过去，这里就记一笔。
         batch_calls, forbidden, del_calls = [], [], []
+        # 任务台账桩：先报几轮「还在跑」，再收工。用来验「跑着的时候开工按钮
+        # 摁不动」——默认直接给 done，那一段就无从验起。
+        task_box = {"running_left": 0}
 
         def stub(route):
             u = route.request.url
@@ -762,11 +767,20 @@ def main():
                 batch_calls.append(json.loads(route.request.post_data or "{}"))
                 body = {"ok": True, "task_id": "SMOKE-BATCH", "total": 3}
             elif "/api/task/" in u:
-                body = {"ok": True, "job": {
-                    "id": "SMOKE-BATCH", "kind": "batch", "status": "done",
-                    "stage": "完成", "progress": 1.0, "log": ["桩任务"],
-                    "batch": {"index": 2, "total": 2, "no": "2"},
-                    "result": {"done": ["1", "2"], "failed": []}}}
+                if task_box["running_left"] > 0:
+                    task_box["running_left"] -= 1
+                    body = {"ok": True, "job": {
+                        "id": "SMOKE-BATCH", "kind": "batch", "status": "running",
+                        "stage": "第 1 步 · 干活", "progress": 0.3,
+                        "log": ["桩任务：还在跑"],
+                        "batch": {"index": 1, "total": 2, "no": "1"},
+                        "result": None}}
+                else:
+                    body = {"ok": True, "job": {
+                        "id": "SMOKE-BATCH", "kind": "batch", "status": "done",
+                        "stage": "完成", "progress": 1.0, "log": ["桩任务"],
+                        "batch": {"index": 2, "total": 2, "no": "2"},
+                        "result": {"done": ["1", "2"], "failed": []}}}
             elif "/api/render" in u or "/api/script/generate" in u:
                 forbidden.append(u.split("/api/")[-1].split("?")[0])
                 body = {"ok": False, "error": "多期不该落到单期接口"}
@@ -834,6 +848,40 @@ def main():
               "请求 %s" % json.dumps(batch_calls[1] if len(batch_calls) > 1 else {},
                                     ensure_ascii=False))
         check(not forbidden, "多期不落到单期接口", "；".join(forbidden) or "无")
+
+        # ---- 任务跑着的时候，开工按钮必须摁不动 ----
+        # 桩里让任务先报两轮「还在跑」再收工，判据只有一条：这期间按钮一直是灰
+        # 的。从前的轮询第一次就交差（等下一轮的那句 setTimeout 一扔就走），
+        # await 的调用方当场往下执行——按钮在任务刚起步时就亮了，看着像已经收
+        # 工，人一点就起了第二个任务。
+        JS_BTN = r"""() => {
+  const b = document.getElementById('btn-gen');
+  const s = document.getElementById('btn-stop-s');
+  const bar = document.getElementById('gen-bar');
+  return [b.disabled ? 1 : 0, s ? s.style.display : 'na',
+          bar ? bar.style.width : 'na',
+          (document.getElementById('gen-status').textContent || '')];
+}"""
+        task_box["running_left"] = 2
+        # 上一段跑完时刷了一次期表，勾选跟着回到默认——这里重新摆好「有项目、
+        # 勾了三期」，否则点下去会走单期那条路，验的不是这一段。
+        pg.evaluate(
+            "async () => { document.getElementById('s-project').value = 'SMOKE-FAKE';"
+            " await loadEpisodes('s'); pickAll('s', true); }")
+        pg.wait_for_timeout(300)
+        pg.evaluate("() => document.getElementById('btn-gen').click()")
+        pg.wait_for_timeout(600)
+        mid = pg.evaluate(JS_BTN)
+        check(mid[0] == 1, "任务还在跑：开工按钮摁不动（不再点完就亮）",
+              "按钮 disabled=%s / 阶段「%s」/ 进度条 %s"
+              % (bool(mid[0]), mid[3], mid[2]))
+        check(mid[1] != "none", "任务还在跑：中止按钮露着", "display=%s" % mid[1])
+        pg.wait_for_timeout(4200)
+        end = pg.evaluate(JS_BTN)
+        check(end[0] == 0 and end[1] == "none",
+              "任务收工：按钮恢复、中止按钮收起",
+              "disabled=%s / 中止 %s / 阶段「%s」"
+              % (bool(end[0]), end[1], end[2]))
 
         hd = pg.evaluate(JS_PICK_HIDE % {"w": "s"})
         check(hd[0] == "none" and hd[1] == 0, "未选项目时收起选期表",

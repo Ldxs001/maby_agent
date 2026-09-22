@@ -74,9 +74,20 @@ class TestPromptBlockStages(unittest.TestCase):
         self.assertIn("换个说法", PG.prompt_block("essay", {"focus": "换个说法"}))
         # 写侧的上限不在卡上：改卡上的键没用，它跟着**形式**走。
         picked = PG.prompt_block("essay", stage="script", chosen_form="anchor")
-        self.assertIn("A 最多连着说 1 句、B 最多连着说 10 句", picked)
-        self.assertNotIn("A 最多连着说 5 句", picked,
-                         "上限跟的是形式；这里出现 5 说明它还在按卡上的默认形式算")
+        # **数字从 run_caps 现取，不写死。** 写死的话，动一次形式上限定这条测试就
+        # 红一次——红的是它自己抄的那个数，不是主体坏了（改的只是「哪种形式给几个
+        # 句子的余量」，与「上限是不是跟着形式走」毫无关系）。
+        cap_a, cap_b = PG.run_caps("anchor")
+        self.assertIn("A 最多连着说 %d 句、B 最多连着说 %d 句" % (cap_a, cap_b),
+                      picked)
+        # 卡上默认形式（essay 是 alternate）的上限不许露头——露了说明它按卡算、
+        # 没按选中的形式算。
+        deck_a = PG.run_caps(PG.resolve_form(PG.get("essay"), ""))[0]
+        self.assertNotEqual(deck_a, cap_a,
+                            "两种形式的上限撞上了，这条测试就失去区分力")
+        self.assertNotIn("A 最多连着说 %d 句" % deck_a, picked,
+                         "上限跟的是形式；这里出现 %d 说明它还在按卡上的默认形式算"
+                         % deck_a)
 
     def test_unknown_key_falls_back_to_auto_without_raising(self):
         self.assertIn("自适应", PG.prompt_block("没有这张卡", stage="script"))
@@ -659,9 +670,9 @@ class TestRunCapsHaveOneSource(unittest.TestCase):
         正文就被 `emotion_vocab` 门禁打回，那一轮白写。
         """
         src = self._src("script_engine.py")
-        # 定义一处 + 三处调用（整篇 / 分段 / 插入）
-        self.assertEqual(src.count("_vocab_block()"), 4)
-        self.assertEqual(src.count("_style_block(preset)"), 4)
+        # 定义一处 + 四处调用（整篇 / 分段 / 插入 / 就地替换）
+        self.assertEqual(src.count("_vocab_block()"), 5)
+        self.assertEqual(src.count("_style_block(preset)"), 5)
         # 节奏与上限也只有一个取法口：各写一份就会出现插入按另一种节奏补句
         calls = re.findall(r"[^`]paradigms\.run_caps\(", src)
         self.assertEqual(len(calls), 1,
@@ -688,9 +699,11 @@ class TestRunCapsHaveOneSource(unittest.TestCase):
             tmpl = src.split(name + ' = """', 1)[1].split('"""', 1)[0]
             self.assertNotIn("8–40", tmpl, "%s 的句长不许写死" % name)
             self.assertIn("%d–%d 字", tmpl, "%s 的句长该按配置填" % name)
-        # 修补与压紧两处确实把配置递了进去（不递就等于退回写死的默认值）
+        # 修补与压紧两处确实把配置递了进去（不递就等于退回写死的默认值）。
+        # 压紧那处 v0.36.0 起还多带两个数（`trim_system(cfg, low, high)`）——
+        # 「减到差不多就停」换成明确的验收区间，所以只钉前缀。
         self.assertIn("patch_system(cfg)", src)
-        self.assertIn("trim_system(cfg)", src)
+        self.assertIn("trim_system(cfg", src)
 
     def test_the_gate_says_where_the_caps_come_from(self):
         from podcast_maker.config_manager import GATE_BY_KEY

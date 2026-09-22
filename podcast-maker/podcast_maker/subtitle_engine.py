@@ -14,7 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""字幕引擎：断行（唯一入口）+ SRT / ASS 生成 + 断词率统计。
+"""字幕引擎：断行（唯一入口）+ SRT / ASS / LRC 生成 + 断词率统计。
+
+三种字幕同源：都吃同一份逐句时间轴，差别只在「交出去的东西给谁用」——
+SRT 是通用成品（起止时间齐全），ASS 是烧进画面的中间件（带 A/B 双色与断行），
+LRC 是音频平台的歌词位（只有起始时间、没有样式）。
 
 断行四级算法（原项目逐字符硬切，实测 393 处折行中 42 处断在词中间）：
     1. token 保护      英文词、数字、连字符词不被切开
@@ -184,6 +188,30 @@ def fmt_ass_time(seconds):
     return "%d:%02d:%05.2f" % (h, m, s)
 
 
+def fmt_lrc_time(seconds):
+    """LRC 时间标签用的 `mm:ss.xx`——秒后是**两位百分秒**，不是三位毫秒。
+
+    先换成百分秒总数再拆位：59.999 这类若先取分秒再算小数，会得到 00:59.99；
+    按总百分秒取整进位才是 01:00.00。分钟位允许超过 59（一小时以上照常两位）。
+    """
+    seconds = max(0.0, float(seconds))
+    total = int(round(seconds * 100))
+    return "%02d:%02d.%02d" % (total // 6000, (total // 100) % 60, total % 100)
+
+
+def speaker_name_shown(cfg):
+    """说话人名要不要写进字幕文本。ASS 与 LRC 共用这一个判据。
+
+    两处合成一条：版式自带名字（「双行带名」），或姓名指示选了「字幕色区分」。
+    不给 LRC 另立一个开关——它没有样式层承载 A/B 双色，名字只能进文本，
+    比画面字幕更需要这一条，而不是需要另一条。
+    """
+    preset = cfg.get("subtitle.preset", "dual")
+    if MODE_SPEC["subtitle.preset"]["options"].get(preset, {}).get("show_name", False):
+        return True
+    return cfg.get("speaker_indicator.mode") == "style"
+
+
 def _ass_color(hex_or_ass, default="&HFFFFFF"):
     """接受 #RRGGBB 或 &HAABBGGRR，统一返回 ASS 的 &HBBGGRR。"""
     v = (hex_or_ass or "").strip()
@@ -212,12 +240,35 @@ def build_srt(script, cfg, timings):
     return "\n".join(out)
 
 
+def build_lrc(script, cfg, timings):
+    """生成 LRC（音频平台歌词位认的那一份）。timings 为逐句 [{"start","end"}]。
+
+    与 SRT 同一份时间轴，只取**起始时间**：LRC 没有结束时间，一条从自己的
+    时刻显示到下一条为止。所以这里用**原始整句**、不套 ASS 的断行——LRC 一行
+    就是一条，照画面宽度断开只会得到「半句配一个时间戳」。
+
+    说话人：判据与 ASS 同源（`speaker_name_shown`），因为 LRC 没有样式可承载
+    A/B 双色，名字是唯一能区分谁在说的办法。
+    """
+    show_name = speaker_name_shown(cfg)
+    out = []
+    for i, item in enumerate(script):
+        t = timings[i] if i < len(timings) else {"start": 0.0, "end": 0.0}
+        # 一条一行：句内的换行会把一条歌词劈成两条，只剩第一条带着时间戳
+        text = str(item.get("text", "")).replace("\r", " ").replace("\n", " ")
+        if show_name:
+            who = cfg.get("tts.name_a" if item.get("speaker") == "A" else "tts.name_b", "")
+            if who:
+                text = "%s：%s" % (who, text)
+        out.append("[%s]%s" % (fmt_lrc_time(t["start"]), text))
+    return "\n".join(out)
+
+
 def build_ass(script, cfg, timings, width, height, suffix=""):
     """直接生成 ASS，不再经 ffmpeg 转换（避免样式被改写）。"""
     preset = cfg.get("subtitle.preset", "dual")
     max_lines = MODE_SPEC["subtitle.preset"]["options"].get(preset, {}).get("max_lines", 2)
-    show_name = MODE_SPEC["subtitle.preset"]["options"].get(preset, {}).get("show_name", False)
-    show_name = show_name or cfg.get("speaker_indicator.mode") == "style"
+    show_name = speaker_name_shown(cfg)
 
     font = cfg.get("subtitle.font_family") or "Sans"
     if suffix == "_v":

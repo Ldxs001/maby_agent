@@ -24,6 +24,7 @@
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -37,7 +38,8 @@ from . import planner
 from . import probe, project_store, script_engine, source_store, subtitle_engine, tts_engine
 from .config_manager import (BANNED_RULES, CONTENT_CHECKS,
                              DISCOURSE_ORDER, GROUPS, PARAM_SPEC, PRESET_SPEC,
-                             STYLE_DIMS, VERSION, ConfigManager, gates_payload,
+                             PROGRAM_ONLY_TAGS, STYLE_DIMS, VERSION, ConfigManager,
+                             gates_payload,
                              modes_payload, param_options, params_payload,
                              presets_payload, resolve_base_url, ui_payload,
                              validate_config)
@@ -324,7 +326,11 @@ def api_script_gate(body):
                     cfg["script.dialogue_form"] = recorded
             paradigm = script_engine.resolve_paradigm(
                 {"paradigm": item.get("paradigm")}, cfg)
-    rep = script_engine.gate_generate(script, cfg, paradigm)
+    # 门禁给片头尾那两个词放行（**只有这一处**）：这份稿子是盘上的成品，程序粘上去
+    # 的片头尾已经在里面，标签是 `PROGRAM_ONLY_TAGS`、不在语篇词表内——不放行就会在
+    # 页面上被报成「词表外标签」。生成侧不传这个参数，正文的门槛一点没松。
+    rep = script_engine.gate_generate(script, cfg, paradigm,
+                                      extra_tags=PROGRAM_ONLY_TAGS)
     est = duration_model.explain(script, cfg)
     return {"ok": True, "report": rep, "estimate": est}
 
@@ -456,26 +462,55 @@ def api_script_generate(body):
     return {"ok": True, "task_id": jid}
 
 
-def _script_stage(job, msg):
-    """把一行日志记进任务，并按它更新阶段与轮次进度。
+# 轮次日志的段名与序号：两段各自成环，界面靠段名决定进度往哪一半折算。
+_ROUND_LOG = re.compile(r"^(门禁|检查)第\s*(\d+)\s*轮")
+_GEN_LOG = re.compile(r"^生成第\s*\d+\s*次")
 
-    进度只在**一轮真的跑完**时前进（看「模型返回」那一行），且按「轮次预算用掉
-    多少」算，不编造字节数：正在跑的那一轮有多长本来就没人知道，画一根匀速前进的
-    假进度条只会让人以为快好了。「调用模型…」那一行只更新阶段——它的用处是让界面
-    在漫长的一轮里说得出自己在干什么，而不是停在上一句话上。
+
+def _script_stage(job, msg):
+    """把一行日志记进任务，并按段折算轮次进度。
+
+    三段串行：出货（整篇现写或分段初稿）→ 检查（内容检）→ 门禁（形式门禁）。
+    后两段各跑各的轮，检查段占 0~50%、门禁段占 50~100%。所以主体把段名写进每一行
+    ——「门禁第 N 轮」「检查第 N 轮」「生成第 N 次」。界面拿段名去认该用哪一段的
+    预算折算；两段都喊「第 N 轮」的话，进度条会在门禁段开头往回跳一半。
+
+    进度只在**一轮真的跑完**时前进（看「模型返回」那一行）；一轮刚开头那几行只把
+    进度补到本段已跑完的格数。正在跑的那一轮有多长本来就没人知道，画一根匀速前进
+    的假进度条只会让人以为快好了。「调用模型…」那几行只更新阶段——它的用处是让
+    界面在漫长的一轮里说得出自己在干什么，而不是停在上一句话上。
     """
     pipeline.job_log(job, msg)
-    if not (msg.startswith("第 ") and "轮" in msg[:8]):
+    if _GEN_LOG.match(msg):
+        # 出货那条线（生成第 N 次）：它是三段里的第一段，只有整篇路才走。
+        # 「输出坏了重发」不是一轮判定，所以它只改阶段、不动进度。
+        job["stage"] = msg
+        return
+    if msg.startswith("检查通过"):
+        # 检查段提前收工：把进度补齐到它的终点，好让门禁段从 50% 接着走。
+        job["stage"] = msg
+        job["progress"] = max(job.get("progress", 0.0), 0.5)
+        return
+    if msg.startswith("门禁通过"):
+        # 门禁段是最后一段，它通过就等于定稿了。
+        job["stage"] = msg
+        job["progress"] = max(job.get("progress", 0.0), 0.95)
+        return
+    m = _ROUND_LOG.match(msg)
+    if not m:
         return
     job["stage"] = msg
-    if "模型返回" not in msg:
-        return
-    try:
-        done = int(msg.split("第", 1)[1].split("轮")[0].strip())
-        budget = int(CFG.get("script.max_llm_rounds", 3)) + 1
-        job["progress"] = min(0.95, done / float(budget))
-    except (ValueError, IndexError):
-        pass
+    seg, done = m.group(1), int(m.group(2))
+    # 检查在前（0~50%）、门禁在后（50~100%）。门禁段多一格：首轮只判定不出货，
+    # 所以它的轮次编号从 1 到 gate_rounds + 1。
+    if seg == "检查":
+        budget, base = int(CFG.get("script.check_rounds", 3)), 0.0
+    else:
+        budget, base = int(CFG.get("script.gate_rounds", 3)) + 1, 0.5
+    step = 0.5 / max(1, budget)
+    ratio = done if "模型返回" in msg else max(0, done - 1)
+    job["progress"] = max(job.get("progress", 0.0),
+                          min(base + step * ratio, base + 0.5))
 
 
 def _script_generate_work(body, job=None):
@@ -1090,6 +1125,11 @@ def api_batch(body):
                                           % (len(done), total - i + 1))
                     break
                 job["batch"] = {"index": i, "total": total, "no": no}
+                # 批任务里的进度报的是**本期**的进度，整批进度由界面按
+                # (index-1+本期进度)/总期数 折算。进度口一律只增不减（见
+                # pipeline._step），不在这里归零的话，第二期一开局就顶着
+                # 上一期跑完时的高位，整期都看不出在动。
+                job["progress"] = 0.0
                 pipeline.job_log(job, "—— 第 %s 期（%d/%d）——" % (no, i, total))
                 try:
                     if kind == "script":
@@ -2256,8 +2296,9 @@ td input,td select{padding:4px 7px;font-size:12px}
 </div></div>
 <script>
 let CFG=null, SCRIPT=[], CUR_JOB=null, VOICES_BY_ENGINE={}, PROJECTS=[];
-/* 语篇标签下拉选项：占位串由 Python 侧替换成 config_manager.DISCOURSE_ORDER
-   的 JSON 数组（单源注入，见文件尾部的 replace）。 */
+/* 标签下拉选项：占位串由 Python 侧替换成 config_manager 两份标签合成的 JSON 数组
+   ——语篇词表 DISCOURSE_ORDER ＋ 程序专用的 PROGRAM_ONLY_TAGS（单源注入，见文件
+   尾部的 replace）。 */
 const EMOTIONS="__DISCOURSE_VOCAB__";
 /* 两页各一份「可选的期」。EPISEL 是勾上的那些——勾几期就做几期。
    顺序即勾选顺序不保证，所以实际按 EPISODES 的顺序取，跟地图一致。 */
@@ -2354,15 +2395,18 @@ function pruneReg(){
 }
 function syncKey(key,v){
   (REG[key]||[]).forEach(n=>{
+    // 标题行右侧那枚「当前值」在**每一次值变化**时重填，不分控件形态：滑杆、开关、
+    // 下拉、数字框、字体全都走这一句。先前只在这里填了滑杆与开关，下拉和数字框
+    // 的金字于是停在渲染那一刻的旧值上——下拉里换了值，金字不动。
+    // 开关的字是「开/关」不是取值本身，单独一支处理。
+    if(n.val) n.val.textContent=(n.kind==='sw')?(v?'开':'关'):fmtVal(n.spec,v);
     if(n.kind==='sw'){
       n.node.classList.toggle('on',!!v);
       // 拨杆只表达状态，字还是得有一行——网格里每个格子的标题行高度是写死的，
       // 这里跟着亮暗一起改字，视觉上「开」与「关」的差别就不用靠猜。
-      if(n.val) n.val.textContent=(v?'开':'关');
     }
     else if(n.kind==='font') syncFontPick(n.node,v);
     else if(n.node){
-      if(n.kind==='range'&&n.val) n.val.textContent=fmtVal(n.spec,v);
       // 模型下拉不能直接塞 value：名字不在候选里时 select 会被清成空选中。
       // 一律走重填，把当前值本身作为一项补进去。
       if(n.spec&&n.node.dataset&&n.node.dataset.models){
@@ -2714,11 +2758,15 @@ function recalcSoon(){clearTimeout(recalcTimer);recalcTimer=setTimeout(()=>{if(S
        tests/test_config_keys 里那条与 PARAM_SPEC 的对账）。 */
 const ZONES=[
   ['script','时长与规模',['script.target_minutes','script.segment_min_sents',
-                        'script.max_llm_rounds','script.map_max_episodes']],
+                        'script.segment_tol_frac',
+                        'script.segment_fix_rounds','script.segment_parse_rounds',
+                        'script.gate_rounds','script.check_rounds',
+                        'script.map_max_episodes']],
   ['script','切分与文体',['script.paradigm','script.compress_ratio',
-                        'script.style_preset','script.dialogue_form']],
+                        'script.style_preset','script.dialogue_form',
+                        'script.plan_rounds']],
   ['script','取材与门禁',['script.shape_flags','script.gate_strict',
-                        'script.flag_title_words']],
+                        'script.flag_title_words','script.check_semantic']],
   ['gate','总时长容差',['gate.max_deviation_pct','gate.min_deviation_seconds']],
   ['gate','单句长短',['gate.min_chars','gate.max_chars','gate.max_seconds_per_line']],
   ['llm','连接',['llm.backend','llm.model','llm.base_url','llm.api_key']],
@@ -3435,7 +3483,10 @@ async function watchBatch(tid,which){
            b.total?((b.index-1+(j.progress||0))/b.total):(j.progress||0));
     if(st) st.textContent=head+(j.stage||'');
     if(lg) lg.textContent=(j.log||[]).join('\n')||'等待中…';
-    if(j.status==='running'){setTimeout(tick,1200);return}
+    // 等下一轮要**等着**：链子串成一条 Promise，外层 await 才等得到真跑完。
+    // 从前这里 setTimeout 一扔就走，await 的调用方当场就往下执行——按钮于是
+    // 在任务刚起步时就恢复了，看着像已经收工。
+    if(j.status==='running'){await new Promise(r=>setTimeout(r,1200));return tick()}
     if(btn) btn.style.display='none';
     const res=j.result||{};
     if(j.status==='done'){
@@ -3449,7 +3500,7 @@ async function watchBatch(tid,which){
     }
     loadProjects(); loadHistory(); loadEpisodes(which);
   };
-  tick();
+  return tick();
 }
 
 async function genScript(){
@@ -3506,7 +3557,10 @@ async function watchScript(tid,no){
     setBar('gen-bar',j.progress||0);
     el('gen-status').textContent=j.stage||'写作中';
     el('gen-log').textContent=(j.log||[]).join('\n')||'等待中…';
-    if(j.status==='running'){setTimeout(tick,1500);return}
+    // 与 watchBatch 同一条规矩：链子串成一条 Promise，外层 await 才等得到
+    // 真跑完。单期生成按钮由调用方的 finally 恢复，这里一扔就走的话，
+    // 按钮在任务刚起步时就亮了。
+    if(j.status==='running'){await new Promise(r=>setTimeout(r,1500));return tick()}
     if(stop) stop.style.display='none';
     if(btn) btn.disabled=false;
     if(j.status!=='done'){
@@ -3537,7 +3591,7 @@ async function watchScript(tid,no){
     toast('脚本已生成'+(r2.title?('：'+r2.title):'')+(r2.planned_episodes?('（建议共 '+r2.planned_episodes+' 期）'):''),'ok');
     if(el('s-project').value) loadProjects();
   };
-  tick();
+  return tick();
 }
 async function gateOnly(){
   if(!SCRIPT.length){toast('尚无脚本');return}
@@ -3655,7 +3709,7 @@ function showOutputs(res){
     fileHref(relOf(p))+'"></'+tag+'>'}};
   item(ep.video,'横屏视频'); item(ep.video_vertical,'竖屏视频'); item(ep.audio,'音频');
   media(ep.audio,'audio'); media(ep.video,'video'); media(ep.video_vertical,'video');
-  item(ep.subtitle,'字幕'); item(ep.article,'图文');
+  item(ep.subtitle,'字幕'); item(ep.subtitle_lrc,'字幕（歌词 LRC）'); item(ep.article,'图文');
   item(ep.bg_h,'背景图（横屏）'); item(ep.bg_v,'背景图（竖屏）');
   const cov=ep.cover||{};
   Object.keys(cov).forEach(k=>{const n=String(cov[k]).split(/[\\/]/).pop();
@@ -4485,10 +4539,15 @@ window.onload=async()=>{
 </html>
 """
 
-# 语篇词表单源注入：脚本页情绪下拉的选项来自 config_manager 的 DISCOURSE_ORDER，
-# 就是**唯一的那一份词表**（生成侧的枚举、门禁的判据也读它，没有任何按风格收窄
-# 的第二步——收窄过两次，两次都导致「界面能选、门禁打回」）。词表改了这里自动跟，
-# 不存在两处各一份的账。
+# 脚本页标签下拉的单源注入：选项＝**语篇词表**（`DISCOURSE_ORDER`，也是生成侧枚举
+# 与门禁判据读的那唯一一份）＋ **程序粘合句专用标签**（`PROGRAM_ONLY_TAGS`）。
+#
+# 词表那一份：没有任何按风格收窄的第二步——收窄过两次，两次都导致「界面能选、门禁
+# 打回」。词表改了这里自动跟，不存在两处各一份的账。
+# 程序标签那一份（v0.36.0 加）：盘上的成品稿里有「开场／回顾／收束」，下拉里没有的
+# 话，那一格就没有任何选项能被选中，浏览器会退回显示第一项——**数据是对的，界面
+# 是错的**。两个元组都取自 config_manager，页面不留字面量。
 PAGE = PAGE.replace('"__DISCOURSE_VOCAB__"',
-                    json.dumps(DISCOURSE_ORDER, ensure_ascii=False))
+                    json.dumps(list(DISCOURSE_ORDER) + list(PROGRAM_ONLY_TAGS),
+                               ensure_ascii=False))
 

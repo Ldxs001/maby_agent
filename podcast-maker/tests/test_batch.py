@@ -101,6 +101,31 @@ class BatchBase(unittest.TestCase):
 class TestBatchLoop(BatchBase):
     """批任务的循环规矩：串行、跳过、熔断、软中止。"""
 
+    def test_progress_restarts_at_each_episode(self):
+        """批任务里的进度是**本期**的，切到新一期必须归零。
+
+        界面按 (第几期-1+本期进度)/总期数 折算整批进度，而进度口一律只增不减
+        （见 pipeline._step）。不归零的话，第二期一开局就顶着上一期跑完时的高
+        位——整期看着不动，反倒像卡住了。
+        """
+        self.put_scripts(["1", "2", "3"])
+        seen = []
+
+        def fake(body, job=None):
+            seen.append((str(body.get("episode_no")), job.get("progress")))
+            job["progress"] = 0.9                 # 模拟这一期跑到九成
+            return {"ok": True, "episode_files": {}}
+
+        with self.patched_render(fake):
+            r = web_ui.api_batch({"kind": "render", "project_id": self.pid,
+                                  "episodes": ["1", "2", "3"]})
+            self.assertTrue(r.get("ok"), r)
+            wait_job(r["task_id"])
+
+        self.assertEqual([no for no, _ in seen], ["1", "2", "3"])
+        self.assertEqual([p for _, p in seen], [0.0, 0.0, 0.0],
+                         "每期开头都要把本期进度清零：%r" % (seen,))
+
     def test_serial_and_skip_failed(self):
         self.put_scripts(["1", "2", "3"])
         calls = []
@@ -316,18 +341,39 @@ class TestScriptJobEntry(BatchBase):
         self.assertTrue(any("第 1 轮" in m for m in j["log"]), j["log"])
 
     def test_stage_and_progress_follow_the_round(self):
-        """阶段标签与进度从日志行里长出来，界面才知道现在跑到哪了。"""
+        """阶段标签与进度从日志行里长出来，界面才知道现在跑到哪了。
+
+        三段串行：出货 → 检查 → 门禁。后两段各跑各的轮，**检查段占 0~50%、
+        门禁段占 50~100%**；日志行自带段名（「检查第 N 轮」「门禁第 N 轮」），
+        界面按段折算——两段都喊「第 N 轮」的话，进度条会在门禁段开头往回跳一半。
+        出货段只改阶段：它没有轮次表，跑多久也不该假装进度条在动。
+        """
         job = pipeline.new_job("script", "试")
         web_ui._script_stage(job, "目标：1500 秒 / 约 6024 字")
         self.assertEqual(job["stage"], "排队", "不是轮次行就不该改阶段")
         self.assertEqual(job["progress"], 0.0)
-        web_ui._script_stage(job, "第 1 轮：调用模型…")
-        self.assertEqual(job["stage"], "第 1 轮：调用模型…",
+        web_ui._script_stage(job, "生成第 1 次：调用模型…")
+        self.assertEqual(job["stage"], "生成第 1 次：调用模型…",
                          "一轮要跑十几分钟，这期间界面不能停在上一句话上")
-        self.assertEqual(job["progress"], 0.0, "这一轮还没跑完，进度不该动")
-        web_ui._script_stage(job, "第 2 轮：模型返回 18466 字符")
-        self.assertEqual(job["stage"], "第 2 轮：模型返回 18466 字符")
-        self.assertGreater(job["progress"], 0.0)
+        self.assertEqual(job["progress"], 0.0, "出货还没跑完，进度不该动")
+        web_ui._script_stage(job, "检查第 1 轮：模型返回正文 18466 有效字")
+        first = job["progress"]
+        self.assertGreater(first, 0.0)
+        self.assertLessEqual(first, 0.5, "检查段最多走到一半")
+        web_ui._script_stage(job, "检查通过（第 1 轮）")
+        self.assertGreaterEqual(job["progress"], 0.5,
+                                "检查段提前收工，进度也得交到它的终点，"
+                                "门禁段才有 50% 这个起点")
+        web_ui._script_stage(job, "门禁第 1 轮：模型返回正文 18466 有效字")
+        self.assertGreater(job["progress"], first, "门禁段接着走 50~100%")
+        self.assertGreaterEqual(job["progress"], 0.5)
+        before = job["progress"]
+        web_ui._script_stage(job, "门禁第 1 轮：定点修补 2 句…")
+        self.assertEqual(job["progress"], before, "进度条只许前进，不许倒回")
+        web_ui._script_stage(job, "门禁通过（第 2 轮）")
+        self.assertGreater(job["progress"], before, "门禁过了就等于定稿，推到尾")
+        self.assertLess(job["progress"], 1.0, "留一格给粘合与写盘")
+
 
     def test_batch_calls_the_work_function_not_the_entry(self):
         """批任务自己就是一个任务，里面再起一个，日志会分叉成两处。"""

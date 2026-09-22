@@ -651,9 +651,9 @@ class TestReadableGate(unittest.TestCase):
         s = _script(20, 3)
         s[1]["text"] = "加 --mode 参数再跑"
         rep = SE.gate_generate(s, self.cfg)
-        targets, refull, manual = SE.patch_targets(rep, 3)
+        targets, unfixed = SE.patch_targets(rep, 3)
         self.assertIn(2, targets)
-        self.assertFalse(refull, "形状判据自带句号，不该落进整篇重出")
+        self.assertFalse(unfixed, "形状判据自带句号，定得了点，不该落进未修好")
 
     def test_prompt_bears_the_rule(self):
         """前置禁令进整篇提示词，与门禁判据同一条形状清单。"""
@@ -694,6 +694,34 @@ class TestLineEndPunct(unittest.TestCase):
         self.assertIsNone(SE.end_punct_tail("「他说完就走了。」"))
         self.assertIsNone(SE.end_punct_tail(""))
 
+    def test_tail_helper_flags_structural_symbols_before_the_punctuation(self):
+        """补个标点不能洗白：`…{` 被指出后模型照处方补成 `…{。`，末字符就合规了
+        ——那个 `{` 只是从末位挪到倒数第二位，照样念不出来，而这是唯一会拦它的
+        地方（见 `END_PUNCT_JUNK`）。
+
+        判据是黑名单，不是「标点前必须是中文/数字」：叠标点与百分数收尾都合法。
+        """
+        self.assertEqual(SE.end_punct_tail("先扫描再进模型{。"), "{")
+        self.assertEqual(SE.end_punct_tail("调用接口\\。"), "\\")
+        self.assertEqual(SE.end_punct_tail("参数是［1,2］。"), "］")
+        self.assertIsNone(SE.end_punct_tail("真的吗？！"), "叠标点是合法写法")
+        self.assertIsNone(SE.end_punct_tail("占比 15%。"), "百分数收尾合法")
+        # 包裹符里没有标点照样算漏：剥掉 `）` 之后收在 `A` 上，念出来没有停顿。
+        self.assertEqual(SE.end_punct_tail("（见附录 A）"), "A")
+
+    def test_two_bad_endings_are_told_apart(self):
+        """两种坏法分开报，因为**处方不一样**：缺标点的补一个，带结构符号的把
+        符号去掉。混成一条，`…{` 就会被照处方补成 `…{。`。
+        """
+        junk = self._item(["先扫描再进模型{。"])
+        self.assertFalse(junk["ok"])
+        self.assertEqual(junk["hits"][0]["kind"], "junk")
+        self.assertIn("混进", junk["detail"])
+        missing = self._item(["先扫描再进模型"])
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["hits"][0]["kind"], "missing")
+        self.assertIn("没有终止标点", missing["detail"])
+
     def test_bad_endings_are_caught(self):
         item = self._item(["首要难题是如何拆解语言", "先扫描，再进模型，"])
         self.assertFalse(item["ok"])
@@ -723,10 +751,12 @@ class TestLineEndPunct(unittest.TestCase):
         s = _script(20, 3)
         s[1]["text"] = "靠什么机制来运转呢"
         rep = SE.gate_generate(s, self.cfg)
-        targets, refull, manual = SE.patch_targets(rep, 3)
+        targets, unfixed = SE.patch_targets(rep, 3)
         self.assertIn(2, targets)
-        self.assertFalse(refull, "句尾标点自带句号，不该落进整篇重出")
-        self.assertIn("语义", targets[2][0])
+        self.assertFalse(unfixed, "句尾标点自带句号，定得了点，不该落进未修好")
+        # 这一句同时命中语篇词表与句尾标点，两项都该进定点清单：只要方向里有
+        # 「按语义补标点」这一条就算数（词表那条与它并列，谁也不顶替谁）。
+        self.assertTrue(any("语义" in w for w in targets[2]), targets[2])
 
     def test_prompt_bears_the_rule(self):
         """契约与句尾标点条款进整篇与分段两份提示词，一处都不许漏。"""
