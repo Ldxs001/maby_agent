@@ -18,7 +18,7 @@
 
 与生成侧的分工
 --------------
-- **生成时归一**：`_smoke/_bgm_gen.py` 落盘即调 `bgm_loudness.normalize_file()`，
+- **生成时归一**：`tools/probes/bgm_gen.py` 落盘即调 `bgm_loudness.normalize_file()`，
   新产出的素材一出来就是平的一档。
 - **事后校正（本脚本）**：对**已存在的**素材目录就地拉平，带备份 + 闭环复测。
   用途是补历史素材，或校正从别处拿来的素材。
@@ -26,7 +26,7 @@
 
 为什么需要
 ----------
-`_smoke/_bgm_gen.py` 原先只在 `save_wav()` 里做**削峰保护**（`peak > 0.90`
+`tools/probes/bgm_gen.py` 原先只在 `save_wav()` 里做**削峰保护**（`peak > 0.90`
 才缩），不做响度归一。MusicGen 每一档生成出来的动态差异被原样保留，实测
 15 档的 integrated LUFS 从 `chimes -15.18` 到 `horror -28.76`，**相差 13.6
 LU**。后果：同一个 `bgm.volume` 值在不同档位上实际响度差 4 倍 —— 换一档

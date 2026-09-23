@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "0.39.0"
+VERSION = "0.40.1"
 
 
 # ============================================================================
@@ -316,20 +316,27 @@ MODE_SPEC = {
         },
     },
     "speaker_indicator.mode": {
-        "label": "说话人指示",
+        "label": "说话人提示",
         "options": {
             "none": {"label": "无", "desc": "仅靠音色区分"},
-            "style": {"label": "字幕色区分", "desc": "A/B 两套字幕样式 + 名字前缀"},
+            "style": {"label": "AB两套字幕样式",
+                      "desc": "A 说的句子走 A 角字幕色、B 的走 B 角字幕色"},
             "block": {"label": "侧栏色块", "desc": "左右色块按句高亮当前说话方"},
             "portrait": {"label": "自备立绘", "desc": "用户提供透明 PNG，说话方高亮"},
         },
     },
+    # 版式只管「排几行、怎么折」，三档各自给一条路：
+    #   single / dual  折行上限写死，走 wrap_text（贪心填满）
+    #   lyric          不给 max_lines —— balanced 标记走 wrap_balanced，
+    #                  行数由「每行容量」自己算出来，外面不设上限
+    # 「行首要不要写说话人名」从前塞在版式里（dual_named 档），那是把两个维度
+    # 绑在一起：名字归「说话人提示」的角色名称开关，版式不再管。
     "subtitle.preset": {
         "label": "字幕版式",
         "options": {
             "single": {"label": "单行", "max_lines": 1},
             "dual": {"label": "双行", "max_lines": 2},
-            "dual_named": {"label": "双行带名", "max_lines": 2, "show_name": True},
+            "lyric": {"label": "歌词", "balanced": True},
         },
     },
     "intro_outro.preset": {
@@ -772,16 +779,24 @@ PARAM_SPEC = {
     "animation.mode": _p("enum", "static", "frame", "动画档位"),
     "animation.zoom_max": _p("float", 1.04, "frame", "缓推终点倍率",
                              min=1.0, max=1.20, step=0.01, unit="倍"),
-    "speaker_indicator.mode": _p("enum", "style", "frame", "说话人指示"),
+    "speaker_indicator.mode": _p("enum", "style", "frame", "说话人提示"),
+    # 角色名称独立成一个开关，不再由「说话人提示」的某一档兼职：
+    # 从前名字只在「字幕色区分」那一档里出现（侧栏色块/自备立绘两档反而没有），
+    # 于是「谁在说」这件事在四档之间飘。现在它是唯一判据 `speaker_name_shown`，
+    # 画面字幕与 LRC 共用——LRC 没有样式层，名字是它唯一能区分说话人的办法。
+    "speaker_indicator.name_shown": _p("bool", True, "frame", "角色名称",
+                                       help="在字幕句首写上说话人名字（A/B 取「声音」里的称呼）。"
+                                            "与版式无关：选了哪一档都按这个开关走"),
     "speaker_indicator.color_a": _p("str", "#C9A45C", "frame", "A 角色彩"),
     "speaker_indicator.color_b": _p("str", "#6FA8DC", "frame", "B 角色彩"),
     "speaker_indicator.portrait_a": _p("path", "", "frame", "A 角立绘 PNG", pick="image",
                                        help="本机绝对路径的透明 PNG，留空即不使用。"
-                                            "只在「说话人指示」选「自备立绘」时生效："
-                                            "说话方高亮、另一方压暗；文件不在等同于"
-                                            "没填，会退回「侧栏色块」档"),
+                                            "只在「说话人提示」选「自备立绘」时生效："
+                                            "该说话人开口的句子里出现在左下角，其余时间不显示。"
+                                            "两张必须同尺寸同高才会一样大——立绘高 = 源图高 × 42%；"
+                                            "两张都缺时退回「侧栏色块」"),
     "speaker_indicator.portrait_b": _p("path", "", "frame", "B 角立绘 PNG", pick="image",
-                                       help="同上，B 角那一张"),
+                                       help="同上，B 角那一张（右下角）"),
 
     # 画面上的字（背景、封面）与字幕各有一款字体，两个下拉并排放在「字体」卡片里。
     # 从前画面字体写死成「本机第一个可用字体」，人看得见字、却选不了它用哪款。
@@ -798,8 +813,40 @@ PARAM_SPEC = {
     "subtitle.margin_v_vertical": _p("int", 220, "frame", "竖屏底部边距", min=0, max=1200, step=5, unit="像素"),
     "subtitle.outline": _p("int", 6, "frame", "字幕框边距", min=0, max=30, step=1, unit="像素"),
     "subtitle.bg_alpha": _p("int", 128, "frame", "字幕底框透明度", min=0, max=255, step=1),
-    "subtitle.color_a": _p("str", "&HFFFFFF", "frame", "A 角字幕色"),
-    "subtitle.color_b": _p("str", "&HFFFFFF", "frame", "B 角字幕色"),
+    "subtitle.color_a": _p("str", "&HFFFFFF", "frame", "A 角字幕色",
+                           help="A 说的句子的字幕颜色。只有「说话人提示」选"
+                                "「AB两套字幕样式」时才生效"),
+    "subtitle.color_b": _p("str", "&HFFFFFF", "frame", "B 角字幕色",
+                           help="B 说的句子的字幕颜色。两色配成同一个颜色即等于不分色"),
+
+    # ---- 高亮：当前台词的重点色 ----
+    # 只有一个色：高亮是「盖在底色上的一层」。非当前句走自己的本色（说话人档的
+    # A/B 色，或「无」档的单色）并压暗——不能只换当前句的色而不压暗其余：
+    # A/B 默认都是纯白，比金色更亮，不压暗就成了「高亮的那句反而更暗」。
+    "subtitle.highlight": _p("bool", False, "frame", "高亮",
+                             help="把当前这句台词染成高亮配色。歌词版式下染的是"
+                                  "「正在读的那一句」，单行/双行下整句就是当前句，"
+                                  "等于给全部字幕换个色"),
+    "subtitle.highlight_color": _p("str", "#FFD98A", "frame", "高亮配色",
+                                   help="当前句的颜色，接受 #RRGGBB"),
+
+    # ---- 歌词版式：窗口与滚动 ----
+    "subtitle.lyric_window": _p("int", 3, "frame", "歌词窗口句数",
+                                min=1, max=7, step=1, unit="句",
+                                help="窗口里最多显示几句（含当前句）。当前句必留，"
+                                     "然后先按住下面的句子、再按住上面的"),
+    "subtitle.lyric_max_rows": _p("int", 8, "frame", "窗口上限行数",
+                                  min=2, max=24, step=1, unit="行",
+                                  help="**含空行**：每句占 1 个空行 + 它自己折的行数。"
+                                       "放不下就往远里丢句子，丢掉的在换点处上滚淡出"),
+    "subtitle.lyric_anchor_y": _p("int", 470, "frame", "当前句锚点高度",
+                                  min=0, max=1080, step=10, unit="像素",
+                                  help="当前句在画面上的纵向中心（按 1080 高的横屏定，"
+                                       "竖屏按比例换算）。越小越靠上"),
+    "subtitle.lyric_scroll_ms": _p("int", 600, "frame", "上滚时长",
+                                   min=0, max=3000, step=50, unit="毫秒",
+                                   help="换句时整块自下而上滑到新位置用的时间，"
+                                        "0 即不滚、直接跳"),
 
     "cover.preset": _p("enum", "book", "frame", "封面档位"),
 
@@ -862,7 +909,7 @@ SECTION_LABELS = {
     "tts": "角色与音色", "audio": "音频输出", "bgm": "背景音乐",
     "aigc": "AIGC 标识",
     "video": "画面输出", "background": "背景", "animation": "动画",
-    "speaker_indicator": "说话人指示", "subtitle": "字幕", "cover": "封面",
+    "speaker_indicator": "说话人提示", "subtitle": "字幕", "cover": "封面",
     "frame": "字体",
 }
 
@@ -924,7 +971,12 @@ def _views_of(key, spec):
 # 卡片归属的例外。默认按命名空间前缀归（subtitle.* 一律归「字幕」），但字体是
 # 另一类东西：画面与字幕各一款，分在两张卡片就得跑两个地方去挑字号长什么样。
 # 归到一张「字体」卡片，两个下拉并排，谁管哪一块一眼可见。
-SECTION_OF_OVERRIDE = {"subtitle.font_family": "frame"}
+# 卡片归属的例外表。键名带上「subtitle.」前缀不等于它归字幕卡：
+# A/B 角字幕色只有「说话人提示」的「AB两套字幕样式」那一档在读，把它留在字幕卡，
+# 就等于「选在哪、配色在哪」隔了一张卡——改的人要来回翻。整体归到说话人提示卡。
+SECTION_OF_OVERRIDE = {"subtitle.font_family": "frame",
+                       "subtitle.color_a": "speaker_indicator",
+                       "subtitle.color_b": "speaker_indicator"}
 
 
 def section_of(key):
@@ -1076,7 +1128,21 @@ class ConfigManager:
                     shutil.copy2(self.path, bak)
                 except OSError:
                     pass
+        self._migrate(self._data)
         return self._data
+
+    @staticmethod
+    def _migrate(data):
+        """存量配置里已下线的值，读到就改掉（下次保存时落盘）。
+
+        `dual_named`（双行带名）已从版式里删除——名字归「角色名称」开关，版式只管
+        折行。旧值留在配置里会静默落回「双行」的折行上限，而人当初点它的目的是
+        「要名字」：所以拆成两件事搬过去，意图不丢。
+        """
+        if data.get("subtitle.preset") == "dual_named":
+            data["subtitle.preset"] = "dual"
+            data.setdefault("speaker_indicator.name_shown", True)
+        return data
 
     def save(self):
         _atomic_write_json(self.path, self._data)

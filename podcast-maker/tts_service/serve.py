@@ -100,7 +100,7 @@ INSTRUCT_EMOTIONS = ("平静", "好奇", "疑惑", "恍然", "肯定", "感慨",
 # 20 个种子里有 4 句直接跑满生成上限、炸成两分半的噪声；0.4 与 0.9 都是 0/20。
 # 也就是 0.2 这一档不能用——省下的那点抖动，换来的是「每五句废一句」。
 # 取 0.4：退化率与音色漂移都与库默认同级，但采样幅度收一档，属不额外冒险的保守值。
-# 定档依据见 _smoke/_probe_degen_rate.py 与 _smoke/_probe_temp_clean.py。
+# 定档依据见 tools/probes/probe_degen_rate.py 与 tools/probes/probe_temp_clean.py。
 TEMPERATURE = 0.4
 
 # 采样参数。库默认就是这几个值，这里显式写出来：它们是「音色稳不稳」的直接

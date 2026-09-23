@@ -937,12 +937,13 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
         w = int(cfg.get("video.width", 1920))
         h = int(cfg.get("video.height", 1080))
 
-        ass_h, max_chars, max_lines = subtitle_engine.build_ass(script, cfg, timings, w, h, "")
+        ass_h, max_chars, max_lines, balanced = subtitle_engine.build_ass(
+            script, cfg, timings, w, h, "")
         p_h = os.path.join(work, "sub.ass")
         with open(p_h, "w", encoding="utf-8") as f:
             f.write(ass_h)
         video_engine.render_ass(p_h, p_h, script, timings, cfg, w, h, "")
-        wrap_stats = subtitle_engine.wrap_stats(script, max_chars, max_lines)
+        wrap_stats = subtitle_engine.wrap_stats(script, max_chars, max_lines, balanced)
 
         video_h = ep["video"]
         video_engine.compose(audio_final, p_h, video_h, cfg, built["bg_h"],
@@ -954,7 +955,8 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
         if cfg.get("video.produce_vertical", True):
             step(7, "合成竖屏视频", 0.85)
             wv, hv = h, w
-            ass_v, mc_v, ml_v = subtitle_engine.build_ass(script, cfg, timings, wv, hv, "_v")
+            ass_v, mc_v, ml_v, bal_v = subtitle_engine.build_ass(
+                script, cfg, timings, wv, hv, "_v")
             p_v = os.path.join(work, "sub_v.ass")
             with open(p_v, "w", encoding="utf-8") as f:
                 f.write(ass_v)

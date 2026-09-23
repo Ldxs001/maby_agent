@@ -2786,13 +2786,16 @@ const ZONES=[
   ['bgm','人声闪避',['bgm.ducking','bgm.duck_threshold','bgm.duck_ratio','bgm.fade_seconds']],
   ['video','画幅与帧率',['video.width','video.height','video.fps','video.produce_vertical']],
   ['video','编码与画面处理',['video.encoder_preset','video.crf','video.bg_dim']],
-  ['speaker_indicator','指示方式与颜色',['speaker_indicator.mode','speaker_indicator.color_a',
-                                   'speaker_indicator.color_b']],
+  ['speaker_indicator','提示方式',['speaker_indicator.mode','speaker_indicator.name_shown']],
+  ['speaker_indicator','角色字幕色',['subtitle.color_a','subtitle.color_b']],
+  ['speaker_indicator','色块与立绘配色',['speaker_indicator.color_a','speaker_indicator.color_b']],
   ['speaker_indicator','立绘',['speaker_indicator.portrait_a','speaker_indicator.portrait_b']],
   ['subtitle','版式与字号',['subtitle.preset','subtitle.font_size','subtitle.font_size_vertical']],
+  ['subtitle','高亮',['subtitle.highlight','subtitle.highlight_color']],
+  ['subtitle','歌词窗口',['subtitle.lyric_window','subtitle.lyric_max_rows',
+                        'subtitle.lyric_anchor_y','subtitle.lyric_scroll_ms']],
   ['subtitle','边距与底框',['subtitle.margin_lr','subtitle.margin_v','subtitle.margin_v_vertical',
-                          'subtitle.outline','subtitle.bg_alpha']],
-  ['subtitle','角色字幕色',['subtitle.color_a','subtitle.color_b']]
+                          'subtitle.outline','subtitle.bg_alpha']]
 ];
 const ZONE_OF={};
 ZONES.forEach(z=>{(z[2]||[]).forEach(k=>{ZONE_OF[k]={sec:z[0],label:z[1]}})});

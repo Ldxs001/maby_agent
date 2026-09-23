@@ -208,7 +208,7 @@ class TestSingleImplementation(unittest.TestCase):
             return fh.read()
 
     def test_generator_normalizes_on_save(self):
-        src = self._read("_smoke", "_bgm_gen.py")
+        src = self._read("tools", "probes", "bgm_gen.py")
         self.assertIn("normalize_file(", src,
                       "生成器落盘时没调归一 —— 新素材又会不齐")
         self.assertIn("import bgm_loudness", src,
@@ -223,7 +223,7 @@ class TestSingleImplementation(unittest.TestCase):
 
     def test_save_wav_failure_deletes_the_file(self):
         """归一失败必须删掉半成品：main() 会跳过已存在的文件。"""
-        src = self._read("_smoke", "_bgm_gen.py")
+        src = self._read("tools", "probes", "bgm_gen.py")
         self.assertIn("os.remove(path)", src,
                       "归一失败没删半成品，会被 main() 永久跳过")
 
