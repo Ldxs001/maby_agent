@@ -21,6 +21,7 @@
 测试把修正后的判据钉住。
 """
 
+import json
 import os
 import sys
 import unittest
@@ -258,6 +259,107 @@ class TestMissingKeyIsUnjudged(unittest.TestCase):
         out = self._run("这不是 JSON")
         self.assertEqual([out[k][0] for k, _ in SE.CHECK6_DIMS],
                          ["pending", "pending"])
+
+
+class TestPromiseIssuesSurviveNormalization(unittest.TestCase):
+    """承诺链检报出的问题项不能被丢掉，且必须走两段共用的那条定点修路。
+
+    两项的输出契约**本来就不一样**：语义检答「哪一句有什么毛病」（quote + problem），
+    承诺链答「开了什么口子 / 怎么才算合上 / 谁来说 / 合在第几句之后」（promise / how /
+    speaker / close_after）。归一化只能把两种形状映射到同一条记录上，不能拿语义检的
+    字段表去判承诺链的死活——否则模型报的每一条承诺问题都在出口被丢掉，只剩一个判
+    不通过、却指不出任何一处的空壳：`patch_targets` 无从下手，「没有可定点修的项」当场
+    break，报告上的承诺链永远红着（实测 2a / 2c 两期 `issues=0`，`detail` 还写着「通过」）。
+
+    **不许给承诺链另起一套**：修好落点之后，它走的就是 `patch_targets` → 定点修 →
+    `check_rounds` 封顶 → 超了落盘，与形式门禁同一条路。
+    """
+
+    #: 30 句，够放下 line=8 与 close_after=20
+    SCRIPT = [{"speaker": "A" if i % 2 == 0 else "B",
+               "text": "第%d句。" % (i + 1)} for i in range(30)]
+
+    class _LLM:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def chat(self, messages, **kw):
+            return self.payload, {}
+
+    def _run_key(self, key, node):
+        raw = json.dumps({key: node}, ensure_ascii=False)
+        return SE.check6_llm(self.SCRIPT, ConfigManager().data(),
+                             self._LLM(raw), "素材")[key]
+
+    def _run(self, node):
+        return self._run_key("promise", node)
+
+    @staticmethod
+    def _node(**over):
+        it = {"line": 8, "promise": "开头问了「能不能落地」",
+              "how": "给出一个已经落地的实例", "speaker": "B",
+              "close_after": 20}
+        it.update(over)
+        return {"pass": False, "issues": [it]}
+
+    def test_issue_survives_without_quote_and_problem(self):
+        state, detail, issues = self._run(self._node())
+        self.assertEqual(state, "fail")
+        self.assertEqual(len(issues), 1,
+                         "承诺项没有 quote / problem，不该因此被整条丢掉")
+        rec = issues[0]
+        self.assertEqual(rec["line"], 8)
+        self.assertIn("第 8 句", detail)
+        for k in ("promise", "how", "speaker", "close_after"):
+            self.assertIn(k, rec, "补什么、谁来补、补在哪不能在出口处丢")
+
+    def test_issue_reaches_patch_targets(self):
+        """有落点就该被定点修——走的是两段共用的那条路，不是另起一套。"""
+        _, detail, issues = self._run(self._node())
+        item = {"key": "check_promise", "label": "承诺链检", "level": "warn",
+                "judge": "llm", "ok": False, "detail": detail, "issues": issues}
+        targets, unfixed = SE.patch_targets(
+            {"items": [item]}, len(self.SCRIPT),
+            want=lambda k: k.startswith("check_"), cfg=ConfigManager().data())
+        self.assertEqual(unfixed, [], "有落点就不该记「未修好」")
+        self.assertIn(8, targets, "承诺句要被点名（明令不许删）")
+        self.assertIn(20, targets, "close_after 要成为插入锚点")
+        self.assertTrue(any("inserts" in t for t in targets[20]),
+                        "补回应是插一句新话，不是改已有句子")
+
+    def test_failed_without_any_issue_is_not_called_pass(self):
+        """判不通过却一条也报不出来时，详情不许印「通过」——结论与详情同源。"""
+        state, detail, issues = self._run({"pass": False, "issues": []})
+        self.assertEqual(state, "fail")
+        self.assertEqual(issues, [])
+        self.assertNotEqual(detail, "通过", "结论不通过、详情通过，是自相矛盾")
+        self.assertIn("未通过", detail)
+        # 判通过时空清单照旧念「通过」，别把这条改歪了
+        state, detail, _ = self._run({"pass": True, "issues": []})
+        self.assertEqual((state, detail), ("pass", "通过"))
+
+    def test_every_required_issue_key_survives(self):
+        """**通用钉子**：schema 要求哪些键，归一化后就得留下哪些键。
+
+        这条不针对承诺链一项。将来哪一项的输出契约改了、加了必填字段，而归一化
+        没跟上，就会被它当场钉住——不再有「模型报了、程序悄悄丢掉」这种无声故障
+        （承诺链这一整轮故障，起因正是这一条）。
+        """
+        for key in [k for k, _ in SE.CHECK6_DIMS]:
+            spec = SE.check6_schema((key,), len(self.SCRIPT))
+            required = spec["properties"][key]["properties"]["issues"]["items"][
+                "required"]
+            node = {"pass": False,
+                    "issues": [{k: (8 if k == "line" else
+                                   20 if k == "close_after" else
+                                   "B" if k == "speaker" else "值")
+                                for k in required}]}
+            _, _, issues = self._run_key(key, node)
+            self.assertEqual(len(issues), 1,
+                             "%s：按契约把必填项都给全了，不该一条都不剩" % key)
+            for k in required:
+                self.assertIn(k, issues[0],
+                              "%s：契约要求 %s，归一化把它丢了" % (key, k))
 
 
 class TestReviewTokenBudget(unittest.TestCase):

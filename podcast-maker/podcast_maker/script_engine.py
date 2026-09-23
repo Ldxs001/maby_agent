@@ -1603,13 +1603,24 @@ def _norm_issues(node, total, script=None):
 
     落点由 `_locate_line` 定：模型给了有效句号就用它，给不出就拿 `quote` 反查。
     两样都落空的才留 0，由 `patch_targets` 记「未修好」——**不早退、不重写**。
+
+    两项的输出契约**本来就不一样**（见 `_CHECK6_SEMANTIC_ITEM` / `_CHECK6_PROMISE_ITEM`）：
+    语义检答「哪一句有什么毛病」，字段是 `quote` + `problem`；承诺链答「开了什么口子 /
+    怎么才算合上 / 谁来说 / 合在第几句之后」，字段是 `promise` + `how` + `speaker` +
+    `close_after`。归一化的职责是**把两种形状映射到同一条记录上**，不是拿语义检的字段表
+    去判承诺链的死活——「没有 quote / problem 就当这条没说过」会让承诺链报的每一条问题
+    都在这里被丢掉，只剩一个判不通过、却指不出任何一处的空壳，下游无从修起。
+    所以说明性字段按两种契约取齐：`quote ← quote|promise`，
+    `problem ← problem|how|promise|text`；五键原样带下去。
     """
     out = []
     for it in (node.get("issues") or []):
         if isinstance(it, dict):
             line = _locate_line(it, total, script)
-            quote = str(it.get("quote") or "").strip()
-            problem = str(it.get("problem") or it.get("text") or "").strip()
+            quote = str(it.get("quote") or it.get("promise") or "").strip()
+            problem = str(it.get("problem") or it.get("how")
+                          or it.get("promise") or it.get("text")
+                          or "").strip()
             rec = {"line": line, "quote": quote, "problem": problem}
             # 承诺项多出来的键原样带下去：定点修补要拿 promise / how /
             # speaker / close_after 去补那句回应，在这里压成三键等于把
@@ -1628,10 +1639,15 @@ def _norm_issues(node, total, script=None):
     return out
 
 
-def _issues_detail(issues):
-    """给人看的那一行。句号缺失时明说「未指出句号」，不假装知道是哪一句。"""
+def _issues_detail(issues, state="pass"):
+    """给人看的那一行。句号缺失时明说「未指出句号」，不假装知道是哪一句。
+
+    `state` 决定**空清单**怎么念：判通过时它就是「通过」；判不通过时它是
+    「一条也没报出来」。后者若照旧印「通过」，条面上就是结论不通过、详情通过——
+    一句话自相矛盾。报告是给人看的，结论与详情必须同源。
+    """
     if not issues:
-        return "通过"
+        return "通过" if state == "pass" else "未通过（模型未指出具体句子）"
     parts = []
     for it in issues[:4]:
         where = "第 %d 句" % it["line"] if it["line"] else "未指出句号"
@@ -1668,8 +1684,8 @@ def _parse_check6(text, dims, labels, total, script=None):
                         "%s未判定（模型未返回该项结论），交人工复核" % labels[key], [])
             continue
         issues = _norm_issues(node, total, script)
-        out[key] = ("pass" if bool(node.get("pass")) else "fail",
-                    _issues_detail(issues), issues)
+        state = "pass" if bool(node.get("pass")) else "fail"
+        out[key] = (state, _issues_detail(issues, state), issues)
     return out
 
 

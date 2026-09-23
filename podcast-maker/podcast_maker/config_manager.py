@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "0.40.1"
+VERSION = "0.41.1"
 
 
 # ============================================================================
@@ -808,11 +808,29 @@ PARAM_SPEC = {
                                help="字幕用这款。留空则自动选择可用字体"),
     "subtitle.font_size": _p("int", 52, "frame", "横屏字号", min=16, max=140, step=2, unit="像素"),
     "subtitle.font_size_vertical": _p("int", 40, "frame", "竖屏字号", min=16, max=140, step=2, unit="像素"),
-    "subtitle.margin_lr": _p("int", 90, "frame", "字幕左右边距", min=0, max=500, step=5, unit="像素"),
-    "subtitle.margin_v": _p("int", 90, "frame", "横屏底部边距", min=0, max=800, step=5, unit="像素"),
-    "subtitle.margin_v_vertical": _p("int", 220, "frame", "竖屏底部边距", min=0, max=1200, step=5, unit="像素"),
-    "subtitle.outline": _p("int", 6, "frame", "字幕框边距", min=0, max=30, step=1, unit="像素"),
-    "subtitle.bg_alpha": _p("int", 128, "frame", "字幕底框透明度", min=0, max=255, step=1),
+    # 字幕这几项「一套配置管两种模式」：单行/双行是「文字背景填充 + 文字位置」，
+    # 歌词是「一个固定宽高的半透明框、文字在框里」。下面每项在两种模式下语义
+    # 不同，标签保持中性、help 里写清两义（见 CHANGELOG 0.41.0 的接驳表）；
+    # 只对单双行成立的项在 help 里点明「仅单双行生效」。
+    "subtitle.margin_lr": _p("int", 90, "frame", "字幕左右边距",
+                             min=0, max=500, step=5, unit="像素",
+                             help="单行/双行＝文字距左右；歌词＝框宽"
+                                  "（框左右各收这么多，同时决定每行能放几个字）"),
+    "subtitle.margin_v": _p("int", 90, "frame", "横屏底部边距",
+                            min=0, max=800, step=5, unit="像素",
+                            help="单行/双行＝文字距底边；歌词＝框底距底边"),
+    "subtitle.margin_v_vertical": _p("int", 220, "frame", "竖屏底部边距",
+                                     min=0, max=1200, step=5, unit="像素",
+                                     help="单行/双行＝文字距底边；歌词＝框底距底边"
+                                          "（竖屏那一份）"),
+    "subtitle.outline": _p("int", 6, "frame", "字幕框边距",
+                           min=0, max=30, step=1, unit="像素",
+                           help="**仅单双行生效**：文字背景填充块的描边粗细。"
+                                "歌词档的边界是整块框自己算出来的，不用这一项"),
+    "subtitle.bg_alpha": _p("int", 128, "frame", "字幕底框透明度",
+                            min=0, max=255, step=1,
+                            help="单行/双行＝每行填充块的透明度；"
+                                 "歌词＝整块背景框的透明度。0 全实、255 全透"),
     "subtitle.color_a": _p("str", "&HFFFFFF", "frame", "A 角字幕色",
                            help="A 说的句子的字幕颜色。只有「说话人提示」选"
                                 "「AB两套字幕样式」时才生效"),
@@ -838,11 +856,8 @@ PARAM_SPEC = {
     "subtitle.lyric_max_rows": _p("int", 8, "frame", "窗口上限行数",
                                   min=2, max=24, step=1, unit="行",
                                   help="**含空行**：每句占 1 个空行 + 它自己折的行数。"
-                                       "放不下就往远里丢句子，丢掉的在换点处上滚淡出"),
-    "subtitle.lyric_anchor_y": _p("int", 470, "frame", "当前句锚点高度",
-                                  min=0, max=1080, step=10, unit="像素",
-                                  help="当前句在画面上的纵向中心（按 1080 高的横屏定，"
-                                       "竖屏按比例换算）。越小越靠上"),
+                                       "放不下就往远里丢句子，丢掉的在换点处上滚淡出。"
+                                       "歌词档里它同时就是**框高** = 行数 × 行距"),
     "subtitle.lyric_scroll_ms": _p("int", 600, "frame", "上滚时长",
                                    min=0, max=3000, step=50, unit="毫秒",
                                    help="换句时整块自下而上滑到新位置用的时间，"

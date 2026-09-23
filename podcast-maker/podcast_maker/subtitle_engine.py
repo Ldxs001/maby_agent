@@ -429,10 +429,19 @@ def build_ass(script, cfg, timings, width, height, suffix=""):
         "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding",
     ]
+    # 歌词档与单双行的样式分岔：歌词的框是**独立画出来的一个矩形**（见
+    # _lyric_box_event），所以 Style 的 per-line 盒必须关掉——BackColour 全透明、
+    # BorderStyle=1（不做自动盒）、Outline 用写死小值，免得叠出一层多余的盒。
+    # 单双行那一路逐字沿用旧值：它的 ASS 全文有冻结哈希钉着（tests）。
+    if balanced:
+        back_use, bstyle, outline_use = "&HFF000000", 1, LYRIC_BOX_BORDER
+    else:
+        back_use, bstyle, outline_use = back, 3, outline
     for name, color in styles:
         header.append(
-            "Style: %s,%s,%d,%s,%s,&H00000000,%s,0,0,0,0,100,100,0,0,3,%d,0,2,%d,%d,%d,1"
-            % (name, font, size, color, color, back, outline, mlr, mlr, mv)
+            "Style: %s,%s,%d,%s,%s,&H00000000,%s,0,0,0,0,100,100,0,0,%d,%d,0,2,%d,%d,%d,1"
+            % (name, font, size, color, color, back_use,
+               bstyle, outline_use, mlr, mlr, mv)
         )
     header += ["", "[Events]",
                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
@@ -470,6 +479,12 @@ def build_ass(script, cfg, timings, width, height, suffix=""):
 # ------------------------------------------------------------------ 歌词档
 LYRIC_CONTEXT_ALPHA = 0x8C      # 非当前句的不透明度档（约 45% 可见）
 LYRIC_LINE_PITCH = 1.35         # 行距 = 字号 × 本值（折行之间与句间空行同用）
+# 歌词框的写死描边。`subtitle.outline` 在歌词档语义冲突（单双行它是填充块内边距，
+# 歌词档的「块」是整块框、由几何算出，不需要内边距），所以歌词档**不读它**，
+# 另用这一组固定值画一道浅边——见 CHANGELOG 0.41.0 的接驳表。
+LYRIC_BOX_BORDER = 2            # 描边宽（像素），写死，不跟 subtitle.outline
+LYRIC_BOX_BORDER_COLOR = "&HFFFFFF"
+LYRIC_BOX_BORDER_ALPHA = 0x66   # 约 60% 透明，只留一道淡边
 
 
 def _lyric_window(n, line_counts, current, window, max_rows):
@@ -517,12 +532,15 @@ def _lyric_style_of(k, current, highlight, speaker, mode):
     return "LyricCtxA" if speaker == "A" else "LyricCtxB"
 
 
-def _lyric_head(cx, y_from, y_to, scroll_ms, fade_ms=0):
-    """一条歌词的定位头：不动就 \\pos，要动就 \\move。
+def _lyric_head(cx, y_from, y_to, scroll_ms, fade_ms=0, clip=None):
+    """一条歌词的定位头：不动就 \\pos，要动就 \\move；给了框四角就裁到框内。
 
     \\an5 是钉死的：\\pos/\\move 的锚点由 \\an 决定，不写就跟着 Style 的
     Alignment 走，而歌词的 Style 沿用了底中对齐——那样横向居中和纵向锚点会各算
     一遍，锚点越靠上偏得越多。
+
+    \\clip 用**画面绝对坐标**（不受 \\pos/\\move 的位移影响），所以直接传框的
+    四角即可：上滚时离开框顶的句子会被裁掉、不会飘到框外。
     """
     if y_from != y_to and scroll_ms > 0:
         head = r"{\an5\move(%d,%d,%d,%d,0,%d)" % (cx, y_from, cx, y_to, scroll_ms)
@@ -530,7 +548,31 @@ def _lyric_head(cx, y_from, y_to, scroll_ms, fade_ms=0):
         head = r"{\an5\pos(%d,%d)" % (cx, y_to)
     if fade_ms > 0:
         head += r"\fad(0,%d)" % fade_ms
+    if clip:
+        head += r"\clip(%d,%d,%d,%d)" % clip
     return head + "}"
+
+
+def _lyric_box_event(x1, y1, x2, y2, alpha, t0, t1):
+    """歌词整块半透明框：一条贯穿时间轴的 ASS 绘图矩形（\\p1 路径）。
+
+    单双行的「底框」是每行自己的 Style BackColour（per-line 盒），画不出「一个
+    固定宽高的框」；歌词档要的正是后者，所以只能自己画：\\an7 把 \\pos 定在左上
+    角，路径坐标相对它就等于从 (x1,y1) 到 (x2,y2)。
+
+    · 填充 `\\1c` 写死黑、`\\1a` = `subtitle.bg_alpha`（与旧 per-line 盒
+      `&H%02X000000` 同一口径：128 → 50% 透明）；
+    · 描边用写死常量 `LYRIC_BOX_BORDER*`，**不读 subtitle.outline**（语义冲突）；
+    · 起止取首句起点到末句终点——框从第一句出现到最后一句消失为止。
+    """
+    w, h = x2 - x1, y2 - y1
+    a = max(0, min(255, int(alpha)))
+    body = (r"{\p1\an7\pos(%d,%d)\1c&H000000&\1a&H%02X&"
+            r"\bord%d\3c%s\3a&H%02X&}m 0 0 l %d 0 l %d %d l 0 %d c"
+            % (x1, y1, a, LYRIC_BOX_BORDER, LYRIC_BOX_BORDER_COLOR,
+               LYRIC_BOX_BORDER_ALPHA, w, w, h, h))
+    return "Dialogue: 0,%s,%s,Default,,0,0,0,,%s" % (
+        fmt_ass_time(t0), fmt_ass_time(t1), body)
 
 
 def _lyric_events(script, cfg, timings, width, height, suffix,
@@ -540,6 +582,10 @@ def _lyric_events(script, cfg, timings, width, height, suffix,
     纵向位置全部自己算。位置只跟句子自身有关（全局行尺），当前句挪一格时所有
     句子的位移量天然相同——整块带子刚性上移，不必逐句去算差值，这也是「跳换 +
     缓慢从下往上滚」能用一条 \\move 表达出来的原因。
+
+    纵向基准是一块**固定宽高的框**（见 _lyric_box_event）：框底距画面底 mv、
+    框高 = 行预算 × 行距，当前句落在框的垂直中心。不再读绝对锚点
+    `subtitle.lyric_anchor_y`——该项 0.41.0 起删除（见接驳表）。
 
     区间按**句首到下一句句首**取（不是句首到句尾），句间停顿里窗口不闪断；
     最后一句止于自己的结束时间。
@@ -553,13 +599,22 @@ def _lyric_events(script, cfg, timings, width, height, suffix,
     mode = cfg.get("speaker_indicator.mode", "style")
     if suffix == "_v":
         size = int(cfg.get("subtitle.font_size_vertical", 40))
+        mv = int(cfg.get("subtitle.margin_v_vertical", 220))
     else:
         size = int(cfg.get("subtitle.font_size", 52))
+        mv = int(cfg.get("subtitle.margin_v", 90))
+    mlr = int(cfg.get("subtitle.margin_lr", 90))
+    alpha = int(cfg.get("subtitle.bg_alpha", 128))
     pitch = max(1, int(round(size * LYRIC_LINE_PITCH)))
-    anchor = int(cfg.get("subtitle.lyric_anchor_y", 470))
-    if suffix == "_v":
-        # 锚点按 1080 高的横屏定，竖屏按画幅比例换算——同一套配置两种画幅一致。
-        anchor = int(round(anchor * float(height) / 1080.0))
+
+    # 框几何（唯一出处；预览与测试都照这一组画）：左右由 margin_lr 收，底距画面底
+    # mv，高 = 行预算 × 行距（正好装下窗口允许的全部行）。锚点 = 框的垂直中心。
+    frame_h = max_rows * pitch
+    x1, x2 = mlr, width - mlr
+    frame_bottom = height - mv
+    frame_top = frame_bottom - frame_h
+    clip = (x1, frame_top, x2, frame_bottom)
+    anchor = frame_bottom - frame_h / 2.0
     cx = width // 2
 
     texts, line_counts = [], []
@@ -586,26 +641,30 @@ def _lyric_events(script, cfg, timings, width, height, suffix,
     ends = [float(t.get("end", 0.0)) for t in timings[:n]]
     vis = [_lyric_window(n, line_counts, j, window, max_rows) for j in range(n)]
 
-    events = []
+    # 框垫在最底层（图层 0）：整条时间轴一条矩形，先于所有文字。文字层号往上抬
+    # 一级（常驻 1 / 淡出 2），三层顺序显式化，比「同层靠文件先后」稳。
+    events = [_lyric_box_event(x1, frame_top, x2, frame_bottom, alpha,
+                               starts[0], max(ends[-1], starts[-1] + 0.01))]
     for j in range(n):
         t0 = starts[j]
         t1 = starts[j + 1] if j + 1 < n else max(ends[j], t0 + 0.01)
         for k in vis[j]:
             y_from = y_at(k, j - 1) if j > 0 else y_at(k, j)
             y_to = y_at(k, j)
-            body = _lyric_head(cx, y_from, y_to, scroll_ms) + "\\N".join(texts[k])
+            body = (_lyric_head(cx, y_from, y_to, scroll_ms, clip=clip)
+                    + "\\N".join(texts[k]))
             style = _lyric_style_of(k, j, highlight, script[k].get("speaker", "A"), mode)
-            events.append("Dialogue: 0,%s,%s,%s,,0,0,0,,%s"
+            events.append("Dialogue: 1,%s,%s,%s,,0,0,0,,%s"
                           % (fmt_ass_time(t0), fmt_ass_time(t1), style, body))
         # 被行预算挤出去的那句：让它跟着整块上移并淡掉（硬消失会像画面抖了一下）。
-        # 单独一条短事件，上下各差 1 个图层号，跟留下来的句子错开。
+        # 单独一条短事件，图层号最高（2）——正在淡出，压在常驻句之上。
         if j > 0 and scroll_ms > 0:
             for k in [x for x in vis[j - 1] if x not in vis[j]]:
                 body = (_lyric_head(cx, y_at(k, j - 1), y_at(k, j), scroll_ms,
-                                    fade_ms=scroll_ms)
+                                    fade_ms=scroll_ms, clip=clip)
                         + "\\N".join(texts[k]))
                 style = _lyric_style_of(k, j - 1, highlight, script[k].get("speaker", "A"), mode)
-                events.append("Dialogue: 1,%s,%s,%s,,0,0,0,,%s"
+                events.append("Dialogue: 2,%s,%s,%s,,0,0,0,,%s"
                               % (fmt_ass_time(t0), fmt_ass_time(t0 + scroll_ms / 1000.0),
                                  style, body))
     return events

@@ -3550,7 +3550,7 @@ class TestShapeFlags(unittest.TestCase):
         """八家族各按形状命中；正文干净就不误报。"""
         cases = {
             "网址": "看 https://mirrors.aliyun.com/pypi 或 tuna.tsinghua.edu.cn，"
-                    "联系 admin@example.com",
+                    "联系 [email-redacted]",
             "公式": "损失 $L=\\frac{1}{n}$，取 α 小、β 大，∑ 求和即可。",
             "代码": "```py\ndef a():\n    return 1\n```\n再 import os 即可",
             "表格": "| 甲 | 乙 |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |",

@@ -314,7 +314,11 @@ class TestLyricPreset(unittest.TestCase):
 
     @staticmethod
     def _rows(ass):
-        """把 Dialogue 拆成字段。head 里的 \\pos/\\move 是歌词档的位置来源。"""
+        """把 Dialogue 拆成字段。head 里的 \\pos/\\move 是歌词档的位置来源。
+
+        `box` 标记这条是不是歌词档垫底的整块框（\\p1 绘图事件）——它不参与
+        「文字行预算 / 图层号」那几条断言，必须能一眼摘出来。
+        """
         out = []
         for line in ass.splitlines():
             if not line.startswith("Dialogue:"):
@@ -324,9 +328,10 @@ class TestLyricPreset(unittest.TestCase):
             head, text = (raw.split("}", 1) + [""])[:2] if raw.startswith("{") else ("", raw)
             head = head + "}" if head else ""
             rec = {"layer": f[0].split()[1], "start": f[1], "end": f[2],
-                   "style": f[3], "head": head, "text": text}
+                   "style": f[3], "head": head, "text": text,
+                   "box": "\\p1" in head}
             mv = re.search(r"\\move\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)", head)
-            ps = re.search(r"\\pos\((\d+),(\d+)\)", head)
+            ps = re.search(r"\\pos\((-?\d+),(-?\d+)\)", head)
             if mv:
                 rec.update(cx=int(mv.group(1)), y_from=int(mv.group(2)),
                            cx2=int(mv.group(3)), y_to=int(mv.group(4)),
@@ -344,6 +349,35 @@ class TestLyricPreset(unittest.TestCase):
             groups.setdefault(d["start"], []).append(d)
         return [groups[k] for k in sorted(groups)]
 
+    def _boxes(self, ass):
+        """歌词档垫底的整块框（\\p1 绘图事件）。"""
+        return [d for d in self._rows(ass) if d["box"]]
+
+    def _lyrics(self, ass):
+        """歌词文本事件（排除垫底的框）。"""
+        return [d for d in self._rows(ass) if not d["box"]]
+
+    def _geom(self, cfg=None, size=(1920, 1080), sfx=""):
+        """独立算一遍框几何（不调引擎内部），供断言引用。
+
+        与 subtitle_engine._lyric_events 同源：x1/x2 由 margin_lr 收，底 = 画幅高
+        − 边距（竖屏取 margin_v_vertical），高 = 行数 × 行距，锚点 = 框垂直中心。
+        """
+        cfg = cfg if cfg is not None else self.BASE
+        w, h = size
+        if sfx:
+            s = int(cfg.get("subtitle.font_size_vertical", 40))
+            mv = int(cfg.get("subtitle.margin_v_vertical", 220))
+        else:
+            s = int(cfg.get("subtitle.font_size", 52))
+            mv = int(cfg.get("subtitle.margin_v", 90))
+        mlr = int(cfg.get("subtitle.margin_lr", 90))
+        rows = max(2, int(cfg.get("subtitle.lyric_max_rows", 8)))
+        pitch = max(1, int(round(s * S.LYRIC_LINE_PITCH)))
+        fh = rows * pitch
+        return {"x1": mlr, "x2": w - mlr, "bottom": h - mv, "top": h - mv - fh,
+                "h": fh, "anchor": h - mv - fh / 2.0, "pitch": pitch}
+
     def test_preset_reports_balanced(self):
         _, mc, _, balanced = self._ass()
         self.assertTrue(balanced, "歌词档没走到均衡折行那一支")
@@ -356,17 +390,20 @@ class TestLyricPreset(unittest.TestCase):
         自动换行」这条路在画面烧录里不存在——折行只能自己来。
         """
         ass, mc, _, _ = self._ass()
-        for d in self._rows(ass):
+        for d in self._lyrics(ass):
             for seg in d["text"].split("\\N"):
                 self.assertLessEqual(len(seg), mc, "行超容量：%r" % seg)
 
     def test_row_budget_counts_blank_rows(self):
-        """上限按行计（含空行）：每句的代价 = 1 个空行 + 它自己折的行数。"""
+        """上限按行计（含空行）：每句的代价 = 1 个空行 + 它自己折的行数。
+
+        只数文字（图层 1）——垫底的框（图层 0）不占文字行预算。
+        """
         for cap in (5, 8, 12):
             ass, _, _, _ = self._ass(**{"subtitle.lyric_max_rows": cap})
             for j, evs in enumerate(self._by_interval(ass)):
                 used = sum(len(d["text"].split("\\N")) + 1
-                           for d in evs if d["layer"] == "0")
+                           for d in evs if d["layer"] == "1")
                 with self.subTest(cap=cap, interval=j):
                     self.assertLessEqual(used, cap)
 
@@ -374,7 +411,7 @@ class TestLyricPreset(unittest.TestCase):
         ass, _, _, _ = self._ass(**{"subtitle.lyric_window": 2,
                                    "subtitle.lyric_max_rows": 12})
         for j, evs in enumerate(self._by_interval(ass)):
-            n = len([d for d in evs if d["layer"] == "0"])
+            n = len([d for d in evs if d["layer"] == "1"])
             with self.subTest(interval=j):
                 self.assertLessEqual(n, 2)
 
@@ -385,7 +422,7 @@ class TestLyricPreset(unittest.TestCase):
         for j, evs in enumerate(self._by_interval(ass)):
             deltas = set()
             for d in evs:
-                if d["layer"] != "0":
+                if d["layer"] != "1":
                     continue
                 self.assertEqual(d["cx"], d["cx2"], "横向中心被移动了")
                 deltas.add(d["y_to"] - d["y_from"])
@@ -395,7 +432,7 @@ class TestLyricPreset(unittest.TestCase):
     def test_scroll_happens_at_the_sentence_boundary(self):
         """滚在换点那一刻开始：\\move 的 t1 = 0，历时就是配置里的上滚时长。"""
         ass, _, _, _ = self._ass(**{"subtitle.lyric_scroll_ms": 600})
-        moved = [d for d in self._rows(ass) if d["layer"] == "0" and "\\move(" in d["head"]]
+        moved = [d for d in self._rows(ass) if d["layer"] == "1" and "\\move(" in d["head"]]
         self.assertTrue(moved)
         for d in moved:
             self.assertEqual((d["t1"], d["t2"]), (0, 600))
@@ -405,24 +442,26 @@ class TestLyricPreset(unittest.TestCase):
     def test_squeezed_sentence_slides_out_and_fades(self):
         """被行预算挤出去的那句在换点处上滚淡出，不是硬消失。"""
         ass, _, _, _ = self._ass(**{"subtitle.lyric_max_rows": 5})
-        exits = [d for d in self._rows(ass) if d["layer"] == "1"]
+        exits = [d for d in self._rows(ass) if d["layer"] == "2"]
         self.assertTrue(exits, "行预算挤压没触发，这条没验到东西")
         for d in exits:
             self.assertIn("\\fad(0,", d["head"])
             self.assertIn("\\move(", d["head"])
 
-    def test_highlight_marks_the_sentence_at_the_anchor(self):
+    def test_highlight_marks_the_sentence_in_the_box_centre(self):
+        """当前句只有一个、且落在框的垂直中心；上下文用压暗的说话人本色。"""
         ass, _, _, _ = self._ass(**{"subtitle.highlight": True,
                                     "subtitle.highlight_color": "#FFD98A"})
+        anchor = int(round(self._geom()["anchor"]))
         per = self._by_interval(ass)
         for j, evs in enumerate(per[:len(self.SCRIPT)]):
             cur = [d for d in evs if d["style"] == "LyricCur"]
             with self.subTest(interval=j):
                 self.assertEqual(len(cur), 1, "当前句该有且只该有一句是高亮色")
-                self.assertEqual(cur[0]["y_to"], 470)              # 落在锚点上
+                self.assertEqual(cur[0]["y_to"], anchor)           # 落在框垂直中心
                 self.assertIn(self.SCRIPT[j]["text"][:4], cur[0]["text"])
             for d in evs:
-                if d["layer"] == "0" and d["style"] != "LyricCur":
+                if d["layer"] == "1" and d["style"] != "LyricCur":
                     self.assertIn(d["style"], ("LyricCtxA", "LyricCtxB"))
         # 高亮色真的写进了样式表（#FFD98A → ASS 的 &H8AD9FF）
         self.assertIn("Style: LyricCur,%s,52,&H8AD9FF" % self.BASE["subtitle.font_family"], ass)
@@ -430,7 +469,7 @@ class TestLyricPreset(unittest.TestCase):
     def test_highlight_off_keeps_speaker_colours(self):
         """高亮关掉时三句同底色（读到哪里只靠位置看），不建高亮样式。"""
         ass, _, _, _ = self._ass(**{"subtitle.highlight": False})
-        styles = {d["style"] for d in self._rows(ass) if d["layer"] == "0"}
+        styles = {d["style"] for d in self._rows(ass) if d["layer"] == "1"}
         self.assertEqual(styles, {"SpeakerA", "SpeakerB"})
         self.assertNotIn("Style: LyricCur", ass)
         self.assertNotIn("LyricCtx", ass)
@@ -448,16 +487,69 @@ class TestLyricPreset(unittest.TestCase):
                "subtitle.lyric_max_rows": 24, "speaker_indicator.name_shown": False}
         ass, mc, _, _ = S.build_ass([{"speaker": "A", "text": long_text}], cfg,
                                     [{"start": 0.0, "end": 5.0}], 1920, 1080, "")
-        body = [d for d in self._rows(ass) if d["layer"] == "0"][0]["text"]
+        body = [d for d in self._rows(ass) if d["layer"] == "1"][0]["text"]
         rows = body.split("\\N")
         self.assertEqual(len(rows), -(-len(long_text) // mc))
 
-    def test_vertical_anchor_scales_with_the_frame(self):
-        """锚点按 1080 高的横屏定，竖屏按画幅比例换算（同一套配置两种画幅一致）。"""
-        cfg = dict(self.BASE, **{"subtitle.lyric_window": 1, "subtitle.lyric_anchor_y": 470})
-        ass_v, _, _, _ = S.build_ass(self.SCRIPT, cfg, self.TIMINGS, 1080, 1920, "_v")
-        ys = [d["y_to"] for d in self._rows(ass_v) if d["layer"] == "0"]
-        self.assertIn(int(round(470 * 1920.0 / 1080.0)), ys)
+    def test_box_geometry_uses_each_frames_own_margin(self):
+        """框几何：底 = 画幅高 − 边距，高 = 行数 × 行距，左右由 margin_lr 收。
+
+        竖屏取 margin_v_vertical、横屏取 margin_v。纵向基准从 0.41.0 起只剩这一条
+        ——旧配置里的绝对锚点 `lyric_anchor_y` 已删，两种画幅靠各自的边距各得其所
+        （从前靠 1080 比例换算）。
+        """
+        for (w, h), sfx, size, mvkey, mv in (
+                ((1920, 1080), "", 52, "subtitle.margin_v", 90),
+                ((1080, 1920), "_v", 40, "subtitle.margin_v_vertical", 220)):
+            cfg = dict(self.BASE, **{"subtitle.lyric_window": 1, mvkey: mv})
+            ass, _, _, _ = S.build_ass(self.SCRIPT, cfg, self.TIMINGS, w, h, sfx)
+            g = self._geom(cfg, (w, h), sfx)
+            box = self._boxes(ass)
+            with self.subTest(size=(w, h)):
+                self.assertEqual(len(box), 1, "歌词档该有且只有一条框事件")
+                self.assertEqual(box[0]["cx"], g["x1"], "框左边 ≠ margin_lr")
+                self.assertEqual(box[0]["y_to"], g["top"], "框顶 ≠ 高 − 边距 − 框高")
+                self.assertEqual(g["h"], 8 * max(1, int(round(size * S.LYRIC_LINE_PITCH))))
+                self.assertIn("l %d 0 l %d %d l 0 %d c"
+                              % (g["x2"] - g["x1"], g["x2"] - g["x1"], g["h"], g["h"]),
+                              box[0]["text"])
+
+    def test_box_fill_and_border_are_fixed(self):
+        """框填充 = bg_alpha（与旧 per-line 盒同口径）；描边写死、不读 subtitle.outline。"""
+        ass, _, _, _ = self._ass(**{"subtitle.bg_alpha": 64, "subtitle.outline": 6})
+        box = self._boxes(ass)[0]
+        self.assertIn(r"\1a&H40&", box["head"])                 # 64 → 0x40
+        self.assertIn(r"\bord%d" % S.LYRIC_BOX_BORDER, box["head"])
+        self.assertNotIn(r"\bord6", box["head"], "歌词档不该读 subtitle.outline")
+
+    def test_every_line_is_clipped_to_the_box(self):
+        """每条歌词都裁到框内：\\clip 的矩形与框四点一致（上滚时不许飘出框）。"""
+        ass, _, _, _ = self._ass()
+        g = self._geom()
+        want = r"\clip(%d,%d,%d,%d)" % (g["x1"], g["top"], g["x2"], g["bottom"])
+        lines = self._lyrics(ass)
+        self.assertTrue(lines)
+        for d in lines:
+            self.assertIn(want, d["head"])
+
+    def test_layers_run_box_then_text_then_exit(self):
+        """图层号显式三层：框 0 < 常驻句 1 < 淡出句 2。"""
+        ass, _, _, _ = self._ass(**{"subtitle.lyric_max_rows": 5})
+        self.assertEqual({d["layer"] for d in self._boxes(ass)}, {"0"})
+        self.assertEqual({d["layer"] for d in self._rows(ass) if not d["box"]}, {"1", "2"})
+
+    def test_style_forks_between_lyric_and_single_dual(self):
+        """样式分叉：歌词档 BorderStyle=1 + 写死小描边 + 全透明 per-line 盒；
+        单双行仍是 BorderStyle=3 + subtitle.outline。"""
+        ass_l, _, _, _ = self._ass(**{"subtitle.outline": 6})
+        head = ass_l.split("[Events]")[0]
+        self.assertIn(",&HFF000000,0,0,0,0,100,100,0,0,1,2,0,2,", head)   # 歌词档
+        for preset in ("single", "dual"):
+            cfg = {"subtitle.preset": preset, "speaker_indicator.mode": "style",
+                   "speaker_indicator.name_shown": False, "subtitle.outline": 6}
+            txt = S.build_ass(self.SCRIPT, cfg, self.TIMINGS, 1920, 1080, "")[0]
+            self.assertIn(",&H%02X000000,0,0,0,0,100,100,0,0,3,6,0,2," % 128, txt,
+                          "%s 档的样式被歌词档带跑了" % preset)
 
     def test_lrc_and_srt_ignore_the_window(self):
         """窗口只管画面字幕：SRT 与 LRC 一行一条，不看行数与窗口。"""

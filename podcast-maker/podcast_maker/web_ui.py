@@ -1898,6 +1898,21 @@ main{flex:1;overflow:auto;padding:22px}
 .f .desc{font-size:11px;color:var(--fg3);line-height:1.55}
 .f .sub{font-size:11px;color:var(--fg3);line-height:1.55}
 
+/* 字幕预览：两格 SVG 按真实画幅绘图（viewBox = 画幅），显示尺寸交给 CSS。
+   两格**同一个固定舞台高**：盒子比例与画幅比例不一致时，preserveAspectRatio
+   的 meet 会自动把画面摆正——横屏上下居中、竖屏左右居中，两格互相对齐。
+   若改回 height:auto + max-height，横屏盒子会正好等于画面比例而没有余量，
+   就只剩竖屏居中、横屏贴顶。 */
+.sub-prev{margin:2px 0 16px}
+.sub-prev .zhead{margin-bottom:8px}
+.sub-prev-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 18px;
+               align-items:start;max-width:780px}
+.sub-prev-cell{display:flex;flex-direction:column;gap:5px;min-width:0}
+.sub-prev-cap{font-size:11px;color:var(--fg3)}
+.sub-prev-cell svg{width:100%;height:400px;display:block;border-radius:6px;
+                   border:1px solid var(--line);background:var(--panel2)}
+.sub-prev-note{font-size:11px;color:var(--fg3);line-height:1.6;margin-top:9px;max-width:900px}
+
 input[type=text],input[type=number],select,textarea{
   background:var(--panel2);border:1px solid var(--line);border-radius:6px;
   padding:7px 10px;outline:none;width:100%;transition:border-color .12s}
@@ -2697,7 +2712,8 @@ function control(stage,key,spec){
   const isFont=!!(spec.font_pick&&spec.type==='enum');
   if(node&&!isFont){
     if(node.type==='range'){
-      node.oninput=()=>{if(val)val.textContent=fmtVal(spec,node.value)};
+      node.oninput=()=>{if(val)val.textContent=fmtVal(spec,node.value);
+        throttleSubPreview()};
       node.onchange=()=>put(key,spec.type==='int'?parseInt(node.value,10):parseFloat(node.value));
     }else if(spec.type==='int'||spec.type==='float'){
       node.onchange=()=>put(key,spec.type==='int'?parseInt(node.value,10):parseFloat(node.value));
@@ -2743,6 +2759,8 @@ async function put(key,value){
   // 同时决定「本地语音环境」那块要不要露出来（只有 Qwen3-TTS 需要它）
   if(key==='tts.engine'){loadVoices(false); paintTts();}
   if(key.indexOf('tts.speed')===0||key==='script.target_minutes') recalcSoon();
+  // 字幕相关点位落值后重画预览：版式 / 字号 / 边距 / 底色 / 说话人分色都影响它
+  if(key.indexOf('subtitle.')===0||key==='speaker_indicator.mode') drawSubtitlePreview();
 }
 let recalcTimer=null;
 function recalcSoon(){clearTimeout(recalcTimer);recalcTimer=setTimeout(()=>{if(SCRIPT.length)recalc()},700)}
@@ -2793,7 +2811,7 @@ const ZONES=[
   ['subtitle','版式与字号',['subtitle.preset','subtitle.font_size','subtitle.font_size_vertical']],
   ['subtitle','高亮',['subtitle.highlight','subtitle.highlight_color']],
   ['subtitle','歌词窗口',['subtitle.lyric_window','subtitle.lyric_max_rows',
-                        'subtitle.lyric_anchor_y','subtitle.lyric_scroll_ms']],
+                        'subtitle.lyric_scroll_ms']],
   ['subtitle','边距与底框',['subtitle.margin_lr','subtitle.margin_v','subtitle.margin_v_vertical',
                           'subtitle.outline','subtitle.bg_alpha']]
 ];
@@ -2884,6 +2902,9 @@ function renderConfig(){
     card.className='card';
     card.innerHTML='<h2>'+esc(secLabel(sec))+'</h2>'+
       (CFG.ui.section_note[sec]?'<p class="note">'+esc(CFG.ui.section_note[sec])+'</p>':'');
+    // 字幕卡在标题下先挂一块实时预览（横屏格 + 竖屏格）：改「版式与字号 / 边距」
+    // 时图就在眼前。挂法与 tts 卡那块相同（都按 sec 判定），只是位置在开头而非末尾。
+    if(sec==='subtitle') card.insertAdjacentHTML('beforeend', subtitlePreviewHtml());
     const zones=zoneList(sec,groups[sec]||[]);
     zones.forEach(z=>{
       // 只有一件事的卡不画小标题：多一行标题等于给一个不言自明的分区加注解
@@ -2910,6 +2931,8 @@ function renderConfig(){
   applyEngineScope();
   // 本地语音环境那块刚重建出来，探一次现状（缺环境 / 缺包 / 缺模型）
   if(el('tts-env')) refreshTtsState();
+  // 字幕预览也随整卡重建，重画一次（块不在时 drawSubtitlePreview 直接返回）
+  drawSubtitlePreview();
 }
 function renderQuick(){
   // 称呼与语速跟脚本同时生效：称呼直接写进提示词，模型据此称呼两位说话人。
@@ -3118,6 +3141,96 @@ function ttsEnvHtml(){
     '</div>'+
     '<div class="bar"><i id="tts-bar"></i></div>'+
     '<pre class="log" id="tts-log" style="display:none;margin-top:10px">等待任务。</pre>'+
+  '</div>';
+}
+/* ---- 字幕预览（横屏格 + 竖屏格）----
+   照抄「本地语音环境」那块的做法：renderConfig 里按 sec 挂一块。
+   两格 SVG 的 viewBox 就是真实画幅（1920×1080 / 1080×1920），内部坐标全用真实
+   像素——位置 / 框宽高 / 边距 / 透明度全部零换算，显示大小交给 CSS。所以
+   margin_v=90 就是画面里的 90px、bg_alpha=128 就是 50% 透明，字号也随画幅等比缩。
+   三条精度边界（块内小字与这里同源）：①字号等比缩，不能当字体样张；②不模拟后端
+   的四级断行，示例短句装不下就按字数硬切，断点位置不作数；③台词是示例。 */
+const SUB_PREV_TEXT=['这是一句示例台词。','第二句稍微长一些，用来看折行。','第三句回到短句。'];
+function estSubW(s,size){
+  let w=0;
+  for(const ch of s){w+=/[\u2e80-\u9fff\uff00-\uffef\u3000-\u303f]/.test(ch)?size:size*0.52}
+  return w;
+}
+function paintSubPreview(svg,W,H,sfx){
+  if(!svg) return;
+  const num=k=>{const x=cfgVal(k);return (x===null||x===undefined||x==='')?null:Number(x)};
+  const preset=String(cfgVal('subtitle.preset')||'dual');
+  const size=num('subtitle.font_size'+(sfx?'_vertical':''))||52;
+  const mlr=num('subtitle.margin_lr')||0;
+  const mv=num(sfx?'subtitle.margin_v_vertical':'subtitle.margin_v')||0;
+  const outline=num('subtitle.outline')||0;
+  const aRaw=num('subtitle.bg_alpha'), a=(aRaw===null?128:aRaw);
+  const fillOp=Math.max(0,Math.min(1,1-a/255)).toFixed(3);
+  const hl=!!cfgVal('subtitle.highlight');
+  const hlColor=cfgVal('subtitle.highlight_color')||'#FFD98A';
+  const txtColor=cfgVal('subtitle.color_a')||'#FFFFFF';
+  // 行距与后端同口径：int(round(字号 × LYRIC_LINE_PITCH))——预览与成片不许各算各的
+  const pitch=Math.round(size*1.35), cx=W/2, R=Math.round;
+  let o='<rect x="0" y="0" width="'+W+'" height="'+H+'" fill="#0d1117"/>';
+  if(preset==='lyric'){
+    // 框几何与后端同源（见 subtitle_engine._lyric_events）：x1=mlr、x2=W-mlr、
+    // 底=H-mv、高=行数×行距；当前句落框垂直中心，超出框的用 clipPath 裁掉。
+    const maxRows=Math.max(2,num('subtitle.lyric_max_rows')||8);
+    const fh=maxRows*pitch, x1=mlr, x2=W-mlr, y2=H-mv, y1=y2-fh;
+    const anchor=y2-fh/2, cur=1;
+    const base=[0,2,4].map(v=>v*pitch);          // 三句各 1 行：base = 累计行 × 行距
+    const cid='pvclip'+sfx;
+    o+='<defs><clipPath id="'+cid+'"><rect x="'+x1+'" y="'+R(y1)+'" width="'+(x2-x1)+
+       '" height="'+R(fh)+'"/></clipPath></defs>';
+    o+='<rect x="'+x1+'" y="'+R(y1)+'" width="'+(x2-x1)+'" height="'+R(fh)+
+       '" fill="#000000" fill-opacity="'+fillOp+
+       '" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="2"/>';
+    o+='<g clip-path="url(#'+cid+')">';
+    for(let k=0;k<3;k++){
+      const y=R(anchor+(base[k]-base[cur]));
+      const col=(k===cur&&hl)?hlColor:txtColor;
+      const op=(k===cur||!hl)?1:0.45;
+      o+='<text x="'+cx+'" y="'+y+'" text-anchor="middle" dominant-baseline="central" '+
+         'font-size="'+size+'" fill="'+col+'" fill-opacity="'+op+'">'+esc(SUB_PREV_TEXT[k])+'</text>';
+    }
+    o+='</g>';
+  }else{
+    // 单双行：文字底部对齐（距底 mv），整块一个填充盒（含 outline 内边距）。
+    const lines=(preset==='single')?SUB_PREV_TEXT.slice(0,1):SUB_PREV_TEXT.slice(0,2);
+    const bottom=H-mv-outline, lh=pitch;
+    const ys=lines.map((_,i)=>bottom-(lines.length-1-i)*lh);
+    const maxw=Math.max.apply(null,lines.map(s=>estSubW(s,size)));
+    const top=Math.min.apply(null,ys)-size*0.82-outline;
+    const bot=Math.max.apply(null,ys)+size*0.22+outline;
+    o+='<rect x="'+R(cx-maxw/2-outline)+'" y="'+R(top)+'" width="'+R(maxw+outline*2)+
+       '" height="'+R(bot-top)+'" fill="#000000" fill-opacity="'+fillOp+'"'+
+       (outline>0?' stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="'+outline+'"':'')+'/>';
+    for(let i=0;i<lines.length;i++)
+      o+='<text x="'+cx+'" y="'+R(ys[i])+'" text-anchor="middle" font-size="'+size+
+         '" fill="'+(hl?hlColor:txtColor)+'">'+esc(lines[i])+'</text>';
+  }
+  svg.innerHTML=o;
+}
+function drawSubtitlePreview(){
+  paintSubPreview(el('sub-prev-h'),1920,1080,'');
+  paintSubPreview(el('sub-prev-v'),1080,1920,'_v');
+}
+let subPrevTimer=null;
+function throttleSubPreview(){
+  clearTimeout(subPrevTimer); subPrevTimer=setTimeout(drawSubtitlePreview,60);
+}
+function subtitlePreviewHtml(){
+  return '<div class="sub-prev">'+
+    '<div class="zhead">预览</div>'+
+    '<div class="sub-prev-grid">'+
+      '<div class="sub-prev-cell"><div class="sub-prev-cap">横屏 1920×1080</div>'+
+        '<svg id="sub-prev-h" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid meet"></svg></div>'+
+      '<div class="sub-prev-cell"><div class="sub-prev-cap">竖屏 1080×1920</div>'+
+        '<svg id="sub-prev-v" viewBox="0 0 1080 1920" preserveAspectRatio="xMidYMid meet"></svg></div>'+
+    '</div>'+
+    '<div class="sub-prev-note">①字号随画面等比缩小，不能当字体样张用；'+
+    '②不模拟后端的四级断行——示例短句装不下就按字数硬切，断点位置不作数；'+
+    '③台词是示例，不取自当期脚本。</div>'+
   '</div>';
 }
 async function refreshTtsState(){

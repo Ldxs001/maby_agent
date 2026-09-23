@@ -36,3 +36,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # 要 import �
 - **`check_buttons.js`** — 浏览器外的渲染体检：把卡片渲染函数真跑一遍，逐条校验拼串
   出来的事件属性语法与下拉过滤。见 `README.md`「端到端为什么要走 HTTP」一节。
 - **`e2e_*.py`** — 端到端验收（起真服务、跑真权重）。
+- **`verify_pypi_wheel.py`** — 发布前干跑构建：照打包模板在本地构建一次 wheel（**不上传**），
+  列出内容，并核对「`entry_points` 声明的模块是否真在包内」——这条只能把 wheel 解开逐条看
+  才会暴露（声明了入口却没打进包里，装完命令直接失败）。加 `--against <另一个.whl>` 按内容比对。
