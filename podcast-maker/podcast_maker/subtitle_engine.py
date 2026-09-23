@@ -31,6 +31,9 @@ LRC 是音频平台的歌词位（只有起始时间、没有样式）。
     wrap_text       贪心填满：第一行撑满，余数全甩末行（单行 / 双行档）
     wrap_balanced   先定行数再均分，行数由每行容量算出来（歌词档）
 
+还有一层不在「折行」里，却同样决定字幕成不成话：
+    split_sentences 一句话该有多长——程序自己拼的文本按正文那把尺切句
+
 断词率必须为 0，否则产物门禁判 FAIL。歌词档必须用 wrap_balanced 那一套切点
 统计（见 count_word_breaks 的 balanced 形参），否则算的是另一种折法的账。
 """
@@ -44,6 +47,11 @@ _LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-\.]*")
 
 # 逗号类标点断行后不宜留在行首
 _TAIL_ONLY = set("，。！？；：、）》】”…—·")
+
+# 句读标点：**一句话之后**可以停下换句的位置（见 split_sentences）。
+# 与 BREAK_PUNCT 的差别只在去掉了 `…` 与 `—`：它们是连接号，不是句读点——
+# 断在「——」之后会留下一行以破折号结尾、下一行以破折号开头的怪东西。
+SENTENCE_PUNCT = set("。！？；：，、）》】”")
 
 
 def _in_latin_token(text, i):
@@ -138,13 +146,17 @@ def _nearest_legal_break(text, pos, want, lo, hi):
     向两侧交替外扩：先试目标位置，再试「多切一个字」与「少切一个字」。一边倒的
     搜索会把行越推越偏——只会往小里找，第一行就永远贴不满；只会往大里找，末行
     就永远是个尾巴。
+
+    **找不到返回 None**，不返回一个「大概齐」的位置。窗口里没有合法切点，说明
+    窗口给错了，该由调用方扩窗或加行；在这一层悄悄兜底硬切，等于把「切在词中间」
+    藏进一个看不出问题的返回值里——2c / 2d 的两期就是死在这个 `return hi` 上。
     """
     for d in range(0, hi - lo + 1):
         cands = (want,) if d == 0 else (want + d, want - d)
         for c in cands:
             if lo <= c <= hi and _legal_break(text, pos + c):
                 return c
-    return hi          # 窗口内没有一个合法位置，只能硬切
+    return None
 
 
 def wrap_balanced(text, max_chars):
@@ -162,28 +174,80 @@ def wrap_balanced(text, max_chars):
     「从哪儿开始找」，找出来的位置照样合法。每行都 ≤ max_chars——这是硬保证，
     末行也一样（与 wrap_text「末行允许超出、不丢字」的取舍不同：歌词窗口里
     一行超出画面宽会直接顶到边上，比多一行难看）。
+
+    **合法是硬约束，均衡只是偏好，行数是下界。** 三者冲突时的次序不能反：
+    被 `_in_latin_token` 护住的 token 横跨整个均衡窗口时，窗口里一个合法切点都
+    没有——从前那版在这里兜底硬切（`…semantic-` / `split`、`…RAG Assista` / `nt`）。
+    现在的做法是把窗口放开到整行：宁可这一行短一点、后面多占一行，也不把词切开。
+    只有整行只装得下一个超长 token 时才硬切——那时确实无点可切。
     """
     text = (text or "").strip()
     if not text:
         return [""]
     if len(text) <= max_chars:
         return [text]
-    need = -(-len(text) // max_chars)                 # 放得下所需的最少行数
-    out, pos = [], 0
-    for i in range(need):
-        left = need - i                               # 含本行还剩几行
-        rem = len(text) - pos
-        if left == 1:
+    out, pos, n = [], 0, len(text)
+    while pos < n:
+        rem = n - pos
+        if rem <= max_chars:
             out.append(text[pos:])
             break
+        left = -(-rem // max_chars)                    # 含本行，装下余料至少要几行
         want = min(max_chars, int(round(rem / float(left))))
         # 本行至少切这么多，剩下 left-1 行才装得下；至多切这么多，剩下每行至少一字
         lo = max(1, rem - (left - 1) * max_chars)
-        hi = min(max_chars, rem - (left - 1))
-        cut = _nearest_legal_break(text, pos, want, lo, hi)
+        cut = _nearest_legal_break(text, pos, want, lo, max_chars)
+        if cut is None:
+            # 均衡窗口里没有合法切点：放开到整行找最近的合法点，行数由「下界」
+            # 变「下界 + 1」——多一行是版式问题，切在词中间是读错意思。
+            cut = _nearest_legal_break(text, pos, want, 1, max_chars)
+        if cut is None:
+            cut = max_chars                             # 整行就是一个超长 token
         out.append(text[pos:pos + cut])
         pos += cut
     return [ln for ln in out if ln] or [text]
+
+
+def split_sentences(text, max_chars):
+    """把一段文本切成若干**合尺的句子**，每句 ≤ max_chars。返回句子列表。
+
+    分工要说清：`wrap_text` / `wrap_balanced` 管「一句话在画面上排几行」，
+    本函数管「一句话该有多长」。两者都不是可选的——一行排得再漂亮，一句话
+    几百字放进歌词框照样被 `\\clip` 裁掉。
+
+    这一层是给**程序自己拼的文本**用的（片头 / 前期回顾 / 片尾）：它们按设计粘在
+    门禁之后，长度没有任何人管，于是长成两百字的「一句」。按正文那把尺
+    （`gate.max_chars`）切开，是「前置规范大于后验证」的落地——不合尺的东西在
+    拼出来的那一刻就该合尺，不甩给下游去拒（下游只会拒，不会改）。
+
+    切点只落在句读标点之后（标点跟着前一句走）；一段里没有标点可切时，先退到
+    西文词间空格（不切词），再退到通用的四级折行判定。所以切出来的一定是
+    「读得下去的句子」，不会是半截词。空文本返回空列表。
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    out, start, n = [], 0, len(text)
+    while start < n:
+        rest = text[start:]
+        if len(rest) <= max_chars:
+            out.append(rest)
+            break
+        cut = -1
+        for i in range(start + max_chars - 1, start, -1):
+            if text[i] in SENTENCE_PUNCT:
+                cut = i + 1
+                break
+        if cut <= start:
+            for i in range(start + max_chars - 1, start, -1):
+                if text[i] == " ":
+                    cut = i + 1          # 空格跟着前一句，下一句不从空格起行
+                    break
+        if cut <= start:
+            cut = start + max(1, find_break(rest, max_chars))
+        out.append(text[start:cut])
+        start = cut
+    return out
 
 
 def count_word_breaks(text, max_chars, max_lines=2, balanced=False):

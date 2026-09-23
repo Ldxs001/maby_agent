@@ -405,5 +405,68 @@ class TestScriptJobEntry(BatchBase):
         self.assertIn("后端连不上", j["error"])
 
 
+class TestBatchReportsUnpassedEpisodes(BatchBase):
+    """批量报「成功」，但产物校验过没过要单独说出来。
+
+    「成功」说的是这一期**跑完了**（没有中途退出、产物落了盘），这个口径不变；
+    过没过是另一件事，写在报告里。从前批量只数「成功几期」，九项里挂了一项也照样
+    一片绿——人交了任务、等它跑完，界面上看不到任何异常，得自己记得去翻报告才
+    知道有问题（2c / 2d 就是这么静默掉的）。
+    """
+
+    def test_unpassed_episode_is_reported_not_silent(self):
+        self.put_scripts(["1", "2"])
+
+        def fake(body, job=None):
+            no = str(body.get("episode_no"))
+            bad = no == "2"
+            return {"episode_files": {},
+                    "report": {"passed": not bad,
+                               "fails": [{"label": "断词率"}] if bad else [],
+                               "warns": []}}
+
+        with self.patched_render(fake):
+            r = web_ui.api_batch({"kind": "render", "project_id": self.pid,
+                                  "episodes": ["1", "2"]})
+            self.assertTrue(r.get("ok"), r)
+            job = wait_job(r["task_id"])
+
+        res = job.get("result") or {}
+        self.assertEqual(res.get("done"), ["1", "2"],
+                         "跑完了就是「成功」，这一条分类不动")
+        self.assertEqual(res.get("failed"), [])
+        self.assertEqual(res.get("not_passed"),
+                         [{"no": "2", "fails": ["断词率"], "warns": []}],
+                         "未过的期必须单独报出来")
+
+    def test_all_passed_leaves_the_list_empty(self):
+        """全过时那个口必须是空的——不然界面上会挂一条无意义的提示。"""
+        self.put_scripts(["1"])
+
+        def fake(body, job=None):
+            return {"episode_files": {}, "report": {"passed": True,
+                                                    "fails": [], "warns": []}}
+
+        with self.patched_render(fake):
+            r = web_ui.api_batch({"kind": "render", "project_id": self.pid,
+                                  "episodes": ["1"]})
+            job = wait_job(r["task_id"])
+        self.assertEqual((job.get("result") or {}).get("not_passed"), [])
+
+    def test_script_batch_has_no_render_report(self):
+        """脚本批任务没有产物报告这一说：那个口照样在，但是空的。"""
+        def fake(body, job=None):
+            return {"ok": True}
+
+        with mock.patch.object(web_ui, "_script_generate_work", fake):
+            r = web_ui.api_batch({"kind": "script", "project_id": self.pid,
+                                  "episodes": ["1", "2"]})
+            self.assertTrue(r.get("ok"), r)
+            job = wait_job(r["task_id"])
+        res = job.get("result") or {}
+        self.assertEqual(res.get("done"), ["1", "2"])
+        self.assertEqual(res.get("not_passed"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -654,6 +654,39 @@ class TestRenderStageDoesNotWriteScript(unittest.TestCase):
                           "读坏了要当没有，不是抛出去把人挡在门外")
 
 
+class TestRenderAlwaysRecordsTheEpisode(unittest.TestCase):
+    """产物落了盘就出片：记账不看门禁过没过。
+
+    从前是「九项全过才入册」，未过的一期在册子上压根不存在：盘上音视频字幕封面
+    一样不少、进度表的下期号还停在这一期；报告落了盘没人看，界面报「成功」——
+    四份信号互相打架，账是空的。过没过写在报告里（清单的 `report` 与「报告/」
+    那一份），账只记「出没出片」这一件事。
+    """
+
+    def _tail_of_run_episode(self):
+        """出片那一段（`run_episode` 只是包了本地语音服务的起停，正文在
+        `_run_episode`）——从门禁判定到结果装箱之间。"""
+        import io
+        from podcast_maker import pipeline
+        src = io.open(pipeline.__file__, encoding="utf-8").read()
+        body = src.split("def _run_episode(")[1].split("\ndef ")[0]
+        return body.split('if report["passed"]:')[1].split("result.update(")[0]
+
+    def test_record_episode_is_outside_both_branches(self):
+        tail = self._tail_of_run_episode()
+        passed_branch, _sep, after = tail.partition("else:")
+        self.assertIn("clear_lock", passed_branch)
+        self.assertNotIn("record_episode", passed_branch,
+                         "记账不该再挂在「全过」那一支上")
+        unpassed_branch = after.split("if project_id:")[0]
+        self.assertIn("write_lock", unpassed_branch,
+                      "未过要留痕，--continue 靠它认期")
+        self.assertNotIn("record_episode", unpassed_branch,
+                         "记账也不该挂在「未过」那一支上")
+        self.assertIn("record_episode", after,
+                      "产物落盘就要记账，与过没过无关")
+
+
 class TestBannedFeedbackIsActionable(unittest.TestCase):
     """措辞命中的回灌要精确到句、给全量、带替换落点。
 

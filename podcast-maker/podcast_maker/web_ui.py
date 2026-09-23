@@ -1107,7 +1107,7 @@ def api_batch(body):
                              % "、".join(missing)}
 
     def _run(job):
-        done, failed = [], []
+        done, failed, not_passed = [], [], []
         streak, last_key = 0, ""
         total = len(eps)
         # 本地语音引擎：整批共用一次服务起停。逐期各起各停的话，每一期都要重新
@@ -1142,9 +1142,18 @@ def api_batch(body):
                             raise RuntimeError(res.get("error") or "生成失败")
                         done.append(no)
                     else:
-                        _render_sync(dict(body, project_id=pid, episode_no=no,
-                                          script=[]), job=job)
+                        res = _render_sync(dict(body, project_id=pid,
+                                                episode_no=no, script=[]), job=job)
                         done.append(no)
+                        # 一期跑完（产物落盘、报告落盘）算成功，但**过没过**要
+                        # 单独报：从前批量只数「成功几期」，九项里挂了一项也照样
+                        # 一片绿，人得自己记得去历史里翻报告才看得出问题。
+                        rep = (res or {}).get("report") or {}
+                        if not rep.get("passed", True):
+                            not_passed.append({
+                                "no": no,
+                                "fails": [i.get("label") for i in (rep.get("fails") or [])],
+                                "warns": [i.get("label") for i in (rep.get("warns") or [])]})
                     streak, last_key = 0, ""
                 except Exception as e:                        # noqa: BLE001
                     msg = str(e)
@@ -1162,7 +1171,8 @@ def api_batch(body):
             if serve:
                 tts_engine.release_service(blog)
         job["batch"] = {"index": total, "total": total, "no": ""}
-        return {"kind": kind, "done": done, "failed": failed, "requested": total}
+        return {"kind": kind, "done": done, "failed": failed,
+                "not_passed": not_passed, "requested": total}
 
     jid = pipeline.run_async("batch", _run,
                              "%s · %d 期" % (item.get("name") or pid, len(eps)))
@@ -3607,9 +3617,18 @@ async function watchBatch(tid,which){
     const res=j.result||{};
     if(j.status==='done'){
       const ok=(res.done||[]).length, bad=(res.failed||[]).length;
+      const np=res.not_passed||[];
       if(lg&&bad) lg.textContent+='\n\n失败明细：\n'+
         (res.failed||[]).map(f=>'第 '+f.no+' 期：'+f.error).join('\n');
-      toast('批量跑完：成功 '+ok+' 期'+(bad?('，失败 '+bad+' 期（可在选期里重勾再跑）'):''),
+      /* 「成功」报的是「这一期跑完了」——没有中途退出、产物落了盘，就是成功。
+         产物校验过没过是另一件事，写在报告里：不把它说出来，界面上就只剩一片
+         绿，人得自己记得去翻报告才看得出问题（2c / 2d 就是这么静默掉的）。 */
+      if(lg&&np.length) lg.textContent+='\n\n产物校验未过：\n'+
+        np.map(x=>'第 '+x.no+' 期：'+
+                  ((x.fails||[]).concat(x.warns||[]).join('、')||'有项未过')+
+                  '（在「历史」里点报告看明细）').join('\n');
+      toast('批量跑完：成功 '+ok+' 期'+(bad?('，失败 '+bad+' 期（可在选期里重勾再跑）'):'')+
+            (np.length?('，其中 '+np.length+' 期产物校验未过（见日志与报告）'):''),
             bad?'err':'ok');
     }else{
       toast('批任务失败：'+(j.error||''),'err');
@@ -3798,8 +3817,12 @@ async function pollJob(){
   el('btn-render').disabled=false;
   const sb=el('btn-stop-r'); if(sb) sb.style.display='none';
   if(j.status==='done'){
-    toast('合成完成','ok');
     const res=j.result||{};
+    /* 「合成完成」报的是「跑完了」。产物校验过没过单独说一句——产物区下面就
+       是门禁表，但一句话都不提的话，那三行小字很容易被当成装饰。 */
+    const rp=res.report||{}, miss=(rp.fails||[]).concat(rp.warns||[]);
+    toast(miss.length?('合成完成：'+miss.length+' 项未过（见产物校验表）'):'合成完成',
+          miss.length?'err':'ok');
     if(res.episode_files) showOutputs(res);
     loadProjects(); loadHistory(); loadEpisodes('r');
   }else{
@@ -3838,11 +3861,16 @@ async function loadHistory(){
   if(!r.ok) return;
   const ps=r.projects||[];
   /* 一期由「树根 + 期号」定位：产物按类型分放在项目里，没有「期目录」
-     这种东西可以指。 */
-  el('history').innerHTML=ps.length?ps.slice(0,20).map(p=>
-    '<div class="kv"><b>'+esc((p.created||'').slice(0,16))+'</b><span>'+
-    (p.episode_no?('第 '+esc(p.episode_no)+' 期 · '):'')+esc(p.title||p.root)+
-    ' <a href="#" onclick="viewReport(\''+esc(p.root)+'\',\''+esc(p.no)+'\');return false">报告</a></span></div>').join('')
+     这种东西可以指。
+     未过的期一样在历史里——产物落了盘就出片。报告链接本来就有，缺的是
+     「一眼看出这期有项没过」：过没过写在清单的 report 里，就在这一行标出来。 */
+  el('history').innerHTML=ps.length?ps.slice(0,20).map(p=>{
+    const rp=p.report||{}, miss=(rp.fails||[]).concat(rp.warns||[]);
+    const mark=miss.length?(' <span class="mk bad" title="'+esc(miss.join('、'))+
+                            '">✕ '+miss.length+' 项未过</span>'):'';
+    return '<div class="kv"><b>'+esc((p.created||'').slice(0,16))+'</b><span>'+
+    (p.episode_no?('第 '+esc(p.episode_no)+' 期 · '):'')+esc(p.title||p.root)+mark+
+    ' <a href="#" onclick="viewReport(\''+esc(p.root)+'\',\''+esc(p.no)+'\');return false">报告</a></span></div>'}).join('')
     :'<div class="empty">尚无产出</div>';
 }
 async function viewReport(root,no){

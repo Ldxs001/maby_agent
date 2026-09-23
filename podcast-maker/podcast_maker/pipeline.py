@@ -545,10 +545,13 @@ def episode_form(root, no):
 
 
 def review_rows(base, proj_item, episode_no, cfg, log=None):
-    """前期回顾：读上一期，组一句固定文本。返回**已经填好文本的句子列表**。
+    """前期回顾：读上一期，组一段固定文本。返回**已经填好文本的句子列表**。
 
     与片头尾同类：模型不参与，程序逐字拼（见 `script_engine.glue_intro_outro`），
-    位置在片头之后、正文之前。
+    位置在片头之后、正文之前。模板是一条，拼出来却可能是两百字——**所以拼完之后
+    按正文那把尺（`gate.max_chars`）切成若干句**：程序拼的文本同样要合尺，不合尺
+    的句子放进画面会被歌词框的 `\\clip` 裁掉，而它绕过了脚本阶段的门禁、没有第二
+    个人会管长度。
 
     两路引用：
     - **期主旨**取地图行（`project_store.map_episodes` 里的 gist）——地图挂在项目
@@ -558,8 +561,8 @@ def review_rows(base, proj_item, episode_no, cfg, log=None):
       json 里：正文是扁平句子数组，出片、时长、字幕、视频、前端预览都按数组读，
       加字段会一次踩掉所有这些读取方。
 
-    **任一路缺就整句不粘**：第 1 期、本期不在地图上、上一期不在本项目、上一期
-    没留下段主旨——一律按「这句没有」处理，绝不留「上期我们聊了……」后面空着。
+    **任一路缺就整段不粘**：第 1 期、本期不在地图上、上一期不在本项目、上一期
+    没留下段主旨——一律按「这段没有」处理，绝不留「上期我们聊了……」后面空着。
     开关默认关（`intro_outro.review`）。
     """
     log = log or (lambda m: None)
@@ -588,13 +591,19 @@ def review_rows(base, proj_item, episode_no, cfg, log=None):
     if missing:
         log("前期回顾：%s 取不到，这一句不粘" % "、".join(missing))
         return []
+    # 段主旨自带句号，拼进「讲了…等」这一段时要去掉：留着会长出「逻辑。、」
+    # 与「操作。等。」这种拼坏了的标点。
     fill = {"prev_title": title, "prev_gist": gist,
-            "prev_topics": "、".join(topics)}
-    rows = [{"speaker": r["speaker"], "emotion": r["emotion"],
-             "text": str(r["text"]).format(**fill)}
-            for r in (INTRO_OUTRO.get("review") or [])]
-    log("前期回顾：引用第 %s 期《%s》的期主旨与 %d 条段主旨"
-        % (prev.get("no"), title, len(topics)))
+            "prev_topics": "、".join(t.rstrip("。！？；，、 ") for t in topics)}
+    limit = max(8, int(cfg.get("gate.max_chars", 40)))
+    rows = []
+    for r in (INTRO_OUTRO.get("review") or []):
+        for sentence in subtitle_engine.split_sentences(str(r["text"]).format(**fill),
+                                                        limit):
+            rows.append({"speaker": r["speaker"], "emotion": r["emotion"],
+                         "text": sentence})
+    log("前期回顾：引用第 %s 期《%s》的期主旨与 %d 条段主旨，按正文尺（≤%d 字）"
+        "切成 %d 句" % (prev.get("no"), title, len(topics), limit, len(rows)))
     return rows
 
 
@@ -1022,22 +1031,30 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
 
     if report["passed"]:
         script_engine.clear_lock(work)
-        # 只在整条链都过了才记账。未过的片子不占期号——
-        # 占了下一次重跑就得跳号，进度表会与现实对不上。
-        if project_id:
-            try:
-                project_store.record_episode(
-                    base, project_id, title, episode_no,
-                    manifest.get("created", ""))
-                nxt = (project_store.find(base, project_id) or {}).get("next_episode")
-                log("已记入项目「%s」，下一期自动排到第 %s 期"
-                    % ((proj_item or {}).get("name", project_id), nxt))
-            except project_store.ProjectError as e:
-                log("项目记账失败（产物不受影响）：%s" % e)
     else:
+        # 未过项留痕：`--continue` 靠它认出「哪一期卡在这儿」，排查也靠它。
+        # 它不再拦人——产物与报告都已经落盘，要不要带着问题出片是人的选择，
+        # 与脚本阶段的定调一致（见 `script_engine.write_lock` 的说明）。
         script_engine.write_lock(work, "render",
                                  "；".join(i["label"] for i in report["fails"]) or "warn 项未放行",
                                  {}, 1)
+        log("产物校验未过：%s —— 产物与报告都已落盘，这一期照常出片"
+            % "、".join(i["label"] for i in report["fails"] + report["warns"]))
+
+    # **产物落了盘就记账。** 从前只有九项全过才入册，未过的一期在册子上压根
+    # 不存在：盘上音视频字幕封面一样不少、进度表的下期号还停在这一期，而报告
+    # 没人看、界面报「成功」——三份盘互相打架，账上却是空的。过没过是**报告**
+    # 的事（清单里的 `report` 与「报告/」那一份写着），账只记「出没出片」。
+    if project_id:
+        try:
+            project_store.record_episode(
+                base, project_id, title, episode_no,
+                manifest.get("created", ""))
+            nxt = (project_store.find(base, project_id) or {}).get("next_episode")
+            log("已记入项目「%s」，下一期自动排到第 %s 期"
+                % ((proj_item or {}).get("name", project_id), nxt))
+        except project_store.ProjectError as e:
+            log("项目记账失败（产物不受影响）：%s" % e)
 
     result.update({"assets": assets, "report": report, "script_file": script_path,
                    "episode_files": ep,

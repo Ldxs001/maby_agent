@@ -239,12 +239,56 @@ class TestBalancedWrap(unittest.TestCase):
     TEXTS = [LONG, LONG * 2, "中" * 96, "我们把 GPT-4 和 Claude-3.5 放在一起比较它们的表现，"
                                "看看谁在长句里的断点更稳一点。"]
 
-    def test_line_count_is_what_the_capacity_needs(self):
+    def test_line_count_is_a_lower_bound_not_a_target(self):
+        """行数是**下界**：容量算出来的最少行数一定要够，但允许更多一行。
+
+        「合法」是硬约束，「均衡」只是偏好，行数服从前两者。窗口里找不到合法
+        断点时宁可多占一行（见 test_token_covering_the_window_never_gets_cut），
+        所以这里判 ≥——判 = 会把「不许切词」这条硬约束判死。
+        """
         for text in self.TEXTS:
             for mc in (12, 22, 33):
                 with self.subTest(text=text[:8], mc=mc):
                     rows = S.wrap_balanced(text, mc)
-                    self.assertEqual(len(rows), -(-len(text) // mc))
+                    self.assertGreaterEqual(len(rows), -(-len(text) // mc))
+
+    def test_count_is_exactly_the_lower_bound_when_every_cut_is_legal(self):
+        """切点处处合法时不留余量：纯中文不触发任何禁则，行数就是下界。"""
+        for n in (24, 96, 101):
+            text = "中" * n
+            with self.subTest(n=n):
+                self.assertEqual(len(S.wrap_balanced(text, 12)), -(-n // 12))
+
+    # 两处实测样本：2c / 2d 两期就是死在这上面。这类退化只在「被保护的西文词
+    # 恰好横跨整个均衡窗口」时出现，随手编的短句复现不了，所以把现场的句子搬进来。
+    TOKEN_COVER_CASES = [
+        ("上期《零依赖拆解与渐进加载的决策引擎》聊的是以 semantic-split 为核心，"
+         "阐释 Pipeline A/B/C 递进匹配、懒加载门禁与 0.6 阈值复用机制，"
+         "实现低开销任务分解。", 33),
+        ("我们把 GPT-4 与 RAG Assistant 放在一起比较，"
+         "看看谁是靠 semantic-split 做任务分解的。", 20),
+    ]
+
+    def test_token_covering_the_window_never_gets_cut(self):
+        """受保护的词横跨整个均衡窗口时，宁可加一行，也不切在词中间。
+
+        从前的 `_nearest_legal_break` 在窗口里找不到合法点就 `return hi` 兜底
+        硬切，切出 `…聊的是以 semantic-` / `split`、`…靠 semantic-sp` / `lit`——
+        一个一百多行的报告里只有这一处违规，整期却被判不过。
+        """
+        for text, mc in self.TOKEN_COVER_CASES:
+            rows = S.wrap_balanced(text, mc)
+            at = 0
+            for row in rows[:-1]:
+                at += len(row)
+                with self.subTest(mc=mc, at=at):
+                    self.assertFalse(S._in_latin_token(text, at),
+                                     "切在西文词中间：%r" % (rows,))
+            with self.subTest(mc=mc):
+                self.assertEqual(S.count_word_breaks(text, mc, 2, True), 0)
+                self.assertEqual("".join(rows), text, "切行不许丢字")
+                for row in rows:
+                    self.assertLessEqual(len(row), mc, "行超容量：%r" % row)
 
     def test_every_line_fits_the_capacity(self):
         """含末行——与 wrap_text「末行允许超出、不丢字」的取舍不同。
@@ -291,6 +335,80 @@ class TestBalancedWrap(unittest.TestCase):
         # 歌词档不设上限，写死 max_lines=1 也不该让它漏统计（单行档才该跳过）
         self.assertEqual(S.wrap_stats([{"text": self.LONG}], 33, 1, True)["wraps"], 1)
         self.assertEqual(S.wrap_stats([{"text": self.LONG}], 33, 1)["wraps"], 0)
+
+
+class TestSplitSentences(unittest.TestCase):
+    """程序拼的文本（片头 / 前期回顾 / 片尾）按正文那把尺切句。
+
+    这一层管的是「一句话该有多长」，与 wrap_* 管的「一句话排几行」不是一回事。
+    它们按设计粘在脚本阶段门禁之后，长度本来没人管——2c / 2d 的回顾就这么长到
+    195 / 241 字，在 33 字/行下要 7 / 9 行，而歌词框只有 `lyric_max_rows` 行高：
+    多出来的行被 `\\clip` 裁掉，不是难看，是丢字。所以「拼出来的那一刻就合尺」。
+    """
+
+    RECAP = ("上期《零依赖拆解与渐进加载的决策引擎》聊的是以 semantic-split 为核心，"
+             "阐释 Pipeline A/B/C 递进匹配、懒加载门禁与 0.6 阈值复用机制，"
+             "实现低开销任务分解。——讲了阐释系统零依赖正则分析、递进匹配机制与"
+             "基于门禁钩子的懒加载管控逻辑、说明按优先级扫描的渐进决策树机制与"
+             "模板自动凝练的管理流程、演示模型路径解析、流水线执行控制与本地环境"
+             "配置的命令行操作等。")
+
+    def test_every_sentence_fits_the_ruler(self):
+        for limit in (40, 30, 24):
+            for s in S.split_sentences(self.RECAP, limit):
+                with self.subTest(limit=limit, s=s[:12]):
+                    self.assertTrue(s)
+                    self.assertLessEqual(len(s), limit, "句子超尺：%r" % s)
+
+    def test_splitting_never_loses_a_character(self):
+        for limit in (40, 16):
+            with self.subTest(limit=limit):
+                self.assertEqual("".join(S.split_sentences(self.RECAP, limit)),
+                                 self.RECAP)
+
+    def test_short_text_is_one_sentence(self):
+        self.assertEqual(S.split_sentences("上期《标题》聊的是主旨。", 40),
+                         ["上期《标题》聊的是主旨。"])
+
+    def test_empty_text_gives_no_sentences(self):
+        self.assertEqual(S.split_sentences("", 40), [])
+        self.assertEqual(S.split_sentences("   ", 40), [])
+
+    def test_cut_lands_after_punctuation(self):
+        """切点落在句读标点之后（标点跟着前一句走），且尽量切满。"""
+        self.assertEqual(S.split_sentences("第一句。第二句也很短。", 10),
+                         ["第一句。", "第二句也很短。"])
+        self.assertEqual(S.split_sentences("甲，乙，丙，丁，戊，己，庚，辛。", 6),
+                         ["甲，乙，丙，", "丁，戊，己，", "庚，辛。"])
+
+    def test_no_punctuation_falls_back_to_a_word_gap(self):
+        """中间没有句读标点时先退到西文词间空格——不留半截词。"""
+        text = "覆盖 activity-duration 与 Structured Writer 的边界"
+        parts = S.split_sentences(text, 24)
+        self.assertEqual(parts, ["覆盖 activity-duration 与 ", "Structured Writer 的边界"])
+        self.assertEqual("".join(parts), text)
+
+    def test_never_cuts_inside_a_latin_token_when_a_break_exists(self):
+        """只要窗口里有合法断点，就不会切在西文词中间（40 字那把尺下必然如此）。
+
+        整段连一个断点都没有时只能硬切——那是与折行同源的兜底，见下一条。
+        """
+        for limit in (40, 30, 18):
+            text = self.RECAP
+            at = 0
+            for s in S.split_sentences(text, limit)[:-1]:
+                at += len(s)
+                with self.subTest(limit=limit, at=at):
+                    self.assertFalse(S._in_latin_token(text, at),
+                                     "切在西文词中间：%r" % text[max(0, at - 12):at + 12])
+
+    def test_an_unbreakable_span_is_hard_cut(self):
+        """一段里没有任何断点可切（一个词就长过尺）时硬切，且不丢字。
+
+        两种兜底次序与折行一致：标点 → 词间空格 → 四级判定的硬切。
+        """
+        self.assertEqual(S.split_sentences("semantic-split", 8), ["semantic", "-split"])
+        self.assertEqual("".join(S.split_sentences("semantic-split", 8)), "semantic-split")
 
 
 class TestLyricPreset(unittest.TestCase):

@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "0.41.1"
+VERSION = "0.41.2"
 
 
 # ============================================================================
@@ -252,6 +252,9 @@ INTRO_OUTRO = {
     # 标签用程序专有的「回顾」（v0.36.0 起）：它跟片头尾同类——程序逐字拼、
     # 模型没参与，也就没有「它照没照做」可验。挂词表内的「承接」会把「这是回顾」
     # 这个位置信息丢掉，还让它混进正文标签里。
+    # 模板只写一条：拼出来的是一段话，由 `pipeline.review_rows` 按正文那把尺
+    # （`gate.max_chars`）切成若干句——写死成多条，就要求填进来的期主旨 / 段主旨
+    # 恰好合尺，而它们的长度是地图与规划给的，不受这里控制。
     "review": [
         {"speaker": "B", "emotion": REVIEW_TAG,
          "text": "上期《{prev_title}》聊的是{prev_gist}——讲了{prev_topics}等。"},

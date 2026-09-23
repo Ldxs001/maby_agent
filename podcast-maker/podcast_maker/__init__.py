@@ -24,7 +24,7 @@
 # 发布工具读取 __version__ 赋值行的引号字面量（PyPI setup.py 解析同理），
 # 故本文件任何注释都不得出现形如 赋值名 + 等号 + 引号 的文本。
 # 与 config_manager.VERSION 同步修改。
-__version__ = "0.41.1"
+__version__ = "0.41.2"
 
 from .config_manager import (ConfigManager, GATE_SPEC, MODE_SPEC, PARAM_SPEC,
                              PRESET_SPEC, VERSION)

@@ -124,6 +124,42 @@ class TestReviewRows(unittest.TestCase):
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
         self.assertIn("讲了唯一一条等。", rows[0]["text"])
 
+    def test_a_long_recap_is_split_to_the_body_ruler(self):
+        """拼出来的是一「段」而不是一「句」：按正文那把尺切成若干句。
+
+        2c / 2d 的回顾实测有 195 / 241 字：33 字/行要 7 / 9 行，而歌词框只有
+        `subtitle.lyric_max_rows`（默认 8）行高——多出来的行被 `\\clip` 裁掉，
+        不是难看，是丢字。它按设计粘在脚本阶段门禁之后，没有第二个人管长度，
+        所以得在拼出来的这一刻就合尺。
+        """
+        gist = ("以 semantic-split 为核心，阐释 Pipeline A/B/C 递进匹配、"
+                "懒加载门禁与 0.6 阈值复用机制，实现低开销任务分解。")
+        topics = ["阐释系统零依赖正则分析、递进匹配机制与基于门禁钩子的懒加载管控逻辑。",
+                  "说明按优先级扫描的渐进决策树机制与模板自动凝练的管理流程。",
+                  "演示模型路径解析、流水线执行控制与本地环境配置的命令行操作。"]
+        self._sidecar("1", topics)
+        P.save_map(self.base, self.p["id"], "",
+                   [_map_row("1", "零依赖拆解与渐进加载的决策引擎", gist),
+                    _map_row("2", "第二期标题", "第二期主旨")])
+        self.item = P.find(self.base, self.p["id"])
+        rows = PL.review_rows(self.base, self.item, "2", self.cfg)
+        limit = int(self.cfg.get("gate.max_chars", 40))
+        self.assertGreater(len(rows), 1, "两百字的回顾必须切成多句")
+        # 段主旨自带句号，拼进「讲了 A、B、C」时去掉：留着会长出「。、」与「。等。」
+        self.assertEqual("".join(r["text"] for r in rows),
+                         "上期《零依赖拆解与渐进加载的决策引擎》聊的是%s——讲了%s等。"
+                         % (gist, "、".join(t.rstrip("。") for t in topics)))
+        for r in rows:
+            with self.subTest(text=r["text"][:12]):
+                self.assertLessEqual(len(r["text"]), limit)
+                self.assertEqual((r["speaker"], r["emotion"]), ("B", "回顾"))
+
+    def test_a_short_recap_stays_one_sentence(self):
+        """短回顾不因为「可能长」就被切碎——尺只管上限。"""
+        self._sidecar("1", ["甲段主旨", "乙段主旨"])
+        rows = PL.review_rows(self.base, self.item, "2", self.cfg)
+        self.assertEqual(len(rows), 1)
+
     def test_the_gist_comes_from_the_map_not_the_register(self):
         """期主旨取自地图行。
 
