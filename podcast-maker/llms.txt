@@ -15,7 +15,7 @@
 - 一切都是项目：成稿规划、逐期即兴、单集（`single`）三种规划方式并列，只出一集也立项，没有「不归属项目」的第二条路。
 - 画面字体与字幕字体是两个可选点位（`frame.font_family` / `subtitle.font_family`），同归「字体」卡片，都由自绘下拉渲染——原生 select 的选项不接受自定义字体。
 - 缺依赖、缺字形或参数不可达时报错停下，不静默降级。
-- 产物门禁不过即写 `LOCK.json` 中断，不产出次品；脚本门禁不过不拦人——稿子与结论一起落盘，合成前提醒一次，改稿还是照出由人定。
+- 产物门禁不过时写锁**留痕**、照常出片照常记账：产物与报告都落了盘，要不要带着问题出片由人定，过没过写在报告里；脚本门禁不过不拦人——稿子与结论一起落盘，合成前提醒一次，改稿还是照出由人定。
 
 ## 文档
 
@@ -36,9 +36,9 @@
 - [podcast_maker/duration_model.py](podcast_maker/duration_model.py)：字数 ↔ 时长换算、标准语速与音色校准
 - [podcast_maker/tts_engine.py](podcast_maker/tts_engine.py)：语音合成
 - [podcast_maker/audio_engine.py](podcast_maker/audio_engine.py)：拼接、混音、编码、参数校验
-- [podcast_maker/subtitle_engine.py](podcast_maker/subtitle_engine.py)：断行、SRT/ASS、时间轴
-- [podcast_maker/assets_factory.py](podcast_maker/assets_factory.py)：排版规格与流式执行器、声波几何（wave_layout）、背景、封面、BGM、字形覆盖检查
-- [podcast_maker/video_engine.py](podcast_maker/video_engine.py)：动画、说话人指示、压暗、合成
+- [podcast_maker/subtitle_engine.py](podcast_maker/subtitle_engine.py)：字幕框几何（两档共用同一个矩形）、歌词档折行与换句上滚、单行滚动档的三段式横滚、字宽实渲标定、SRT/ASS/LRC、时间轴
+- [podcast_maker/assets_factory.py](podcast_maker/assets_factory.py)：排版规格与流式执行器、声波几何（wave_layout）、背景与静态层烘焙（整幅压暗 + 字幕框一次画进背景图）、封面、BGM、字形覆盖检查
+- [podcast_maker/video_engine.py](podcast_maker/video_engine.py)：动画、说话人指示、合成（含「框与第一句字幕同时出现」的双背景按帧接）、分段并行（默认关——实测净亏）
 - [podcast_maker/project_store.py](podcast_maker/project_store.py)：项目登记表、三种规划方式（成稿规划 / 逐期即兴 / 单集）、期号记忆、期数地图与分支期号、项目设定覆盖配置
 - [podcast_maker/source_store.py](podcast_maker/source_store.py)：素材库（成稿入库落盘、章节清单、按落点取原文；结构不归它管，由 probe 给）
 - [podcast_maker/planner.py](podcast_maker/planner.py)：期数地图（排图、插入点与拆分、分支期号分配、落点核对）
@@ -51,11 +51,12 @@
 ## 测试
 
 - [tests/test_duration_model.py](tests/test_duration_model.py)：字数换算与校准
-- [tests/test_subtitle_wrap.py](tests/test_subtitle_wrap.py)：字幕断行与时间轴
+- [tests/test_subtitle_wrap.py](tests/test_subtitle_wrap.py)：字幕框几何、两档同框、单行横滚的三段式与「恒滚得完」、断行与时间轴、与实渲量出的宽对账、预览同源
 - [tests/test_audio_params.py](tests/test_audio_params.py)：编码参数与 BGM 来源解析
 - [tests/test_gates.py](tests/test_gates.py)：门禁判据、待复核语义、产物校验与开关一致
-- [tests/test_layout.py](tests/test_layout.py)：排版包围盒、间距规格、文字层级、画面字体换款即换图、字形覆盖、动画缩放曲线、压暗色彩域、声波包络不相交
-- [tests/test_config_keys.py](tests/test_config_keys.py)：配置点位静态对账、界面入口覆盖、枚举标签、类型归一
+- [tests/test_layout.py](tests/test_layout.py)：排版包围盒、间距规格、文字层级、画面字体换款即换图、字形覆盖、动画缩放曲线、静态层烘焙与取色口径、声波包络不相交
+- [tests/test_box_onset.py](tests/test_box_onset.py)：字幕框出现时刻（帧号向上取整与浮点边界、两张背景按帧精确接、缓推档的帧偏移、输入顺序与音频下标、分段互斥、只压暗不画框）
+- [tests/test_config_keys.py](tests/test_config_keys.py)：配置点位静态对账、界面入口覆盖、枚举标签、类型归一、存量配置迁移
 - [tests/test_script_contract.py](tests/test_script_contract.py)：脚本契约、逻辑拆分归一到防重排、按整节凝缩装箱、补字与压字提示词质控、标题收束、片头尾整期定稿一次粘合、期数归属
 - [tests/test_project_store.py](tests/test_project_store.py)：期号进位、规划方式与定死、单集出完即完结、期数地图、分支期号、归档、未归属产物
 - [tests/test_source_store.py](tests/test_source_store.py)：素材入库与索引完整性、章节清单、按落点取原文与截断记账

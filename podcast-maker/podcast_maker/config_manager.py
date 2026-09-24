@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "0.41.2"
+VERSION = "0.42.0"
 
 
 # ============================================================================
@@ -209,6 +209,10 @@ KINSOKU_TAIL = set("一第每各某")
 # 就整句不粘——第 1 期、前一期不在本项目、上一期没留下段主旨，三种情况一律按
 # 「这句没有」处理，绝不留「上期我们聊了……」后面空着。
 #
+# 模板是**三条**（标题 / 期主旨 / 段主旨各一条），底下 `review` 那一组写的就是
+# 它们。引用值进位前只剃尾（去掉尾部的句号与空格），中间一个字不动——见
+# `pipeline.review_rows`。
+#
 # `{prev_topics}` 后面那个「等」**写死在模板里**：一期三五段，全念出来是流水账，
 # 只引前三段；「等」是告诉听众"还有"，一条时也照留。不给程序按条数决定加不加——
 # 条数一变句子形状就变，听感上像两套模板。
@@ -252,12 +256,19 @@ INTRO_OUTRO = {
     # 标签用程序专有的「回顾」（v0.36.0 起）：它跟片头尾同类——程序逐字拼、
     # 模型没参与，也就没有「它照没照做」可验。挂词表内的「承接」会把「这是回顾」
     # 这个位置信息丢掉，还让它混进正文标签里。
-    # 模板只写一条：拼出来的是一段话，由 `pipeline.review_rows` 按正文那把尺
-    # （`gate.max_chars`）切成若干句——写死成多条，就要求填进来的期主旨 / 段主旨
-    # 恰好合尺，而它们的长度是地图与规划给的，不受这里控制。
+    # 模板写三条，一物一句：标题 / 期主旨 / 段主旨各归各的句子。**不再拼成一整段
+    # 再按尺切**——按尺切的边界由长度说了算，切出过「…收窄至"仅填空"的本质，」
+    # 下一句以「的架构迭代」开头这种半句话（切点落在西文词后的空格上，虚词被甩到
+    # 下一句）。三条各自是一句完整的话，拼完不再切（见 `pipeline.review_rows`）。
+    # **引用值里的标点只剃尾，中间半字不碰**。所以「上期标题／期主旨／段主旨」这三样
+    # 源数据自己写坏了，坏字会逐字进到这三句里：地图 gist 上就真出现过
+    # `…硬约束逻辑。：将抽象方法论…` 这种「。：」（真人手输的，不是程序拼的——按尺切
+    # 只把它切开露出来，不是它造成的）。回顾这一层**不替数据删字符**：替它删就是
+    # 「中间也管」，正是要避免的自行发挥。要干净就去改地图那一格。
     "review": [
-        {"speaker": "B", "emotion": REVIEW_TAG,
-         "text": "上期《{prev_title}》聊的是{prev_gist}——讲了{prev_topics}等。"},
+        {"speaker": "B", "emotion": REVIEW_TAG, "text": "上期《{prev_title}》。"},
+        {"speaker": "B", "emotion": REVIEW_TAG, "text": "聊的是{prev_gist}。"},
+        {"speaker": "B", "emotion": REVIEW_TAG, "text": "讲了{prev_topics}等。"},
     ],
 }
 
@@ -328,18 +339,24 @@ MODE_SPEC = {
             "portrait": {"label": "自备立绘", "desc": "用户提供透明 PNG，说话方高亮"},
         },
     },
-    # 版式只管「排几行、怎么折」，三档各自给一条路：
-    #   single / dual  折行上限写死，走 wrap_text（贪心填满）
-    #   lyric          不给 max_lines —— balanced 标记走 wrap_balanced，
-    #                  行数由「每行容量」自己算出来，外面不设上限
+    # 版式只管「字在框里怎么排」。两档共用同一个矩形框（左右与底边取自边距、
+    # 高 = 行数 × 行距），**唯一的分岔是轴**：
+    #   lyric   纵轴 —— 框内若干句、折行后纵向排布，换句时整块上滚
+    #   single  横轴 —— 框内一行，装不下就横向滚过框口（不折行、不裁字）
+    # window / frame_rows 写在档位里，因为它们是**框的形状**：单行滚动的框按定义
+    # 就是一行（1 行高、只显示当前句），给用户一个「框排几行」的旋钮去调它等于
+    # 摆一个死框。歌词档不写这两个，取 `subtitle.window` / `subtitle.frame_rows`。
+    # 从前是三档（single / dual / lyric），各有各的模型：单行与双行是「per-line
+    # 填充块 + Style 静态定位」，歌词是「整块框 + \move」——同一个「字幕版式」
+    # 下拉里塞了两套定位模型。双行已于 0.42.0 删除，单行改横滚，三档并两档。
     # 「行首要不要写说话人名」从前塞在版式里（dual_named 档），那是把两个维度
     # 绑在一起：名字归「说话人提示」的角色名称开关，版式不再管。
     "subtitle.preset": {
         "label": "字幕版式",
         "options": {
-            "single": {"label": "单行", "max_lines": 1},
-            "dual": {"label": "双行", "max_lines": 2},
-            "lyric": {"label": "歌词", "balanced": True},
+            "single": {"label": "单行滚动", "axis": "x",
+                       "window": 1, "frame_rows": 1},
+            "lyric": {"label": "歌词", "axis": "y"},
         },
     },
     "intro_outro.preset": {
@@ -631,10 +648,11 @@ PARAM_SPEC = {
                                   "定稿那一刻由程序粘上去，不进生成、也不进任何门禁"),
     "intro_outro.review": _p("bool", False, "script", "前期回顾",
                              views=("script",),
-                             help="开启后，在片头之后、正文之前拼一句前期回顾："
-                                  "逐字引用上一期的期主旨与段主旨（程序拼，模型不参与、"
-                                  "也不进任何门禁）。第 1 期、上一期不在本项目、"
-                                  "或上一期没留下段主旨时这一句不出现"),
+                             help="开启后，在片头之后、正文之前拼三句前期回顾"
+                                  "（上期标题 / 期主旨 / 前三段段主旨），逐字引用、"
+                                  "程序拼、模型不参与、也不进任何门禁。"
+                                  "第 1 期、上一期不在本项目、或上一期没留下段主旨时"
+                                  "这三句都不出现"),
 
     "gate.max_deviation_pct": _p("float", 15.0, "gate", "总时长偏差阈值（%）",
                                  min=0.5, max=50, step=0.5, unit="%",
@@ -806,34 +824,30 @@ PARAM_SPEC = {
     # 两项的 section 都是 frame（见 SECTION_OF_OVERRIDE）。
     "frame.font_family": _p("str", "", "frame", "画面字体",
                             help="背景与封面上的字用这款。留空则自动选择可用字体"),
-    "subtitle.preset": _p("enum", "dual", "frame", "字幕版式"),
+    "subtitle.preset": _p("enum", "lyric", "frame", "字幕版式"),
     "subtitle.font_family": _p("str", "", "frame", "字幕字体",
                                help="字幕用这款。留空则自动选择可用字体"),
     "subtitle.font_size": _p("int", 52, "frame", "横屏字号", min=16, max=140, step=2, unit="像素"),
     "subtitle.font_size_vertical": _p("int", 40, "frame", "竖屏字号", min=16, max=140, step=2, unit="像素"),
-    # 字幕这几项「一套配置管两种模式」：单行/双行是「文字背景填充 + 文字位置」，
-    # 歌词是「一个固定宽高的半透明框、文字在框里」。下面每项在两种模式下语义
-    # 不同，标签保持中性、help 里写清两义（见 CHANGELOG 0.41.0 的接驳表）；
-    # 只对单双行成立的项在 help 里点明「仅单双行生效」。
-    "subtitle.margin_lr": _p("int", 90, "frame", "字幕左右边距",
+    # 字幕这几项「一套配置管两档」：两档都是**一个固定宽高的半透明框**，文字在
+    # 框里——歌词档纵向排、单行滚动档横向走。每一档的语义只剩一处差别（轴），
+    # 所以下面每项的标签与 help 只写一套含义，不再有「单双行＝…；歌词＝…」这种
+    # 两义并列（见 CHANGELOG 0.42.0 的接驳表）。
+    "subtitle.margin_lr": _p("int", 90, "frame", "字幕框左右边距",
                              min=0, max=500, step=5, unit="像素",
-                             help="单行/双行＝文字距左右；歌词＝框宽"
-                                  "（框左右各收这么多，同时决定每行能放几个字）"),
-    "subtitle.margin_v": _p("int", 90, "frame", "横屏底部边距",
+                             help="框左右各收这么多，同时决定框内一行能放几个字"),
+    "subtitle.margin_v": _p("int", 90, "frame", "横屏框底距边",
                             min=0, max=800, step=5, unit="像素",
-                            help="单行/双行＝文字距底边；歌词＝框底距底边"),
-    "subtitle.margin_v_vertical": _p("int", 220, "frame", "竖屏底部边距",
+                            help="框底距画面底边多远"),
+    "subtitle.margin_v_vertical": _p("int", 220, "frame", "竖屏框底距边",
                                      min=0, max=1200, step=5, unit="像素",
-                                     help="单行/双行＝文字距底边；歌词＝框底距底边"
-                                          "（竖屏那一份）"),
-    "subtitle.outline": _p("int", 6, "frame", "字幕框边距",
+                                     help="竖屏那一份（横竖两幅各配一套）"),
+    "subtitle.outline": _p("int", 2, "frame", "字幕框描边宽",
                            min=0, max=30, step=1, unit="像素",
-                           help="**仅单双行生效**：文字背景填充块的描边粗细。"
-                                "歌词档的边界是整块框自己算出来的，不用这一项"),
-    "subtitle.bg_alpha": _p("int", 128, "frame", "字幕底框透明度",
+                           help="框四周那一道淡边的粗细"),
+    "subtitle.bg_alpha": _p("int", 128, "frame", "字幕框透明度",
                             min=0, max=255, step=1,
-                            help="单行/双行＝每行填充块的透明度；"
-                                 "歌词＝整块背景框的透明度。0 全实、255 全透"),
+                            help="整块框填充的透明度。0 全实、255 全透"),
     "subtitle.color_a": _p("str", "&HFFFFFF", "frame", "A 角字幕色",
                            help="A 说的句子的字幕颜色。只有「说话人提示」选"
                                 "「AB两套字幕样式」时才生效"),
@@ -846,25 +860,30 @@ PARAM_SPEC = {
     # A/B 默认都是纯白，比金色更亮，不压暗就成了「高亮的那句反而更暗」。
     "subtitle.highlight": _p("bool", False, "frame", "高亮",
                              help="把当前这句台词染成高亮配色。歌词版式下染的是"
-                                  "「正在读的那一句」，单行/双行下整句就是当前句，"
-                                  "等于给全部字幕换个色"),
+                                  "「正在读的那一句」；单行滚动版式下屏幕上只有"
+                                  "当前句，等于给全部字幕换个色"),
     "subtitle.highlight_color": _p("str", "#FFD98A", "frame", "高亮配色",
                                    help="当前句的颜色，接受 #RRGGBB"),
 
-    # ---- 歌词版式：窗口与滚动 ----
-    "subtitle.lyric_window": _p("int", 3, "frame", "歌词窗口句数",
-                                min=1, max=7, step=1, unit="句",
-                                help="窗口里最多显示几句（含当前句）。当前句必留，"
-                                     "然后先按住下面的句子、再按住上面的"),
-    "subtitle.lyric_max_rows": _p("int", 8, "frame", "窗口上限行数",
-                                  min=2, max=24, step=1, unit="行",
-                                  help="**含空行**：每句占 1 个空行 + 它自己折的行数。"
-                                       "放不下就往远里丢句子，丢掉的在换点处上滚淡出。"
-                                       "歌词档里它同时就是**框高** = 行数 × 行距"),
-    "subtitle.lyric_scroll_ms": _p("int", 600, "frame", "上滚时长",
-                                   min=0, max=3000, step=50, unit="毫秒",
-                                   help="换句时整块自下而上滑到新位置用的时间，"
-                                        "0 即不滚、直接跳"),
+    # ---- 框与滚动：两档共用一套旋钮（切档位时值跟着档位走）----
+    # window / frame_rows 是框的形状：歌词档取这里，单行滚动档由档位表写死 1 / 1
+    # （滚动的框按定义就是一行）。scroll_ms 只给歌词档用——横滚的速度由语速算出，
+    # 不另给旋钮（见 subtitle_engine 的说明）。
+    "subtitle.window": _p("int", 3, "frame", "框内窗口句数",
+                          min=1, max=7, step=1, unit="句",
+                          help="歌词档：框里最多显示几句（含当前句）。当前句必留，"
+                               "然后先按住下面的句子、再按住上面的。"
+                               "单行滚动档固定为 1 句"),
+    "subtitle.frame_rows": _p("int", 8, "frame", "框高（行）",
+                              min=2, max=24, step=1, unit="行",
+                              help="歌词档：**含空行**——每句占 1 个空行 + 它自己折的"
+                                   "行数，放不下就往远里丢句子。它同时就是框高"
+                                   "（行数 × 行距）。单行滚动档固定为 1 行"),
+    "subtitle.scroll_ms": _p("int", 600, "frame", "上滚时长",
+                             min=0, max=3000, step=50, unit="毫秒",
+                             help="歌词档：换句时整块自下而上滑到新位置用的时间，"
+                                  "0 即不滚、直接跳。单行滚动档不用这一项"
+                                  "（它的横滚速度跟着语速走）"),
 
     "cover.preset": _p("enum", "book", "frame", "封面档位"),
 
@@ -1136,6 +1155,10 @@ class ConfigManager:
                 with open(self.path, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 if isinstance(saved, dict):
+                    # 迁移必须跑在白名单过滤**之前**：改过名的旧键（如
+                    # `subtitle.lyric_window`）已不在 PARAM_SPEC 里，过滤会把它
+                    # 连同值一起丢掉——人配好的窗口会静默回到默认值。
+                    self._migrate(saved)
                     for k, v in saved.items():
                         if k in PARAM_SPEC and v is not None:
                             self._data[k] = v
@@ -1151,15 +1174,30 @@ class ConfigManager:
 
     @staticmethod
     def _migrate(data):
-        """存量配置里已下线的值，读到就改掉（下次保存时落盘）。
+        """存量配置里已下线的键与值，读到就改掉（下次保存时落盘）。
 
-        `dual_named`（双行带名）已从版式里删除——名字归「角色名称」开关，版式只管
-        折行。旧值留在配置里会静默落回「双行」的折行上限，而人当初点它的目的是
-        「要名字」：所以拆成两件事搬过去，意图不丢。
+        两件事，都在这里做，别处不许再写一份：
+
+        1. **版式三档并两档**（0.42.0）：`dual`（双行）已从版式里删除，
+           `dual_named`（双行带名）更早下线。两个旧值都搬到 `lyric`——旧配置里
+           存着 `dual` 的多半是当年的默认值，人没主动选过；留在配置里会变成
+           一个不在档位表内的值（界面上那个下拉会显示成空）。
+           `dual_named` 还多一件事：名字归「角色名称」开关，旧值的人当初点它的
+           目的是「要名字」，所以顺手把那个开关打开，意图不丢。
+        2. **歌词那三个键去掉歌词前缀**（0.42.0）：窗口与框高两档共用，
+           改名为 `subtitle.window` / `subtitle.frame_rows` / `subtitle.scroll_ms`。
+           不搬就丢值——旧键不在 PARAM_SPEC 里，会被白名单过滤掉。
         """
-        if data.get("subtitle.preset") == "dual_named":
-            data["subtitle.preset"] = "dual"
-            data.setdefault("speaker_indicator.name_shown", True)
+        if data.get("subtitle.preset") in ("dual", "dual_named"):
+            if data.get("subtitle.preset") == "dual_named":
+                data.setdefault("speaker_indicator.name_shown", True)
+            data["subtitle.preset"] = "lyric"
+        for old_key, new_key in (("subtitle.lyric_window", "subtitle.window"),
+                                 ("subtitle.lyric_max_rows", "subtitle.frame_rows"),
+                                 ("subtitle.lyric_scroll_ms", "subtitle.scroll_ms")):
+            if old_key in data:
+                v = data.pop(old_key)
+                data.setdefault(new_key, v)
         return data
 
     def save(self):

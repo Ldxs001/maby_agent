@@ -14,7 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""字幕断行测试：断词率必须为 0，且单行/双行两档的输出逐字不变。"""
+"""字幕版式测试：断词率必须为 0，两档共用同一个框、只差一个轴。
+
+两档：`lyric` 纵轴（折行进框、换句上滚）、`single` 单行滚动（不折行、装不下就
+滚过框口）。它们共用 `frame_geometry` 的矩形、同一套 Style、同一套像素宽度口径
+（`CHAR_W_*`）——所以这一组里凡是写「两档一致」的地方，都是拿两侧的输出直接比。
+"""
 
 import hashlib
 import os
@@ -40,57 +45,58 @@ CASES = [
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\.\-_/]*[A-Za-z0-9]|[A-Za-z0-9]")
 
+MOVE_RE = re.compile(r"\\move\((-?\d+),(-?\d+),(-?\d+),(-?\d+),(\d+),(\d+)\)")
+POS_RE = re.compile(r"\\pos\((-?\d+),(-?\d+)\)")
 
-class TestWrap(unittest.TestCase):
-    def test_no_breaks_inside_words(self):
-        """西文 token 不得被切断（Claude-3.5 内部含 - 与 .）。"""
-        for text, width in CASES:
-            chunks = S.wrap_text(text, width, 2)
-            for chunk in chunks:
-                for token in TOKEN_RE.findall(text):
-                    for i in range(1, len(token)):
-                        head, tail = token[:i], token[i:]
-                        if any(c.endswith(head) for c in chunks) and \
-                           any(c.startswith(tail) for c in chunks):
-                            self.fail("token %r 在第 %d 位被切断：%r" % (token, i, chunks))
 
-    def test_no_violations_across_cases(self):
-        """整卷断词率必须为 0。"""
-        for text, width in CASES:
-            n = S.count_word_breaks(text, width, 2)
-            self.assertEqual(n, 0, "宽度 %d 下 %r 出现 %d 处断词" % (width, text, n))
+def dialogues(ass):
+    """把 ASS 的 Dialogue 拆成字段（两档共用这一份解析）。
 
-    def test_kinsoku_head_char_never_starts_line(self):
-        """禁则字不得出现在行首。"""
-        for text, width in CASES:
-            for chunk in S.wrap_text(text, width, 2):
-                if chunk:
-                    self.assertNotIn(chunk[0], S.KINSOKU_HEAD,
-                                     "%r 以禁则字 %r 起行" % (chunk, chunk[0]))
+    `box` 标记这条是不是垫底的整块框（`\\p1` 绘图事件）——它不参与「文字行数 /
+    图层号」那几条断言，必须能一眼摘出来。横滚档的 `\\move` 终点坐标**可能是负的**
+    （文字中心滑到画面左边外），所以坐标一律按有符号解析。
+    """
+    out = []
+    for line in ass.splitlines():
+        if not line.startswith("Dialogue:"):
+            continue
+        f = line.split(",", 9)
+        raw = f[9]
+        head, text = (raw.split("}", 1) + [""])[:2] if raw.startswith("{") else ("", raw)
+        head = head + "}" if head else ""
+        rec = {"layer": f[0].split()[1], "start": f[1], "end": f[2],
+               "style": f[3], "head": head, "text": text,
+               "box": "\\p1" in head}
+        mv = MOVE_RE.search(head)
+        ps = POS_RE.search(head)
+        if mv:
+            rec.update(x_from=int(mv.group(1)), y_from=int(mv.group(2)),
+                       x_to=int(mv.group(3)), y_to=int(mv.group(4)),
+                       t1=int(mv.group(5)), t2=int(mv.group(6)))
+        elif ps:
+            # 静止的一句（装得下、\pos 居中）：没有滚动期，两个时间都记 0，
+            # 这样「这条动没动」就只看 t1 < t2。
+            rec.update(x_from=int(ps.group(1)), y_from=int(ps.group(2)),
+                       x_to=int(ps.group(1)), y_to=int(ps.group(2)),
+                       t1=0, t2=0)
+        out.append(rec)
+    return out
 
-    def test_break_after_punctuation_wins(self):
-        """标点之后是最高优先级断点。"""
-        idx = S.find_break("这个问题的答案其实很简单，就是不该停的地方不能停。", 16)
-        self.assertEqual(idx, 13)
-        self.assertTrue(S.wrap_text("这个问题的答案其实很简单，就是不该停的地方不能停。",
-                                    16, 2)[0].endswith("，"))
 
-    def test_long_unbreakable_text_falls_back(self):
-        """无任何合法断点时二分回退，且不抛异常、不丢字。"""
-        text = "中" * 60
-        chunks = S.wrap_text(text, 12, 2)
-        self.assertTrue(chunks)
-        self.assertEqual("".join(chunks), text)
+def boxes(ass):
+    """垫底的整块框（`\\p1` 绘图事件）。"""
+    return [d for d in dialogues(ass) if d["box"]]
 
-    def test_short_text_untouched(self):
-        self.assertEqual(S.wrap_text("短句。", 20, 2), ["短句。"])
 
-    def test_wrap_stats_shape(self):
-        script = [{"speaker": "A", "text": t} for t, _ in CASES]
-        st = S.wrap_stats(script, 16, 2)
-        for key in ("wraps", "violations", "rate"):
-            self.assertIn(key, st)
-        self.assertEqual(st["violations"], 0)
+def captions(ass):
+    """文字事件（排除垫底的框）。"""
+    return [d for d in dialogues(ass) if not d["box"]]
+
+
+def seconds(stamp):
+    """ASS 时间戳 "0:00:27.10" → 秒。"""
+    h, m, s = stamp.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
 
 class TestTimeFormat(unittest.TestCase):
@@ -199,7 +205,7 @@ class TestLrc(unittest.TestCase):
 
         # 换版式、换提示档都不该动摇它——从前这两处各自兼职决定名字，
         # 于是选「侧栏色块」「自备立绘」反而没了名字。
-        for preset in ("single", "dual", "lyric"):
+        for preset in ("single", "lyric"):
             with self.subTest(preset=preset):
                 self.assertTrue(S.speaker_name_shown(dict(on, **{"subtitle.preset": preset})))
         for mode in ("none", "style", "block", "portrait"):
@@ -231,8 +237,7 @@ class TestLrc(unittest.TestCase):
 class TestBalancedWrap(unittest.TestCase):
     """歌词档的折行：行数自己算、每行都不超容量。
 
-    「单行/双行」那一档的毛病是贪心填满——第一行撑满、余数甩末行，40 字一句在
-    33 字/行下得到 33+7。均衡版先定行数再均分，得到 21+19。
+    先定行数再均分（40 字一句在 33 字/行下得到 21+19；贪心填满会得到 33+7）。
     """
 
     LONG = "既然产物种类繁多，统一归口预设文件夹是为了让后续自动化清理与备份能精准定位目标。"
@@ -285,16 +290,13 @@ class TestBalancedWrap(unittest.TestCase):
                     self.assertFalse(S._in_latin_token(text, at),
                                      "切在西文词中间：%r" % (rows,))
             with self.subTest(mc=mc):
-                self.assertEqual(S.count_word_breaks(text, mc, 2, True), 0)
+                self.assertEqual(S.count_word_breaks(text, mc, "y"), 0)
                 self.assertEqual("".join(rows), text, "切行不许丢字")
                 for row in rows:
                     self.assertLessEqual(len(row), mc, "行超容量：%r" % row)
 
     def test_every_line_fits_the_capacity(self):
-        """含末行——与 wrap_text「末行允许超出、不丢字」的取舍不同。
-
-        歌词窗口里一行超出画面宽会直接顶到边上，比多一行难看。
-        """
+        """含末行：歌词框里一行超出框宽会顶到框边，比多一行难看。"""
         for text in self.TEXTS:
             for mc in (12, 22, 33):
                 for row in S.wrap_balanced(text, mc):
@@ -311,18 +313,7 @@ class TestBalancedWrap(unittest.TestCase):
         for text in self.TEXTS:
             for mc in (12, 22, 33):
                 with self.subTest(mc=mc):
-                    self.assertEqual(S.count_word_breaks(text, mc, 2, True), 0)
-
-    def test_balances_where_greedy_leaves_a_stub(self):
-        """同一句 40 字：贪心给 33+7（头重脚轻），均衡给 21+19。"""
-        greedy = S.wrap_text(self.LONG, 33, 2)
-        bal = S.wrap_balanced(self.LONG, 33)
-        self.assertEqual(greedy, ["既然产物种类繁多，统一归口预设文件夹是为了让后续自动化清理与备份能",
-                                  "精准定位目标。"])
-        self.assertEqual(bal, ["既然产物种类繁多，统一归口预设文件夹是为了",
-                               "让后续自动化清理与备份能精准定位目标。"])
-        self.assertLess(max(len(x) for x in bal) - min(len(x) for x in bal),
-                        max(len(x) for x in greedy) - min(len(x) for x in greedy))
+                    self.assertEqual(S.count_word_breaks(text, mc, "y"), 0)
 
     def test_short_text_untouched(self):
         self.assertEqual(S.wrap_balanced("短句。", 20), ["短句。"])
@@ -330,89 +321,313 @@ class TestBalancedWrap(unittest.TestCase):
 
     def test_stats_follow_the_balanced_cuts(self):
         """统计必须跟实际折行走同一套切点，否则报的是另一种折法的账。"""
-        st = S.wrap_stats([{"text": self.LONG}], 33, 2, True)
+        st = S.wrap_stats([{"text": self.LONG}], 33, "y")
         self.assertEqual((st["wraps"], st["violations"], st["rate"]), (1, 0, 0.0))
-        # 歌词档不设上限，写死 max_lines=1 也不该让它漏统计（单行档才该跳过）
-        self.assertEqual(S.wrap_stats([{"text": self.LONG}], 33, 1, True)["wraps"], 1)
-        self.assertEqual(S.wrap_stats([{"text": self.LONG}], 33, 1)["wraps"], 0)
+
+    def test_the_roll_rail_has_no_wrapping_at_all(self):
+        """横滚档不折行：一句一行滚过去，一个断点都不存在。
+
+        在这一档报「折行 N 处」是假账——那些句子一行都没折。从前这里靠
+        「行数上限 = 1 就跳过」漏出统计，那是个巧合。
+        """
+        st = S.wrap_stats([{"text": self.LONG}, {"text": self.LONG * 2}], 33, "x")
+        self.assertEqual(st, {"wraps": 0, "violations": 0, "rate": 0.0, "samples": []})
+        self.assertEqual(S.count_word_breaks(self.LONG, 33, "x"), 0)
 
 
-class TestSplitSentences(unittest.TestCase):
-    """程序拼的文本（片头 / 前期回顾 / 片尾）按正文那把尺切句。
+class TestFrameGeometry(unittest.TestCase):
+    """框的几何只有一处出处（`frame_geometry`），两档共用。
 
-    这一层管的是「一句话该有多长」，与 wrap_* 管的「一句话排几行」不是一回事。
-    它们按设计粘在脚本阶段门禁之后，长度本来没人管——2c / 2d 的回顾就这么长到
-    195 / 241 字，在 33 字/行下要 7 / 9 行，而歌词框只有 `lyric_max_rows` 行高：
-    多出来的行被 `\\clip` 裁掉，不是难看，是丢字。所以「拼出来的那一刻就合尺」。
+    这些数是预览与成片的共同分母：预览照同一次算式画（web_ui.paintSubPreview），
+    差一点就是「所见非所得」。
     """
 
-    RECAP = ("上期《零依赖拆解与渐进加载的决策引擎》聊的是以 semantic-split 为核心，"
-             "阐释 Pipeline A/B/C 递进匹配、懒加载门禁与 0.6 阈值复用机制，"
-             "实现低开销任务分解。——讲了阐释系统零依赖正则分析、递进匹配机制与"
-             "基于门禁钩子的懒加载管控逻辑、说明按优先级扫描的渐进决策树机制与"
-             "模板自动凝练的管理流程、演示模型路径解析、流水线执行控制与本地环境"
-             "配置的命令行操作等。")
+    BASE = {"subtitle.font_size": 52, "subtitle.font_size_vertical": 40,
+            "subtitle.margin_lr": 90, "subtitle.margin_v": 90,
+            "subtitle.margin_v_vertical": 220}
 
-    def test_every_sentence_fits_the_ruler(self):
-        for limit in (40, 30, 24):
-            for s in S.split_sentences(self.RECAP, limit):
-                with self.subTest(limit=limit, s=s[:12]):
-                    self.assertTrue(s)
-                    self.assertLessEqual(len(s), limit, "句子超尺：%r" % s)
+    def test_landscape_numbers(self):
+        g = S.frame_geometry(self.BASE, 1920, 1080, "", 8)
+        self.assertEqual((g["x1"], g["x2"]), (90, 1830))
+        self.assertEqual(g["pitch"], round(52 * 1.35))       # 70
+        self.assertEqual(g["bottom"], 990)
+        self.assertEqual(g["h"], 8 * 70)
+        self.assertEqual(g["top"], 990 - 560)
+        self.assertEqual(g["anchor"], 990 - 280)
+        self.assertEqual(g["cx"], 960)
 
-    def test_splitting_never_loses_a_character(self):
-        for limit in (40, 16):
-            with self.subTest(limit=limit):
-                self.assertEqual("".join(S.split_sentences(self.RECAP, limit)),
-                                 self.RECAP)
+    def test_vertical_uses_its_own_margin_and_size(self):
+        g = S.frame_geometry(self.BASE, 1080, 1920, "_v", 8)
+        self.assertEqual((g["x1"], g["x2"]), (90, 990))
+        self.assertEqual(g["pitch"], round(40 * 1.35))       # 54
+        self.assertEqual(g["bottom"], 1700)
+        self.assertEqual(g["h"], 8 * 54)
 
-    def test_short_text_is_one_sentence(self):
-        self.assertEqual(S.split_sentences("上期《标题》聊的是主旨。", 40),
-                         ["上期《标题》聊的是主旨。"])
+    def test_height_is_rows_times_pitch(self):
+        for rows in (1, 3, 8, 24):
+            with self.subTest(rows=rows):
+                g = S.frame_geometry(self.BASE, 1920, 1080, "", rows)
+                self.assertEqual(g["h"], rows * g["pitch"])
 
-    def test_empty_text_gives_no_sentences(self):
-        self.assertEqual(S.split_sentences("", 40), [])
-        self.assertEqual(S.split_sentences("   ", 40), [])
-
-    def test_cut_lands_after_punctuation(self):
-        """切点落在句读标点之后（标点跟着前一句走），且尽量切满。"""
-        self.assertEqual(S.split_sentences("第一句。第二句也很短。", 10),
-                         ["第一句。", "第二句也很短。"])
-        self.assertEqual(S.split_sentences("甲，乙，丙，丁，戊，己，庚，辛。", 6),
-                         ["甲，乙，丙，", "丁，戊，己，", "庚，辛。"])
-
-    def test_no_punctuation_falls_back_to_a_word_gap(self):
-        """中间没有句读标点时先退到西文词间空格——不留半截词。"""
-        text = "覆盖 activity-duration 与 Structured Writer 的边界"
-        parts = S.split_sentences(text, 24)
-        self.assertEqual(parts, ["覆盖 activity-duration 与 ", "Structured Writer 的边界"])
-        self.assertEqual("".join(parts), text)
-
-    def test_never_cuts_inside_a_latin_token_when_a_break_exists(self):
-        """只要窗口里有合法断点，就不会切在西文词中间（40 字那把尺下必然如此）。
-
-        整段连一个断点都没有时只能硬切——那是与折行同源的兜底，见下一条。
+    def test_pixel_width_is_calibrated_not_the_font_size(self):
+        """字宽是实渲标定的系数，不是「一个汉字管一个字号」。
+        
+        按 1.0 倍估会把字宽算多三成，横滚的终点就跑过框（预览也跟着错）。
         """
-        for limit in (40, 30, 18):
-            text = self.RECAP
-            at = 0
-            for s in S.split_sentences(text, limit)[:-1]:
-                at += len(s)
-                with self.subTest(limit=limit, at=at):
-                    self.assertFalse(S._in_latin_token(text, at),
-                                     "切在西文词中间：%r" % text[max(0, at - 12):at + 12])
+        self.assertEqual((S.CHAR_W_HAN, S.CHAR_W_FULL, S.CHAR_W_HALF),
+                         (0.751, 0.820, 0.438))
+        self.assertAlmostEqual(S.text_px_width("中", 100), 75.1, places=4)
+        self.assertAlmostEqual(S.text_px_width("，", 100), 82.0, places=4)
+        self.assertAlmostEqual(S.text_px_width("a", 100), 43.8, places=4)
+        self.assertAlmostEqual(S.text_px_width("中a，", 100), 75.1 + 43.8 + 82.0, places=4)
 
-    def test_an_unbreakable_span_is_hard_cut(self):
-        """一段里没有任何断点可切（一个词就长过尺）时硬切，且不丢字。
+    def test_the_width_rule_matches_a_real_render(self):
+        """验收口径：算式算出的宽**不得小于**实渲量出的宽，偏差 ≤ 2%。
 
-        两种兜底次序与折行一致：标点 → 词间空格 → 四级判定的硬切。
+        实渲那个数是标定阶段用 libass 量的：111 汉字 + 9 全角标点 + 5 半角、
+        字号 52，墨迹宽 4790px（系数本身由同一段文本在 12/16/20/24 四个字号上
+        四点定出，这是拿 52 号做的交叉验证）。算式给 4832.4px，偏宽 0.9%。
+
+        方向是安全的：终点按「文字宽」反推，算宽了只会让文字早一点点停住
+        （框里仍留得住结尾），算窄了才会跑过框、把结尾裁掉。
         """
-        self.assertEqual(S.split_sentences("semantic-split", 8), ["semantic", "-split"])
-        self.assertEqual("".join(S.split_sentences("semantic-split", 8)), "semantic-split")
+        sample = "中" * 111 + "，" * 9 + "a" * 5
+        self.assertEqual(len(sample), 125, "样本被改动了，这一条就失去意义")
+        calc = S.text_px_width(sample, 52)
+        measured = 4790.0
+        self.assertGreaterEqual(calc, measured,
+                                "算式比实渲窄：横滚终点会跑过框，结尾被裁")
+        self.assertLessEqual(abs(calc - measured) / measured, 0.02,
+                             "算式与实渲差过 2%%，字宽系数该重标了")
+
+    def test_unrecognised_preset_falls_back_to_the_default(self):
+        """老项目清单里还存着已删除的 `dual`：认不出就按默认档走，不报错。"""
+        for 老值 in ("dual", "dual_named", "", None):
+            with self.subTest(preset=老值):
+                name, opt = S.preset_of({"subtitle.preset": 老值})
+                self.assertEqual(name, "lyric")
+                self.assertEqual(opt["axis"], "y")
+
+
+class TestColourWritings(unittest.TestCase):
+    """配色有两种写法，点位各定一种：`subtitle.color_a` 收 ASS 的 `&HAABBGGRR`，
+    `subtitle.highlight_color` 收 CSS 的 `#RRGGBB`。
+
+    后端两种都认（`_ass_color`），前端预览要把 ASS **倒回** CSS 才画得出来——倒错
+    方向就是 BGR 当 RGB 用（红蓝互换），不过滤则是非法值被浏览器丢掉、字变黑。
+    所以这一条契约两边一起钉：这边钉后端收两种写法，预览那一边钉转换在。
+    """
+
+    FONT = "HarmonyOS Sans SC"
+
+    def _ass(self, **over):
+        cfg = {"subtitle.preset": "single", "speaker_indicator.name_shown": False,
+               "speaker_indicator.mode": "style", "subtitle.font_family": self.FONT}
+        cfg.update(over)
+        return S.build_ass([{"speaker": "A", "text": "一句。"}], cfg,
+                           [{"start": 0.0, "end": 2.0}], 1920, 1080, "")[0]
+
+    def test_the_speaker_colour_takes_either_writing(self):
+        for value in ("&H8AD9FF", "#FFD98A"):          # 同一个颜色的两种写法
+            with self.subTest(value=value):
+                ass = self._ass(**{"subtitle.color_a": value})
+                self.assertIn("Style: SpeakerA,%s,52,&H8AD9FF" % self.FONT, ass,
+                              "A 角字幕色没认出来（%s）" % value)
+
+    def test_the_highlight_colour_takes_either_writing(self):
+        for value in ("#FFD98A", "&H8AD9FF"):
+            with self.subTest(value=value):
+                ass = self._ass(**{"subtitle.highlight": True,
+                                   "subtitle.highlight_color": value})
+                self.assertIn("Style: FrameCur,%s,52,&H8AD9FF" % self.FONT, ass,
+                              "高亮配色没认出来（%s）" % value)
+
+
+class TestStripPreset(unittest.TestCase):
+    """单行滚动档：一句一行、不折字，装不下就在框里滚过框口。"""
+
+    LONG = ("上期《骨架叙事切分与介质边界的确定性约束》聊的是聚焦成书的结构性排版，"
+            "揭示注册列表驱动的四部叙事弧线、页面物理边界（断页/字体/缩放）与"
+            "元数据口径的刚性同步机制。")
+    SCRIPT = [
+        {"speaker": "A", "text": "第一句很短。"},
+        {"speaker": "B", "text": LONG},
+        {"speaker": "A", "text": "第三句。"},
+    ]
+    TIMINGS = [{"start": 0.0, "end": 2.0}, {"start": 2.0, "end": 29.1},
+               {"start": 29.1, "end": 31.0}]
+    BASE = {"subtitle.preset": "single", "speaker_indicator.name_shown": False,
+            "speaker_indicator.mode": "style", "subtitle.font_family": "HarmonyOS Sans SC"}
+
+    def _ass(self, script=None, timings=None, suffix="", size=(1920, 1080), **over):
+        cfg = dict(self.BASE, **over)
+        text, mc, axis = S.build_ass(script or self.SCRIPT, cfg,
+                                     timings or self.TIMINGS,
+                                     size[0], size[1], suffix)
+        return text, mc, axis
+
+    def test_preset_reports_the_horizontal_axis(self):
+        _, _, axis = self._ass()
+        self.assertEqual(axis, "x", "单行档没走到横滚那一支")
+
+    def test_one_dialogue_per_sentence_and_no_wrapping(self):
+        """不折行：每句一条 Dialogue，正文里一个 \\N 都没有。
+
+        从前的单行档把整句交给渲染器自动折行——中文没有词间空格，libass 把整句
+        当成一个超长 token（实测它根本不折），超出画幅的那截被直接裁掉。
+        """
+        ass, _, _ = self._ass()
+        rows = captions(ass)
+        self.assertEqual(len(rows), len(self.SCRIPT))
+        for d in rows:
+            self.assertNotIn("\\N", d["text"])
+
+    def test_nothing_is_dropped_from_the_text(self):
+        """整句原样进画面：一个字不少（这正是横滚要保住的东西）。"""
+        ass, _, _ = self._ass()
+        for d, item in zip(captions(ass), self.SCRIPT):
+            self.assertEqual(d["text"], item["text"])
+
+    def test_the_box_is_one_construct_for_both_presets(self):
+        """两档的框是同一个构造：左右、底边、填充、描边完全相同。
+
+        只有「高」随各自的行数（单行滚动 1 行、歌词 `frame_rows` 行）——它由
+        `frame_geometry` 同一行算式算出来。框已改由烘焙画进背景图，所以这里断言的是
+        **画框那份参数**（`frame_box_paint`），不再是 ASS 里的一条事件。
+        """
+        cfg = dict(self.BASE, **{"subtitle.bg_alpha": 128, "subtitle.outline": 2})
+        px = S.frame_box_paint(S.frame_of(cfg, 1920, 1080, ""), 128, 2)
+        cfg_y = dict(cfg, **{"subtitle.preset": "lyric"})
+        gy = S.frame_of(cfg_y, 1920, 1080, "")
+        py = S.frame_box_paint(gy, 128, 2)
+        gx = S.frame_of(cfg, 1920, 1080, "")
+        self.assertEqual(px["rect"][:2], (gx["x1"], gx["top"]),
+                         "框左上角 ≠ frame_geometry")
+        self.assertEqual(py["rect"][:2], (gy["x1"], gy["top"]))
+        # 左右与底边同源：同一个 margin_lr / margin_v
+        self.assertEqual(px["rect"][0], py["rect"][0])
+        self.assertEqual(px["rect"][2], py["rect"][2])
+        self.assertEqual(px["rect"][3], py["rect"][3])
+        # 填充、描边、描边宽都是同一套参数（描边只往外扩整宽）
+        for key in ("fill", "border", "width", "out"):
+            with self.subTest(key=key):
+                self.assertEqual(px[key], py[key])
+        self.assertEqual(px["out"], px["width"])
+        # 两档的框宽相同、高不同（同一条 `frame_geometry` 算式，只有行数不一样）
+        self.assertEqual(px["rect"][2] - px["rect"][0], py["rect"][2] - py["rect"][0])
+        self.assertLess(px["rect"][3] - px["rect"][1], py["rect"][3] - py["rect"][1])
+        self.assertEqual(px["rect"][3] - px["rect"][1], gx["h"])
+        self.assertEqual(py["rect"][3] - py["rect"][1], gy["h"])
+        # 两档的 ASS 里都不该再有框事件——框只有烘焙一处画
+        for preset in ("single", "lyric"):
+            with self.subTest(preset=preset):
+                ass = self._ass(**{"subtitle.preset": preset})[0]
+                self.assertEqual(boxes(ass), [], "ASS 里还有框事件：%s" % preset)
+
+    def test_short_sentence_stays_put_in_the_middle(self):
+        """装得下就静止居中：\\pos 落在框中心，不滚。"""
+        ass, _, _ = self._ass()
+        g = S.frame_geometry(self.BASE, 1920, 1080, "", 1)
+        cy = int(round(g["anchor"]))
+        first = captions(ass)[0]
+        self.assertEqual((first["x_from"], first["y_to"]), (g["cx"], cy))
+        self.assertNotIn("\\move(", first["head"])
+
+    def test_long_sentence_rolls_between_the_two_edges(self):
+        """装不下就滚：起点左缘贴框左、终点右缘贴框右，位移 = 文字宽 − 框宽。
+
+        三段式里的「句首静止」由 t1 > 0 表达——t1 = 0 就是「一上来就动」，
+        观众还没读到开头字就滑走了。
+        """
+        ass, _, _ = self._ass()
+        g = S.frame_geometry(self.BASE, 1920, 1080, "", 1)
+        cy = int(round(g["anchor"]))
+        d = captions(ass)[1]
+        w_t = S.text_px_width(self.LONG, g["size"])
+        self.assertGreater(w_t, g["x2"] - g["x1"], "这条样本本该溢出，测试没验到东西")
+        self.assertEqual((d["x_from"], d["y_to"], d["x_to"]),
+                         (int(round(g["x1"] + w_t / 2.0)), cy,
+                          int(round(g["x2"] - w_t / 2.0))))
+        self.assertGreater(d["t1"], 0, "句首静止期为 0：开头一个字都留不住")
+        self.assertLessEqual(d["t2"], int(round(27.1 * 1000)) + 1)
+        self.assertEqual(d["t2"], int(round((29.1 - 2.0) * 1000)))
+
+    #: 终点允许晚于句末的余量。ASS 时间戳只有 10ms 一格（`fmt_ass_time` 是
+    #: `%05.2f`），而 `\move` 的终点是 `round(span × 1000)` 毫秒，事件起止又各自
+    #: 落格一次——两端各最多差 5ms，合起来不到一格半，取 20ms 封顶。
+    #:
+    #: 所以「终点 ≤ 句末」这条不变量只能断言到 20ms 以内：差额是时间戳取整的
+    #: 零头，**不是滚不完**。画面上的表现是最后十几毫秒的位移被掐掉，不足一个
+    #: 像素，肉眼不可见。拿 `end <= span` 去卡会误报（真渲实测差 3ms）。
+    TAIL_TOLERANCE = 0.020
+
+    def test_the_roll_always_finishes_before_the_sentence_ends(self):
+        """滚得完——写进测试的硬断言，不靠眼看。
+
+        位移 = 文字宽 − 框宽 恒小于文字总宽；速度 = 文字宽 ÷ 句时长，于是
+        滚动时长 = 句时长 × 位移 ÷ 文字宽 **恒小于句时长**。这条在真时间轴上
+        逐句验一遍（长短句、两种画幅都覆盖）。
+
+        静止的那几句（装得下、`\\pos` 居中）本来就没有滚动期，跳过——不动的
+        话 t1 == t2 == 0，拿「t2 ≤ 时长」去套它没有意义。句时长不足 0.3 秒的
+        也跳过：那会顶到 `_strip_events` 的时长下限（防零除的兜底），推不出
+        「滚得完」的结论。
+
+        终点不精确等于句末，只保证落在句末的**一格时间戳**之内——理由见
+        `TAIL_TOLERANCE`。
+        """
+        for size, suffix in (((1920, 1080), ""), ((1080, 1920), "_v")):
+            ass, _, _ = self._ass(size=size, suffix=suffix)
+            moving = [d for d in captions(ass) if "\\move(" in d["head"]]
+            self.assertTrue(moving, "这份样本一句都没滚起来，测试没验到东西")
+            for d in moving:
+                span = seconds(d["end"]) - seconds(d["start"])
+                if span < 0.3:
+                    continue
+                with self.subTest(size=size, start=d["start"]):
+                    self.assertLessEqual(d["t2"] / 1000.0, span + self.TAIL_TOLERANCE,
+                                         "终点冲出去了：句长 %.2fs，终点 %.2fs"
+                                         % (span, d["t2"] / 1000.0))
+                    self.assertGreater(d["t1"], 0)
+                    self.assertLess(d["t1"], d["t2"], "这句根本没动")
+
+    def test_the_width_counts_the_name_prefix(self):
+        """说话人名算进文字宽——它是画面上的字，不算就滚不到位。"""
+        cfg = dict(self.BASE, **{"speaker_indicator.name_shown": True,
+                                 "tts.name_a": "小美", "tts.name_b": "大美"})
+        ass = S.build_ass(self.SCRIPT, cfg, self.TIMINGS, 1920, 1080, "")[0]
+        d = captions(ass)[1]
+        g = S.frame_geometry(cfg, 1920, 1080, "", 1)
+        w_t = S.text_px_width("大美：" + self.LONG, g["size"])
+        self.assertEqual(d["x_from"], int(round(g["x1"] + w_t / 2.0)))
+
+    def test_every_sentence_is_clipped_to_the_box(self):
+        """每条都裁到框内：\\clip 的矩形与框四点一致。"""
+        ass, _, _ = self._ass()
+        g = S.frame_geometry(self.BASE, 1920, 1080, "", 1)
+        want = "\\clip(%d,%d,%d,%d)" % (g["x1"], g["top"], g["x2"], g["bottom"])
+        for d in captions(ass):
+            with self.subTest(start=d["start"]):
+                self.assertIn(want, d["head"])
+
+    def test_speaker_colours_still_apply(self):
+        """说话人分色在这一档照旧：样式名字跟歌词档同一套。"""
+        ass, _, _ = self._ass()
+        self.assertEqual([d["style"] for d in captions(ass)],
+                         ["SpeakerA", "SpeakerB", "SpeakerA"])
+
+    def test_highlight_turns_the_only_sentence_into_the_highlight_colour(self):
+        """屏幕上只有当前句，高亮就是整句换色（不建上下文样式）。"""
+        ass, _, _ = self._ass(**{"subtitle.highlight": True,
+                                 "subtitle.highlight_color": "#FFD98A"})
+        self.assertEqual({d["style"] for d in captions(ass)}, {"FrameCur"})
+        self.assertIn("Style: FrameCur,%s,52,&H8AD9FF"
+                      % self.BASE["subtitle.font_family"], ass)
+        self.assertNotIn("FrameCtx", ass)
 
 
 class TestLyricPreset(unittest.TestCase):
-    """歌词版式：窗口行预算、自动折行、上滚、高亮。"""
+    """歌词版式（纵轴）：框内行预算、自动折行、上滚、高亮。"""
 
     SCRIPT = [
         {"speaker": "A", "text": "第一句很短。"},
@@ -425,40 +640,13 @@ class TestLyricPreset(unittest.TestCase):
 
     def _ass(self, script=None, timings=None, suffix="", size=(1920, 1080), **over):
         cfg = dict(self.BASE, **over)
-        text, mc, ml, balanced = S.build_ass(script or self.SCRIPT, cfg,
-                                             timings or self.TIMINGS,
-                                             size[0], size[1], suffix)
-        return text, mc, ml, balanced
+        text, mc, axis = S.build_ass(script or self.SCRIPT, cfg,
+                                     timings or self.TIMINGS,
+                                     size[0], size[1], suffix)
+        return text, mc, axis
 
-    @staticmethod
-    def _rows(ass):
-        """把 Dialogue 拆成字段。head 里的 \\pos/\\move 是歌词档的位置来源。
-
-        `box` 标记这条是不是歌词档垫底的整块框（\\p1 绘图事件）——它不参与
-        「文字行预算 / 图层号」那几条断言，必须能一眼摘出来。
-        """
-        out = []
-        for line in ass.splitlines():
-            if not line.startswith("Dialogue:"):
-                continue
-            f = line.split(",", 9)
-            raw = f[9]
-            head, text = (raw.split("}", 1) + [""])[:2] if raw.startswith("{") else ("", raw)
-            head = head + "}" if head else ""
-            rec = {"layer": f[0].split()[1], "start": f[1], "end": f[2],
-                   "style": f[3], "head": head, "text": text,
-                   "box": "\\p1" in head}
-            mv = re.search(r"\\move\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)", head)
-            ps = re.search(r"\\pos\((-?\d+),(-?\d+)\)", head)
-            if mv:
-                rec.update(cx=int(mv.group(1)), y_from=int(mv.group(2)),
-                           cx2=int(mv.group(3)), y_to=int(mv.group(4)),
-                           t1=int(mv.group(5)), t2=int(mv.group(6)))
-            elif ps:
-                rec.update(cx=int(ps.group(1)), y_from=int(ps.group(2)),
-                           cx2=int(ps.group(1)), y_to=int(ps.group(2)))
-            out.append(rec)
-        return out
+    def _rows(self, ass):
+        return dialogues(ass)
 
     def _by_interval(self, ass):
         """按区间分组（区间起点就是句子的起点）。"""
@@ -468,37 +656,20 @@ class TestLyricPreset(unittest.TestCase):
         return [groups[k] for k in sorted(groups)]
 
     def _boxes(self, ass):
-        """歌词档垫底的整块框（\\p1 绘图事件）。"""
-        return [d for d in self._rows(ass) if d["box"]]
+        return boxes(ass)
 
     def _lyrics(self, ass):
-        """歌词文本事件（排除垫底的框）。"""
-        return [d for d in self._rows(ass) if not d["box"]]
+        return captions(ass)
 
     def _geom(self, cfg=None, size=(1920, 1080), sfx=""):
-        """独立算一遍框几何（不调引擎内部），供断言引用。
-
-        与 subtitle_engine._lyric_events 同源：x1/x2 由 margin_lr 收，底 = 画幅高
-        − 边距（竖屏取 margin_v_vertical），高 = 行数 × 行距，锚点 = 框垂直中心。
-        """
+        """框几何：直接问引擎要（唯一出处），测试不再自己算一遍。"""
         cfg = cfg if cfg is not None else self.BASE
-        w, h = size
-        if sfx:
-            s = int(cfg.get("subtitle.font_size_vertical", 40))
-            mv = int(cfg.get("subtitle.margin_v_vertical", 220))
-        else:
-            s = int(cfg.get("subtitle.font_size", 52))
-            mv = int(cfg.get("subtitle.margin_v", 90))
-        mlr = int(cfg.get("subtitle.margin_lr", 90))
-        rows = max(2, int(cfg.get("subtitle.lyric_max_rows", 8)))
-        pitch = max(1, int(round(s * S.LYRIC_LINE_PITCH)))
-        fh = rows * pitch
-        return {"x1": mlr, "x2": w - mlr, "bottom": h - mv, "top": h - mv - fh,
-                "h": fh, "anchor": h - mv - fh / 2.0, "pitch": pitch}
+        rows = max(2, int(cfg.get("subtitle.frame_rows", 8)))
+        return S.frame_geometry(cfg, size[0], size[1], sfx, rows)
 
-    def test_preset_reports_balanced(self):
-        _, mc, _, balanced = self._ass()
-        self.assertTrue(balanced, "歌词档没走到均衡折行那一支")
+    def test_preset_reports_the_vertical_axis(self):
+        _, mc, axis = self._ass()
+        self.assertEqual(axis, "y")
         self.assertEqual(mc, (1920 - 90 * 2) // 52)        # 每行容量仍由边距与字号算
 
     def test_capacity_is_ours_not_the_renderers(self):
@@ -507,18 +678,18 @@ class TestLyricPreset(unittest.TestCase):
         实测过 libass 不自动折行（不写 \\N 时长句直接顶到边），所以「交给渲染器
         自动换行」这条路在画面烧录里不存在——折行只能自己来。
         """
-        ass, mc, _, _ = self._ass()
+        ass, mc, _ = self._ass()
         for d in self._lyrics(ass):
             for seg in d["text"].split("\\N"):
                 self.assertLessEqual(len(seg), mc, "行超容量：%r" % seg)
 
     def test_row_budget_counts_blank_rows(self):
-        """上限按行计（含空行）：每句的代价 = 1 个空行 + 它自己折的行数。
+        """框高按行计（含空行）：每句的代价 = 1 个空行 + 它自己折的行数。
 
         只数文字（图层 1）——垫底的框（图层 0）不占文字行预算。
         """
         for cap in (5, 8, 12):
-            ass, _, _, _ = self._ass(**{"subtitle.lyric_max_rows": cap})
+            ass, _, _ = self._ass(**{"subtitle.frame_rows": cap})
             for j, evs in enumerate(self._by_interval(ass)):
                 used = sum(len(d["text"].split("\\N")) + 1
                            for d in evs if d["layer"] == "1")
@@ -526,8 +697,7 @@ class TestLyricPreset(unittest.TestCase):
                     self.assertLessEqual(used, cap)
 
     def test_window_cap_limits_visible_sentences(self):
-        ass, _, _, _ = self._ass(**{"subtitle.lyric_window": 2,
-                                   "subtitle.lyric_max_rows": 12})
+        ass, _, _ = self._ass(**{"subtitle.window": 2, "subtitle.frame_rows": 12})
         for j, evs in enumerate(self._by_interval(ass)):
             n = len([d for d in evs if d["layer"] == "1"])
             with self.subTest(interval=j):
@@ -535,31 +705,31 @@ class TestLyricPreset(unittest.TestCase):
 
     def test_shift_is_one_rigid_block(self):
         """整块带子上移：同一区间里各句的位移量相同，横向中心不动。"""
-        ass, _, _, _ = self._ass()
+        ass, _, _ = self._ass()
         self.assertIn("\\move(", ass, "一处都不滚，「上滚」是空话")
         for j, evs in enumerate(self._by_interval(ass)):
             deltas = set()
             for d in evs:
                 if d["layer"] != "1":
                     continue
-                self.assertEqual(d["cx"], d["cx2"], "横向中心被移动了")
+                self.assertEqual(d["x_from"], d["x_to"], "横向中心被移动了")
                 deltas.add(d["y_to"] - d["y_from"])
             with self.subTest(interval=j):
                 self.assertLessEqual(len(deltas), 1, "同区间内各句位移不一致：%s" % deltas)
 
     def test_scroll_happens_at_the_sentence_boundary(self):
         """滚在换点那一刻开始：\\move 的 t1 = 0，历时就是配置里的上滚时长。"""
-        ass, _, _, _ = self._ass(**{"subtitle.lyric_scroll_ms": 600})
+        ass, _, _ = self._ass(**{"subtitle.scroll_ms": 600})
         moved = [d for d in self._rows(ass) if d["layer"] == "1" and "\\move(" in d["head"]]
         self.assertTrue(moved)
         for d in moved:
             self.assertEqual((d["t1"], d["t2"]), (0, 600))
-        ass0, _, _, _ = self._ass(**{"subtitle.lyric_scroll_ms": 0})
+        ass0, _, _ = self._ass(**{"subtitle.scroll_ms": 0})
         self.assertNotIn("\\move(", ass0)          # 0 即不滚，直接跳
 
     def test_squeezed_sentence_slides_out_and_fades(self):
-        """被行预算挤出去的那句在换点处上滚淡出，不是硬消失。"""
-        ass, _, _, _ = self._ass(**{"subtitle.lyric_max_rows": 5})
+        """被框高挤出去的那句在换点处上滚淡出，不是硬消失。"""
+        ass, _, _ = self._ass(**{"subtitle.frame_rows": 5})
         exits = [d for d in self._rows(ass) if d["layer"] == "2"]
         self.assertTrue(exits, "行预算挤压没触发，这条没验到东西")
         for d in exits:
@@ -568,43 +738,43 @@ class TestLyricPreset(unittest.TestCase):
 
     def test_highlight_marks_the_sentence_in_the_box_centre(self):
         """当前句只有一个、且落在框的垂直中心；上下文用压暗的说话人本色。"""
-        ass, _, _, _ = self._ass(**{"subtitle.highlight": True,
-                                    "subtitle.highlight_color": "#FFD98A"})
+        ass, _, _ = self._ass(**{"subtitle.highlight": True,
+                                 "subtitle.highlight_color": "#FFD98A"})
         anchor = int(round(self._geom()["anchor"]))
         per = self._by_interval(ass)
         for j, evs in enumerate(per[:len(self.SCRIPT)]):
-            cur = [d for d in evs if d["style"] == "LyricCur"]
+            cur = [d for d in evs if d["style"] == "FrameCur"]
             with self.subTest(interval=j):
                 self.assertEqual(len(cur), 1, "当前句该有且只该有一句是高亮色")
                 self.assertEqual(cur[0]["y_to"], anchor)           # 落在框垂直中心
                 self.assertIn(self.SCRIPT[j]["text"][:4], cur[0]["text"])
             for d in evs:
-                if d["layer"] == "1" and d["style"] != "LyricCur":
-                    self.assertIn(d["style"], ("LyricCtxA", "LyricCtxB"))
+                if d["layer"] == "1" and d["style"] != "FrameCur":
+                    self.assertIn(d["style"], ("FrameCtxA", "FrameCtxB"))
         # 高亮色真的写进了样式表（#FFD98A → ASS 的 &H8AD9FF）
-        self.assertIn("Style: LyricCur,%s,52,&H8AD9FF" % self.BASE["subtitle.font_family"], ass)
+        self.assertIn("Style: FrameCur,%s,52,&H8AD9FF" % self.BASE["subtitle.font_family"], ass)
 
     def test_highlight_off_keeps_speaker_colours(self):
         """高亮关掉时三句同底色（读到哪里只靠位置看），不建高亮样式。"""
-        ass, _, _, _ = self._ass(**{"subtitle.highlight": False})
+        ass, _, _ = self._ass(**{"subtitle.highlight": False})
         styles = {d["style"] for d in self._rows(ass) if d["layer"] == "1"}
         self.assertEqual(styles, {"SpeakerA", "SpeakerB"})
-        self.assertNotIn("Style: LyricCur", ass)
-        self.assertNotIn("LyricCtx", ass)
+        self.assertNotIn("Style: FrameCur", ass)
+        self.assertNotIn("FrameCtx", ass)
 
     def test_highlight_off_ignores_a_configured_colour(self):
         """配色只在开关打开时才读——关着还染色的活，是开关没接上。"""
-        ass, _, _, _ = self._ass(**{"subtitle.highlight": False,
-                                    "subtitle.highlight_color": "#FF0000"})
-        self.assertNotIn("Style: LyricCur", ass)
+        ass, _, _ = self._ass(**{"subtitle.highlight": False,
+                                 "subtitle.highlight_color": "#FF0000"})
+        self.assertNotIn("Style: FrameCur", ass)
 
     def test_long_sentence_gets_as_many_lines_as_needed(self):
         """料多长就排多少行：96 字一句在三行容量下必须排满三行，不是两行。"""
         long_text = "既然产物种类繁多，统一归口预设文件夹是为了让后续自动化清理与备份能精准定位目标。" * 3
-        cfg = {"subtitle.preset": "lyric", "subtitle.lyric_window": 1,
-               "subtitle.lyric_max_rows": 24, "speaker_indicator.name_shown": False}
-        ass, mc, _, _ = S.build_ass([{"speaker": "A", "text": long_text}], cfg,
-                                    [{"start": 0.0, "end": 5.0}], 1920, 1080, "")
+        cfg = {"subtitle.preset": "lyric", "subtitle.window": 1,
+               "subtitle.frame_rows": 24, "speaker_indicator.name_shown": False}
+        ass, mc, _ = S.build_ass([{"speaker": "A", "text": long_text}], cfg,
+                                 [{"start": 0.0, "end": 5.0}], 1920, 1080, "")
         body = [d for d in self._rows(ass) if d["layer"] == "1"][0]["text"]
         rows = body.split("\\N")
         self.assertEqual(len(rows), -(-len(long_text) // mc))
@@ -612,37 +782,44 @@ class TestLyricPreset(unittest.TestCase):
     def test_box_geometry_uses_each_frames_own_margin(self):
         """框几何：底 = 画幅高 − 边距，高 = 行数 × 行距，左右由 margin_lr 收。
 
-        竖屏取 margin_v_vertical、横屏取 margin_v。纵向基准从 0.41.0 起只剩这一条
-        ——旧配置里的绝对锚点 `lyric_anchor_y` 已删，两种画幅靠各自的边距各得其所
-        （从前靠 1080 比例换算）。
+        竖屏取 margin_v_vertical、横屏取 margin_v。两种画幅靠各自的边距各得其所。
+        几何只有一处出处（`frame_geometry`），烘焙与 ASS 都从这里取——所以这里比的是
+        「画框那份参数」与引擎给的那组数，不再去 ASS 里找框事件。
         """
         for (w, h), sfx, size, mvkey, mv in (
                 ((1920, 1080), "", 52, "subtitle.margin_v", 90),
                 ((1080, 1920), "_v", 40, "subtitle.margin_v_vertical", 220)):
-            cfg = dict(self.BASE, **{"subtitle.lyric_window": 1, mvkey: mv})
-            ass, _, _, _ = S.build_ass(self.SCRIPT, cfg, self.TIMINGS, w, h, sfx)
+            cfg = dict(self.BASE, **{"subtitle.window": 1, mvkey: mv,
+                                     "subtitle.bg_alpha": 128, "subtitle.outline": 2})
             g = self._geom(cfg, (w, h), sfx)
-            box = self._boxes(ass)
+            p = S.frame_box_paint(g, 128, 2)
             with self.subTest(size=(w, h)):
-                self.assertEqual(len(box), 1, "歌词档该有且只有一条框事件")
-                self.assertEqual(box[0]["cx"], g["x1"], "框左边 ≠ margin_lr")
-                self.assertEqual(box[0]["y_to"], g["top"], "框顶 ≠ 高 − 边距 − 框高")
-                self.assertEqual(g["h"], 8 * max(1, int(round(size * S.LYRIC_LINE_PITCH))))
-                self.assertIn("l %d 0 l %d %d l 0 %d c"
-                              % (g["x2"] - g["x1"], g["x2"] - g["x1"], g["h"], g["h"]),
-                              box[0]["text"])
+                self.assertEqual(p["rect"][0], g["x1"], "框左边 ≠ margin_lr")
+                self.assertEqual(p["rect"][2], g["x2"])
+                self.assertEqual(p["rect"][1], g["top"], "框顶 ≠ 高 − 边距 − 框高")
+                self.assertEqual(p["rect"][3], g["bottom"])
+                self.assertEqual(g["h"], 8 * max(1, int(round(size * S.FRAME_LINE_PITCH))))
+                self.assertEqual(g["bottom"], h - mv, "底边没按这一画幅自己的边距收")
 
-    def test_box_fill_and_border_are_fixed(self):
-        """框填充 = bg_alpha（与旧 per-line 盒同口径）；描边写死、不读 subtitle.outline。"""
-        ass, _, _, _ = self._ass(**{"subtitle.bg_alpha": 64, "subtitle.outline": 6})
-        box = self._boxes(ass)[0]
-        self.assertIn(r"\1a&H40&", box["head"])                 # 64 → 0x40
-        self.assertIn(r"\bord%d" % S.LYRIC_BOX_BORDER, box["head"])
-        self.assertNotIn(r"\bord6", box["head"], "歌词档不该读 subtitle.outline")
+    def test_box_fill_and_border_come_from_the_config(self):
+        """框填充 = bg_alpha；描边宽 = subtitle.outline（两档共用同一项）。
+
+        从前歌词档不读 subtitle.outline（那一项只给单双行的填充块当内边距），
+        描边写死 2px——两档各有一套框的样子，正是这次合并要消掉的东西。框改由烘焙
+        画进背景图之后，这一项仍然只值一处：`frame_box_paint` 的参数。
+        """
+        g = self._geom()
+        p = S.frame_box_paint(g, 64, 7)
+        self.assertEqual(p["width"], 7, "描边宽没跟 subtitle.outline 走")
+        self.assertEqual(p["out"], 7, "描边只往外扩整宽")
+        # ASS 口径的 64 透明度 → Pillow 的不透明度 191（255 × (1 − 64/255)）
+        self.assertEqual(p["fill_alpha"], 191)
+        # 描边的不透明度是常量（FRAME_BOX_BORDER_ALPHA = 0x66）
+        self.assertEqual(p["border_alpha"], 153)
 
     def test_every_line_is_clipped_to_the_box(self):
         """每条歌词都裁到框内：\\clip 的矩形与框四点一致（上滚时不许飘出框）。"""
-        ass, _, _, _ = self._ass()
+        ass, _, _ = self._ass()
         g = self._geom()
         want = r"\clip(%d,%d,%d,%d)" % (g["x1"], g["top"], g["x2"], g["bottom"])
         lines = self._lyrics(ass)
@@ -650,27 +827,32 @@ class TestLyricPreset(unittest.TestCase):
         for d in lines:
             self.assertIn(want, d["head"])
 
-    def test_layers_run_box_then_text_then_exit(self):
-        """图层号显式三层：框 0 < 常驻句 1 < 淡出句 2。"""
-        ass, _, _, _ = self._ass(**{"subtitle.lyric_max_rows": 5})
-        self.assertEqual({d["layer"] for d in self._boxes(ass)}, {"0"})
-        self.assertEqual({d["layer"] for d in self._rows(ass) if not d["box"]}, {"1", "2"})
+    def test_layers_are_text_only_the_box_is_not_an_ass_layer(self):
+        """框不再是 ASS 里的一层。
 
-    def test_style_forks_between_lyric_and_single_dual(self):
-        """样式分叉：歌词档 BorderStyle=1 + 写死小描边 + 全透明 per-line 盒；
-        单双行仍是 BorderStyle=3 + subtitle.outline。"""
-        ass_l, _, _, _ = self._ass(**{"subtitle.outline": 6})
-        head = ass_l.split("[Events]")[0]
-        self.assertIn(",&HFF000000,0,0,0,0,100,100,0,0,1,2,0,2,", head)   # 歌词档
-        for preset in ("single", "dual"):
+        从前框是 layer 0 的 `\\p1` 绘图事件、文字在 1/2 层。现在框由烘焙画在背景图上，
+        ASS 里只剩文字层——留着框事件就成了「两处都能画框」，迟早叠成两层。
+        """
+        ass, _, _ = self._ass(**{"subtitle.frame_rows": 5})
+        self.assertEqual(boxes(ass), [], "ASS 里还有框事件")
+        self.assertEqual({d["layer"] for d in dialogues(ass)}, {"1", "2"},
+                         "文字层号仍是 1（常驻）/ 2（淡出）")
+
+    def test_both_presets_share_one_style_set(self):
+        """两档的 Style 逐字相同：per-line 盒关掉（BackColour 全透明、BorderStyle=1）、
+        描边宽同取 subtitle.outline。从前的单双行是另一套（BorderStyle=3 + per-line
+        填充块），同一个下拉里塞两套框的样子。"""
+        want = ",&HFF000000,0,0,0,0,100,100,0,0,1,%d,0,2," % 6
+        for preset in ("lyric", "single"):
             cfg = {"subtitle.preset": preset, "speaker_indicator.mode": "style",
-                   "speaker_indicator.name_shown": False, "subtitle.outline": 6}
+                   "speaker_indicator.name_shown": False, "subtitle.outline": 6,
+                   "subtitle.font_family": "HarmonyOS Sans SC"}
             txt = S.build_ass(self.SCRIPT, cfg, self.TIMINGS, 1920, 1080, "")[0]
-            self.assertIn(",&H%02X000000,0,0,0,0,100,100,0,0,3,6,0,2," % 128, txt,
-                          "%s 档的样式被歌词档带跑了" % preset)
+            with self.subTest(preset=preset):
+                self.assertIn(want, txt.split("[Events]")[0])
 
     def test_lrc_and_srt_ignore_the_window(self):
-        """窗口只管画面字幕：SRT 与 LRC 一行一条，不看行数与窗口。"""
+        """框只管画面字幕：SRT 与 LRC 一行一条，不看窗口与框高。"""
         srt = S.build_srt(self.SCRIPT, self.BASE, self.TIMINGS)
         self.assertEqual([ln for ln in srt.split("\n") if " --> " in ln][1],
                          "00:00:02,000 --> 00:00:06,000")
@@ -679,9 +861,112 @@ class TestLyricPreset(unittest.TestCase):
         self.assertEqual(len(lrc.split("\n")), 3)
 
 
-# 单行/双行两档的冻结值。来源不是「照现在的代码跑一遍」——那会连 bug 一起冻上，
-# 而是拿改造前的发布副本（v0.39.0）与改造后各跑一份 dump，逐字比对 diff 为 0 之后
-# 取下来的。所以这里红了只有两种可能：单双行真的被动过，或名字开关串了路。
+class TestPreviewSharesTheGeometry(unittest.TestCase):
+    """预览与成片必须同源。
+
+    配置页那两格预览是拿 JS 重画一遍的（`web_ui.paintSubPreview`）：框的几何、字宽、
+    横滚的静止占比都得跟成片一样。界面上的 JS 读不到 Python 常量，只能靠对账——
+    系数差一成，预览里的滚动终点就跟成片差一截，而界面看着一切正常（人按预览调参数，
+    成片却是另一个样子）。这一组按源码扫，逮住就拦。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, "podcast_maker", "web_ui.py"),
+                  encoding="utf-8") as fh:
+            cls.src = fh.read()
+
+    def test_pixel_width_coefficients_are_the_same_numbers(self):
+        m = re.search(r"const CHAR_W=\{han:([\d.]+),full:([\d.]+),half:([\d.]+)\}",
+                      self.src)
+        self.assertIsNotNone(m, "预览的字宽系数表没了，正则已失效")
+        self.assertEqual([float(x) for x in m.groups()],
+                         [S.CHAR_W_HAN, S.CHAR_W_FULL, S.CHAR_W_HALF],
+                         "预览与后端的字宽系数对不上，横滚终点会各算各的")
+
+    def test_line_pitch_matches_the_backend(self):
+        self.assertIn("Math.round(size*%s)" % S.FRAME_LINE_PITCH, self.src,
+                      "预览的行距不是后端那一档系数（%s）" % S.FRAME_LINE_PITCH)
+
+    def test_the_roll_rhythm_matches_the_backend_formula(self):
+        """静止占比 = 框宽 ÷ 文字宽；两端分别贴框左 / 框右——与 `_strip_events` 同式。"""
+        for want in ("bw/tw", "x1+tw/2", "x2-tw/2", "animateTransform"):
+            with self.subTest(fragment=want):
+                self.assertIn(want, self.src, "预览的横滚少了这一式：%s" % want)
+
+    def test_preview_converts_the_ass_colours_to_css(self):
+        """配色两种写法，取哪一路看点位：`subtitle.color_a` 是 ASS 的 `&HAABBGGRR`，
+        `highlight_color` 是 CSS 的 `#RRGGBB`。
+
+        前者直接喂给 SVG 的 fill 是非法值——浏览器丢掉它、回落到黑色，深色框里的
+        「非当前句」就成了看不见的字（`&HFFFFFF` 倒过来还是白，所以白字下看不出问题）。
+        预览必须过一道 `cssColor`。
+        """
+        self.assertIn("cssColor(", self.src, "预览没做配色转换")
+        self.assertIn("h.slice(6,8)+h.slice(4,6)+h.slice(2,4)", self.src,
+                      "ASS→CSS 的字节序没倒过来（BGR → RGB）")
+        self.assertIn("const txtColor=cssColor(cfgVal('subtitle.color_a')", self.src)
+        self.assertIn("const hlColor=cssColor(cfgVal('subtitle.highlight_color')", self.src)
+
+    def test_the_box_is_drawn_from_the_same_four_numbers(self):
+        """框的四点与后端 `frame_geometry` 同源：x1=mlr、x2=W−mlr、底=H−mv、高=行数×行距。"""
+        for want in ("const fh=rows*pitch", "x1=mlr", "x2=W-mlr", "y2=H-mv",
+                     "(axis==='x')?1:"):
+            with self.subTest(fragment=want):
+                self.assertIn(want, self.src, "预览的框几何与后端脱钩了：%s" % want)
+
+
+class TestWrapStyle(unittest.TestCase):
+    """折行只由引擎自己决定，libass 不许插手。
+
+    `WrapStyle: 0`（smart wrap）允许 libass 把宽于可用宽的文字自己折成两行。单行
+    滚动档就是这么长出双行的：整句连说话人名 2458 px 宽、框内可用宽只有 1740 px，
+    libass 折成两行，两行都落在 70 px 高的框里，于是屏幕上真的并排两行小字。
+    `\\clip` 只裁像素、拦不住折行——这不是裁切能解决的问题，只能把折行的决定收回
+    来：写成 2（只在 `\\N` 处断）。本引擎的文字全是自己拼的、断点全由 `_frame_window`
+    的 `\\N` 给出，所以关掉自动折行不会少任何一处换行。
+    """
+
+    SCRIPT = [{"speaker": "A", "text": "第一句。"},
+              {"speaker": "B", "text": "既然产物种类繁多，统一归口预设文件夹。"}]
+    TIMINGS = [{"start": 0.0, "end": 2.0}, {"start": 2.0, "end": 6.0}]
+
+    def _ass(self, preset, w=1920, h=1080, suffix=""):
+        cfg = {"subtitle.preset": preset,
+               "subtitle.font_family": "HarmonyOS Sans SC"}
+        return S.build_ass(self.SCRIPT, cfg, self.TIMINGS, w, h, suffix)[0]
+
+    def test_wrap_is_off_in_both_presets_and_both_orientations(self):
+        for preset in ("single", "lyric"):
+            for w, h, suffix in ((1920, 1080, ""), (1080, 1920, "_v")):
+                with self.subTest(preset=preset, suffix=suffix or "h"):
+                    head = self._ass(preset, w, h, suffix).split("[Events]")[0]
+                    self.assertIn("WrapStyle: 2", head)
+
+    def test_nobody_hands_the_decision_back_to_libass(self):
+        """`\\q` 是逐事件的折行覆盖。写一条就等于把决定又还回去一半。"""
+        for preset in ("single", "lyric"):
+            with self.subTest(preset=preset):
+                self.assertNotIn(chr(92) + "q", self._ass(preset))
+
+    def test_ass_no_longer_carries_the_box_event(self):
+        """框改由烘焙画进背景图（`assets_factory.bake_static_layers`），ASS 里不该
+        再有 `\\p1` 绘图事件——留着就是「两处都能画框」，迟早叠成两层。"""
+        for preset in ("single", "lyric"):
+            with self.subTest(preset=preset):
+                self.assertEqual(boxes(self._ass(preset)), [],
+                                 "ASS 里还有框事件：%s" % preset)
+
+
+# 单行滚动档的冻结值。来源**不是**「照现在的代码跑一遍」——那会连 bug 一起冻上；
+# 是改造后逐条核对过横滚算式（位移 = 文字宽 − 框宽、句首静止 = 框宽 ÷ 速度）之后
+# 取下来的。所以这里红了只有两种可能：横滚真的被动过，或名字开关串了路。
+#
+# 2026-09-24 重取过一次（0.42.0 的「字幕版式两档」与「静态层预烘焙」）：ASS 全文确实
+# 变了，但**只变了这两处**——`WrapStyle: 0 → 2`（关掉 libass 的自动折行，单行滚动
+# 不再长出双行）与删掉框事件（框改由 `assets_factory.bake_static_layers` 画进背景图）。
+# 这不是「跑一遍取个新值」：拿已发布那一期真用过的 ASS（253 句、1920×1080）逐字节
+# 比对过——**253 条文字事件完全一致**，头部只有 `WrapStyle` 一行不同，框事件旧 1 条新 0 条。
 FROZEN_FIXTURE = {
     "script": [
         {"speaker": "A", "text": "第一句。"},
@@ -693,32 +978,27 @@ FROZEN_FIXTURE = {
                 {"start": 6.0, "end": 10.0}, {"start": 10.0, "end": 11.5}],
 }
 FROZEN_ASS = {
-    "single|none|False|h": "86a145ae131da143",
-    "single|none|False|_v": "c87b2958b8dfeb99",
-    "single|style|True|h": "e29381badf818491",
-    "single|style|True|_v": "44b8f4747c20c39d",
-    "dual|none|False|h": "5e1a8210f90571e4",
-    "dual|none|False|_v": "95413c0bee7e015f",
-    "dual|style|True|h": "1ae6ca4eb54650b5",
-    "dual|style|True|_v": "38db2003d0ce4732",
+    "single|none|False|h": "c39ce614428a0e25",
+    "single|none|False|_v": "2ecb2687c9e9d15f",
+    "single|style|True|h": "e081ad3b2c6ce0fb",
+    "single|style|True|_v": "f355fd89ad925d4b",
 }
-FROZEN_WRAP = [
-    ("这个问题的答案其实很简单，就是不该停的地方不能停，否则读者会读错意思。", 16, 2,
-     ["这个问题的答案其实很简单，", "就是不该停的地方不能停，否则读者会读错意思。"]),
-    ("我们把 GPT-4 和 Claude-3.5 放在一起比较它们的表现。", 18, 2,
-     ["我们把 GPT-4 和 ", "Claude-3.5 放在一起比较它们的表现。"]),
-    ("一条链加两头：链是主体，模型只做两端。", 10, 2,
-     ["一条链加两头：", "链是主体，模型只做两端。"]),
-]
+# 横滚的算式样本：（句时长秒, 期望的 move 参数 x_from/x_to/t1/t2）。文字与画幅
+# 固定为下面这条 81 字的句子与横屏 1920×1080——数字背后是
+# 「文字宽 3155.8px、框宽 1740px、位移 1415.8px、句首静止 14.94 秒」。
+ROLL_TEXT = ("上期《骨架叙事切分与介质边界的确定性约束》聊的是聚焦成书的结构性排版，"
+             "揭示注册列表驱动的四部叙事弧线、页面物理边界（断页/字体/缩放）与"
+             "元数据口径的刚性同步机制。")
+FROZEN_ROLL = {
+    27.1: (1668, 252, 14942, 27100),
+}
 
 
-class TestSingleDualFrozen(unittest.TestCase):
-    """单行/双行两档必须逐字不变。
+class TestStripFrozen(unittest.TestCase):
+    """横滚档必须逐字不变。
 
-    这次改造把「折几行」从一个函数换成了两个，风险是顺手改了旧路径（改一处、
-    另一处跟着动是最典型的回归形状）。下面钉住的是改造前的**实际输出**：ASS 全文
-    的 sha256、wrap_text 的逐行结果。它们的 16 位摘要够用——本测试只防误改，
-    不防有人蓄意伪造。
+    这一档是新写的，风险是往后有人「顺手调一个数」——位移或句首静止一偏，观众
+    就是「读不完」或「开头没读到」。下面钉住 ASS 全文的 sha256 与 \\move 的四个数。
     """
 
     def test_ass_text_is_byte_identical(self):
@@ -733,15 +1013,20 @@ class TestSingleDualFrozen(unittest.TestCase):
                                w, h, "" if sfx == "h" else "_v")[0]
             got = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
             with self.subTest(case=key):
-                self.assertEqual(got, want, "单双行这一路被改动了：%s" % key)
+                self.assertEqual(got, want, "横滚这一路被改动了：%s" % key)
 
-    def test_wrap_text_rows_are_frozen(self):
-        for text, w, ml, want in FROZEN_WRAP:
-            with self.subTest(text=text[:10]):
-                self.assertEqual(S.wrap_text(text, w, ml), want)
+    def test_roll_arithmetic_is_frozen(self):
+        cfg = {"subtitle.preset": "single", "speaker_indicator.name_shown": False,
+               "subtitle.font_family": "HarmonyOS Sans SC"}
+        for span, want in FROZEN_ROLL.items():
+            ass = S.build_ass([{"speaker": "B", "text": ROLL_TEXT}], cfg,
+                              [{"start": 0.0, "end": span}], 1920, 1080, "")[0]
+            d = captions(ass)[0]
+            with self.subTest(span=span):
+                self.assertEqual((d["x_from"], d["x_to"], d["t1"], d["t2"]), want)
 
     def test_stats_shape_is_frozen(self):
-        st = S.wrap_stats(FROZEN_FIXTURE["script"], 33, 2)
+        st = S.wrap_stats(FROZEN_FIXTURE["script"], 33, "y")
         self.assertEqual(st, {"wraps": 2, "violations": 0, "rate": 0.0, "samples": []})
 
 

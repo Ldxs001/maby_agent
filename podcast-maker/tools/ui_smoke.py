@@ -193,6 +193,35 @@ JS_ENUM = r"""() => {
   return bad;
 }"""
 
+# 字幕预览：两档是**同一个框**，只有轴不同；框与裁切矩形同四点；配色必须是合法
+# CSS 色。最后这条不是吹毛求疵——`subtitle.color_a` 存的是 ASS 的 `&HAABBGGRR`，
+# 直接喂给 SVG 的 fill 是非法值，浏览器丢掉它、回落到黑色，深色框里的「非当前句」
+# 就成了看不见的字，而界面上不会有任何报错（`&HFFFFFF` 倒过来还是白，白字下看不出）。
+JS_SUBPREV = r"""() => {
+  const HEX = /^#[0-9A-Fa-f]{6}$/;
+  const bad = [];
+  const svgs = Array.from(document.querySelectorAll('.sub-prev svg'));
+  if (svgs.length !== 2) return ['预览格数 ' + svgs.length + '（应为 2）'];
+  for (const svg of svgs) {
+    const box = svg.querySelector('rect[stroke]');
+    const clip = svg.querySelector('clipPath rect');
+    if (!box) { bad.push('没有框'); continue; }
+    if (!clip) { bad.push('框没有配裁切矩形'); continue; }
+    for (const a of ['x', 'y', 'width', 'height']) {
+      if (box.getAttribute(a) !== clip.getAttribute(a)) {
+        bad.push('框与裁切矩形的 ' + a + ' 不一致');
+      }
+    }
+    const texts = Array.from(svg.querySelectorAll('text'));
+    if (!texts.length) { bad.push('没画字'); continue; }
+    for (const t of texts) {
+      const f = t.getAttribute('fill') || '';
+      if (!HEX.test(f)) bad.push('fill 不是 #RRGGBB：' + f);
+    }
+  }
+  return bad;
+}"""
+
 # 选期表的桩数据：三期里有两期有脚本、一期没有。合成页只该列出前两期——
 # 「选了一期却没有脚本」这个状态要在入口就产生不了，而不是等合成报错。
 STUB_PROJECTS = {"ok": True, "projects": [
@@ -384,6 +413,23 @@ def main():
         # 排布第二层：卡内功能区（一张卡讲几件事时，一件事一块网格 + 一行小标题）
         zone_bad = pg.evaluate(JS_ZONE)
         check(not zone_bad, "卡内功能区一块网格配一行小标题", "；".join(zone_bad))
+
+        # 字幕预览：两档同一个框（框与裁切矩形同四点）、配色是合法 CSS 色、
+        # 单行滚动档真的在滚。这里换的是版式档位，验完复原。
+        keep_preset = pg.eval_on_selector("#f_cfg_subtitle__preset", "e=>e.value")
+        for preset in ("single", "lyric"):
+            pg.select_option("#f_cfg_subtitle__preset", preset)
+            pg.wait_for_timeout(500)
+            prev_bad = pg.evaluate(JS_SUBPREV)
+            check(not prev_bad, "字幕预览画对了（%s）" % preset, "；".join(prev_bad))
+            if preset == "single":
+                rolling = pg.evaluate(
+                    "() => Array.from(document.querySelectorAll('.sub-prev text'))"
+                    ".filter(t => t.querySelector('animateTransform')).length")
+                check(rolling == 2, "单行滚动档的预览在滚（两格都带动画）",
+                      "带动画的字 %d 个" % rolling)
+        pg.select_option("#f_cfg_subtitle__preset", keep_preset)
+        pg.wait_for_timeout(300)
 
         # 路径类点位：说清要什么 + 给「选择…」
         n_path = sum(1 for sec in cfg["params"]["config"].values()

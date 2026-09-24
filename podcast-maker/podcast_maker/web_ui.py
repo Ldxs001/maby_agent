@@ -2820,8 +2820,8 @@ const ZONES=[
   ['speaker_indicator','立绘',['speaker_indicator.portrait_a','speaker_indicator.portrait_b']],
   ['subtitle','版式与字号',['subtitle.preset','subtitle.font_size','subtitle.font_size_vertical']],
   ['subtitle','高亮',['subtitle.highlight','subtitle.highlight_color']],
-  ['subtitle','歌词窗口',['subtitle.lyric_window','subtitle.lyric_max_rows',
-                        'subtitle.lyric_scroll_ms']],
+  ['subtitle','框与滚动',['subtitle.window','subtitle.frame_rows',
+                        'subtitle.scroll_ms']],
   ['subtitle','边距与底框',['subtitle.margin_lr','subtitle.margin_v','subtitle.margin_v_vertical',
                           'subtitle.outline','subtitle.bg_alpha']]
 ];
@@ -3161,15 +3161,43 @@ function ttsEnvHtml(){
    三条精度边界（块内小字与这里同源）：①字号等比缩，不能当字体样张；②不模拟后端
    的四级断行，示例短句装不下就按字数硬切，断点位置不作数；③台词是示例。 */
 const SUB_PREV_TEXT=['这是一句示例台词。','第二句稍微长一些，用来看折行。','第三句回到短句。'];
+/* 单行滚动档的示例单独备一句长的：短句装得下就不滚，那一档能看出什么来？
+   长度按「明显溢出框口」取（约 55 字，横屏默认值下 2148px > 框宽 1740px）。 */
+const SUB_PREV_LONG='上期《骨架叙事切分与介质边界的确定性约束》聊的是聚焦成书的结构性排版，揭示注册列表驱动的四部叙事弧线。';
+/* 字宽系数与后端同源（subtitle_engine.CHAR_W_*，libass 实渲标定）：汉字 0.751、
+   全角标点 0.820、半角 0.438。从前按「汉字 = 字号」算，宽出三成——横滚的终点
+   靠这个数算，两边差一成就滚过头。 */
+const CHAR_W={han:0.751,full:0.820,half:0.438};
+function charW(ch){
+  const c=ch.codePointAt(0);
+  if((c>=0x2000&&c<=0x206f)||(c>=0x3000&&c<=0x303f)||(c>=0xff00&&c<=0xffef))return CHAR_W.full;
+  if(c>=0x2e80)return CHAR_W.han;
+  return CHAR_W.half;
+}
 function estSubW(s,size){
   let w=0;
-  for(const ch of s){w+=/[\u2e80-\u9fff\uff00-\uffef\u3000-\u303f]/.test(ch)?size:size*0.52}
+  for(const ch of s){w+=charW(ch)*size}
   return w;
+}
+/* 配色有两种写法，取哪一路看点位：`subtitle.color_a` / `color_b` 存的是 **ASS 的
+   `&HAABBGGRR`**（字节序是 BGR，与 CSS 反着来），`highlight_color` 存的是 CSS
+   的 `#RRGGBB`。直接把前者喂给 SVG 的 fill 是**非法值**：浏览器丢掉它、回落到黑色，
+   于是深色框里的「非当前句」成了看不见的字（预览看着像只画了一句）。
+   这里统一成 CSS 色——`&HFFFFFF` 倒过来还是白，所以白字配色下看不出问题，
+   一旦有人把 A/B 角改成别的颜色就现形。 */
+function cssColor(v,fallback){
+  const s=String(v==null?'':v).trim();
+  if(s.charAt(0)==='#') return s;
+  const m=/^&H([0-9A-Fa-f]{1,8})$/.exec(s);
+  if(!m) return fallback;
+  const h=m[1].padStart(8,'0');
+  return '#'+h.slice(6,8)+h.slice(4,6)+h.slice(2,4);
 }
 function paintSubPreview(svg,W,H,sfx){
   if(!svg) return;
   const num=k=>{const x=cfgVal(k);return (x===null||x===undefined||x==='')?null:Number(x)};
-  const preset=String(cfgVal('subtitle.preset')||'dual');
+  const preset=String(cfgVal('subtitle.preset')||'lyric');
+  const axis=(preset==='single')?'x':'y';
   const size=num('subtitle.font_size'+(sfx?'_vertical':''))||52;
   const mlr=num('subtitle.margin_lr')||0;
   const mv=num(sfx?'subtitle.margin_v_vertical':'subtitle.margin_v')||0;
@@ -3177,25 +3205,42 @@ function paintSubPreview(svg,W,H,sfx){
   const aRaw=num('subtitle.bg_alpha'), a=(aRaw===null?128:aRaw);
   const fillOp=Math.max(0,Math.min(1,1-a/255)).toFixed(3);
   const hl=!!cfgVal('subtitle.highlight');
-  const hlColor=cfgVal('subtitle.highlight_color')||'#FFD98A';
-  const txtColor=cfgVal('subtitle.color_a')||'#FFFFFF';
-  // 行距与后端同口径：int(round(字号 × LYRIC_LINE_PITCH))——预览与成片不许各算各的
+  const hlColor=cssColor(cfgVal('subtitle.highlight_color'),'#FFD98A');
+  const txtColor=cssColor(cfgVal('subtitle.color_a'),'#FFFFFF');
+  // 框几何与后端同源（见 subtitle_engine.frame_geometry）：x1=mlr、x2=W-mlr、
+  // 底=H-mv、高=行数×行距。**两档是同一个框**，只有轴不同；单行滚动档的框按
+  // 定义就是一行。行距 int(round(字号 × 1.35))，预览与成片不许各算各的。
   const pitch=Math.round(size*1.35), cx=W/2, R=Math.round;
+  const rows=(axis==='x')?1:Math.max(2,num('subtitle.frame_rows')||8);
+  const fh=rows*pitch, x1=mlr, x2=W-mlr, y2=H-mv, y1=y2-fh;
   let o='<rect x="0" y="0" width="'+W+'" height="'+H+'" fill="#0d1117"/>';
-  if(preset==='lyric'){
-    // 框几何与后端同源（见 subtitle_engine._lyric_events）：x1=mlr、x2=W-mlr、
-    // 底=H-mv、高=行数×行距；当前句落框垂直中心，超出框的用 clipPath 裁掉。
-    const maxRows=Math.max(2,num('subtitle.lyric_max_rows')||8);
-    const fh=maxRows*pitch, x1=mlr, x2=W-mlr, y2=H-mv, y1=y2-fh;
+  const cid='pvclip'+sfx;
+  o+='<defs><clipPath id="'+cid+'"><rect x="'+x1+'" y="'+R(y1)+'" width="'+(x2-x1)+
+     '" height="'+R(fh)+'"/></clipPath></defs>';
+  o+='<rect x="'+x1+'" y="'+R(y1)+'" width="'+(x2-x1)+'" height="'+R(fh)+
+     '" fill="#000000" fill-opacity="'+fillOp+
+     '" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="'+Math.max(1,outline)+'"/>';
+  o+='<g clip-path="url(#'+cid+')">';
+  if(axis==='x'){
+    // 单行滚动：一句一行、不折字。装得下就居中静止；装不下就按后端 `_strip_events`
+    // 的三段式走一遍——文字左缘贴框左静止一段，再匀速左移到右缘贴框右。
+    // 静止占比不是拍的：后端是「框宽 ÷ 文字宽」（速度取自语速，见 _strip_events），
+    // 这里照同一个式子算，预览的节奏才跟成片一样。
+    const strip=SUB_PREV_LONG;
+    const tw=estSubW(strip,size), cy=R(y1+fh/2), bw=x2-x1;
+    const fits=(tw<=bw), x0=fits?cx:(x1+tw/2), xEnd=fits?cx:(x2-tw/2);
+    o+='<text x="'+R(x0)+'" y="'+cy+'" text-anchor="middle" dominant-baseline="central" '+
+       'font-size="'+size+'" fill="'+(hl?hlColor:txtColor)+'">'+esc(strip);
+    if(!fits){
+      const hold=Math.max(0.05,Math.min(0.95,bw/tw)).toFixed(3);
+      o+='<animateTransform attributeName="transform" type="translate" '+
+         'values="0 0;0 0;'+R(xEnd-x0)+' 0" keyTimes="0;'+hold+';1" '+
+         'dur="7s" repeatCount="indefinite"/>';
+    }
+    o+='</text>';
+  }else{
     const anchor=y2-fh/2, cur=1;
     const base=[0,2,4].map(v=>v*pitch);          // 三句各 1 行：base = 累计行 × 行距
-    const cid='pvclip'+sfx;
-    o+='<defs><clipPath id="'+cid+'"><rect x="'+x1+'" y="'+R(y1)+'" width="'+(x2-x1)+
-       '" height="'+R(fh)+'"/></clipPath></defs>';
-    o+='<rect x="'+x1+'" y="'+R(y1)+'" width="'+(x2-x1)+'" height="'+R(fh)+
-       '" fill="#000000" fill-opacity="'+fillOp+
-       '" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="2"/>';
-    o+='<g clip-path="url(#'+cid+')">';
     for(let k=0;k<3;k++){
       const y=R(anchor+(base[k]-base[cur]));
       const col=(k===cur&&hl)?hlColor:txtColor;
@@ -3203,22 +3248,8 @@ function paintSubPreview(svg,W,H,sfx){
       o+='<text x="'+cx+'" y="'+y+'" text-anchor="middle" dominant-baseline="central" '+
          'font-size="'+size+'" fill="'+col+'" fill-opacity="'+op+'">'+esc(SUB_PREV_TEXT[k])+'</text>';
     }
-    o+='</g>';
-  }else{
-    // 单双行：文字底部对齐（距底 mv），整块一个填充盒（含 outline 内边距）。
-    const lines=(preset==='single')?SUB_PREV_TEXT.slice(0,1):SUB_PREV_TEXT.slice(0,2);
-    const bottom=H-mv-outline, lh=pitch;
-    const ys=lines.map((_,i)=>bottom-(lines.length-1-i)*lh);
-    const maxw=Math.max.apply(null,lines.map(s=>estSubW(s,size)));
-    const top=Math.min.apply(null,ys)-size*0.82-outline;
-    const bot=Math.max.apply(null,ys)+size*0.22+outline;
-    o+='<rect x="'+R(cx-maxw/2-outline)+'" y="'+R(top)+'" width="'+R(maxw+outline*2)+
-       '" height="'+R(bot-top)+'" fill="#000000" fill-opacity="'+fillOp+'"'+
-       (outline>0?' stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="'+outline+'"':'')+'/>';
-    for(let i=0;i<lines.length;i++)
-      o+='<text x="'+cx+'" y="'+R(ys[i])+'" text-anchor="middle" font-size="'+size+
-         '" fill="'+(hl?hlColor:txtColor)+'">'+esc(lines[i])+'</text>';
   }
+  o+='</g>';
   svg.innerHTML=o;
 }
 function drawSubtitlePreview(){
@@ -3239,7 +3270,8 @@ function subtitlePreviewHtml(){
         '<svg id="sub-prev-v" viewBox="0 0 1080 1920" preserveAspectRatio="xMidYMid meet"></svg></div>'+
     '</div>'+
     '<div class="sub-prev-note">①字号随画面等比缩小，不能当字体样张用；'+
-    '②不模拟后端的四级断行——示例短句装不下就按字数硬切，断点位置不作数；'+
+    '②歌词档不模拟后端的四级断行（断点位置不作数）；单行滚动档的示例是一句长台词，'+
+    '按三段式循环演示（句首静止 → 匀速左移 → 结尾贴框右），静止与滚动的时长比照后端算式走；'+
     '③台词是示例，不取自当期脚本。</div>'+
   '</div>';
 }

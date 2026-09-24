@@ -23,6 +23,7 @@
 这类缺陷靠人看不出，只能靠扫描代码里读了哪些点位、与总表逐一对账。
 """
 
+import json
 import os
 import re
 import sys
@@ -375,6 +376,87 @@ class TestEngineScope(unittest.TestCase):
                  and not PARAM_SPEC[k].get("engine_scope")]
         self.assertFalse(loose,
                          "以下音色点位没声明引擎归属，会在两个引擎下同时露出：%s" % loose)
+
+
+class TestConfigMigration(unittest.TestCase):
+    """第十三类缺陷：点位改了名或下了线，存量配置里的值静默消失。
+
+    `load()` 只收 `PARAM_SPEC` 里有的键（白名单），这是对的——但改过名的键
+    **已不在总表里**，于是白名单会把它连同值一起丢掉：用户配的窗口、框高、
+    上滚时长一律回到默认值，界面上看不出任何异常。所以搬迁必须跑在过滤之前，
+    这一组就是钉这条顺序。
+
+    旧值 `dual` / `dual_named` 是另一种情形：值还在，但它已不在档位表内，
+    下拉会显示成空。搬到 `lyric`——存着 `dual` 的多半是当年的默认值，人没主动
+    选过；`dual_named` 的人当初要的是「名字」，顺手把那个开关打开，意图不丢。
+    """
+
+    def _load(self, saved):
+        """把一份配置写进临时文件，让 ConfigManager 读它。"""
+        from podcast_maker.config_manager import ConfigManager
+        fd, path = tempfile.mkstemp(prefix="pm-cfg-", suffix=".json")
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(saved, fh, ensure_ascii=False)
+        return ConfigManager(path).data()
+
+    def test_the_two_deleted_presets_land_on_lyric(self):
+        for old in ("dual", "dual_named"):
+            with self.subTest(preset=old):
+                got = self._load({"subtitle.preset": old})
+                self.assertEqual(got["subtitle.preset"], "lyric")
+                self.assertIn(got["subtitle.preset"],
+                              MODE_SPEC["subtitle.preset"]["options"],
+                              "搬过去的值不在档位表里，下拉会显示成空")
+
+    def test_dual_named_keeps_its_one_intention(self):
+        """`dual_named` 的人当初点它是要「名字」，于是补上那个开关——但只补缺。
+
+        从前「行首写不写说话人名」是塞在版式里的，没有独立开关；后来拆出来。
+        老配置里那个开关**根本不存在**，所以搬迁要把它补成「开」（带名档的人
+        要的就是名字）。反过来，如果配置里已经有一个明确的值，那一定是人在
+        独立开关上做过的选择，搬迁不许覆盖它——补缺与覆盖是两回事。
+        """
+        got = self._load({"subtitle.preset": "dual_named",
+                          "speaker_indicator.name_shown": False})
+        self.assertFalse(got["speaker_indicator.name_shown"],
+                         "搬迁覆盖了人在独立开关上做过的选择")
+        # 开关缺席的老存档：补成「开」，这是带名档唯一的意思
+        got = self._load({"subtitle.preset": "dual_named"})
+        self.assertTrue(got["speaker_indicator.name_shown"])
+
+    def test_the_three_renamed_points_keep_their_values(self):
+        """改名的键必须搬着值走——白名单过滤在搬迁之后，顺序反了值就没了。"""
+        got = self._load({"subtitle.lyric_window": 5,
+                          "subtitle.lyric_max_rows": 11,
+                          "subtitle.lyric_scroll_ms": 850})
+        self.assertEqual(got["subtitle.window"], 5)
+        self.assertEqual(got["subtitle.frame_rows"], 11)
+        self.assertEqual(got["subtitle.scroll_ms"], 850)
+        for dead in ("subtitle.lyric_window", "subtitle.lyric_max_rows",
+                     "subtitle.lyric_scroll_ms"):
+            self.assertNotIn(dead, got, "%s 没搬走，界面总表里已经没有它了" % dead)
+
+    def test_an_already_migrated_value_wins_over_the_old_one(self):
+        """两边都在（手工改过一半、或新旧版本互相覆盖过）：认新键。"""
+        got = self._load({"subtitle.lyric_window": 5, "subtitle.window": 9})
+        self.assertEqual(got["subtitle.window"], 9)
+
+    def test_a_migrated_file_is_rewritten_in_the_new_names(self):
+        """存档要跟着搬，不然每次启动都走一遍迁移路。"""
+        from podcast_maker.config_manager import ConfigManager
+        fd, path = tempfile.mkstemp(prefix="pm-cfg-", suffix=".json")
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"subtitle.preset": "dual", "subtitle.lyric_window": 5}, fh)
+        cm = ConfigManager(path)
+        cm.save()
+        with open(path, encoding="utf-8") as fh:
+            back = json.load(fh)
+        self.assertNotIn("subtitle.lyric_window", back)
+        self.assertEqual(back["subtitle.window"], 5)
 
 
 class TestVersionStep(unittest.TestCase):

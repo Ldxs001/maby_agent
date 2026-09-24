@@ -544,14 +544,36 @@ def episode_form(root, no):
     return str(data.get("form") or "").strip()
 
 
+# 引用值尾巴上要剃掉的字符：句读标点与空白。三条模板各自在句末补自己的句号，
+# 引用值自带句号就会拼出「。、」「。。」这类脏东西（实际发生过的：段主旨带着
+# 句号进「讲了 A、B、C 等」，长出「逻辑。、」）。
+# 只剃尾这一条**管不到引用值中间**：地图 gist 自己写成 `…逻辑。：将…`，那「。：」
+# 会原样进到「聊的是…」这一句里。这不是拼装造的，也不该由这一层去删——见
+# `config_manager.INTRO_OUTRO["review"]` 上面那段说明。
+REVIEW_TAIL_STRIP = "，。！？；：、·…— \t\r\n\u3000"
+
+
+def _trim_tail(s):
+    """剃掉引用值**尾部**的句读标点与空白。
+
+    只剃尾：头不剃——模型从来不把标点写在句首（实测 99 条引用文本里 0 例），
+    而万一某条以 `（` 或 `《` 起头，剃头会把成对符号剃成孤儿。中间一概不动。
+    """
+    return str(s or "").strip().rstrip(REVIEW_TAIL_STRIP)
+
+
 def review_rows(base, proj_item, episode_no, cfg, log=None):
-    """前期回顾：读上一期，组一段固定文本。返回**已经填好文本的句子列表**。
+    """前期回顾：读上一期，按模板拼三句。返回**已经填好文本的句子列表**。
 
     与片头尾同类：模型不参与，程序逐字拼（见 `script_engine.glue_intro_outro`），
-    位置在片头之后、正文之前。模板是一条，拼出来却可能是两百字——**所以拼完之后
-    按正文那把尺（`gate.max_chars`）切成若干句**：程序拼的文本同样要合尺，不合尺
-    的句子放进画面会被歌词框的 `\\clip` 裁掉，而它绕过了脚本阶段的门禁、没有第二
-    个人会管长度。
+    位置在片头之后、正文之前。
+
+    **模板是三条**（`INTRO_OUTRO["review"]`）——上期标题 / 期主旨 / 前三段段主旨
+    各一条：引用多少料就是几句，拼完不再按字数切。切句那一步删掉是有原因的：
+    一句话该有多长一旦交给「尺」决定，切点就落在长度上，于是切出过
+    「…收窄至"仅填空"的本质，」下一句以「的架构迭代」开头这种半句话（切点落在
+    西文词后的空格上，虚词被甩到下一句）。三条模板各自是一句完整的话，边界由
+    **结构**决定，不由长度决定。
 
     两路引用：
     - **期主旨**取地图行（`project_store.map_episodes` 里的 gist）——地图挂在项目
@@ -576,7 +598,7 @@ def review_rows(base, proj_item, episode_no, cfg, log=None):
                if str(e.get("no") or "").strip()
                and _episode_order(e.get("no")) < key]
     if not earlier:
-        log("前期回顾：本期是第 1 期，或本期不在项目地图上——这一句不粘")
+        log("前期回顾：本期是第 1 期，或本期不在项目地图上——这三句不粘")
         return []
     prev = max(earlier, key=lambda e: _episode_order(e.get("no")))
     root = layout.project_dir(base, proj_item.get("id") or "")
@@ -589,21 +611,17 @@ def review_rows(base, proj_item, episode_no, cfg, log=None):
     missing = [n for n, v in (("上一期标题", title), ("上一期主旨", gist),
                               ("上一期段主旨", topics)) if not v]
     if missing:
-        log("前期回顾：%s 取不到，这一句不粘" % "、".join(missing))
+        log("前期回顾：%s 取不到，这三句不粘" % "、".join(missing))
         return []
-    # 段主旨自带句号，拼进「讲了…等」这一段时要去掉：留着会长出「逻辑。、」
-    # 与「操作。等。」这种拼坏了的标点。
-    fill = {"prev_title": title, "prev_gist": gist,
-            "prev_topics": "、".join(t.rstrip("。！？；，、 ") for t in topics)}
-    limit = max(8, int(cfg.get("gate.max_chars", 40)))
-    rows = []
-    for r in (INTRO_OUTRO.get("review") or []):
-        for sentence in subtitle_engine.split_sentences(str(r["text"]).format(**fill),
-                                                        limit):
-            rows.append({"speaker": r["speaker"], "emotion": r["emotion"],
-                         "text": sentence})
-    log("前期回顾：引用第 %s 期《%s》的期主旨与 %d 条段主旨，按正文尺（≤%d 字）"
-        "切成 %d 句" % (prev.get("no"), title, len(topics), limit, len(rows)))
+    # 每个引用值各自剃尾（句号、空格），中间一个字不动；段主旨之间仍是顿号。
+    fill = {"prev_title": _trim_tail(title),
+            "prev_gist": _trim_tail(gist),
+            "prev_topics": "、".join(_trim_tail(t) for t in topics)}
+    rows = [{"speaker": r["speaker"], "emotion": r["emotion"],
+             "text": str(r["text"]).format(**fill)}
+            for r in (INTRO_OUTRO.get("review") or [])]
+    log("前期回顾：引用第 %s 期《%s》的期主旨与 %d 条段主旨，拼成 %d 句"
+        % (prev.get("no"), title, len(topics), len(rows)))
     return rows
 
 
@@ -946,34 +964,53 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
         w = int(cfg.get("video.width", 1920))
         h = int(cfg.get("video.height", 1080))
 
-        ass_h, max_chars, max_lines, balanced = subtitle_engine.build_ass(
+        ass_h, max_chars, axis = subtitle_engine.build_ass(
             script, cfg, timings, w, h, "")
         p_h = os.path.join(work, "sub.ass")
         with open(p_h, "w", encoding="utf-8") as f:
             f.write(ass_h)
         video_engine.render_ass(p_h, p_h, script, timings, cfg, w, h, "")
-        wrap_stats = subtitle_engine.wrap_stats(script, max_chars, max_lines, balanced)
+        wrap_stats = subtitle_engine.wrap_stats(script, max_chars, axis)
 
         video_h = ep["video"]
-        video_engine.compose(audio_final, p_h, video_h, cfg, built["bg_h"],
+        # 静态层（整幅压暗 + 字幕框）先一次画进背景图，合成时不再逐帧重算。
+        # 产物落过程目录、每次现烘：天然幂等（永远从 assets 的无框原图烘，不会叠
+        # 两次），也不会与背景图缓存耦合（改了 subtitle.margin_v 下次自然用新几何）。
+        # 框要**跟第一句字幕同时出现**：得两张图——一张只压暗、一张压暗加框，合成时
+        # 按帧接起来（见 `video_engine._graph` 的 `box_split`）。第一句就落在开头时
+        # 没有可延后的区间，不烘第二张、退回单张。
+        onset = video_engine.box_onset_frames(timings, int(cfg.get("video.fps", 30)))
+        bg_plain_h = assets_factory.bake_static_layers(
+            built["bg_h"], os.path.join(work, "bg_h_plain.png"), cfg, w, h, "",
+            box=False) if onset else ""
+        bg_flat_h = assets_factory.bake_static_layers(
+            built["bg_h"], os.path.join(work, "bg_h.png"), cfg, w, h, "")
+        video_engine.compose(audio_final, p_h, video_h, cfg, bg_flat_h,
                              audio_duration, w, h, "", font_dir=font_dir,
-                             timings=timings, log=log or (lambda m: None))
+                             timings=timings, log=log or (lambda m: None),
+                             bg_plain=bg_plain_h, box_frame=onset)
         if aigc:
             aigc_label.tag_file(video_h, cfg, faststart=True)
 
         if cfg.get("video.produce_vertical", True):
             step(7, "合成竖屏视频", 0.85)
             wv, hv = h, w
-            ass_v, mc_v, ml_v, bal_v = subtitle_engine.build_ass(
+            ass_v, _mc_v, _axis_v = subtitle_engine.build_ass(
                 script, cfg, timings, wv, hv, "_v")
             p_v = os.path.join(work, "sub_v.ass")
             with open(p_v, "w", encoding="utf-8") as f:
                 f.write(ass_v)
             video_engine.render_ass(p_v, p_v, script, timings, cfg, wv, hv, "_v")
             video_v = ep["video_vertical"]
-            video_engine.compose(audio_final, p_v, video_v, cfg, built["bg_v"],
+            bg_plain_v = assets_factory.bake_static_layers(
+                built["bg_v"], os.path.join(work, "bg_v_plain.png"), cfg, wv, hv, "_v",
+                box=False) if onset else ""
+            bg_flat_v = assets_factory.bake_static_layers(
+                built["bg_v"], os.path.join(work, "bg_v.png"), cfg, wv, hv, "_v")
+            video_engine.compose(audio_final, p_v, video_v, cfg, bg_flat_v,
                                  audio_duration, wv, hv, "_v", font_dir=font_dir,
-                                 timings=timings, log=log or (lambda m: None))
+                                 timings=timings, log=log or (lambda m: None),
+                                 bg_plain=bg_plain_v, box_frame=onset)
             if aigc:
                 aigc_label.tag_file(video_v, cfg, faststart=True)
 

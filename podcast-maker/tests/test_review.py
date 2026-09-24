@@ -17,8 +17,8 @@
 """前期回顾：由程序拼、不进模型，位置在片头之后。
 
 这一组盯的是**降级**。回顾引用的是上一期，而「上一期」有一堆取不到的情形：
-第 1 期、本期不在地图上、上一期没留下段主旨。取不到就整句不粘——留一句
-「上期我们聊了……」后面空着，比少说一句难看。
+第 1 期、本期不在地图上、上一期没留下段主旨。取不到就**三条一句都不粘**——
+留「上期《》。」或「讲了 等。」这种半句，比少说三句难看。
 
 两路数据各有各的坑，两路都盯：
 
@@ -80,7 +80,7 @@ class TestReviewRows(unittest.TestCase):
         self.assertEqual(PL.review_rows(self.base, self.item, "2", self.cfg), [])
 
     def test_first_episode_has_no_previous_one(self):
-        """第 1 期没有上一期——整句不粘，不留半句。"""
+        """第 1 期没有上一期——三条全不粘，不留半句。"""
         self._sidecar("1", ["甲段主旨"])
         self.assertEqual(PL.review_rows(self.base, self.item, "1", self.cfg), [])
 
@@ -90,22 +90,24 @@ class TestReviewRows(unittest.TestCase):
         self.assertEqual(PL.review_rows(self.base, self.item, "9", self.cfg), [])
 
     def test_a_full_previous_episode_gets_quoted(self):
-        """期主旨与段主旨一起引用进来，「等」由模板写死。"""
+        """三条各引一物：标题 / 期主旨 / 前三段段主旨；「等」由模板写死。"""
         self._sidecar("1", ["甲段主旨", "乙段主旨"])
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["text"],
-                         "上期《第一期标题》聊的是第一期主旨——"
-                         "讲了甲段主旨、乙段主旨等。")
-        self.assertEqual(rows[0]["speaker"], "B")
-        self.assertEqual(rows[0]["emotion"], "回顾",
-                         "回顾是程序专有标签（v0.36.0 起），不再挂词表内的「承接」")
+        self.assertEqual([r["text"] for r in rows],
+                         ["上期《第一期标题》。",
+                          "聊的是第一期主旨。",
+                          "讲了甲段主旨、乙段主旨等。"])
+        for r in rows:
+            with self.subTest(text=r["text"]):
+                self.assertEqual(r["speaker"], "B")
+                self.assertEqual(r["emotion"], "回顾",
+                                 "回顾是程序专有标签（v0.36.0 起），不再挂词表内的「承接」")
 
     def test_missing_topics_drop_the_whole_line(self):
-        """上一期没留下旁挂（没跑过分段路、或本功能上线前写的期）→ 整句不粘。
+        """上一期没留下旁挂（没跑过分段路、或本功能上线前写的期）→ 三条全不粘。
 
-        只引期主旨也能凑一句，但那样「讲了…」后面就得空着，或者写成半句——
-        两种都比不说这一句难看。
+        只引标题与期主旨也能凑两句，但那样「讲了…」就永远缺一条，或者得写成
+        「讲了 等。」这种半句——两种都比不说难看。三条是一体的。
         """
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
         self.assertEqual(rows, [])
@@ -118,19 +120,38 @@ class TestReviewRows(unittest.TestCase):
         """
         self._sidecar("1", ["一", "二", "三", "四", "五"])
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
-        self.assertIn("讲了一、二、三等。", rows[0]["text"])
-        self.assertNotIn("四", rows[0]["text"])
+        self.assertEqual(rows[2]["text"], "讲了一、二、三等。")
+        self.assertNotIn("四", rows[2]["text"])
         self._sidecar("1", ["唯一一条"])
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
-        self.assertIn("讲了唯一一条等。", rows[0]["text"])
+        self.assertEqual(rows[2]["text"], "讲了唯一一条等。")
 
-    def test_a_long_recap_is_split_to_the_body_ruler(self):
-        """拼出来的是一「段」而不是一「句」：按正文那把尺切成若干句。
+    def test_every_quote_value_loses_only_its_own_tail(self):
+        """三条模板各自在句末补句号，所以引用值只剃尾——头一个字符不动。
 
-        2c / 2d 的回顾实测有 195 / 241 字：33 字/行要 7 / 9 行，而歌词框只有
-        `subtitle.lyric_max_rows`（默认 8）行高——多出来的行被 `\\clip` 裁掉，
-        不是难看，是丢字。它按设计粘在脚本阶段门禁之后，没有第二个人管长度，
-        所以得在拼出来的这一刻就合尺。
+        剃尾防的是拼出「。、」「。。」；不剃头是因为模型从来不把标点写在句首
+        （实测 99 条引用里 0 例），而万一某条以 `《` 起头，剃头会把成对符号剃成
+        孤儿。中间一律不动。
+        """
+        self._sidecar("1", ["甲段主旨。", "乙段主旨；"])
+        P.save_map(self.base, self.p["id"], "",
+                   [_map_row("1", "第一期标题。", "第一期主旨："),
+                    _map_row("2", "第二期标题", "第二期主旨")])
+        self.item = P.find(self.base, self.p["id"])
+        rows = PL.review_rows(self.base, self.item, "2", self.cfg)
+        self.assertEqual([r["text"] for r in rows],
+                         ["上期《第一期标题》。",
+                          "聊的是第一期主旨。",
+                          "讲了甲段主旨、乙段主旨等。"])
+        self.assertNotIn("。、", "".join(r["text"] for r in rows))
+        self.assertNotIn("。。", "".join(r["text"] for r in rows))
+
+    def test_a_long_recap_is_never_split_by_a_ruler(self):
+        """拼出来的就是三句，多长都不再按尺切。
+
+        从前的做法是把三条拼成一整段再按正文那把尺（`gate.max_chars`）切。切点
+        落在长度上，于是切出过「…收窄至"仅填空"的本质，」下一句以「的架构迭代」
+        开头这种半句话。现在边界由**结构**决定：一物一句，最多三句。
         """
         gist = ("以 semantic-split 为核心，阐释 Pipeline A/B/C 递进匹配、"
                 "懒加载门禁与 0.6 阈值复用机制，实现低开销任务分解。")
@@ -143,36 +164,33 @@ class TestReviewRows(unittest.TestCase):
                     _map_row("2", "第二期标题", "第二期主旨")])
         self.item = P.find(self.base, self.p["id"])
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
+        self.assertEqual([r["text"] for r in rows],
+                         ["上期《零依赖拆解与渐进加载的决策引擎》。",
+                          "聊的是%s。" % gist.rstrip("。"),
+                          "讲了%s等。" % "、".join(t.rstrip("。") for t in topics)])
+        # 第三句（195 字那种）本来就比正文那把尺长——它不归尺管。
         limit = int(self.cfg.get("gate.max_chars", 40))
-        self.assertGreater(len(rows), 1, "两百字的回顾必须切成多句")
-        # 段主旨自带句号，拼进「讲了 A、B、C」时去掉：留着会长出「。、」与「。等。」
-        self.assertEqual("".join(r["text"] for r in rows),
-                         "上期《零依赖拆解与渐进加载的决策引擎》聊的是%s——讲了%s等。"
-                         % (gist, "、".join(t.rstrip("。") for t in topics)))
-        for r in rows:
-            with self.subTest(text=r["text"][:12]):
-                self.assertLessEqual(len(r["text"]), limit)
-                self.assertEqual((r["speaker"], r["emotion"]), ("B", "回顾"))
+        self.assertGreater(len(rows[2]["text"]), limit, "样本没长过尺，测试没验到东西")
 
-    def test_a_short_recap_stays_one_sentence(self):
-        """短回顾不因为「可能长」就被切碎——尺只管上限。"""
+    def test_a_short_recap_is_still_three_sentences(self):
+        """短回顾不因为「短」就被拼成一句——句子的边界是结构，不是长度。"""
         self._sidecar("1", ["甲段主旨", "乙段主旨"])
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows), 3)
 
     def test_the_gist_comes_from_the_map_not_the_register(self):
         """期主旨取自地图行。
 
         出片登记行（`record_episode` 写的）只有期号与标题、**没有主旨**。回顾
-        若照登记取，会永远缺「上一期主旨」而整句不粘——功能看着没坏，其实一次
+        若照登记取，会永远缺「上一期主旨」而整段不粘——功能看着没坏，其实一次
         都不会出现。
         """
         P.record_episode(self.base, self.p["id"], "第一期标题", "1")
         self.item = P.find(self.base, self.p["id"])
         self._sidecar("1", ["甲段主旨"])
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
-        self.assertEqual(len(rows), 1, "主旨取自地图行，不取自出片登记")
-        self.assertIn("第一期主旨", rows[0]["text"])
+        self.assertEqual(len(rows), 3, "主旨取自地图行，不取自出片登记")
+        self.assertIn("第一期主旨", rows[1]["text"])
 
     def test_branch_episode_counts_as_the_previous_one(self):
         """支期（2a）按播出顺序排在正期 2 之后：第 3 期的上一期是 2a。"""
@@ -185,8 +203,10 @@ class TestReviewRows(unittest.TestCase):
         self.item = P.find(self.base, self.p["id"])
         self._sidecar("2a", ["支段主旨"])
         rows = PL.review_rows(self.base, self.item, "3", self.cfg)
-        self.assertEqual(len(rows), 1)
-        self.assertIn("二支主旨", rows[0]["text"])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["text"], "上期《二支》。")
+        self.assertEqual(rows[1]["text"], "聊的是二支主旨。")
+        self.assertEqual(rows[2]["text"], "讲了支段主旨等。")
 
     def test_episode_order_is_broadcast_order(self):
         """期号排序按播出顺序，不按字符串：字符串比会把 10 排到 2 前面。"""
@@ -249,8 +269,8 @@ class TestWritePlanFile(unittest.TestCase):
                          {"no": 2, "topic": "乙段主旨", "sections": [2], "quota": 100}]})
         self.assertTrue(wrote, "这一份就是回顾唯一的取料口")
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
-        self.assertEqual(len(rows), 1)
-        self.assertIn("讲了甲段主旨、乙段主旨等。", rows[0]["text"])
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[2]["text"], "讲了甲段主旨、乙段主旨等。")
 
 
 if __name__ == "__main__":

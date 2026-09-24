@@ -24,7 +24,7 @@ import math
 import os
 import sys
 
-from . import aigc_label
+from . import aigc_label, subtitle_engine
 from .config_manager import MODE_SPEC
 
 WATERMARK_TEXT = "AI 生成"
@@ -915,6 +915,71 @@ def make_background(preset, size, lines_text, out_path, watermark=True,
         img = _add_watermark(img)
     img.save(out_path)
     return {"path": out_path, "size": [w, h], "preset": preset}
+
+
+# ------------------------------------------------------------------ 静态层预烘焙
+def bake_static_layers(bg_path, out_path, cfg, width, height, suffix="", box=True):
+    """把「整幅压暗」与「字幕框」一次画进背景图，返回新图路径。
+
+    这两层原本在合成时逐帧重算：压暗是 ffmpeg 的整幅 `drawbox`，框是 libass 的
+    一条 `\\p1` 绘图矩形。它们的计算结果**只跟背景像素与一组常量有关，跟帧序号
+    无关**，而背景是静态图（`animation.mode` 各档都不动背景本身）——逐帧重算等于
+    把同一道算式抄 1800 遍。实测 60 秒片段：压暗 9.2 秒、框 1.5～12.9 秒，加起来
+    是出片耗时的大头；一次画进去之后横竖两版从 17.8 分钟降到 4.8 分钟。
+
+    顺序与原滤镜链一致：**先压暗、后画框**（框是半透明的，先画会被压暗一层）。
+
+    几何取自 `subtitle_engine.frame_of`——与 ASS 的框、与界面预览同一个出处，
+    不允许在这里重算一份。
+
+    尺寸必须等于画幅：框的坐标是画幅坐标，背景若不是这个尺寸，画上去就等于把框
+    摆错了地方且看不出来。不等即报错，不静默缩放。
+
+    `box=False` 表示**只压暗、不画框**。「字幕框跟第一句字幕同时出现」这件事要两张
+    图才做得到——前一段用无框图、后一段用有框图，合成时按帧接起来（见
+    `video_engine._graph` 的 `box_split`）。**压暗是全程都有的，不跟 `box` 走**：
+    它跟时间无关，两张图都要。烘两张的调用点见 `pipeline.py` 第 7 步。
+    """
+    Image, ImageDraw, _ = _pil()
+    if not os.path.exists(bg_path):
+        raise AssetError("背景图不存在：%s" % bg_path)
+    img = Image.open(bg_path).convert("RGB")
+    if img.size != (int(width), int(height)):
+        raise AssetError(
+            "背景图尺寸 %dx%d 与画幅 %dx%d 不一致，无法把静态层烘焙进去。"
+            % (img.size[0], img.size[1], int(width), int(height)))
+
+    amount = float(cfg.get("video.bg_dim", 0.0))
+    if amount > 0:
+        # 与 drawbox 的 black@amount 等价：黑色按 amount 不透明度压一层。
+        # 必须在 RGB 域做——滤镜链若是带范围的 YUV，压暗会把亮度与色度分开处理，
+        # 成片比背景图与封面明显偏色（蓝色被压掉四成、红色几乎没动）。
+        shade = Image.new("RGB", img.size, (0, 0, 0))
+        img = Image.blend(img, shade, max(0.0, min(1.0, amount)))
+
+    if box:
+        paint = subtitle_engine.frame_box_paint(
+            subtitle_engine.frame_of(cfg, int(width), int(height), suffix),
+            int(cfg.get("subtitle.bg_alpha", 128)),
+            int(cfg.get("subtitle.outline", 2)))
+        if paint["fill_alpha"] > 0 or (paint["width"] > 0 and paint["border_alpha"] > 0):
+            layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            d = ImageDraw.Draw(layer)
+            x1, y1, x2, y2 = paint["rect"]
+            o = paint["out"]
+            if paint["width"] > 0 and paint["border_alpha"] > 0:
+                # 描边整宽向外扩（不是骑在轮廓上、各出一半，见 frame_box_paint 的说明）：
+                # 先铺一块外扩 o px 的整块，再用填充矩形盖回内部——剩下的正好是一圈
+                # o px 的边。Pillow 的 rectangle 两端都是闭区间，所以外扩侧坐标要减一。
+                d.rectangle([x1 - o, y1 - o, x2 + o - 1, y2 + o - 1],
+                            fill=paint["border"] + (paint["border_alpha"],))
+            if paint["fill_alpha"] > 0:
+                d.rectangle([x1, y1, x2 - 1, y2 - 1],
+                            fill=paint["fill"] + (paint["fill_alpha"],))
+            img = Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
+
+    img.save(out_path)
+    return out_path
 
 
 # ------------------------------------------------------------------ 封面

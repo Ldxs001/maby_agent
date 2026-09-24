@@ -26,6 +26,8 @@
 3. 文字块顶边若随文案行数浮动，同一档节目每集的主标题高度都不一样，
    横屏换竖屏还会再挪一次。块顶必须钉住。
 4. 压暗若在带范围的 YUV 里叠黑，亮度与色度会被分开处理，等比压暗变成偏色。
+   压暗与字幕框现在是静态层、由烘焙一次画进背景图，这一条连同「先压暗后画框」
+   与「框几何只有一个出处」一起守着（见 `TestStaticLayerBake`）。
 5. 声波间距按像素写死，小于相邻振幅之和，包络从第一帧就重叠。
    留白必须是结构条件（相邻中线间距 = 振幅之和 + 留白），不能是手感数值。
 """
@@ -44,6 +46,7 @@ if ROOT not in sys.path:
 from PIL import Image, ImageDraw                                  # noqa: E402
 
 from podcast_maker import assets_factory as AF                    # noqa: E402
+from podcast_maker import subtitle_engine as SE                   # noqa: E402
 from podcast_maker import video_engine as VE                      # noqa: E402
 from podcast_maker.config_manager import PARAM_SPEC               # noqa: E402
 
@@ -520,32 +523,123 @@ class TestAnimation(unittest.TestCase):
         self.assertEqual(frag, [])
 
 
-class TestDimFilter(unittest.TestCase):
-    """整幅压暗必须等比。
+class TestStaticLayerBake(unittest.TestCase):
+    """整幅压暗与字幕框改成了**静态层**：一次画进背景图，合成时不再逐帧重算。
 
-    叠黑色若发生在带范围的 YUV 里，亮度与色度会被分开处理：实测蓝色压掉四成、
-    红色几乎没动，成片比背景图和封面明显偏色。压暗必须先在 RGB 域做。
+    这两层的算式只跟背景像素与一组常量有关、跟帧序号无关，逐帧重算等于把同一道
+    算式抄一千八百遍（60 秒片段实测：压暗 9.2 秒、框 1.5～12.9 秒）。挪进烘焙之后
+    原来守在这里的断言照旧有效，只是改守烘焙这一步：
+
+    · **等比压暗**——压暗若在带范围的 YUV 里叠黑，亮度与色度被分开处理，蓝会被
+      压掉四成、红几乎没动，成片比背景图与封面明显偏色。判据是「三个通道按同一
+      比例走」，取样用 (40,90,200) 把通道差放大。
+    · **先压暗、后画框**——框是半透明的，顺序反了框底会被压暗两遍。
+    · **框的几何来自 `subtitle_engine.frame_of`**——ASS、界面预览、烘焙三处同一个
+      出处；这里断言烘焙出来的框正好落在那个矩形的内外边界上。
     """
 
-    def test_dim_blends_in_rgb(self):
-        frag, label = VE._dim_filter("vbase", 1920, 1080, 0.15)
-        self.assertIn("format=rgb24", frag)
-        self.assertLess(frag.index("format=rgb24"), frag.index("drawbox"),
-                        "先转 RGB 再叠黑，顺序不能反")
-        self.assertIn("black@0.15", frag)
-        self.assertEqual(label, "vdim")
+    def setUp(self):
+        import podcast_maker.config_manager as CM
+        self.cfg = dict(CM.ConfigManager().data())
+        self.cfg["subtitle.bg_alpha"] = 0     # 默认只量压暗，不掺框
+        self.cfg["subtitle.outline"] = 0
+        self.tmp = tempfile.mkdtemp(prefix="pmbake")
+        self.w, self.h = 1920, 1080
 
-    def test_no_dim_produces_no_fragment(self):
-        for amount in (0.0, -0.1):
-            with self.subTest(amount=amount):
-                frag, label = VE._dim_filter("vbase", 1920, 1080, amount)
-                self.assertIsNone(frag)
-                self.assertEqual(label, "vbase")
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_dim_covers_the_whole_frame(self):
-        frag, _ = VE._dim_filter("vbase", 1920, 1080, 0.3)
-        self.assertIn("w=1920:h=1080", frag)
-        self.assertIn("t=fill", frag)
+    def _bake(self, color, name="bg"):
+        src = os.path.join(self.tmp, name + ".png")
+        Image.new("RGB", (self.w, self.h), color).save(src)
+        return AF.bake_static_layers(src, os.path.join(self.tmp, name + "_out.png"),
+                                     self.cfg, self.w, self.h)
+
+    def _box(self):
+        return SE.frame_of(self.cfg, self.w, self.h, "")
+
+    def test_dim_scales_all_channels_equally(self):
+        self.cfg["video.bg_dim"] = 0.3
+        got = Image.open(self._bake((40, 90, 200))).convert("RGB").getpixel((50, 50))
+        for want, g in zip((40, 90, 200), got):
+            self.assertLessEqual(abs(g - round(want * 0.7)), 1,
+                                 "压暗不是等比：(40,90,200) → %s" % (got,))
+
+    def test_no_dim_leaves_background_alone(self):
+        self.cfg["video.bg_dim"] = 0.0
+        got = Image.open(self._bake((40, 90, 200))).convert("RGB").getpixel((50, 50))
+        self.assertEqual(got, (40, 90, 200))
+
+    def test_box_sits_where_frame_of_says(self):
+        self.cfg["video.bg_dim"] = 0.0
+        self.cfg["subtitle.bg_alpha"] = 128
+        self.cfg["subtitle.outline"] = 2
+        img = Image.open(self._bake((255, 255, 255))).convert("RGB")
+        g = self._box()
+        cx = (g["x1"] + g["x2"]) // 2
+        self.assertNotEqual(img.getpixel((cx, (g["top"] + g["bottom"]) // 2)),
+                            (255, 255, 255), "框没画上去")
+        self.assertEqual(img.getpixel((cx, g["top"] - 20)), (255, 255, 255),
+                         "框画到了矩形外面")
+        # 描边只往外扩整宽：矩形外第一个像素是描边，矩形内第一个像素是填充
+        self.assertNotEqual(img.getpixel((g["x1"] - 1, g["top"] + 10)),
+                            (255, 255, 255), "描边没有往外扩")
+        self.assertNotEqual(img.getpixel((g["x1"], g["top"] + 10)),
+                            img.getpixel((g["x1"] - 1, g["top"] + 10)),
+                            "描边与填充应当是两种颜色")
+
+    def test_dim_runs_before_the_box(self):
+        self.cfg["video.bg_dim"] = 0.3
+        self.cfg["subtitle.bg_alpha"] = 128
+        self.cfg["subtitle.outline"] = 2
+        img = Image.open(self._bake((0, 0, 0))).convert("RGB")
+        g = self._box()
+        got = img.getpixel(((g["x1"] + g["x2"]) // 2, (g["top"] + g["bottom"]) // 2))
+        # 框底是有限范围的纯黑 16，按 128/255 不透明度盖在纯黑背景上 → 8。
+        # 若顺序反了（先画框再压暗），这 8 会被再压一层变成 6。
+        self.assertLessEqual(abs(got[0] - 8), 1, "框被压暗了两遍：%s" % (got,))
+
+    def test_size_mismatch_raises(self):
+        src = os.path.join(self.tmp, "small.png")
+        Image.new("RGB", (100, 100), (0, 0, 0)).save(src)
+        with self.assertRaises(AF.AssetError):
+            AF.bake_static_layers(src, os.path.join(self.tmp, "o.png"), self.cfg,
+                                  self.w, self.h)
+
+
+class TestTvRangeColor(unittest.TestCase):
+    """框底与描边的颜色走的是 ffmpeg 的**有限范围**口径，不是 0/255。
+
+    ffmpeg 的 `ass` 滤镜逐通道按 `Y = 16 + 219·c/255` 映射字幕颜色。烘焙走 Pillow、
+    直接写 8 bit RGB，不补这一步就会因为「换谁来画」而换一个颜色——框底比现在深 8、
+    描边比现在亮 20。这组数是从实渲画面反推出来的（`bake_static_check.py` 的
+    `--calibrate` 模式 7 组颜色 + 4 档不透明度逐个对过），钉在这里防止被"顺手改回去"。
+    """
+
+    def test_endpoints_and_primaries(self):
+        # 黑→16、白→235；纯色只让对应通道进 235，另两个进 16
+        for src, want in (((0, 0, 0), (16, 16, 16)),
+                          ((255, 255, 255), (235, 235, 235)),
+                          ((255, 0, 0), (235, 16, 16)),
+                          ((0, 255, 0), (16, 235, 16)),
+                          ((0, 0, 255), (16, 16, 235))):
+            with self.subTest(src=src):
+                self.assertEqual(SE.tv_range_color(src), want)
+
+    def test_mid_gray_is_mapped_and_out_of_range_stays_in_8_bit(self):
+        self.assertEqual(SE.tv_range_color((128, 128, 128)), (126, 126, 126))
+        # 越界值不是合法颜色（真实调用只传 0/255 这类常量），但结果必须仍落在
+        # 8 bit 里，不能外溢成一个能让 Pillow 报错或截断的值。
+        for c in SE.tv_range_color((-5, 300, 0)):
+            self.assertTrue(0 <= c <= 255, "越界输入的结果溢出了：%d" % c)
+
+    def test_box_paint_uses_the_tv_range_colors(self):
+        g = SE.frame_geometry({}, 1920, 1080, "", 1)
+        p = SE.frame_box_paint(g, 128, 2)
+        self.assertEqual(p["fill"], (16, 16, 16))
+        self.assertEqual(p["border"], (235, 235, 235))
+        self.assertEqual(p["rect"], (g["x1"], g["top"], g["x2"], g["bottom"]))
+        self.assertEqual(p["out"], 2)
 
 
 class TestWaveBandsDoNotIntersect(unittest.TestCase):
