@@ -264,6 +264,21 @@ def fmt_lrc_time(seconds):
     return "%02d:%02d.%02d" % (total // 6000, (total // 100) % 60, total % 100)
 
 
+def fmt_second_time(seconds):
+    """整秒 TXT 用的 `mm:ss`——LRC 的 `mm:ss.xx` 四舍五入到秒，别处同口径。
+
+    **不写成 `round(seconds)`**：Python 的 `round` 是银行家舍入，`round(2.5)` 得 2，
+    而 `[00:02.50]` 按「四舍五入」必须进到第 3 秒。走整数半加：先量化到**与
+    `fmt_lrc_time` 同一颗百分秒**，再 `+50 // 100` —— 两条路落在同一根数轴上，
+    不会一条进位一条不进（`tests/test_subtitle_txt.py` 锁这条同源律）。
+
+    分钟位与 `fmt_lrc_time` 一样补零两位、允许超过 59（一小时以上照常两位）。
+    """
+    seconds = max(0.0, float(seconds))
+    total = (int(round(seconds * 100)) + 50) // 100
+    return "%02d:%02d" % (total // 60, total % 60)
+
+
 def speaker_name_shown(cfg):
     """说话人名要不要写进字幕文本。ASS 与 LRC 共用这一个判据。
 
@@ -323,6 +338,30 @@ def build_srt(script, cfg, timings):
     return "\n".join(out)
 
 
+def _build_lyrics(script, cfg, timings, fmt, bracket=True):
+    """歌词类产物的共用主体——LRC、整秒 TXT、洁版 TXT 只差时间戳怎么写。
+
+    同一条歌词不该有三条生成路径：它们取同一份 script、同一份 timings、同一个
+    说话人判据（`speaker_name_shown`）、同一套「一条一行」清理（句内换行换成空格，
+    否则一条歌词被劈成两条、只剩第一条带时间戳）。只把**时间戳怎么写**当参数传
+    进来——`fmt` 管精度，`bracket` 管要不要方括号（只有洁版不要）。「同一份源」
+    因此是代码级的事实，而不是三处各写一遍、等着哪天漂开。
+    """
+    show_name = speaker_name_shown(cfg)
+    out = []
+    for i, item in enumerate(script):
+        t = timings[i] if i < len(timings) else {"start": 0.0, "end": 0.0}
+        # 一条一行：句内的换行会把一条歌词劈成两条，只剩第一条带着时间戳
+        one_line = dict(item)
+        one_line["text"] = (str(item.get("text", ""))
+                            .replace("\r", " ").replace("\n", " "))
+        stamp = fmt(t["start"])
+        body = _caption_text(cfg, one_line, show_name)
+        out.append("[%s]%s" % (stamp, body) if bracket
+                   else "%s%s" % (stamp, body))
+    return "\n".join(out)
+
+
 def build_lrc(script, cfg, timings):
     """生成 LRC（音频平台歌词位认的那一份）。timings 为逐句 [{"start","end"}]。
 
@@ -333,17 +372,35 @@ def build_lrc(script, cfg, timings):
     说话人：判据与 ASS 同源（`speaker_name_shown`），因为 LRC 没有样式可承载
     A/B 双色，名字是唯一能区分谁在说的办法。
     """
-    show_name = speaker_name_shown(cfg)
-    out = []
-    for i, item in enumerate(script):
-        t = timings[i] if i < len(timings) else {"start": 0.0, "end": 0.0}
-        # 一条一行：句内的换行会把一条歌词劈成两条，只剩第一条带着时间戳
-        one_line = dict(item)
-        one_line["text"] = (str(item.get("text", ""))
-                            .replace("\r", " ").replace("\n", " "))
-        out.append("[%s]%s" % (fmt_lrc_time(t["start"]),
-                               _caption_text(cfg, one_line, show_name)))
-    return "\n".join(out)
+    return _build_lyrics(script, cfg, timings, fmt_lrc_time)
+
+
+def build_txt(script, cfg, timings):
+    """生成整秒 TXT：`[mm:ss]` 一行一条，与 LRC 逐字同源、只差时间戳精度。
+
+    LRC 的百分秒是给播放器的（逐句精确对齐）；对**读它的人与机器**它是噪声——
+    行对照、检索、外部工具要的是「第几秒开始」。这份就是那个视角的产物：同一份
+    源、同一次生成，只把时间戳四舍五入到秒。
+
+    时间戳口径与 LRC 逐条一致（见 `fmt_second_time`）：把 LRC 那份交给离线取整
+    工具，结果应与本函数输出逐字节相同（`tests/test_subtitle_txt.py` 锁这一条）。
+    """
+    return _build_lyrics(script, cfg, timings, fmt_second_time)
+
+
+def build_clean_txt(script, cfg, timings):
+    """生成洁版 TXT：整秒 TXT 摘掉时间戳的方括号，其余逐字相同。
+
+    这一份是给**读它的人**的：`[00:03]` 的方括号在逐行阅读、复制粘贴、喂给外部
+    工具时都是噪声。摘掉之后时间戳仍是定宽的一列、与文本之间不留分隔
+    （`00:03小美：…`），列照旧对得齐，又少两个字符。
+
+    与 `build_txt` 同源、同一次生成、同一个 `fmt_second_time`——**不是**读磁盘上
+    那份 `.txt` 再拿掉括号：读文件会把「txt 必须先存在」变成隐含依赖，目录里躺着
+    上一次留下的旧文件时还会静默产出错内容。节奏也得一样：取的是**起始时间**、
+    一行一条、说话人判据同源（`tests/test_subtitle_txt.py` 锁这条同源律）。
+    """
+    return _build_lyrics(script, cfg, timings, fmt_second_time, bracket=False)
 
 
 def build_ass(script, cfg, timings, width, height, suffix=""):

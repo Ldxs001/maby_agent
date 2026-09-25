@@ -228,6 +228,13 @@ def episode_files(root, no):
         # 音频平台的字幕走歌词位，只认 LRC——与 SRT 同一份时间轴另落一份，
         # 名字同源同目录，改期号不会两处对不上。
         "subtitle_lrc": os.path.join(sub_dir(root), "%s.lrc" % n),
+        # 同一份时间轴的第三种落法：整秒戳（`[mm:ss]`），给人逐行读、给外部工具读。
+        # 与上面两份同源同目录，一并生成。
+        "subtitle_txt": os.path.join(sub_dir(root), "%s.txt" % n),
+        # 同一份时间轴的第四种落法：整秒戳摘掉方括号（`mm:ss` 直接接正文），
+        # 给人的眼睛与外部工具读。名字带 `_clean` 后缀与前三份区分——期号前缀
+        # 一致，所以按 `2db*` 一列就能把同一期的四份捞在一起。
+        "subtitle_clean_txt": os.path.join(sub_dir(root), "%s_clean.txt" % n),
         "article": os.path.join(article_dir(root), "%s.md" % n),
         "report": os.path.join(report_dir(root), "%s.json" % n),
         "manifest": os.path.join(report_dir(root), "%s.manifest.json" % n),

@@ -1,3 +1,8 @@
+# ---- ffmpeg 二进制：不内置、不随仓分发 ----
+# 由配置页的「一键安装」下到 bin/（源表在 tools/sources.py），或用户自己装。
+# 与 tts_service/models/ 同一待遇：只用不存。
+/bin/
+
 # ---- 独立 TTS 服务：环境与权重都不进版本库 ----
 # 环境由 tts_service/setup_env.py 现建（python -m venv），动辄几个 GB；
 # 权重从网上下。两者都不入库，都是「用时再下」。

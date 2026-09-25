@@ -53,3 +53,35 @@ MODEL_SOURCES = (
     ("hf_mirror", "https://hf-mirror.com（HF 国内镜像）"),
     ("hf_official", "HF 官方源（不设 HF_ENDPOINT 即为官方）"),
 )
+
+# ---------------------------------------------------------------- ffmpeg 运行时
+# 合成、烧字幕、拼视频要用 **ffmpeg + ffprobe 两件**（见 podcast_maker/bins.py）。
+# **不内置、不随仓分发**：仓里只有下载器，二进制落在 .gitignore 排除的 `bin/`，
+# 与 tts_service/models/ 的权重同一待遇 —— 用户自己下，我们不分发。
+#
+# 主源是阿里 npmmirror 镜像的 KarinJS/FFmpeg-Builds（BtbN 系）静态构建。选它的
+# 理由全部实测过：**8.4 MB/s（134 MB / 17 秒）**；`tar.xz` 解出来 3 个 exe、
+# **0 个 dll**；`configure` 里 `--enable-libass --enable-fontconfig` 都在；
+# 拿项目自己的 ass 烧中文字幕实测通过（中文字形真出得来，不只是「列在 -filters 里」）。
+#
+# 版本为什么是 8.1.3 而不是更高的：
+#   * 官方最新是 9.0.2（2026-09-18），但**国内源上没有 9.x** —— 清华只有 MSYS2
+#     的 mingw 仓库（连带 234 个依赖，不可用），腾讯云 / 中科大 404，华为云那条
+#     是门户页不是镜像；
+#   * 8.1.3 是 **8.1 分支的最新补丁**（2026-09-21 发布），不是被淘汰的老版本，
+#     对项目要用的滤镜与编码器**一个不缺**；
+#   * 走 GitHub 拿 9.0.2 实测 18.8~25.7 KB/s（134 MB ≈ 1.8 小时），比国内源慢 400 倍。
+FFMPEG_VERSION = "8.1.3"
+FFMPEG_DIR = "ffmpeg-builds/v%s" % FFMPEG_VERSION
+FFMPEG_BASE = "https://registry.npmmirror.com/-/binary/" + FFMPEG_DIR + "/"
+# 主用 GPL 变体（与项目现有构建同档）；LGPL 变体留作备选（许可证更宽松）。
+FFMPEG_ARCHIVE = "ffmpeg-%s-win32-x64-gpl.tar.xz" % FFMPEG_VERSION
+FFMPEG_ARCHIVE_URL = FFMPEG_BASE + FFMPEG_ARCHIVE
+FFMPEG_ARCHIVE_LGPL = "ffmpeg-%s-win32-x64-lgpl.tar.xz" % FFMPEG_VERSION
+FFMPEG_ARCHIVE_URL_LGPL = FFMPEG_BASE + FFMPEG_ARCHIVE_LGPL
+# 源站自带校验值：一行 `sha256  filename`
+FFMPEG_SHA256_URL = FFMPEG_BASE + "ffmpeg-%s.sha256.txt" % FFMPEG_VERSION
+# 官方下载页（「你也可以自己装」那条路指引用户去的地方）
+FFMPEG_OFFICIAL_PAGE = "https://www.gyan.dev/ffmpeg/builds/"
+# 解压后从归档里取这两件，落到项目 bin/
+FFMPEG_PAYLOAD = ("ffmpeg", "ffprobe")

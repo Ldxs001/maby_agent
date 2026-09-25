@@ -45,7 +45,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import layout
+from . import bins, layout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VOICE_CACHE = os.path.join(ROOT, "voices_cache.json")
@@ -64,16 +64,16 @@ class TTSError(RuntimeError):
 
 # ------------------------------------------------------------------ 环境
 def ffmpeg_bin():
-    exe = shutil.which("ffmpeg")
+    exe = bins.locate("ffmpeg")
     if not exe:
-        raise TTSError("找不到 ffmpeg，请先安装并加入 PATH。")
+        raise TTSError(bins.missing_message("ffmpeg"))
     return exe
 
 
 def ffprobe_bin():
-    exe = shutil.which("ffprobe")
+    exe = bins.locate("ffprobe")
     if not exe:
-        raise TTSError("找不到 ffprobe，请先安装并加入 PATH。")
+        raise TTSError(bins.missing_message("ffprobe"))
     return exe
 
 

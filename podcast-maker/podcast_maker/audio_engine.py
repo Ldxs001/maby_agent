@@ -24,6 +24,7 @@ import os
 import shutil
 import subprocess
 
+from . import bins
 from .config_manager import bitrate_ceiling
 
 
@@ -51,9 +52,9 @@ def validate_params(cfg):
 
 
 def ffmpeg_bin():
-    exe = shutil.which("ffmpeg")
+    exe = bins.locate("ffmpeg")
     if not exe:
-        raise AudioError("找不到 ffmpeg，请先安装并加入 PATH。")
+        raise AudioError(bins.missing_message("ffmpeg"))
     return exe
 
 
@@ -67,9 +68,9 @@ def _run(cmd):
 
 # ------------------------------------------------------------------ 探测
 def probe_audio(path):
-    exe = shutil.which("ffprobe")
+    exe = bins.locate("ffprobe")
     if not exe:
-        raise AudioError("找不到 ffprobe。")
+        raise AudioError(bins.missing_message("ffprobe"))
     r = subprocess.run(
         [exe, "-v", "error", "-show_entries",
          "stream=codec_name,sample_rate,channels,bit_rate:format=duration,bit_rate",

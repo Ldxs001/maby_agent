@@ -29,6 +29,7 @@ import os
 import shutil
 import subprocess
 
+from . import bins
 from .config_manager import MODE_SPEC
 from .subtitle_engine import _ass_color, fmt_ass_time
 
@@ -38,16 +39,16 @@ class VideoError(RuntimeError):
 
 
 def ffmpeg_bin():
-    exe = shutil.which("ffmpeg")
+    exe = bins.locate("ffmpeg")
     if not exe:
-        raise VideoError("找不到 ffmpeg，请先安装并加入 PATH。")
+        raise VideoError(bins.missing_message("ffmpeg"))
     return exe
 
 
 def ffprobe_bin():
-    exe = shutil.which("ffprobe")
+    exe = bins.locate("ffprobe")
     if not exe:
-        raise VideoError("找不到 ffprobe。")
+        raise VideoError(bins.missing_message("ffprobe"))
     return exe
 
 

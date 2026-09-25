@@ -343,36 +343,104 @@ class TestScriptJobEntry(BatchBase):
     def test_stage_and_progress_follow_the_round(self):
         """阶段标签与进度从日志行里长出来，界面才知道现在跑到哪了。
 
-        三段串行：出货 → 检查 → 门禁。后两段各跑各的轮，**检查段占 0~50%、
-        门禁段占 50~100%**；日志行自带段名（「检查第 N 轮」「门禁第 N 轮」），
-        界面按段折算——两段都喊「第 N 轮」的话，进度条会在门禁段开头往回跳一半。
-        出货段只改阶段：它没有轮次表，跑多久也不该假装进度条在动。
+        五段串行：准备 → 写稿 → 检查 → 门禁 → 收尾，区间表见 `web_ui._BANDS`。
+        日志行自带段名（「段 k/N 完成」「检查第 N 轮」「门禁第 N 轮」），界面按段名
+        折到各自的区间去。
+
+        **写稿段必须有刻度**：它占整趟的绝大部分时间（本地模型十几分钟到半小时），
+        从前一格预算都没有，于是进度条只在收尾那几十秒里跳两下，看着像从来没动过。
         """
         job = pipeline.new_job("script", "试")
         web_ui._script_stage(job, "目标：1500 秒 / 约 6024 字")
-        self.assertEqual(job["stage"], "排队", "不是轮次行就不该改阶段")
+        self.assertEqual(job["stage"], "排队", "不是里程碑行就不该改阶段")
         self.assertEqual(job["progress"], 0.0)
-        web_ui._script_stage(job, "生成第 1 次：调用模型…")
-        self.assertEqual(job["stage"], "生成第 1 次：调用模型…",
-                         "一轮要跑十几分钟，这期间界面不能停在上一句话上")
-        self.assertEqual(job["progress"], 0.0, "出货还没跑完，进度不该动")
-        web_ui._script_stage(job, "检查第 1 轮：模型返回正文 18466 有效字")
-        first = job["progress"]
-        self.assertGreater(first, 0.0)
-        self.assertLessEqual(first, 0.5, "检查段最多走到一半")
+
+        # ---- 准备段：一行一格，逻辑拆分 / 装箱 / 规划 ----
+        web_ui._script_stage(job, "分段 · 第1步 逻辑拆分：依据本期主旨与 9 节凝缩…")
+        prep_a = job["progress"]
+        self.assertGreater(prep_a, 0.0, "准备段也要报账")
+        web_ui._script_stage(job, "规划完成：6 个写作段段主旨已定")
+        self.assertGreater(job["progress"], prep_a)
+        self.assertLessEqual(job["progress"], web_ui._BANDS["写稿"][0])
+
+        # ---- 写稿段（分段路）：段 k/N 完成，N 就写在行里 ----
+        web_ui._script_stage(job, "段 1/6：调用模型…（配额 1004 有效字）")
+        started = job["progress"]
+        self.assertGreaterEqual(started, web_ui._BANDS["写稿"][0],
+                                "第 1 段开写就进了写稿段")
+        web_ui._script_stage(job, "段 1/6 完成：41 句 / 1008 有效字（累计 1008/6024）")
+        self.assertGreater(job["progress"], started, "一段写完推一格")
+        mid = job["progress"]
+        web_ui._script_stage(job, "段 3/6 完成：40 句 / 1005 有效字（累计 2995/6024）")
+        self.assertGreater(job["progress"], mid)
+        self.assertLess(job["progress"], web_ui._BANDS["写稿"][1],
+                        "没写完就不许越过写稿段的上限")
+        web_ui._script_stage(job, "段 6/6 完成：41 句 / 1009 有效字（累计 6012/6024）")
+        self.assertAlmostEqual(job["progress"], web_ui._BANDS["写稿"][1],
+                               msg="最后一段写完，写稿段正好走到它的终点")
+
+        # ---- 检查段：按轮推格；通过＝交到本段终点 ----
+        web_ui._script_stage(job, "检查第 1 轮：判定完成（通过）")
+        before = job["progress"]
+        web_ui._script_stage(job, "检查第 1 轮：模型返回正文 6010 有效字")
+        self.assertGreater(job["progress"], before, "一轮真跑完才推一格")
         web_ui._script_stage(job, "检查通过（第 1 轮）")
-        self.assertGreaterEqual(job["progress"], 0.5,
-                                "检查段提前收工，进度也得交到它的终点，"
-                                "门禁段才有 50% 这个起点")
-        web_ui._script_stage(job, "门禁第 1 轮：模型返回正文 18466 有效字")
-        self.assertGreater(job["progress"], first, "门禁段接着走 50~100%")
-        self.assertGreaterEqual(job["progress"], 0.5)
+        self.assertAlmostEqual(job["progress"], web_ui._BANDS["检查"][1],
+                               msg="检查段收工要把进度交到它的终点，"
+                                   "门禁段才有起点")
+
+        # ---- 门禁段：首轮只判定不出货，轮次编号到 gate_rounds + 1 ----
+        before = job["progress"]
+        web_ui._script_stage(job, "门禁第 1 轮：模型返回正文 6010 有效字")
+        self.assertGreater(job["progress"], before)
         before = job["progress"]
         web_ui._script_stage(job, "门禁第 1 轮：定点修补 2 句…")
         self.assertEqual(job["progress"], before, "进度条只许前进，不许倒回")
         web_ui._script_stage(job, "门禁通过（第 2 轮）")
-        self.assertGreater(job["progress"], before, "门禁过了就等于定稿，推到尾")
-        self.assertLess(job["progress"], 1.0, "留一格给粘合与写盘")
+        self.assertAlmostEqual(job["progress"], web_ui._BANDS["门禁"][1],
+                               msg="门禁过了就等于定稿")
+
+        # ---- 收尾段：粘回顾 → 粘片头尾 ----
+        before = job["progress"]
+        web_ui._script_stage(job, "前期回顾已粘上：3 句，位置是第 2 句")
+        self.assertGreater(job["progress"], before)
+        web_ui._script_stage(
+            job, "片头尾已粘上：正文 240 句，首 5 句、尾 1 句固定结构")
+        self.assertAlmostEqual(job["progress"], web_ui._BANDS["收尾"][1])
+        self.assertLess(job["progress"], 1.0, "留一格给落盘与任务收口")
+
+    def test_progress_bands_are_contiguous_and_the_writing_band_has_room(self):
+        """区间表本身的账：段与段首尾相接、写稿段占大头。
+
+        相接是「只前进不后退」的前提——进了下一段就天然比上一段的任何一格都大，
+        不必每处再比一次 max。写稿段占大头是这张表的全部理由：它是整趟最长的一段，
+        从前它在表里根本不存在。
+        """
+        bands = web_ui._BANDS
+        order = ["准备", "写稿", "检查", "门禁", "收尾"]
+        self.assertEqual(list(bands), order)
+        for lo_name, hi_name in zip(order, order[1:]):
+            self.assertEqual(bands[lo_name][1], bands[hi_name][0],
+                             "%s 的终点该接上 %s 的起点" % (lo_name, hi_name))
+        self.assertEqual(bands[order[0]][0], 0.0)
+        self.assertLess(bands[order[-1]][1], 1.0, "末段不占满：1.0 归任务收口")
+        write_lo, write_hi = bands["写稿"]
+        self.assertGreater(write_hi - write_lo, 0.5, "写稿段要占一半以上")
+
+
+    def test_whole_draft_path_ticks_on_the_rewrite_round(self):
+        """整篇路没有分段计数，它的分格是「输出坏了重发」的轮次。
+
+        一次出一整篇，通常第 1 次就成——所以整段写稿只推一格，这是这条路本来的
+        样子：单次调用期间没有任何可报的中间量，硬画一根匀速条就是骗人。
+        """
+        job = pipeline.new_job("script", "试")
+        web_ui._script_stage(job, "生成第 1 次：调用模型…")
+        self.assertAlmostEqual(job["progress"], web_ui._BANDS["写稿"][0],
+                               msg="一开写就进写稿段，但只摆位置、不推格")
+        web_ui._script_stage(job, "生成第 1 次：模型返回正文 5900 有效字")
+        self.assertGreater(job["progress"], web_ui._BANDS["写稿"][0])
+        self.assertLess(job["progress"], web_ui._BANDS["写稿"][1])
 
 
     def test_batch_calls_the_work_function_not_the_entry(self):

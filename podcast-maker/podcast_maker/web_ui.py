@@ -33,7 +33,7 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import assets_factory, audio_engine, duration_model, ingest, layout, paradigms, pipeline
+from . import assets_factory, audio_engine, bins, duration_model, ingest, layout, paradigms, pipeline
 from . import planner
 from . import probe, project_store, script_engine, source_store, subtitle_engine, tts_engine
 from .config_manager import (BANNED_RULES, CONTENT_CHECKS,
@@ -462,55 +462,140 @@ def api_script_generate(body):
     return {"ok": True, "task_id": jid}
 
 
-# 轮次日志的段名与序号：两段各自成环，界面靠段名决定进度往哪一半折算。
+# ------------------------------------------------------------------ 脚本生成进度
+#
+# 各段的进度区间。**写稿是主体，主体必须有刻度**——从前这张表只覆盖后两段
+# （检查 0~50%、门禁 50~100%），写稿段一格都没有，而它是整趟里最长的一段（本地
+# 模型十几分钟到半小时）。于是全程的真实轨迹只有四跳：0% → 50% → 95% → 100%，
+# 还全挤在收尾那几十秒里；界面 1.5 秒问一次，50%/95% 常常一次都抓不到。观感就是
+# 「这条进度条从来没动过」——不是坏了，是从没接上。
+#
+# 值域 [起, 止)，段与段首尾相接：进了下一段就天然比上一段的任何一格都大，所以
+# 进度只前进不后退。刻度写在一张表里而不是散在分支里，是为了让「哪一段有刻度、
+# 哪一段没有」一眼可见——从前散着写，漏掉一整段也看不出来。
+_BANDS = {
+    "准备": (0.00, 0.10),   # 取料 → 判据包 → 逐节原文 → 逻辑拆分 → 装箱 → 规划
+    "写稿": (0.10, 0.72),   # 分段路按「段 k/N 完成」；整篇路按「输出坏了重发」的轮
+    "检查": (0.72, 0.86),   # 内容检，按轮
+    "门禁": (0.86, 0.96),   # 形式门禁，按轮
+    "收尾": (0.96, 0.99),   # 粘片头尾 → 落盘；最后 1% 归 run_async 的收口
+}
+
+# 轮次日志的段名与序号：两段各自成环，段名决定进度折到哪个区间。
 _ROUND_LOG = re.compile(r"^(门禁|检查)第\s*(\d+)\s*轮")
-_GEN_LOG = re.compile(r"^生成第\s*\d+\s*次")
+# 写稿段的两条路各认自己的计数：整篇路「生成第 N 次」，分段路「段 k/N」。
+_GEN_CALL = re.compile(r"^生成第\s*(\d+)\s*次：调用模型")
+_GEN_DONE = re.compile(r"^生成第\s*(\d+)\s*次：模型返回正文")
+_SEG_CALL = re.compile(r"^段\s*(\d+)/(\d+)\s*[：:]")
+_SEG_DONE = re.compile(r"^段\s*(\d+)/(\d+)\s*完成")
+
+# 准备段的里程碑：**只放值得占一格的阶段边界**，不把每一行日志都收进来。取素材、
+# 读凝缩这类读盘动作不进表——它们不为进度服务，进度也不该为它们弯折；留下的是
+# 「要等模型」的那几步与它们的完成线。值是本段里的位置（0~1）。整篇路没有这几步，
+# 自然整段跳过、从写稿段起步。
+_PREP_MARKS = (
+    (re.compile(r"^分段 · 第1步 逻辑拆分"), 0.10),
+    (re.compile(r"^逻辑拆分完成"), 0.45),
+    (re.compile(r"^分段 · 第2步 装箱"), 0.55),
+    (re.compile(r"^装箱完成"), 0.65),
+    (re.compile(r"^规划轮：第\s*\d+\s*次尝试"), 0.75),
+    (re.compile(r"^规划完成"), 1.00),
+)
+# 收尾段：定稿那一刻只剩粘合与落盘，粘回顾在粘片头尾之前。
+_TAIL_MARKS = (
+    (re.compile(r"^前期回顾已粘上"), 0.50),
+    (re.compile(r"^片头尾已粘上"), 1.00),
+)
 
 
 def _script_stage(job, msg):
-    """把一行日志记进任务，并按段折算轮次进度。
+    """把一行日志记进任务，并按段折算进度。
 
-    三段串行：出货（整篇现写或分段初稿）→ 检查（内容检）→ 门禁（形式门禁）。
-    后两段各跑各的轮，检查段占 0~50%、门禁段占 50~100%。所以主体把段名写进每一行
-    ——「门禁第 N 轮」「检查第 N 轮」「生成第 N 次」。界面拿段名去认该用哪一段的
-    预算折算；两段都喊「第 N 轮」的话，进度条会在门禁段开头往回跳一半。
+    五段串行：准备（切段 / 装箱 / 规划）→ 写稿（分段初稿或整篇现写）→ 检查（内容
+    检）→ 门禁（形式门禁）→ 收尾（粘片头尾、落盘）。区间表见 `_BANDS`。所以主体把
+    段名写进每一行——「段 k/N 完成」「检查第 N 轮」「门禁第 N 轮」——界面拿段名去认
+    该往哪个区间折算。
 
-    进度只在**一轮真的跑完**时前进（看「模型返回」那一行）；一轮刚开头那几行只把
-    进度补到本段已跑完的格数。正在跑的那一轮有多长本来就没人知道，画一根匀速前进
-    的假进度条只会让人以为快好了。「调用模型…」那几行只更新阶段——它的用处是让
-    界面在漫长的一轮里说得出自己在干什么，而不是停在上一句话上。
+    进度只在**一格真的走完**时前进：分段路一段写完推一格（N 就写在这一行里，不必
+    另传参数），整篇路一次出一整篇、按「输出坏了重发」的轮推格，后两段按轮推。正在
+    跑的那一轮有多长本来就没人知道，画一根匀速前进的假进度条只会让人以为快好了。
+    「调用模型…」那几行只把进度摆到本格起点、并更新阶段——它的用处是让界面在漫长
+    的一轮里说得出自己在干什么，而不是停在上一句话上。
+
+    **不是里程碑行就不动进度、也不改阶段**：区间是给这五段量的，让一句「目标：
+    1500 秒 / 约 6024 字」也来推一把，等于把刻度稀释成噪声。
     """
+
+    def _put(band, ratio):
+        """推到 band 段里的第 ratio 格（0~1）。只前进不后退。"""
+        lo, hi = _BANDS[band]
+        r = min(1.0, max(0.0, float(ratio)))
+        job["progress"] = max(job.get("progress", 0.0), lo + (hi - lo) * r)
+
     pipeline.job_log(job, msg)
-    if _GEN_LOG.match(msg):
-        # 出货那条线（生成第 N 次）：它是三段里的第一段，只有整篇路才走。
-        # 「输出坏了重发」不是一轮判定，所以它只改阶段、不动进度。
-        job["stage"] = msg
-        return
+
+    # 准备段与收尾段是离散的里程碑：一行一格，没有轮次可言。
+    for band, marks in (("准备", _PREP_MARKS), ("收尾", _TAIL_MARKS)):
+        for pat, at in marks:
+            if pat.match(msg):
+                job["stage"] = msg
+                _put(band, at)
+                return
+
     if msg.startswith("检查通过"):
-        # 检查段提前收工：把进度补齐到它的终点，好让门禁段从 50% 接着走。
+        # 检查段提前收工：补齐到本段终点，门禁段才从这个位置接着走。
         job["stage"] = msg
-        job["progress"] = max(job.get("progress", 0.0), 0.5)
+        _put("检查", 1.0)
         return
     if msg.startswith("门禁通过"):
-        # 门禁段是最后一段，它通过就等于定稿了。
+        # 门禁段是最后一段，它通过就等于定稿了；只剩收尾那一格。
         job["stage"] = msg
-        job["progress"] = max(job.get("progress", 0.0), 0.95)
+        _put("门禁", 1.0)
         return
+
+    # ---- 写稿段：分段路按「段 k/N」，整篇路按重发轮 ----
+    m = _SEG_DONE.match(msg)
+    if m:
+        # 全篇有几个写作段，这一路天然知道（N 就写在行里）。
+        job["stage"] = msg
+        _put("写稿", int(m.group(1)) / float(max(1, int(m.group(2)))))
+        return
+    m = _SEG_CALL.match(msg)
+    if m:
+        # 第 k 段开写：此刻手上是 k-1 段。只摆位置，不推格。
+        job["stage"] = msg
+        _put("写稿", (int(m.group(1)) - 1) / float(max(1, int(m.group(2)))))
+        return
+    # 重发轮次表只有一份实现（`script_engine._segment_parse_rounds`），这里不另写
+    # 一个数——两个地方各写一个数，改了一处另一处就静默错位。
+    rounds = script_engine._segment_parse_rounds(CFG.data()) + 1
+    m = _GEN_DONE.match(msg)
+    if m:
+        job["stage"] = msg
+        _put("写稿", int(m.group(1)) / float(max(1, rounds)))
+        return
+    m = _GEN_CALL.match(msg)
+    if m:
+        job["stage"] = msg
+        _put("写稿", (int(m.group(1)) - 1) / float(max(1, rounds)))
+        return
+
+    # ---- 检查段 / 门禁段：按轮推格 ----
     m = _ROUND_LOG.match(msg)
     if not m:
         return
     job["stage"] = msg
     seg, done = m.group(1), int(m.group(2))
-    # 检查在前（0~50%）、门禁在后（50~100%）。门禁段多一格：首轮只判定不出货，
-    # 所以它的轮次编号从 1 到 gate_rounds + 1。
+    # 检查段按 check_rounds 分格；门禁段多一格——首轮只判定不出货，它的轮次编号
+    # 从 1 到 gate_rounds + 1。
     if seg == "检查":
-        budget, base = int(CFG.get("script.check_rounds", 3)), 0.0
+        budget = int(CFG.get("script.check_rounds", 3))
     else:
-        budget, base = int(CFG.get("script.gate_rounds", 3)) + 1, 0.5
-    step = 0.5 / max(1, budget)
-    ratio = done if "模型返回" in msg else max(0, done - 1)
-    job["progress"] = max(job.get("progress", 0.0),
-                          min(base + step * ratio, base + 0.5))
+        budget = int(CFG.get("script.gate_rounds", 3)) + 1
+    # 一轮**真的跑完**才推一格（看「模型返回」那一行）；一轮刚开头那几行只把进度
+    # 补到本段已跑完的格数。
+    ratio = done if "模型返回" in msg else done - 1
+    _put(seg, ratio / float(max(1, budget)))
 
 
 def _script_generate_work(body, job=None):
@@ -827,6 +912,42 @@ def api_tts_setup(body):
 
     return {"ok": True, "task_id": pipeline.run_async("tts-setup", _run,
                                                       "搭建本地语音环境")}
+
+
+def api_deps_state():
+    """配置页「运行环境」卡的探测：ffmpeg / ffprobe 在不在、走的是哪一份。
+
+    只读 —— 不装任何东西。「装」只发生在用户点按钮之后。
+    """
+    return {"ok": True, "state": bins.state()}
+
+
+def api_deps_install(body):
+    """「一键安装」：从国内镜像下 ffmpeg 到项目 bin/。
+
+    走异步任务：134 MB 的下载压在请求里浏览器会先超时。进度沿用现有的
+    /api/task/<id> 轮询与 /api/job/stop 中止，不另造一套。
+
+    **装项目 bin/ 而不是系统 PATH**：bin 里的这份由 bins.locate() 直接给出
+    绝对路径，程序当场指得到，**不用重启**（装系统 PATH 才要重启 —— PATH 是
+    进程启动时拍的快照，对已经跑着的进程不生效）。
+    """
+    def _run(job):
+        def log(msg):
+            pipeline.job_log(job, msg)
+
+        def step(frac):
+            # 只前进不后退：重试或分支都不会让进度条倒退。
+            job["progress"] = max(job.get("progress") or 0.0, min(0.99, frac))
+
+        st = bins.install(log, should_stop=lambda: bool(job.get("stop")),
+                          on_step=step)
+        job["progress"] = 1.0
+        log("装好了，不用重启 —— 回配置页点「重新探测」就能看到已就绪。")
+        return {"state": st}
+
+    return {"ok": True, "task_id": pipeline.run_async("deps-install", _run,
+                                                      "安装运行环境（ffmpeg）")}
 
 
 # --------------------------------------------------------------- 角色音色档案
@@ -1621,6 +1742,7 @@ ROUTES_GET = {
     "/api/fonts": lambda q, b: api_fonts(),
     "/api/engines": lambda q, b: api_engines(),
     "/api/tts/state": lambda q, b: api_tts_state(),
+    "/api/deps/state": lambda q, b: api_deps_state(),
     "/api/backends": lambda q, b: api_backend_get(),
     "/api/models": lambda q, b: api_models(q),
     "/api/projects": lambda q, b: api_projects(),
@@ -1646,6 +1768,7 @@ ROUTES_POST = {
     "/api/script/save": lambda b: api_script_save(b),
     "/api/tts/preview": lambda b: api_tts_preview(b),
     "/api/tts/setup": lambda b: api_tts_setup(b),
+    "/api/deps/install": lambda b: api_deps_install(b),
     "/api/voice/profile": lambda b: api_voice_profile(b),
     "/api/voice/build": lambda b: api_voice_build(b),
     "/api/render": lambda b: api_render(b),
@@ -2905,6 +3028,9 @@ function specOf(key){
 function renderConfig(){
   const box=el('stage-config'); if(!box) return;
   box.innerHTML=''; pruneReg();
+  // 运行环境（ffmpeg）不依附任何配置分区 —— 它是全链前置，用户一进配置页
+  // 就该看见自己这台机器齐不齐，所以做成独立一张卡挂在最前。
+  box.insertAdjacentHTML('beforeend', depsEnvHtml());
   const groups=CFG.params.config||{};
   const secs=orderSections(Object.keys(groups));
   secs.forEach(sec=>{
@@ -2939,6 +3065,8 @@ function renderConfig(){
   patchModelNote();
   // 点位刚重建，显隐状态得重算一遍：切到配置页时该收起的组要收起
   applyEngineScope();
+  // 运行环境那张卡也刚重建出来，探一次现状（ffmpeg / ffprobe 在不在）
+  refreshDepsState();
   // 本地语音环境那块刚重建出来，探一次现状（缺环境 / 缺包 / 缺模型）
   if(el('tts-env')) refreshTtsState();
   // 字幕预览也随整卡重建，重画一次（块不在时 drawSubtitlePreview 直接返回）
@@ -3327,6 +3455,81 @@ async function watchTts(tid){
     toast(j.status==='done'?'本地语音环境已就绪':'搭建没成功：'+(j.error||''),
           j.status==='done'?'ok':'err');
     await refreshTtsState();
+  };
+  tick();
+}
+
+/* ---- 运行环境（ffmpeg / ffprobe）----
+   这个智能体不内置 ffmpeg，也不随包分发（版权）。用户机器上大概率一个都没有，
+   所以「探测 → 一键装」是绝大多数人唯一会走的路。装到项目 bin/。
+
+   探测顺序与后端 bins.locate() **同一口径**：先 PATH（用户自己装的那份先认），
+   其次项目 bin/。两边必须一致 —— 否则会出现「界面说就绪、跑起来用的是另一个」。 */
+let DEPS_STATE=null;
+function depsEnvHtml(){
+  return '<div class="card" id="deps-env">'+
+    '<h2>运行环境</h2>'+
+    '<p class="note">合成、烧字幕、拼视频要用到 ffmpeg 与 ffprobe 两件工具。'+
+      '本程序不内置它们，装一次就好。</p>'+
+    '<div style="display:flex;align-items:center;gap:8px">'+
+      '<span id="deps-badge" class="dim">探测中…</span></div>'+
+    '<div id="deps-note" style="font-size:12px;color:var(--fg3);line-height:1.6;margin-top:5px"></div>'+
+    '<div class="btn-row" style="margin-top:9px">'+
+      '<button class="btn primary" id="btn-deps-install" onclick="installDeps()">一键安装</button>'+
+      '<button class="btn" onclick="refreshDepsState()">重新探测</button>'+
+      '<button class="btn" id="btn-stop-d" style="display:none" onclick="stopJob(\'d\')">中止</button>'+
+    '</div>'+
+    '<div class="bar"><i id="deps-bar"></i></div>'+
+    '<pre class="log" id="deps-log" style="display:none;margin-top:10px">等待任务。</pre>'+
+  '</div>';
+}
+async function refreshDepsState(){
+  if(!el('deps-env')) return;
+  const r=await api('/api/deps/state');
+  if(!r.ok) return;
+  DEPS_STATE=r.state||null;
+  paintDeps();
+}
+function paintDeps(){
+  const box=el('deps-env'); if(!box||!DEPS_STATE) return;
+  const st=DEPS_STATE, t=st.tools||{};
+  const badge=el('deps-badge'), note=el('deps-note'), btn=el('btn-deps-install');
+  if(st.ok){
+    const where=v=>(v.source==='bin'?'项目 bin/':'PATH');
+    badge.className='ok'; badge.textContent='已就绪';
+    note.textContent='ffmpeg ← '+t.ffmpeg.path+'（'+where(t.ffmpeg)+'）'+
+      (t.ffmpeg.version?('　'+t.ffmpeg.version):'')+
+      '　｜　ffprobe ← '+t.ffprobe.path+'（'+where(t.ffprobe)+'）';
+    btn.style.display='none';
+  }else{
+    badge.className='bad'; badge.textContent='未检测到';
+    note.textContent=st.message||'';
+    btn.style.display=''; btn.textContent='一键安装';
+  }
+}
+async function installDeps(){
+  const btn=el('btn-deps-install'); btn.disabled=true;
+  const r=await api('/api/deps/install',{});
+  if(!r.ok){btn.disabled=false; toast(r.error||'启动失败','err'); return}
+  const lg=el('deps-log'); lg.style.display=''; lg.textContent='已开始…';
+  watchDeps(r.task_id);
+}
+async function watchDeps(tid){
+  CUR_JOB=tid;
+  const btn=el('btn-deps-install'), stop=el('btn-stop-d'), lg=el('deps-log');
+  if(stop) stop.style.display='';
+  const tick=async()=>{
+    const r=await api('/api/task/'+encodeURIComponent(tid));
+    if(!r.ok){toast(r.error||'任务查不到','err'); return}
+    const j=r.job||{};
+    setBar('deps-bar', j.progress||0);
+    if(lg) lg.textContent=(j.log||[]).join('\n')||'等待中…';
+    if(j.status==='running'){setTimeout(tick,1500);return}
+    if(stop) stop.style.display='none';
+    if(btn) btn.disabled=false;
+    toast(j.status==='done'?'运行环境已就绪':'安装没成功：'+(j.error||''),
+          j.status==='done'?'ok':'err');
+    await refreshDepsState();
   };
   tick();
 }
@@ -3880,7 +4083,9 @@ function showOutputs(res){
     fileHref(relOf(p))+'"></'+tag+'>'}};
   item(ep.video,'横屏视频'); item(ep.video_vertical,'竖屏视频'); item(ep.audio,'音频');
   media(ep.audio,'audio'); media(ep.video,'video'); media(ep.video_vertical,'video');
-  item(ep.subtitle,'字幕'); item(ep.subtitle_lrc,'字幕（歌词 LRC）'); item(ep.article,'图文');
+  item(ep.subtitle,'字幕'); item(ep.subtitle_lrc,'字幕（歌词 LRC）');
+  item(ep.subtitle_txt,'字幕（整秒 TXT）');
+  item(ep.subtitle_clean_txt,'字幕（洁版 TXT）'); item(ep.article,'图文');
   item(ep.bg_h,'背景图（横屏）'); item(ep.bg_v,'背景图（竖屏）');
   const cov=ep.cover||{};
   Object.keys(cov).forEach(k=>{const n=String(cov[k]).split(/[\\/]/).pop();

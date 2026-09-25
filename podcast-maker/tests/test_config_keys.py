@@ -493,6 +493,21 @@ class TestVersionStep(unittest.TestCase):
             self.assertEqual(headings[0], "未发布",
                              "「未发布」段被挤到了已发布版本之下")
 
+    def test_the_architecture_doc_reports_the_same_version(self):
+        """`ARCHITECTURE.md` 抬头那个版本号也要齐步。
+
+        它就是上一类缺陷的另一个出口：v1.0.0 那次三端都齐了，唯独架构册抬头
+        还写着上一个版本 —— 三端齐步只盯程序与更新日志，架构册不在它的视野里。
+        """
+        from podcast_maker.config_manager import VERSION
+        with open(os.path.join(ROOT, "ARCHITECTURE.md"), encoding="utf-8") as fh:
+            head = fh.read(2000)
+        m = re.search(r"^> 版本：v([0-9][^\s（(]*)", head, re.M)
+        self.assertIsNotNone(m, "ARCHITECTURE.md 抬头缺少「> 版本：vX.Y.Z」")
+        self.assertEqual(m.group(1), VERSION,
+                         "ARCHITECTURE.md 抬头报的是 %s，程序报的是 %s"
+                         % (m.group(1), VERSION))
+
 
 class TestConfigGrid(unittest.TestCase):
     """配置页的网格与格子骨架。

@@ -159,12 +159,9 @@ def cmd_resume(args):
 def main():
     args = build_parser().parse_args()
 
-    print("=" * 62)
-    print("  Podcast Maker")
-    print("  播客制作智能体 · 脚本 → 声音 → 字幕 → 画面 → 产物")
-    print("=" * 62)
-    print()
-
+    # 启动抬头只印一份，在 web_ui.run_server() 里 —— 那一份才带版本号，还带
+    # 界面地址与停止方式。这里原本另印一份不带版本号的，同一个抬头隔一行连着
+    # 出现两次。短命令（--check / --voices / --fonts / --continue）自此不带抬头。
     if args.check:
         return cmd_check()
     if args.voices:

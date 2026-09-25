@@ -39,10 +39,11 @@
 
 import json
 import os
-import shutil
 import struct
 import subprocess
 import zlib
+
+from . import bins
 
 FIELD = "AIGC"
 DISCLOSURE_TEXT = "本节目人声由人工智能合成。"
@@ -155,9 +156,9 @@ def tag_media(src, dst, cfg, content_id="", faststart=False):
     回来），必须开 ``use_metadata_tags`` 才会把自定义键写进 ilst——实测开与
     不开的差别就是元数据在不在。faststart 请求只是叠加，不是替代。
     """
-    exe = shutil.which("ffmpeg")
+    exe = bins.locate("ffmpeg")
     if not exe:
-        raise LabelError("找不到 ffmpeg，无法写入 AIGC 元数据。")
+        raise LabelError(bins.missing_message("ffmpeg"))
     ext = os.path.splitext(dst)[1].lower()
     tmp = dst + ".aigc.tmp"
     cmd = [exe, "-y", "-i", src, "-c", "copy", "-map", "0",

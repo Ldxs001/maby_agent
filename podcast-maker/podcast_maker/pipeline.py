@@ -617,8 +617,11 @@ def review_rows(base, proj_item, episode_no, cfg, log=None):
     fill = {"prev_title": _trim_tail(title),
             "prev_gist": _trim_tail(gist),
             "prev_topics": "、".join(_trim_tail(t) for t in topics)}
+    # 字距在这里收口一次（`script_engine.tidy_text`）：回顾句的唯一生产者
+    # 就是本函数，粘合与重拼工具（`tools/reglue_review.py`）都吃它的输出——
+    # 重拼那条路不经过 `glue_intro_outro`，只在那里补会漏掉它。
     rows = [{"speaker": r["speaker"], "emotion": r["emotion"],
-             "text": str(r["text"]).format(**fill)}
+             "text": script_engine.tidy_text(str(r["text"]).format(**fill))}
             for r in (INTRO_OUTRO.get("review") or [])]
     log("前期回顾：引用第 %s 期《%s》的期主旨与 %d 条段主旨，拼成 %d 句"
         % (prev.get("no"), title, len(topics), len(rows)))
@@ -953,6 +956,21 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
         f.write(subtitle_engine.build_lrc(script, cfg, timings))
     result["subtitle_lrc"] = lrc_path
 
+    # 整秒 TXT 与上面两份同一次生成、同一份源：只有起始时间，且取整到秒。
+    # 交给需要「第几秒」的场合（逐行对照、检索、外部工具），省得对方去解小数。
+    txt_path = ep["subtitle_txt"]
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(subtitle_engine.build_txt(script, cfg, timings))
+    result["subtitle_txt"] = txt_path
+
+    # 洁版 TXT 与整秒 TXT 同源、同一次生成，只把时间戳的方括号摘掉：逐行读、
+    # 复制粘贴、喂外部工具时少一层噪声。**不是**拿上面那份 .txt 改出来的——
+    # 四份都从同一份 script/timings 现生成。
+    clean_path = ep["subtitle_clean_txt"]
+    with open(clean_path, "w", encoding="utf-8") as f:
+        f.write(subtitle_engine.build_clean_txt(script, cfg, timings))
+    result["subtitle_clean_txt"] = clean_path
+
     font = assets_factory.resolve_font(cfg.get("subtitle.font_family", ""))
     font_dir = assets_factory.fonts_dir_of(font)
 
@@ -1023,7 +1041,8 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
 
     assets = {"video": video_h, "video_vertical": video_v, "audio": mp3,
               "article": article_path, "subtitle": srt_path,
-              "subtitle_lrc": lrc_path,
+              "subtitle_lrc": lrc_path, "subtitle_txt": txt_path,
+              "subtitle_clean_txt": clean_path,
               "bg": built["bg_h"], "covers": built.get("covers", {})}
 
     # 内容检（语义 / 承诺链）不在这里跑。它与其余生成阶段门禁同属脚本阶段，

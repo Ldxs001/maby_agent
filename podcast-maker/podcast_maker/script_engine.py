@@ -426,12 +426,13 @@ def build_system_prompt(cfg, preset_key, target_chars, line_count, project=None,
   - emotion：只填语篇标签，标这句在对话里**干什么活**，每句必须从本篇词表中选一个
     （词表只有这一份，照抄下面列出的词，不在此列的一律不许编）：
 %s
-    正确：{"speaker": "A", "emotion": "追问", "text": "含碳12%%的铁属于钢，为什么这么说呢？"}
-    正确：{"speaker": "A", "emotion": "承接", "text": "大明于1368年立朝。"}
+    正确：{"speaker": "A", "emotion": "追问", "text": "含碳 1.2%% 且含铬 10.5%% 的铁属于 stainless steel，为什么这么说呢？"}
+    正确：{"speaker": "A", "emotion": "承接", "text": "大明于 1368 年立朝。"}
     正确：{"speaker": "A", "emotion": "强调", "text": "这是胜利的预言家在叫喊：——让暴风雨来得更猛烈些吧！"}
-    错误：{"speaker": "A", "emotion": "疑惑", "text": "疑惑含碳12%%的铁属于钢，为什么这么说呢"}
-    （这一条错了三处：「疑惑」是心情不是语篇动作、不在本篇词表里；「疑惑」二字
-    误进了 text 正文；句尾没有标点符号）
+    错误：{"speaker": "A", "emotion": "疑惑", "text": "疑惑含碳1.2%%且含铬10.5%%的铁属于stainlesssteel，为什么这么说呢"}
+    （这一条错了五处：「疑惑」是心情不是语篇动作、不在本篇词表里；「疑惑」二字
+    误进了 text 正文；汉字与西文、数字之间没有空格；英文单词之间也没有空格
+    （stainlesssteel 该写 stainless steel）；句尾没有标点符号）
   - text：只填对话内容，即**会被逐字合成语音念出来的台词正文**。text 里的每个
     字都会被念出来——所以下面这些一律不进 text：语气/情绪描写（「小美疑惑地
     说」「他笑着说」）、说话人标记（「A:」「B:」）、任何形式的标签、注释或说明。
@@ -553,9 +554,53 @@ def parse_script(raw):
     return {"title": "", "planned_episodes": None, "lines": data}
 
 
+# ------------------------------------------------------------------ 字距
+#: 汉字判定区（基本区，与全文件其它正则同一口径）。
+_HAN = r"\u4e00-\u9fff"
+#: 字距边界两条：汉字 →（拉丁字母／阿拉伯数字／百分号），反向同理。
+#: **只补这两个方向**：数字与紧跟着它的百分号之间不补（`12%` 是一个整体，
+#: 拆开是错的）；英文单词与单词之间也不补——正则没有词边界知识，`RAGAssistant`
+#: 切开就成了猜词，那一层交给提示词前置（见 `build_system_prompt` 的示例块）。
+_SPACE_BOUNDARY = (
+    re.compile(rf"(?<=[{_HAN}])(?=[A-Za-z0-9%])"),
+    re.compile(rf"(?<=[A-Za-z0-9%])(?=[{_HAN}])"),
+)
+#: 一切空白（含换行、制表、全角空格）折叠成一个半角空格。
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def tidy_text(raw):
+    """字距规范化：汉字与西文之间**只插入空格**，不删改任何非空白字符。
+
+    补空格的三类边界：汉字 ↔ 拉丁字母（`AI写的` → `AI 写的`）、汉字 ↔ 阿拉伯
+    数字（`2026年` → `2026 年`）、百分号 → 汉字（`占比15%规则` → `占比 15% 规则`）。
+    **不补的**：数字与紧跟着它的百分号（`12%`、`36.5℃` 是一个整体，拆开是错的）、
+    英文单词与单词之间（见下）。
+
+    空白一律折叠成一个半角空格、两端去净——去掉的是**排版噪声**（模型塞进来的
+    换行、缩进、连续空格），不是词与词之间的边界。
+
+    **管不到的那一类，说在明处**：英文单词与单词之间。`RAGAssistant` 该写
+    `RAG Assistant`，可一个字母串该切成几个词，正则判不出来（`AI` 是词、
+    `Assistant` 也是词，而 `NVIDIA` 是一个词）——硬切就是猜。这一层由**提示词
+    前置**管（`build_system_prompt` / `_segment_system_prompt` 的示例块），
+    这里只做保底：汉字与西文之间一处不漏。
+
+    只插不删、**幂等**（同一份文本跑第二遍零变化）。这是它与从前的
+    `re.sub(r"\\s+", "", text)` 的**唯一区别**——那一行把词与词的边界一起删了，
+    等于把「去掉排版噪声」做成了「把整句拧成一个字块」，于是提示词里刚示范过的
+    字距，一到落盘就被它抹平。字距是格式，格式归代码；代码管不到的那一段（英文
+    分词）才归提示词。
+    """
+    s = _SPACE_RUN.sub(" ", str(raw or ""))
+    for pat in _SPACE_BOUNDARY:
+        s = pat.sub(" ", s)
+    return s.strip()
+
+
 def clean_title(raw):
-    """标题收束：去包裹符号、去期号前缀、限长。格式轴的事由代码办。"""
-    t = re.sub(r"\s+", "", str(raw or ""))
+    """标题收束：去包裹符号、去期号前缀、限长、补字距。格式轴的事由代码办。"""
+    t = tidy_text(raw)
     t = t.strip("《》〈〉「」『』\"'“”‘’【】 []")
     t = re.sub(r"^第\s*\d+\s*期[·:：\-—\s]*", "", t)
     return t[:24]
@@ -580,7 +625,7 @@ def title_from_lines(lines):
 def normalize_script(data, cfg):
     """格式确定性后处理（08b：格式轴硬编码收束）。
 
-    - 字段缺失即补位（speaker 缺省承接上一句、text 去空白、emotion 不在词表
+    - 字段缺失即补位（speaker 缺省承接上一句、text 补字距并折叠空白、emotion 不在词表
       落中性档「承接」）
     - 空 text 的条目直接丢弃
     - estimated_seconds 由时长模型按标准语速计算，丢弃 LLM 给的任何数字
@@ -602,8 +647,7 @@ def normalize_script(data, cfg):
         emotion = str(item.get("emotion") or "").strip()
         if emotion not in DISCOURSE_ORDER:
             emotion = DISCOURSE_NEUTRAL
-        text = str(item.get("text", "")).strip()
-        text = re.sub(r"\s+", "", text)
+        text = tidy_text(item.get("text", ""))
         if not text:
             continue
         out.append({
@@ -817,7 +861,7 @@ def glue_intro_outro(script, cfg, title="", log=None, review=None):
                 continue
             out.append({"speaker": tpl["speaker"],
                         "emotion": tpl["emotion"],
-                        "text": tpl["text"].format(**fill)})
+                        "text": tidy_text(tpl["text"].format(**fill))})
         return out
 
     body = [dict(l) for l in (script or [])]
@@ -827,7 +871,14 @@ def glue_intro_outro(script, cfg, title="", log=None, review=None):
     # 之前。文本由调用方组好（`pipeline.review_rows`），这里不填值、不判开关、
     # 不做降级——粘合只负责位置。空列表＝这一期没有回顾，序列退回「片头＋正文＋
     # 片尾」。片头只有一句（简档）时无「其余句」可插，回顾照样接在第 1 句之后。
+    # 片头／回顾／片尾的文本是从模板逐字拼的，**不经过正文那道收束**
+    # （`normalize_script`），所以字距在这里单独补一次（`tidy_text`）：模板
+    # 本身是干净的，脏的是喂进来的变量——本期标题、上期标题、期主旨里
+    # 常年带西文（`Orchestrator v2.8`、`skill-standardization`）。补在
+    # **补时长之前**，量时长用的就是补过字距的文本。
     mid = [dict(r) for r in (review or [])]
+    for row in mid:
+        row["text"] = tidy_text(row.get("text", ""))
     if mid:
         head = head[:1] + mid + head[1:] if len(head) > 1 else head + mid
         log("前期回顾已粘上：%d 句，位置是第 2 句（片头第一句之后）" % len(mid))
@@ -2304,7 +2355,7 @@ def apply_patch(script, edits, targets, inserts=None, cfg=None):
                              "reason": "这一句没被点名——定点修补只动被点名的句子，"
                                        "其余一律照抄"})
             continue
-        text = re.sub(r"\s+", "", str(e.get("text") or "").strip())
+        text = tidy_text(e.get("text") or "")
         if not text:
             rejected.append({"index": idx, "reason": "这一条把整句改成了空文本"})
             continue
@@ -2398,7 +2449,7 @@ def apply_patch(script, edits, targets, inserts=None, cfg=None):
             rejected.append({"index": after,
                              "reason": "emotion 不在本篇词表内：%r" % (emotion,)})
             continue
-        text = re.sub(r"\s+", "", str(ins.get("text") or "").strip())
+        text = tidy_text(ins.get("text") or "")
         if not text:
             rejected.append({"index": after, "reason": "插入的句子是空文本"})
             continue
@@ -2480,7 +2531,7 @@ def apply_replace(script, edits, targets, cfg=None):
             rejected.append({"index": idx,
                              "reason": "第 %d 句在同一份补丁里被动了两次" % idx})
             continue
-        text = re.sub(r"\s+", "", str(e.get("text") or "").strip())
+        text = tidy_text(e.get("text") or "")
         if not text:
             rejected.append({"index": idx, "reason": "这一条把整句改成了空文本"})
             continue
@@ -3765,12 +3816,13 @@ def _segment_system_prompt(cfg, card, preset_key, index, total, quota,
   - emotion：只填语篇标签，标这句在对话里**干什么活**，每句必须从本篇词表中选一个
     （词表只有这一份，照抄下面列出的词，不在此列的一律不许编）：
 %s
-    正确：{"speaker": "A", "emotion": "追问", "text": "含碳12%%的铁属于钢，为什么这么说呢？"}
-    正确：{"speaker": "A", "emotion": "承接", "text": "大明于1368年立朝。"}
+    正确：{"speaker": "A", "emotion": "追问", "text": "含碳 1.2%% 且含铬 10.5%% 的铁属于 stainless steel，为什么这么说呢？"}
+    正确：{"speaker": "A", "emotion": "承接", "text": "大明于 1368 年立朝。"}
     正确：{"speaker": "A", "emotion": "强调", "text": "这是胜利的预言家在叫喊：——让暴风雨来得更猛烈些吧！"}
-    错误：{"speaker": "A", "emotion": "疑惑", "text": "疑惑含碳12%%的铁属于钢，为什么这么说呢"}
-    （这一条错了三处：「疑惑」是心情不是语篇动作、不在本篇词表里；「疑惑」二字
-    误进了 text 正文；句尾没有标点符号）
+    错误：{"speaker": "A", "emotion": "疑惑", "text": "疑惑含碳1.2%%且含铬10.5%%的铁属于stainlesssteel，为什么这么说呢"}
+    （这一条错了五处：「疑惑」是心情不是语篇动作、不在本篇词表里；「疑惑」二字
+    误进了 text 正文；汉字与西文、数字之间没有空格；英文单词之间也没有空格
+    （stainlesssteel 该写 stainless steel）；句尾没有标点符号）
   - text：只填对话内容，即**会被逐字合成语音念出来的台词正文**。text 里的每个
     字都会被念出来——所以下面这些一律不进 text：语气/情绪描写（「小美疑惑地
     说」「他笑着说」）、说话人标记（「A:」「B:」）、任何形式的标签、注释或说明。
@@ -4521,7 +4573,7 @@ def apply_insert(seg_lines, inserts, offset, cfg=None):
         emo = str(it.get("emotion") or "").strip()
         if emo not in DISCOURSE_ORDER:
             raise ScriptError("新增里的 emotion 不在语篇词表内：%r" % (it.get("emotion"),))
-        text = re.sub(r"\s+", "", str(it.get("text") or "").strip())
+        text = tidy_text(it.get("text") or "")
         if not text:
             raise ScriptError("新增里有空文本。")
         buckets.setdefault(after - offset, []).append(
@@ -4567,7 +4619,7 @@ def apply_trim(seg_lines, edits, drops, offset, cfg=None):
         if idx in drop_set:
             raise ScriptError("第 %d 句既在 edits 里又在 drops 里：一句只能选一条路。"
                               % idx)
-        text = re.sub(r"\s+", "", str(e.get("text") or "").strip())
+        text = tidy_text(e.get("text") or "")
         if not text:
             raise ScriptError("压字数把第 %d 句改成了空文本。" % idx)
         seen.add(idx)

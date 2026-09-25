@@ -37,6 +37,29 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # 要 import �
 - **`subtitle_recap_check.py`** — 拿真实项目的**回顾三条**现算（`review_rows`）＋真实估时
   （`duration_model`），逐句验算横滚滚不滚得完。终点与句末的差只可能是 ASS 时间戳
   （10ms 一格）的取整残差，所以判定用 `TAIL_TOLERANCE = 20ms`，拿 `end <= span` 卡会误报。
+- **`lrc_round_verify.py`** — LRC 时间戳取整（工具在 `tools/lrc_round_seconds.py`）的**验收**：
+  把每个戳送两遍——整数半加版 vs 独立写的 `Decimal ROUND_HALF_UP` 版——逐戳比，另带
+  `--txt` 做存量 `<期号>.txt` 与同名 `.lrc` 的产物对账（戳数／守恒／格式／换行／BOM）。
+  单看一种实现，写错方向（银行家舍入、先分后秒取整）是看不出来的，所以得有第二条路。
+- **`subtitle_three_way.py`** — 一期三份字幕（SRT / LRC / TXT）的**同源实测**：从每期已有的
+  `.lrc` 反解真实时间轴（百分秒刻度，无损），再走真实生成路径跑三份，逐项对账——「同源律」
+  （`build_lrc` 交给离线取整工具 == `build_txt`，逐字节）、「产物对账」（磁盘 `.txt` ==
+  磁盘 `.lrc` 取整）、「SRT 时间轴」。**不拿历史产物当还原基准**：历史 `.lrc` 是当时的配置
+  与当时的脚本生成的（配置演化过、脚本改过），用现在的参数还原必然不等，那是配置史。
+  出片实际是四份（多一份洁版 TXT = 整秒摘方括号），洁版不走本探针——它只差时间戳的方括号，
+  由 `_smoke/subtitle_write_integration.py` 与 `_smoke/probe_clean_vs_disk.py` 验。
+- **`bins_install_probe.py`** — 运行环境一键安装的**端到端验收**：真下载（134 MB）→ 真校验
+  sha256 → 真解压到**临时目录**（不碰项目 `bin/`）→ 把 `PATH` **抹成空串** →
+  验 `bins.locate()` 仍命中 `bin/`、且 `audio_engine` / `tts_engine` / `video_engine` 的
+  `ffmpeg_bin()` / `ffprobe_bin()` 拿到的都是它 → 再用它真跑（生成 wav、`ffprobe` 读时长、
+  拿项目自己的 `.ass` 烧中文字幕并检查帧非空白）。**抹掉 `PATH` 那一步是要害**：不这么做，
+  本机那份系统 ffmpeg 会一直挡在前面（PATH 优先），"四份 `shutil.which` 收口到底成不成立"
+  根本看不出来——而用户机器上什么都没装，那才是常态。
+- **`startup_banner_probe.py`** — 启动抬头的**真机验收**：真起一次服务（临时端口 +
+  临时 pidfile），把控制台输出落到文件再数 —— 抬头文案 1 次、分隔线 2 条、界面地址 1 次。
+  收这份抬头之前，`main.py` 与 `web_ui.run_server()` 各印一份（前一份还不带版本号），
+  同一个标题隔一行连着出现两次。另有一条经验写进了文件头：**别用管道 `read1()` 抓
+  常驻进程的输出**——它是阻塞的，服务不退出就永远不返回，第一版探针就是这么挂死的。
 - **`make_*_page.py`、`build_*_report.py`** — 把实测数据与音频拼成单文件试听页
   （音频 base64 内嵌，零依赖）。
 - **`check_buttons.js`** — 浏览器外的渲染体检：把卡片渲染函数真跑一遍，逐条校验拼串

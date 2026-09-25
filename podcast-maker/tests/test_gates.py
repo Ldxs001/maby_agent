@@ -897,13 +897,13 @@ class TestLineEndPunct(unittest.TestCase):
         """契约与句尾标点条款进整篇与分段两份提示词，一处都不许漏。"""
         sys_prompt = SE.build_system_prompt(self.cfg, None, 800, 20)
         self.assertIn("每句必须以标点符号收尾", sys_prompt)
-        self.assertIn("含碳12%的铁属于钢", sys_prompt)
+        self.assertIn("含碳 1.2% 且含铬 10.5% 的铁属于 stainless steel", sys_prompt)
         self.assertIn("承接", sys_prompt)
         card = SE.resolve_paradigm(None, self.cfg)
         seg_prompt = SE._segment_system_prompt(
             self.cfg, card, "science", 1, 3, 800, "段主旨", True)
         self.assertIn("每句必须以标点符号收尾", seg_prompt)
-        self.assertIn("含碳12%的铁属于钢", seg_prompt)
+        self.assertIn("含碳 1.2% 且含铬 10.5% 的铁属于 stainless steel", seg_prompt)
 
 
 class TestDurationGateIsSoft(unittest.TestCase):

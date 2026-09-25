@@ -88,6 +88,11 @@ class TestApiReport(unittest.TestCase):
         self.assertEqual(ep["audio"], os.path.join(layout.av_dir(tree), "0001.mp3"))
         # 歌词字幕与 SRT 同目录同前缀：喂音频平台的产物要在路径表里有位置
         self.assertEqual(ep["subtitle_lrc"], os.path.join(layout.sub_dir(tree), "0001.lrc"))
+        # 整秒 TXT 是第三份字幕：同目录同前缀，产物区据此列出下载链接
+        self.assertEqual(ep["subtitle_txt"], os.path.join(layout.sub_dir(tree), "0001.txt"))
+        # 洁版 TXT 是第四份：同目录，名字在前缀后加 `_clean`
+        self.assertEqual(ep["subtitle_clean_txt"],
+                         os.path.join(layout.sub_dir(tree), "0001_clean.txt"))
         # 封面是三尺寸字典，键随表一起回
         self.assertEqual(sorted(ep["cover"].keys()), ["16x9", "1x1", "3x4"])
 
