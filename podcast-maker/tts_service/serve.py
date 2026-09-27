@@ -109,6 +109,14 @@ SAMPLE_KWARGS = {"temperature": TEMPERATURE, "top_k": 50, "top_p": 1.0,
                  "do_sample": True, "repetition_penalty": 1.05}
 
 
+def _sample_kwargs(temperature: float | None = None) -> dict:
+    """采样参数。temperature 传 None（绝大多数调用）就用服务端定档值。"""
+    kw = dict(SAMPLE_KWARGS)
+    if temperature is not None:
+        kw["temperature"] = temperature
+    return kw
+
+
 def seed_for(text: str, voice_key: str) -> int:
     """按 (文本, 音色标识) 派生随机种子。
 
@@ -355,7 +363,8 @@ class Engine:
             self.log(f"[引擎] 参考音频预热失败（不影响使用）：{e}")
 
     def _gen_clone(self, text: str, ref_audio: str, ref_text: str,
-                   instruct: str | None, language: str, seed: int | None):
+                   instruct: str | None, language: str, seed: int | None,
+                   temperature: float | None = None):
         """参考音频克隆一次，走 ICL 模式（xvec_only=False）。
 
         为什么不用只喂向量的 xvec_only：官方把它标为实验性，而且参考音频的信息量
@@ -380,7 +389,7 @@ class Engine:
             "ref_audio": ref_audio, "ref_text": ref_text or "",
             "xvec_only": False,
             "max_new_tokens": max_frames_for(text),
-            **SAMPLE_KWARGS,
+            **_sample_kwargs(temperature),
         }
         if instruct:
             rich["instruct"] = instruct
@@ -443,6 +452,7 @@ class Engine:
     def synth_one(self, text: str, speaker: str, instruct: str | None = None,
                   language: str = "Chinese", seed: int | None = None,
                   ref_audio: str | None = None, ref_text: str | None = None,
+                  temperature: float | None = None,
                   ) -> tuple[Any, int]:
         """合成一句。两条路**显式分流**，不靠「挨个方法试一遍」去猜。
 
@@ -458,7 +468,7 @@ class Engine:
             if not self._warmed:
                 self._warm_with_ref(ref_audio, ref_text or "")
             return self._gen_clone(text, ref_audio, ref_text or "", instruct,
-                                   language, seed)
+                                   language, seed, temperature)
 
         model = self.ensure()
         if seed is not None:
@@ -470,7 +480,7 @@ class Engine:
         rich: dict[str, Any] = {"text": text, "language": language,
                                 "speaker": speaker,
                                 "max_new_tokens": max_frames_for(text),
-                                **SAMPLE_KWARGS}
+                                **_sample_kwargs(temperature)}
         if instruct:
             rich["instruct"] = instruct
         lean: dict[str, Any] = {"text": text, "speaker": speaker}
@@ -699,6 +709,18 @@ class Handler(BaseHTTPRequestHandler):
             body.get("emotion"), body.get("speed"), body.get("degree"))
         language = str(body.get("language") or "Chinese")
 
+        # 采样温度覆盖：缺省用服务端定档值（0.4），其余调用一律不传、行为不变。
+        # 只有判定者的保底重试会传低一档温度来收窄抽样分布。
+        temperature = body.get("temperature")
+        if temperature is not None:
+            try:
+                temperature = float(temperature)
+            except (TypeError, ValueError):
+                return self._json(400, {"ok": False, "error": "temperature 不是数字"})
+            if not 0.05 <= temperature <= 2.0:
+                return self._json(
+                    400, {"ok": False, "error": "temperature 越界：%.2f" % temperature})
+
         # 参考音频：给了就走克隆。两个必须挡在前面的检查 ——
         # 剧本里少一句是听得出来的，音频路径写错却是「合成到一半才发现」。
         ref_audio = str(body.get("ref_audio") or "").strip()
@@ -719,6 +741,11 @@ class Handler(BaseHTTPRequestHandler):
         else:
             voice_key = speaker
         seed = seed_for(text, voice_key)
+        # 重试偏移：判定者点名某句不合格时，客户端按 +1/+2/+3 换一个抽样点重出。
+        # 0（缺省）行为与从前完全一致：seed 仍由 (文本, 音色) 内容派生，可复现。
+        # 偏移走固定序列而不是随机值 —— 第几次重试对应哪个种子是确定的，
+        # 整期重跑时重试结果也逐比特一致。
+        seed += int(body.get("seed_offset") or 0)
 
         t0 = time.time()
         retried = ""
@@ -735,6 +762,7 @@ class Handler(BaseHTTPRequestHandler):
                     (seed, None, "去掉语气"))):
                 samples, sr = ENGINE.synth_one(
                     text, speaker, instruct=ins, language=language, seed=sd,
+                    temperature=temperature,
                     ref_audio=(ref_audio or None), ref_text=(ref_text or None))
                 dur = len(samples) / float(sr)
                 if not looks_degenerate(dur, text):
@@ -763,11 +791,14 @@ class Handler(BaseHTTPRequestHandler):
             # 只报一句「第 N 句不好听」，是查不动的。克隆时把角色与音频名一起记，
             # 因为「音色」此刻是两个文件而不是一个字符串。
             note = f" · 语气 {instruct}" if instruct else ""
+            off = int(body.get("seed_offset") or 0)
+            offnote = f" · 偏移{off:+d}" if off else ""
             who = (f"克隆 {os.path.basename(os.path.dirname(ref_audio))}/"
                    f"{os.path.basename(ref_audio)}" if ref_audio else speaker)
             sys.stderr.write(
                 f"[合成] {dur:5.2f}s 音频 / {secs:5.2f}s 耗时 · {who} · "
-                f"{len(text)} 字 · seed {seed} · {ENGINE.actual_device()}"
+                f"{len(text)} 字 · seed {seed}{offnote} · "
+                f"{ENGINE.actual_device()}"
                 f"{note}{retried}\n")
         self._send(200, wav, "audio/wav")
 

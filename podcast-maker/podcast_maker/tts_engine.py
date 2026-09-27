@@ -35,8 +35,10 @@ Ollama 的模型请下显存——语音合成本来就用不到任何语言模�
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +46,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import wave
 
 from . import bins, layout
 
@@ -730,7 +733,8 @@ def _warn_if_recorded_on_cpu(out_dir, role, log):
             "从别的项目复制。" % role)
 
 
-def _service_synth(text, voice, speed, cfg, degree=None, ref=None):
+def _service_synth(text, voice, speed, cfg, degree=None, ref=None,
+                   seed_offset=0, temperature=None):
     """调用本地 TTS 服务。采样率不硬编码；变速走 atempo（保持音高）。
 
     语速为什么不交给服务端：服务端也能吃自然语言调语速，但那是概率性的；
@@ -738,6 +742,10 @@ def _service_synth(text, voice, speed, cfg, degree=None, ref=None):
 
     `degree`（文体情绪档位）原样带下去：这一层不认识"文体"，只负责把值送到
     拼措辞的那一处，免得档位的判断在三个模块里各写一遍。
+
+    `seed_offset` / `temperature` 只有音色体检的修复重试会传：前者换一个
+    确定性的抽样点（+1/+2/+3），后者收窄抽样分布。缺省两者都不进请求体，
+    与既往行为逐比特一致。
 
     **不收 `emotion`（v0.27.0 硬隔离）**：脚本行里的语篇标签止步于脚本层，
     请求体里永远没有 emotion 键——服务端的 instruct 判据（`if emotion and …`）
@@ -754,6 +762,10 @@ def _service_synth(text, voice, speed, cfg, degree=None, ref=None):
     if ref:
         body["ref_audio"] = ref["wav"]
         body["ref_text"] = ref["text"]
+    if seed_offset:
+        body["seed_offset"] = int(seed_offset)
+    if temperature is not None:
+        body["temperature"] = float(temperature)
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=payload,
                                  headers={"Content-Type": "application/json"})
@@ -799,7 +811,8 @@ def _service_synth(text, voice, speed, cfg, degree=None, ref=None):
     return data
 
 
-def synth_line(text, voice, speed, cfg, degree=None, ref=None):
+def synth_line(text, voice, speed, cfg, degree=None, ref=None,
+               seed_offset=0, temperature=None):
     """合成一句，返回 wav 字节。
 
     `degree` 只有本地引擎用得上（转成语气指令）；Edge 那档没有等价的入口，
@@ -818,7 +831,8 @@ def synth_line(text, voice, speed, cfg, degree=None, ref=None):
     sr = int(cfg.get("audio.sample_rate", 44100))
     if engine in LOCAL_ENGINES:
         return _service_synth(text, voice, float(speed), cfg,
-                              degree=degree, ref=ref)
+                              degree=degree, ref=ref,
+                              seed_offset=seed_offset, temperature=temperature)
     return _edge_synth(text, voice, float(speed), sr)
 
 
@@ -908,7 +922,272 @@ def synthesize(script, out_dir, cfg, log=None, emotion_level=None,
         if (i + 1) % 5 == 0 or i + 1 == total:
             log("合成 %d/%d 句" % (i + 1, total))
 
+    # 音色体检：全部句子落地后统一判定、点名修复（见 timbre_repair 的说明）。
+    # 修复改写的是「过程/第 N 期/audio」里的句文件，返回的新时长回填给
+    # 字幕与视频——下游拿到的从波形到时间轴都是修复后的。
+    rep = timbre_repair(files, script, cfg, log=log,
+                        emotion_level=emotion_level,
+                        voice_root=voice_root or out_dir, refs=refs,
+                        report_path=os.path.join(out_dir, "timbre_repair.json"))
+    if rep:
+        for i, dur in rep["changed"].items():
+            durations[i] = dur
+
     return {"files": files, "durations": durations, "audio_dir": audio_dir}
+
+
+# ------------------------------------------------------------------ 音色体检
+# 全部单句合成完之后跑一遍：每个角色以自己全体句子为基线（F0 中位、谱质心、
+# 响度三维），逐句算 z 加权偏离分；超阈值的句子按 +1/+2/+3 换种子重出，首次
+# 过线即停。判定分与阈值来自人工试听定标（2c 期六句，2026-09-27）：谱心 1.0
+# + 音高 0.8 + 响度 0.4，4.25 恰好分开「能听出来」与「可接受」，六句全中。
+#
+# 位置为什么在全部句子之后：判定要拿角色全体做基线，逐句进行中基线不存在；
+# 修完才拼整期，后续工序（拼接 / 字幕 / 视频）拿到的就是修复后的最终波形。
+# 修复是确定性的：第几次重试对应哪个种子是固定的，整期重跑逐比特一致。
+
+_TIMBRE_MIN_BASELINE = 10   # 角色基线至少要这么多句，σ 才稳得住
+
+
+def _timbre_features(path):
+    """单句三维特征：F0 中位（自相关）、谱质心中位、响度（ffmpeg RMS dB）。
+
+    测量口径与 2c 定标探针（_smoke/probe_2c_timbre.py / probe_2c_lines2.py）
+    完全一致——基线就是拿这套口径量的，换口径等于换尺子，分数全体失真。
+    """
+    import numpy as np
+
+    with wave.open(path, "rb") as w:
+        sr = w.getframerate()
+        ch = w.getnchannels()
+        raw = w.readframes(w.getnframes())
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32768.0
+    if ch > 1:
+        x = x[::ch]
+    if sr > 16000:
+        step = int(round(sr / 16000.0))
+        x = x[::step]
+        sr = sr // step
+
+    # F0 自相关：帧 50ms / 跳 25ms，音高带 60~420Hz，相关峰 0.35 起信
+    frame, hop = int(0.05 * sr), int(0.025 * sr)
+    lag_min, lag_max = int(sr / 420.0), int(sr / 60.0)
+    f0s, rmss = [], []
+    for s in range(0, len(x) - frame, hop):
+        w = x[s:s + frame]
+        r = float(np.sqrt(np.mean(w * w)))
+        rmss.append(r)
+        wc = w - w.mean()
+        if np.sqrt(np.mean(wc * wc)) < 1e-4:
+            f0s.append(np.nan)
+            continue
+        ac = np.correlate(wc, wc, "full")[frame - 1:]
+        if ac[0] <= 0:
+            f0s.append(np.nan)
+            continue
+        ac = ac / ac[0]
+        seg = ac[lag_min:lag_max]
+        k = int(np.argmax(seg))
+        if seg[k] < 0.35:
+            f0s.append(np.nan)
+            continue
+        f0s.append(sr / float(lag_min + k))
+    f0s = np.array(f0s, dtype=float)
+    rmss = np.array(rmss, dtype=float)
+    good = f0s[~np.isnan(f0s) & (rmss > np.nanmedian(rmss[rmss > 0]) * 0.3)]
+    f0_med = float(np.median(good)) if len(good) else None
+
+    # 谱质心：1024 点窗 / 512 跳，取中位
+    nfft, hopc = 1024, 512
+    cents = []
+    for s in range(0, len(x) - nfft, hopc):
+        w = x[s:s + nfft] * np.hanning(nfft)
+        mag = np.abs(np.fft.rfft(w))
+        if mag.sum() <= 0:
+            continue
+        freqs = np.fft.rfftfreq(nfft, 1.0 / sr)
+        cents.append(float((mag * freqs).sum() / mag.sum()))
+    cent = float(np.median(cents)) if cents else None
+
+    # 响度：ffmpeg astats 的整体 RMS level dB（与定标探针同款）
+    r = subprocess.run(
+        [ffmpeg_bin(), "-hide_banner", "-nostats", "-i", path,
+         "-af", "astats", "-f", "null", "-"], capture_output=True)
+    m = re.findall(r"RMS level dB:\s*(-?[\d.]+|-inf)",
+                   r.stderr.decode("utf-8", "replace"))
+    rms_db = float(m[-1]) if m and m[-1] != "-inf" else None
+    return f0_med, cent, rms_db
+
+
+def _timbre_score(row, base):
+    """感知加权分。谱心只计变暗方向（变亮不出戏），音高与响度取绝对偏离。
+
+    权重来自人工试听定标：0233 响度偏移全场最重仍「可接受」、0157 谱心一维
+    断崖就「非常明显」——响度是最弱的感知维度，谱心最强。
+    """
+    import numpy as np
+
+    s = 0.0
+    if row["cent"] is not None:
+        s += (base["cent_mu"] - row["cent"]) / (base["cent_sd"] or 1.0)
+    if row["f0"] is not None:
+        s += 0.8 * abs(row["f0"] - base["f0_mu"]) / (base["f0_sd"] or 1.0)
+    if row["rms"] is not None:
+        s += 0.4 * abs(row["rms"] - base["rms_mu"]) / (base["rms_sd"] or 1.0)
+    return float(s)
+
+
+def _timbre_baselines(rows, log):
+    """按角色建基线并给每句打分。句数不足的角色不建基线、不参与判定。"""
+    import numpy as np
+
+    baselines, scored = {}, []
+    for spk in sorted({r["speaker"] for r in rows}):
+        rs = [r for r in rows if r["speaker"] == spk]
+        if len(rs) < _TIMBRE_MIN_BASELINE:
+            log("音色体检：%s 角只有 %d 句，不足以建基线，跳过该角色"
+                % (spk, len(rs)))
+            continue
+        base = {}
+        for key, attr in (("f0", "f0"), ("cent", "cent"), ("rms", "rms")):
+            vals = np.array([r[attr] for r in rs if r[attr] is not None])
+            base[key + "_mu"] = float(vals.mean()) if len(vals) else 0.0
+            base[key + "_sd"] = float(vals.std()) if len(vals) else 0.0
+        baselines[spk] = base
+        for r in rs:
+            if r["f0"] is None or r["cent"] is None or r["rms"] is None:
+                r["score"] = None
+            else:
+                r["score"] = round(_timbre_score(r, base), 2)
+            scored.append(r)
+    return baselines, scored
+
+
+def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
+                  voice_root=None, refs=None, report_path=None):
+    """音色体检与修复。全部单句合成完之后调用，返回 None 或修复摘要。
+
+    判定：每角色以自己全体句子为基线算 z 加权分，达到阈值即点名。
+    修复：点名句依次用 seed+1/+2/+3 重出（温度不变），首次过线即停；全败
+    再用保底温度试最后一次；仍失败则保留历次里分数最低的一条并标记人工审。
+    修复是确定性的：重试序号对应固定种子，整期重跑结果逐比特一致。
+
+    返回 {"changed": {句号: 新时长}}——调用方据此刷新 durations 与
+    actual_seconds，下游（拼接 / 字幕 / 视频）拿到的就是修复后的波形。
+    """
+    log = log or (lambda m: None)
+    engine = cfg.get("tts.engine", "edge")
+    if engine not in LOCAL_ENGINES or not audio_files:
+        return None
+    if not bool(cfg.get("tts.timbre_guard", True)):
+        return None
+    threshold = float(cfg.get("tts.timbre_threshold", 4.25))
+    retries = max(1, int(cfg.get("tts.timbre_seed_retries", 3)))
+    fallback_temp = float(cfg.get("tts.timbre_fallback_temp", 0.3))
+
+    t0 = time.time()
+    rows = []
+    for i, item in enumerate(script):
+        try:
+            f0, cent, rms_db = _timbre_features(audio_files[i])
+        except Exception as e:  # noqa: BLE001
+            log("音色体检：第 %d 句测量失败，不参与判定（%s）" % (i + 1, e))
+            continue
+        rows.append({"index": i, "speaker": item.get("speaker", "A"),
+                     "f0": f0, "cent": cent, "rms": rms_db})
+    baselines, scored = _timbre_baselines(rows, log)
+    if not baselines:
+        log("音色体检：没有任何角色建得起基线，跳过")
+        return None
+    for r in scored:
+        r["flag"] = r["score"] is not None and r["score"] >= threshold
+    flagged = [r for r in scored if r["flag"]]
+    log("音色体检：%d 句测完，%d 句点名（阈值 %.2f，%.0f 秒）"
+        % (len(scored), len(flagged), threshold, time.time() - t0))
+
+    voices = {"A": cfg.get("tts.qwen3tts_voice_a", ""),
+              "B": cfg.get("tts.qwen3tts_voice_b", "")}
+    if refs is None:
+        refs = ensure_voice_profiles(
+            voice_root or os.path.dirname(os.path.dirname(audio_files[0])),
+            voices, cfg, log)
+
+    changed, repairs, exhausted = {}, [], []
+    for r in flagged:
+        i = r["index"]
+        item = script[i]
+        spk = item.get("speaker", "A")
+        voice = voices.get(spk, "")
+        speed = float(cfg.get("tts.speed_a" if spk == "A" else "tts.speed_b", 1.0))
+        ref = refs.get(spk)
+        text = item.get("text", "")
+        # 候选池里始终保住分数最低的一条：修复不成就留最好的那条，不静默出货。
+        # 原句先占坑当第一名；每次重出量完立即裁决——过线直接转正收工，
+        # 没过线但比现有最优好就顶替它（旧的最优临时件删掉），否则当场删掉。
+        best_score = r["score"]
+        best_tmp = None
+        fixed = None
+        plans = ([(k, None) for k in range(1, retries + 1)]
+                 + [(1, fallback_temp)])
+        for pos, (attempt, temp) in enumerate(plans, 1):
+            tag = ("seed+%d" % attempt) if temp is None else \
+                  ("seed+%d & 温度%.2f" % (attempt, temp))
+            data = synth_line(text, voice, speed, cfg, degree=emotion_level,
+                              ref=ref, seed_offset=attempt, temperature=temp)
+            # 每次重试独立临时件（按循环位置编号：保底那次 seed_offset 会与
+            # 首次重试相同，用 attempt 编号会撞名，撞名即误删最优候选）
+            tmp = "%s.r%d.tmp" % (audio_files[i], pos)
+            with open(tmp, "wb") as f:
+                f.write(data)
+            f0, cent, rms_db = _timbre_features(tmp)
+            s = _timbre_score({"f0": f0, "cent": cent, "rms": rms_db},
+                              baselines[spk])
+            log("音色体检：第 %d 句 %s 重出 → 分数 %.2f（原 %.2f）"
+                % (i + 1, tag, s, r["score"]))
+            if s < threshold:
+                os.replace(tmp, audio_files[i])
+                best_score, fixed = round(s, 2), attempt
+                break
+            if s < best_score:
+                if best_tmp:
+                    os.remove(best_tmp)
+                best_score, best_tmp = s, tmp
+            else:
+                os.remove(tmp)
+        if fixed is None and best_tmp:
+            # 重出全部没过线：把历次里分数最低的那条转正，标记人工审
+            os.replace(best_tmp, audio_files[i])
+        dur = probe_duration(audio_files[i])
+        if dur > 0:
+            changed[i] = dur
+            item["actual_seconds"] = round(dur, 3)
+        rec = {"index": i, "speaker": spk, "score0": r["score"],
+               "final_score": round(best_score, 2),
+               "attempt": fixed if fixed is not None else best_tmp is not None,
+               "fixed": fixed is not None, "duration": dur}
+        if fixed is not None:
+            repairs.append(rec)
+            log("音色体检：第 %d 句已修复（seed+%d，分数 %.2f）"
+                % (i + 1, fixed, rec["final_score"]))
+        else:
+            exhausted.append(rec)
+            log("音色体检：第 %d 句 %d 次重出均未过线，保留最优一条"
+                "（分数 %.2f），标记人工审" % (i + 1, retries + 1,
+                                              rec["final_score"]))
+
+    if report_path:
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump({"threshold": threshold, "seed_retries": retries,
+                           "fallback_temp": fallback_temp,
+                           "baselines": baselines,
+                           "rows": scored, "repairs": repairs,
+                           "exhausted": exhausted,
+                           "seconds": round(time.time() - t0, 1)}, f,
+                          ensure_ascii=False, indent=1)
+        except OSError as e:
+            log("音色体检：报告写不进 %s（%s）" % (report_path, e))
+    return {"changed": changed, "repairs": repairs, "exhausted": exhausted}
 
 
 def preview(voice, speed, cfg, ref=None):

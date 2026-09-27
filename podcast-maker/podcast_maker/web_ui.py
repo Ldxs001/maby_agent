@@ -2928,6 +2928,8 @@ const ZONES=[
   ['tts','称呼与语速',['tts.name_a','tts.name_b','tts.speed_a','tts.speed_b']],
   ['tts','本地语音服务',['tts.qwen3tts_host','tts.qwen3tts_port','tts.throttle_seconds',
                       'tts.max_retries','tts.unload_llm_before_synth']],
+  ['tts','音色体检',['tts.timbre_guard','tts.timbre_threshold',
+                   'tts.timbre_seed_retries','tts.timbre_fallback_temp']],
   ['audio','编码与响度',['audio.sample_rate','audio.bitrate_kbps','audio.channels',
                        'audio.codec','audio.loudnorm_target']],
   ['audio','停顿与降噪',['audio.pause_between_lines','audio.denoise']],

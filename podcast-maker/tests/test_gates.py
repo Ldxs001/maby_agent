@@ -639,6 +639,35 @@ class TestRenderStageDoesNotWriteScript(unittest.TestCase):
                                      script=script, reuse=False, llm=None)
         self.assertIn("停在语音合成", str(cm.exception))
 
+    def test_audio_synthesis_is_always_full_rebuild(self):
+        """合成段是纯函数：目录里有上一轮的完整音频也照样全量重出。
+
+        从前的文件数判据（音频数 == 句数即整体复用）会在改稿不增删行时
+        静默复用旧音频，成片念的还是旧稿。判据已删：合成只认当前脚本，
+        目录里留着什么、数目对不对得上，都不影响这一步。
+        """
+        from unittest import mock
+        from podcast_maker import pipeline, layout, tts_engine
+        script = [{"speaker": "A", "text": "第一句台词", "emotion": "平静"},
+                  {"speaker": "B", "text": "第二句台词", "emotion": "平静"}]
+        root = os.path.join(self.tmp, "proj")
+        work = layout.tmp_dir(root, "1")
+        os.makedirs(os.path.join(work, "audio"), exist_ok=True)
+        # 上一轮遗留：数目与脚本一致的旧音频，外加一个孤儿件
+        for name in ("0000_A.wav", "0001_B.wav", "9999_A.wav"):
+            with open(os.path.join(work, "audio", name), "wb") as fh:
+                fh.write(b"stale")
+        boom = AssertionError("目录里有旧音频也必须全量重出，不许跳过合成")
+        with mock.patch.object(pipeline.assets_factory, "build_all",
+                               return_value={"bg_h": "", "bg_v": "",
+                                             "bgm": None, "covers": {}}), \
+             mock.patch.object(tts_engine, "synthesize", side_effect=boom):
+            with self.assertRaises(AssertionError) as cm:
+                pipeline.run_episode(self.cfg, self.calib, "", "标题",
+                                     episode_no="1", project_dir=root,
+                                     script=script, reuse=True, llm=None)
+        self.assertIn("全量重出", str(cm.exception))
+
     def test_gate_report_roundtrip_and_broken_file(self):
         """脚本阶段落的结论读得回来；文件坏了当作没有——不拿坏文件去骚扰人。"""
         from podcast_maker import script_engine as SE

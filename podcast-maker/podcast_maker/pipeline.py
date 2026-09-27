@@ -843,27 +843,19 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
     # 逐句语音是过程件：合成完就只剩那条成品音频有用。放进「过程」下的本期
     # 目录，成品不跟它混放，清理时删掉也不心疼。
     audio_dir = os.path.join(work, "audio")
-    audio_files = []
-    durations = []
-    if reuse and os.path.isdir(audio_dir):
-        names = sorted(f for f in os.listdir(audio_dir) if f.endswith(".wav"))
-        if len(names) == len(script):
-            for f in names:
-                p = os.path.join(audio_dir, f)
-                audio_files.append(p)
-                durations.append(tts_engine.probe_duration(p))
-            log("复用已有音频（%d 段）" % len(names))
-    if not audio_files:
-        # 情绪档位与写脚本那一步同源：同一张范式卡。写脚本按它决定能不能填
-        # 心情词，合成按它决定拼不拼「略带」。两头各取一次就会岔开——稿子按略
-        # 写、声音按不贴说，正是要避免的那种不一致。
-        level = paradigms.emotion_level_of(
-            script_engine.resolve_paradigm(proj_item, cfg))
-        tts_result = tts_engine.synthesize(script, work, cfg, log=log,
-                                           emotion_level=level,
-                                           voice_root=root)
-        audio_files = tts_result["files"]
-        durations = tts_result["durations"]
+    # 合成段是纯函数：拿着当前脚本全量合成，不问脚本出处、不留上次的历史。
+    # 目录里有没有上一轮的音频、数目对不对得上，都不影响这一步——任何「跳过」
+    # 都意味着某个改过的输入可能被旧音频顶掉。
+    # 情绪档位与写脚本那一步同源：同一张范式卡。写脚本按它决定能不能填
+    # 心情词，合成按它决定拼不拼「略带」。两头各取一次就会岔开——稿子按略
+    # 写、声音按不贴说，正是要避免的那种不一致。
+    level = paradigms.emotion_level_of(
+        script_engine.resolve_paradigm(proj_item, cfg))
+    tts_result = tts_engine.synthesize(script, work, cfg, log=log,
+                                       emotion_level=level,
+                                       voice_root=root)
+    audio_files = tts_result["files"]
+    durations = tts_result["durations"]
 
     for i, item in enumerate(script):
         if i < len(durations):

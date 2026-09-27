@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 # ============================================================================
@@ -722,6 +722,25 @@ PARAM_SPEC = {
         help="合成前卸载 LM Studio / Ollama 的驻留模型。本地 TTS 上 GPU 要占约 5GB，"
              "和 LLM 同时在场会抢显存；语音合成本来用不到语言模型。"
              "机器资源充足、想一边跑 LLM 一边合成的，关掉此项"),
+    "tts.timbre_guard": _p(
+        "bool", True, "voice", "音色体检（合成后自动判定修复）",
+        engine_scope="qwen3tts", views=("render",),
+        help="全部单句合成完后，按角色自身基线算音色偏离分（谱心+音高+响度），"
+             "超过阈值的句子自动换种子重出；修不好标记人工审。只对 Qwen3-TTS 生效"),
+    "tts.timbre_threshold": _p(
+        "float", 4.25, "voice", "音色体检判定阈值",
+        engine_scope="qwen3tts", min=2.0, max=8.0,
+        help="角色内 z 加权分（谱心 1.0 + 音高 0.8 + 响度 0.4）达到即点名重试。"
+             "4.25 为人工试听六句定标：恰好分开「能听出来」与「可接受」"),
+    "tts.timbre_seed_retries": _p(
+        "int", 3, "voice", "音色体检换种子重试次数",
+        engine_scope="qwen3tts", min=1, max=6,
+        help="点名的句子依次用 seed+1/+2/+3 重出，温度不变；首次过线即停"),
+    "tts.timbre_fallback_temp": _p(
+        "float", 0.3, "voice", "音色体检保底采样温度",
+        engine_scope="qwen3tts", min=0.05, max=0.9,
+        help="换种子重试全部失败后再试一次的采样温度（收窄抽样分布，"
+             "韵律会比其他句子平）；仍失败则保留分数最低的一条并标记人工审"),
 
     "audio.sample_rate": _p("enum", 44100, "voice", "采样率（Hz）"),
     "audio.bitrate_kbps": _p("int", 192, "voice", "码率（kbps）",
