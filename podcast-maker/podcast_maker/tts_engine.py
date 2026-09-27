@@ -912,11 +912,11 @@ def synthesize(script, out_dir, cfg, log=None, emotion_level=None,
                 break
             except Exception as e:
                 if attempt == retries - 1:
-                    raise TTSError("第 %d 句合成失败（已重试 %d 次）：%s"
-                                   % (i + 1, retries, e))
+                    raise TTSError("%s 合成失败（已重试 %d 次）：%s"
+                                   % (os.path.basename(path), retries, e))
                 wait = BACKOFF_BASE * (2 ** attempt)
-                log("第 %d 句第 %d 次失败，%.1f 秒后重试：%s"
-                    % (i + 1, attempt + 1, wait, e))
+                log("%s 第 %d 次失败，%.1f 秒后重试：%s"
+                    % (os.path.basename(path), attempt + 1, wait, e))
                 time.sleep(wait)
 
         if (i + 1) % 5 == 0 or i + 1 == total:
@@ -938,9 +938,14 @@ def synthesize(script, out_dir, cfg, log=None, emotion_level=None,
 
 # ------------------------------------------------------------------ 音色体检
 # 全部单句合成完之后跑一遍：每个角色以自己全体句子为基线（F0 中位、谱质心、
-# 响度三维），逐句算 z 加权偏离分；超阈值的句子按 +1/+2/+3 换种子重出，首次
-# 过线即停。判定分与阈值来自人工试听定标（2c 期六句，2026-09-27）：谱心 1.0
-# + 音高 0.8 + 响度 0.4，4.25 恰好分开「能听出来」与「可接受」，六句全中。
+# 响度、存在感频带四维），逐句算 z 加权偏离分；超阈值的句子按 +1/+2/+3 换种子
+# 重出，首次过线即停。判定分与阈值来自人工试听定标：三维版（谱心 1.0 + 音高
+# 0.8 + 响度 0.4，4.25）由 2c 期六句定出（2026-09-27）；第 4 维存在感频带
+# （2.4-4.8kHz 能量占比，权重 0.5 只计刺耳方向）由 2da 期 0054 句补出——该句
+# 三维分 3.45 放行，实为频谱形状重分布（低频抬、中频掏空、存在感带 +4.6σ），
+# 谱心是加权平均，对形状搬移结构性失明。四维版在两期修复前音频上回放验证：
+# 2c 点名 [93,101,135,157] 原样复现（169=4.19/233=3.87 放过），2da 点名
+# [30,54,102,166]，0054 重出 seed+1 分数 1.27。
 #
 # 位置为什么在全部句子之后：判定要拿角色全体做基线，逐句进行中基线不存在；
 # 修完才拼整期，后续工序（拼接 / 字幕 / 视频）拿到的就是修复后的最终波形。
@@ -950,10 +955,13 @@ _TIMBRE_MIN_BASELINE = 10   # 角色基线至少要这么多句，σ 才稳得�
 
 
 def _timbre_features(path):
-    """单句三维特征：F0 中位（自相关）、谱质心中位、响度（ffmpeg RMS dB）。
+    """单句四维特征：F0 中位（自相关）、谱质心中位、响度（ffmpeg RMS dB）、
+    存在感频带（2.4-4.8kHz 能量占比）。
 
-    测量口径与 2c 定标探针（_smoke/probe_2c_timbre.py / probe_2c_lines2.py）
+    测量口径与定标探针（_smoke/probe_2c_timbre.py / probe_2da_54.py）
     完全一致——基线就是拿这套口径量的，换口径等于换尺子，分数全体失真。
+    存在感频带必须在降采样之前的原始采样率上量：降到 16k 后 Nyquist 只有
+    8k，带内功率谱形状会变；占比对比整段功率谱，幅度归一（响度另算）。
     """
     import numpy as np
 
@@ -964,6 +972,18 @@ def _timbre_features(path):
     x = np.frombuffer(raw, dtype=np.int16).astype(np.float64) / 32768.0
     if ch > 1:
         x = x[::ch]
+
+    # 存在感频带占比：原始采样率上整段（≤20s）加 hanning 窗，功率谱里
+    # 2.4-4.8kHz 的份额。与 2da 扩维验证探针同口径，必须在降采样前量。
+    pres = None
+    L = min(len(x), sr * 20)
+    if L > 3:
+        seg = x[:L] * np.hanning(L)
+        spec = np.abs(np.fft.rfft(seg)) ** 2
+        freqs = np.fft.rfftfreq(L, 1.0 / sr)
+        pres = float(spec[(freqs >= 2400) & (freqs < 4800)].sum()
+                     / (spec.sum() + 1e-12))
+
     if sr > 16000:
         step = int(round(sr / 16000.0))
         x = x[::step]
@@ -1016,14 +1036,16 @@ def _timbre_features(path):
     m = re.findall(r"RMS level dB:\s*(-?[\d.]+|-inf)",
                    r.stderr.decode("utf-8", "replace"))
     rms_db = float(m[-1]) if m and m[-1] != "-inf" else None
-    return f0_med, cent, rms_db
+    return f0_med, cent, rms_db, pres
 
 
 def _timbre_score(row, base):
-    """感知加权分。谱心只计变暗方向（变亮不出戏），音高与响度取绝对偏离。
+    """感知加权分。谱心只计变暗方向（变亮不出戏），音高与响度取绝对偏离，
+    存在感频带只计刺耳方向（占比偏低是音色自然差异，不点名）。
 
     权重来自人工试听定标：0233 响度偏移全场最重仍「可接受」、0157 谱心一维
-    断崖就「非常明显」——响度是最弱的感知维度，谱心最强。
+    断崖就「非常明显」——响度是最弱的感知维度，谱心最强；2da 0054 证明频谱
+    形状畸变独立于谱心可闻，存在感带以 0.5 计入。
     """
     import numpy as np
 
@@ -1034,6 +1056,9 @@ def _timbre_score(row, base):
         s += 0.8 * abs(row["f0"] - base["f0_mu"]) / (base["f0_sd"] or 1.0)
     if row["rms"] is not None:
         s += 0.4 * abs(row["rms"] - base["rms_mu"]) / (base["rms_sd"] or 1.0)
+    if row.get("pres") is not None:
+        s += 0.5 * max(0.0, (row["pres"] - base["pres_mu"])
+                       / (base["pres_sd"] or 1.0))
     return float(s)
 
 
@@ -1049,13 +1074,15 @@ def _timbre_baselines(rows, log):
                 % (spk, len(rs)))
             continue
         base = {}
-        for key, attr in (("f0", "f0"), ("cent", "cent"), ("rms", "rms")):
+        for key, attr in (("f0", "f0"), ("cent", "cent"), ("rms", "rms"),
+                          ("pres", "pres")):
             vals = np.array([r[attr] for r in rs if r[attr] is not None])
             base[key + "_mu"] = float(vals.mean()) if len(vals) else 0.0
             base[key + "_sd"] = float(vals.std()) if len(vals) else 0.0
         baselines[spk] = base
         for r in rs:
-            if r["f0"] is None or r["cent"] is None or r["rms"] is None:
+            if (r["f0"] is None or r["cent"] is None or r["rms"] is None
+                    or r["pres"] is None):
                 r["score"] = None
             else:
                 r["score"] = round(_timbre_score(r, base), 2)
@@ -1089,12 +1116,13 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
     rows = []
     for i, item in enumerate(script):
         try:
-            f0, cent, rms_db = _timbre_features(audio_files[i])
+            f0, cent, rms_db, pres = _timbre_features(audio_files[i])
         except Exception as e:  # noqa: BLE001
-            log("音色体检：第 %d 句测量失败，不参与判定（%s）" % (i + 1, e))
+            log("音色体检：%s 测量失败，不参与判定（%s）"
+                % (os.path.basename(audio_files[i]), e))
             continue
         rows.append({"index": i, "speaker": item.get("speaker", "A"),
-                     "f0": f0, "cent": cent, "rms": rms_db})
+                     "f0": f0, "cent": cent, "rms": rms_db, "pres": pres})
     baselines, scored = _timbre_baselines(rows, log)
     if not baselines:
         log("音色体检：没有任何角色建得起基线，跳过")
@@ -1115,6 +1143,9 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
     changed, repairs, exhausted = {}, [], []
     for r in flagged:
         i = r["index"]
+        # 日志一律用音频文件名（0054_B 这种），所见即文件所在——
+        # 「第 N 句」从 1 数，与 0 基文件名永远差一位，看日志找文件要对暗号。
+        fname = os.path.basename(audio_files[i])
         item = script[i]
         spk = item.get("speaker", "A")
         voice = voices.get(spk, "")
@@ -1139,11 +1170,12 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
             tmp = "%s.r%d.tmp" % (audio_files[i], pos)
             with open(tmp, "wb") as f:
                 f.write(data)
-            f0, cent, rms_db = _timbre_features(tmp)
-            s = _timbre_score({"f0": f0, "cent": cent, "rms": rms_db},
+            f0, cent, rms_db, pres = _timbre_features(tmp)
+            s = _timbre_score({"f0": f0, "cent": cent, "rms": rms_db,
+                               "pres": pres},
                               baselines[spk])
-            log("音色体检：第 %d 句 %s 重出 → 分数 %.2f（原 %.2f）"
-                % (i + 1, tag, s, r["score"]))
+            log("音色体检：%s %s 重出 → 分数 %.2f（原 %.2f）"
+                % (fname, tag, s, r["score"]))
             if s < threshold:
                 os.replace(tmp, audio_files[i])
                 best_score, fixed = round(s, 2), attempt
@@ -1167,12 +1199,12 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
                "fixed": fixed is not None, "duration": dur}
         if fixed is not None:
             repairs.append(rec)
-            log("音色体检：第 %d 句已修复（seed+%d，分数 %.2f）"
-                % (i + 1, fixed, rec["final_score"]))
+            log("音色体检：%s 已修复（seed+%d，分数 %.2f）"
+                % (fname, fixed, rec["final_score"]))
         else:
             exhausted.append(rec)
-            log("音色体检：第 %d 句 %d 次重出均未过线，保留最优一条"
-                "（分数 %.2f），标记人工审" % (i + 1, retries + 1,
+            log("音色体检：%s %d 次重出均未过线，保留最优一条"
+                "（分数 %.2f），标记人工审" % (fname, retries + 1,
                                               rec["final_score"]))
 
     if report_path:

@@ -16,9 +16,12 @@
 
 """音色体检：判定分定标回归 + 修复循环行为钉子。
 
-判定分模型不是拍脑袋，是 2c 期六句人工试听定出来的（2026-09-27）：四句耳朵
-判「有问题」的必须全报警，两句「可接受」的必须放过——这六句就是这把尺子的
-刻度，模型或阈值一动，这里先红。
+判定分模型不是拍脑袋，是人工试听定出来的：三维版（谱心 1.0 + 音高 0.8 +
+响度 0.4，阈值 4.25）由 2c 期六句定标（2026-09-27），四句耳朵判「有问题」
+的必须全报警，两句「可接受」的必须放过；第 4 维存在感频带（2.4-4.8kHz 能量
+占比，权重 0.5 只计刺耳方向）由 2da 期 0054 句补出——该句三维 3.45 放行，
+实为频谱形状重分布，谱心（加权平均）对形状搬移结构性失明。这七个句子就是
+这把尺子的刻度，模型或阈值一动，这里先红。
 
 修复循环用假测量离线跑：真合成已经在 _smoke/probe_seed_retry.py 用真服务端
 验过（四问题句 × seed+1/+2/+3，15/16 过线、四句全部首试即过），这里钉的是
@@ -36,48 +39,89 @@ from unittest import mock
 
 from podcast_maker import tts_engine
 
-#: 2c 期大美（B 角）基线：129 句实测（F0 中位 / 谱质心 / ffmpeg RMS dB）
+#: 2c 期大美（B 角）基线：129 句实测（F0 中位 / 谱质心 / ffmpeg RMS dB /
+#: 存在感频带占比——量自修复前音频，四句修复句用 44k a0 存档）
 BASE = {"f0_mu": 263.7, "f0_sd": 19.85,
         "cent_mu": 1882.79, "cent_sd": 130.81,
-        "rms_mu": -27.21, "rms_sd": 0.948}
+        "rms_mu": -27.21, "rms_sd": 0.948,
+        "pres_mu": 0.02209, "pres_sd": 0.010614}
 
-#: 六句定标刻度：(F0, 谱心, 响度, 期望判定)。0.02 分的边际也是刻度的一部分
-#: ——0101（4.32）与 0169（4.20）骑在阈值两侧，正是人耳划的那条线。
+#: 七句定标刻度：(F0, 谱心, 响度, 存在感, 期望判定)。0.02 分的边际也是刻度的
+#: 一部分——0101（4.32）与 0169（4.20）骑在阈值两侧，正是人耳划的那条线。
+#: 2c 六句的存在感全在基线下侧或均值附近，第 4 维不参与其判定（权重项为 0），
+#: 定标结论原样保持；点名 2da 0054 的刻度单列在 PresenceBandTest。
 CALIBRATION = [
-    ("0157", 237.1, 1304.4, -28.77, False),   # 非常明显（谱心 z=-4.4）
-    ("0093", 210.0, 1654.9, -24.29, False),   # 非常明显（F0 全场最低）
-    ("0135", 216.2, 1532.5, -27.38, False),   # 能听出来
-    ("0101", 222.7, 1620.6, -28.77, False),   # 不大对劲（探针曾漏报）
-    ("0169", 222.7, 1562.9, -27.00, True),    # 可接受
-    ("0233", 226.2, 1698.6, -29.46, True),    # 可接受（响度主导偏移）
+    ("0157", 237.1, 1304.4, -28.77, 0.007812, False),   # 非常明显（谱心 z=-4.4）
+    ("0093", 210.0, 1654.9, -24.29, 0.032810, False),   # 非常明显（F0 全场最低）
+    ("0135", 216.2, 1532.5, -27.38, 0.018010, False),   # 能听出来
+    ("0101", 222.7, 1620.6, -28.77, 0.011532, False),   # 不大对劲（探针曾漏报）
+    ("0169", 222.7, 1562.9, -27.00, 0.004392, True),    # 可接受
+    ("0233", 226.2, 1698.6, -29.46, 0.014155, True),    # 可接受（响度主导偏移）
 ]
 
 THRESHOLD = 4.25
 
 
-def _score(f0, cent, rms):
+def _score(f0, cent, rms, pres=None):
     return tts_engine._timbre_score(
-        {"f0": f0, "cent": cent, "rms": rms}, BASE)
+        {"f0": f0, "cent": cent, "rms": rms, "pres": pres}, BASE)
 
 
 class CalibrationTest(unittest.TestCase):
-    """六句定标回归：尺子动了这里先红。"""
+    """2c 六句定标回归：尺子动了这里先红。"""
 
     def test_six_ear_verified_lines(self):
-        for name, f0, cent, rms, expect_pass in CALIBRATION:
-            s = _score(f0, cent, rms)
+        for name, f0, cent, rms, pres, expect_pass in CALIBRATION:
+            s = _score(f0, cent, rms, pres)
             self.assertEqual(
                 s < THRESHOLD, expect_pass,
                 "%s 得分 %.2f，期望%s（阈值 %.2f）"
                 % (name, s, "过线" if expect_pass else "报警", THRESHOLD))
 
     def test_boundary_rides_between_0101_and_0169(self):
-        s101 = _score(222.7, 1620.6, -28.77)
-        s169 = _score(222.7, 1562.9, -27.00)
+        s101 = _score(222.7, 1620.6, -28.77, 0.011532)
+        s169 = _score(222.7, 1562.9, -27.00, 0.004392)
         self.assertGreater(s101, THRESHOLD)
         self.assertLess(s169, THRESHOLD)
         self.assertLess(s101 - THRESHOLD, 0.2)   # 阈值就该贴着这条线
         self.assertLess(THRESHOLD - s169, 0.2)
+
+
+#: 2da 期 B 角四维基线：实测（30/102/166 用 attempt0 重构、0054 用坏句原盘，
+#: 与 4 维验证回放同集合；_smoke/probe_presence_consts.py 量取）
+BASE2DA = {"f0_mu": 259.083369, "f0_sd": 25.004402,
+           "cent_mu": 1855.170858, "cent_sd": 205.623577,
+           "rms_mu": -27.041119, "rms_sd": 1.240858,
+           "pres_mu": 0.022269, "pres_sd": 0.008681}
+
+
+def _score2da(f0, cent, rms, pres=None):
+    return tts_engine._timbre_score(
+        {"f0": f0, "cent": cent, "rms": rms, "pres": pres}, BASE2DA)
+
+
+class PresenceBandTest(unittest.TestCase):
+    """第 4 维钉子：存在感频带抓频谱形状重分布，2da 0054 是活体刻度。"""
+
+    def test_presence_band_catches_shape_redistribution(self):
+        """0054 原句：三维 3.45 放行、四维 5.67 点名——第 4 维是唯一判据。"""
+        s3 = _score2da(230.77, 1583.01, -30.84, None)      # 不带存在感项
+        s4 = _score2da(230.77, 1583.01, -30.84, 0.060724)  # 0054 a0 实测
+        self.assertLess(s3, THRESHOLD)
+        self.assertGreaterEqual(s4, THRESHOLD)
+
+    def test_repaired_line_passes(self):
+        """0054 seed+1 重出（a1 实测）：存在感回带内，四维 1.27 过线。"""
+        s = _score2da(266.67, 1720.98, -28.20, 0.022101)
+        self.assertLess(s, THRESHOLD)
+
+    def test_presence_term_is_one_sided(self):
+        """占比偏低（变闷）不加权——只有刺耳方向点名，与谱心变亮不出戏同理。"""
+        f0m, cm, rm = BASE2DA["f0_mu"], BASE2DA["cent_mu"], BASE2DA["rms_mu"]
+        s_low = _score2da(f0m, cm, rm, 0.0)          # 远低于均值
+        s_mid = _score2da(f0m, cm, rm, BASE2DA["pres_mu"])  # 恰在均值
+        self.assertAlmostEqual(s_low, 0.0, places=9)
+        self.assertAlmostEqual(s_mid, 0.0, places=9)
 
 
 def _fake_cfg(**over):
@@ -117,8 +161,8 @@ class RepairLoopTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="timbre_guard_")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.n_a = self.n_b = 12          # 每角色 ≥10 句才建基线
-        self.bad = (210.0, 1304.4, -28.8)   # 三维都偏：必报警
-        self.good = (264.0, 1883.0, -27.2)  # 全带内
+        self.bad = (210.0, 1304.4, -28.8, 0.022)   # 三维都偏：必报警
+        self.good = (264.0, 1883.0, -27.2, 0.022)  # 全带内
         self.files = []
         self.script = []
         for i in range(self.n_a + self.n_b):
@@ -165,7 +209,7 @@ class RepairLoopTest(unittest.TestCase):
 
     def test_fallback_temp_only_after_seed_retries_exhausted(self):
         # 三次换种子都仍报警（中等坏），保底温度那一次才量出好样本
-        mid = (210.0, 1500.0, -27.2)   # 谱心+音高仍双偏，分数 ~5.1：报警
+        mid = (210.0, 1500.0, -27.2, 0.022)   # 谱心+音高仍双偏，分数 ~5.1：报警
         rep, calls = self._run({5: [self.bad, mid, mid, mid, self.good]})
         self.assertIn(5, rep["changed"])
         self.assertEqual(len(calls), 4)
