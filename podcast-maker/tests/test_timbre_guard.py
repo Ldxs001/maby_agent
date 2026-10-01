@@ -14,19 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""音色体检：判定分定标回归 + 修复循环行为钉子。
+"""音色体检：三判据定标回归 + 修复循环行为钉子。
 
-判定分模型不是拍脑袋，是人工试听定出来的：三维版（谱心 1.0 + 音高 0.8 +
-响度 0.4，阈值 4.25）由 2c 期六句定标（2026-09-27），四句耳朵判「有问题」
-的必须全报警，两句「可接受」的必须放过；第 4 维存在感频带（2.4-4.8kHz 能量
-占比，权重 0.5 只计刺耳方向）由 2da 期 0054 句补出——该句三维 3.45 放行，
-实为频谱形状重分布，谱心（加权平均）对形状搬移结构性失明。这七个句子就是
-这把尺子的刻度，模型或阈值一动，这里先红。
+判定模型不是拍脑袋，是人工试听定出来的，三条判据各管一族病：
+① 四维严苛分（谱心 1.0 + 音高 0.8 + 响度 0.4 + 存在感 0.5 单边，4.25）：
+   2c 六句定标 + 2da 0054 补存在感维；② 暗淡子分（F0 下偏 + 谱心变暗 +
+   0.6×基音抖动，4.9）：ep3 58 句 a2 候选——F0 向下还不稳 = 病态嗓；
+③ 身份下限（F0 ≤ -2.4σ，或 F0 ≤ -2.0σ 且低频占比 ≥ +1.5σ）：大美是单薄
+   女高音，音高掉了 + 低频鼓起来 = 滑向中音、不是本人；掉了但依然单薄 =
+   嗓子累，放行。15 个耳标样本（9 坏 6 好）三规则合验 15/15。
 
 修复循环用假测量离线跑：真合成已经在 _smoke/probe_seed_retry.py 用真服务端
-验过（四问题句 × seed+1/+2/+3，15/16 过线、四句全部首试即过），这里钉的是
-循环自身的纪律——首次过线即停、保底温度只在全败后出场、全败保留最优一条
-并标记人工审、修复后时长与 actual_seconds 必须回填。
+验过，这里钉的是循环自身的纪律——三判据全过即停、保底（复用同角色最近一条
+未点名句的种子，温度不动，无条件落盘）只在全败后出场、
+全败保留最优一条并标记人工审、修复后时长与 actual_seconds 必须回填。
 """
 
 import json
@@ -60,6 +61,8 @@ CALIBRATION = [
 ]
 
 THRESHOLD = 4.25
+DULL_THRESHOLD = 4.9
+ID_DEEP, ID_FULL, ID_S300 = 2.4, 2.0, 1.5
 
 
 def _score(f0, cent, rms, pres=None):
@@ -124,10 +127,93 @@ class PresenceBandTest(unittest.TestCase):
         self.assertAlmostEqual(s_mid, 0.0, places=9)
 
 
+#: 暗淡子分与身份下限的活体刻度（ep3 期 B 角，2026-09-30 复听定标）。
+#: 用合成基线/测量值复刻实测 z 分——数值本身来自产线口径的测量，见
+#: _smoke/probe_identity_features.py 与 ear_review/identity_z.json。
+DULL_BASE = {"f0_mu": 264.0, "f0_sd": 20.0,
+             "cent_mu": 1880.0, "cent_sd": 130.0,
+             "jit_mu": 7.0, "jit_sd": 1.0,
+             "s300_mu": 0.30, "s300_sd": 0.10,
+             "rms_mu": -27.0, "rms_sd": 1.0,
+             "pres_mu": 0.022, "pres_sd": 0.0106}
+#: a2：F0 下偏 1.70σ + 谱心暗 1.38σ + 抖动 3.91σ → 暗淡 5.42，坏
+A2 = {"f0": 264.0 - 1.70 * 20.0, "cent": 1880.0 - 1.38 * 130.0,
+      "jit": 7.0 + 3.91 * 1.0, "s300": 0.30, "rms": -27.0, "pres": 0.022}
+#: ep3-0169（主人判「最好」）：暗淡 3.63，放行
+EP3_0169 = {"f0": 264.0 - 0.94 * 20.0, "cent": 1880.0 - 2.17 * 130.0,
+            "jit": 7.0 + 0.85 * 1.0, "s300": 0.30, "rms": -27.0, "pres": 0.022}
+
+
+class DullScoreTest(unittest.TestCase):
+    """暗淡子分钉子：抓发抖病态嗓，ep3 0169 不冤。"""
+
+    def test_a2_trembling_voice_is_caught(self):
+        s = tts_engine._dull_score(A2, DULL_BASE)
+        self.assertGreaterEqual(s, DULL_THRESHOLD)
+        self.assertAlmostEqual(s, 5.42, delta=0.02)
+
+    def test_best_line_passes(self):
+        s = tts_engine._dull_score(EP3_0169, DULL_BASE)
+        self.assertLess(s, DULL_THRESHOLD)
+
+
+class IdentityRuleTest(unittest.TestCase):
+    """身份下限钉子：音高掉了 + 低频鼓起来 = 别人；掉了但单薄 = 她累了。"""
+
+    def _flag(self, f0, s300):
+        row = {"f0": f0, "s300": s300, "cent": DULL_BASE["cent_mu"],
+               "rms": -27.0, "pres": 0.022, "jit": 7.0}
+        return tts_engine._identity_flag(row, DULL_BASE,
+                                         ID_DEEP, ID_FULL, ID_S300)
+
+    def test_deep_f0_drop_is_another_person(self):
+        """ep3-009（a1 现成片）：F0 -2.75σ，掉破深降线。"""
+        self.assertTrue(self._flag(DULL_BASE["f0_mu"] - 2.75 * 20.0, 0.30))
+
+    def test_low_pitch_with_full_low_band_is_another_person(self):
+        """2c-0101（04 号）：同样 -2.26σ，低频 +2.27σ → 滑向中音。"""
+        self.assertTrue(self._flag(DULL_BASE["f0_mu"] - 2.26 * 20.0,
+                                   0.30 + 2.27 * 0.10))
+
+    def test_low_pitch_but_thin_is_still_her(self):
+        """2c-0169（05 号）：F0 -2.26σ 但低频 +0.09σ → 嗓子累，放行。"""
+        self.assertFalse(self._flag(DULL_BASE["f0_mu"] - 2.26 * 20.0,
+                                    0.30 + 0.09 * 0.10))
+
+    def test_full_low_band_alone_is_fine(self):
+        """ep3-0169（15 号）：低频 +2.12σ 但 F0 -0.95σ → 放行。"""
+        self.assertFalse(self._flag(DULL_BASE["f0_mu"] - 0.95 * 20.0,
+                                    0.30 + 2.12 * 0.10))
+
+
+class CaptureTest(unittest.TestCase):
+    """三判据合验：检测与候选验收共用同一把尺。"""
+
+    def _capture(self, row):
+        row = dict(row, score=tts_engine._timbre_score(row, DULL_BASE),
+                   dull=tts_engine._dull_score(row, DULL_BASE))
+        return tts_engine._timbre_capture(row, DULL_BASE, THRESHOLD,
+                                          DULL_THRESHOLD, ID_DEEP,
+                                          ID_FULL, ID_S300)
+
+    def test_clean_row_passes_all_three(self):
+        good = {"f0": 264.0, "cent": 1880.0, "rms": -27.0, "pres": 0.022,
+                "s300": 0.30, "jit": 7.0}
+        self.assertEqual(self._capture(good), [])
+
+    def test_trembling_row_caught_by_dull(self):
+        self.assertTrue(self._capture(A2))
+
+    def test_deep_drop_caught_by_identity(self):
+        row = {"f0": DULL_BASE["f0_mu"] - 2.75 * 20.0, "cent": 1880.0,
+               "rms": -27.0, "pres": 0.022, "s300": 0.30, "jit": 7.0}
+        why = self._capture(row)
+        self.assertTrue(any(w.startswith("身份") for w in why))
+
+
 def _fake_cfg(**over):
     cfg = {"tts.engine": "qwen3tts", "tts.timbre_guard": True,
            "tts.timbre_threshold": THRESHOLD, "tts.timbre_seed_retries": 3,
-           "tts.timbre_fallback_temp": 0.3,
            "tts.qwen3tts_voice_a": "Vivian", "tts.qwen3tts_voice_b": "Serena",
            "tts.speed_a": 1.0, "tts.speed_b": 1.0}
     cfg.update(over)
@@ -161,8 +247,10 @@ class RepairLoopTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="timbre_guard_")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.n_a = self.n_b = 12          # 每角色 ≥10 句才建基线
-        self.bad = (210.0, 1304.4, -28.8, 0.022)   # 三维都偏：必报警
-        self.good = (264.0, 1883.0, -27.2, 0.022)  # 全带内
+        # 六维元组：F0 / 谱心 / 响度 / 存在感 / 低频占比 / 抖动。
+        # bad 三维+抖动全偏：任一判据都能抓；good 全带内。
+        self.bad = (210.0, 1304.4, -28.8, 0.022, 0.030, 11.0)
+        self.good = (264.0, 1883.0, -27.2, 0.022, 0.020, 7.0)
         self.files = []
         self.script = []
         for i in range(self.n_a + self.n_b):
@@ -170,8 +258,13 @@ class RepairLoopTest(unittest.TestCase):
             p = os.path.join(self.tmp, "%04d_%s.wav" % (i, spk))
             self.files.append(p)
             self.script.append({"speaker": spk, "text": "第%d句" % i})
-        self.refs = {"A": {"wav": "a.wav", "text": "x"},
-                     "B": {"wav": "b.wav", "text": "x"}}
+        self.refs = {"A": {"wav": os.path.join(self.tmp, "a.wav"), "text": "x"},
+                     "B": {"wav": os.path.join(self.tmp, "b.wav"), "text": "x"}}
+        # 保底复用种子要读参考音频算内容指纹（与服务端 voice_key_for 同口径），
+        # 所以这里的档案 wav 必须真实存在——内容无所谓，字节固定即可。
+        for r in self.refs.values():
+            with open(r["wav"], "wb") as f:
+                f.write(b"ref-bytes")
         self.cfg = _fake_cfg()
         self.report = os.path.join(self.tmp, "timbre_repair.json")
 
@@ -207,29 +300,35 @@ class RepairLoopTest(unittest.TestCase):
         self.assertIsNone(calls[0]["temperature"])          # 温度没动
         self.assertEqual(self.script[5]["actual_seconds"], 4.5)
 
-    def test_fallback_temp_only_after_seed_retries_exhausted(self):
-        # 三次换种子都仍报警（中等坏），保底温度那一次才量出好样本
-        mid = (210.0, 1500.0, -27.2, 0.022)   # 谱心+音高仍双偏，分数 ~5.1：报警
+    def test_fallback_reuses_nearest_clean_seed(self):
+        # 三次换种子都仍报警，第 4 招保底：复用同角色最近一条未点名句的种子
+        #（温度同样不动，只换抽样点），这一招量出好样本即转正
+        mid = (210.0, 1500.0, -27.2, 0.022, 0.020, 7.0)   # 谱心+音高双偏：报警
         rep, calls = self._run({5: [self.bad, mid, mid, mid, self.good]})
         self.assertIn(5, rep["changed"])
-        self.assertEqual(len(calls), 4)
-        self.assertEqual([c["seed_offset"] for c in calls], [1, 2, 3, 1])
-        self.assertIsNone(calls[0]["temperature"])
-        self.assertIsNone(calls[2]["temperature"])
-        self.assertAlmostEqual(calls[3]["temperature"], 0.3)  # 第 4 次才保底
-        self.assertEqual(rep["repairs"][0]["attempt"], 1)     # 报告里按偏移记
+        self.assertEqual([c["seed_offset"] for c in calls[:3]], [1, 2, 3])
+        vk = tts_engine._voice_fingerprint(self.refs["A"])
+        exp = ((tts_engine._line_seed(vk, "第4句")
+                - tts_engine._line_seed(vk, "第5句")) % (1 << 32))
+        self.assertEqual(calls[3]["seed_offset"], exp)      # 第 4 次复用句 4 种子
+        self.assertTrue(all(c["temperature"] is None for c in calls))
+        r0 = rep["repairs"][0]
+        self.assertEqual(r0["attempt"], exp)                # 报告里按偏移记
+        self.assertEqual(r0["via"], "reuse")
+        self.assertEqual(r0["fallback"]["ref_index"], 4)    # 离 5 最近且未点名
 
-    def test_exhausted_marks_manual_review_and_keeps_best(self):
-        # 怎么重出都坏：保留最优一条（分数与原句同为坏档），标记人工审
-        rep, calls = self._run({7: [self.bad] * 5})
+    def test_fallback_lands_even_if_failing_and_marks_review(self):
+        # 三次换种子 + 保底全部仍报警：保底不管过不过都落盘，标记人工审
+        rep, calls = self._run({7: [self.bad] * 4})
+        self.assertEqual(len(calls), 4)                     # 3 次重试 + 1 次保底
         self.assertEqual(rep["repairs"], [])
         self.assertEqual(len(rep["exhausted"]), 1)
-        self.assertFalse(rep["exhausted"][0]["fixed"])
-        self.assertEqual(len(calls), 4)
-        with open(self.report, encoding="utf-8") as f:
-            report = json.load(f)
-        self.assertEqual(len(report["exhausted"]), 1)
-        self.assertEqual(report["exhausted"][0]["index"], 7)
+        rec = rep["exhausted"][0]
+        self.assertFalse(rec["fixed"])
+        self.assertEqual(rec["via"], "fallback")
+        self.assertEqual(rec["fallback"]["ref_index"], 6)   # 离 7 最近的未点名句
+        with open(self.files[7], "rb") as f:
+            self.assertEqual(f.read(), b"wav")              # 保底那条已在盘上
 
     def test_only_flagged_line_touched(self):
         rep, _ = self._run({5: [self.bad, self.good]})
@@ -292,8 +391,13 @@ class WiringTest(unittest.TestCase):
     def test_config_keys_exist(self):
         src = self._src(os.path.join("podcast_maker", "config_manager.py"))
         for key in ("tts.timbre_guard", "tts.timbre_threshold",
-                    "tts.timbre_seed_retries", "tts.timbre_fallback_temp"):
+                    "tts.timbre_seed_retries",
+                    "tts.timbre_dull_threshold",
+                    "tts.timbre_identity_f0_deep",
+                    "tts.timbre_identity_f0_full",
+                    "tts.timbre_identity_s300"):
             self.assertIn('"%s"' % key, src)
+        self.assertNotIn("timbre_fallback_temp", src)   # 保底温度已废，改复用种子
 
 
 if __name__ == "__main__":

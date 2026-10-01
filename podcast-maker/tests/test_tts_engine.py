@@ -32,7 +32,10 @@
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -711,6 +714,56 @@ class TestDegenerationGuard(unittest.TestCase):
     def test_temperature_is_out_of_the_degenerate_band(self):
         self.assertGreaterEqual(self.serve.TEMPERATURE, 0.3,
                                 "0.2 实测 20 个种子里 4 句失控，是禁用档")
+
+
+class TestServiceJob(unittest.TestCase):
+    """服务进程的 Job 绑定：主程序死了，内核必须替我们杀掉服务、还掉显存。
+
+    服务是独立进程（自己的隐藏控制台），没有 Job 绑定时父进程死了它照活，
+    几个 G 显存一直占着。钉住三件事：句柄生命周期、挂载失败不挡路、
+    KILL_ON_JOB_CLOSE 的核心保证（关句柄 = 整棵进程树被内核杀掉）。
+    """
+
+    def test_service_slot_has_job(self):
+        self.assertIsNone(tts_engine._SERVICE.get("job"),
+                          "服务状态槽必须有 job 位，且初始为空")
+
+    def test_job_close_none_is_noop(self):
+        tts_engine._job_close(None)  # 不抛即过
+
+    def test_kill_on_job_close_reaps_child(self):
+        """核心保证：句柄一关，内核杀掉 Job 里的子进程——不留孤儿。"""
+        if os.name != "nt":
+            self.skipTest("Job 对象是 Windows 内核机制")
+        flags = (subprocess.CREATE_NEW_PROCESS_GROUP
+                 | subprocess.CREATE_NO_WINDOW)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, creationflags=flags)
+        try:
+            job = tts_engine._job_assign(proc)
+            self.assertTrue(job, "活进程必须能挂进 Job")
+            tts_engine._job_close(job)
+            deadline = time.time() + 8
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+            self.assertIsNotNone(proc.poll(),
+                                 "关 Job 句柄后子进程必须被内核终止")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_job_assign_dead_process_returns_none(self):
+        """挂载失败不挡路：死进程挂不进 Job，返回 None 而不是抛异常。"""
+        if os.name != "nt":
+            self.skipTest("Job 对象是 Windows 内核机制")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc.wait(timeout=10)
+        self.assertIsNone(tts_engine._job_assign(proc))
 
 
 if __name__ == "__main__":

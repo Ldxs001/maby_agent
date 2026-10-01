@@ -223,9 +223,13 @@ def resolve_model(model_id: str) -> str:
 def free_vram_mb() -> int | None:
     """读当前空闲显存（MB）。读不到返回 None。"""
     try:
+        # 服务由 CREATE_NO_WINDOW 拉起，自带一个隐藏控制台：子进程默认继承
+        # 它，不会弹窗。这里再加 CREATE_NO_WINDOW 是双保险——万一上游改回
+        # DETACHED（无控制台），没有这标志每次量显存都会闪一个黑窗。
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         p = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=6,
+            capture_output=True, text=True, timeout=6, creationflags=flags,
         )
         if p.returncode != 0 or not p.stdout.strip():
             return None
@@ -236,9 +240,10 @@ def free_vram_mb() -> int | None:
 
 def used_vram_mb() -> int | None:
     try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         p = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=6,
+            capture_output=True, text=True, timeout=6, creationflags=flags,
         )
         if p.returncode != 0 or not p.stdout.strip():
             return None

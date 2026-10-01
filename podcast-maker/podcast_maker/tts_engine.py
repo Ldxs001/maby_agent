@@ -35,6 +35,7 @@ Ollama 的模型请下显存——语音合成本来就用不到任何语言模�
 
 import asyncio
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -221,7 +222,7 @@ def unload_llm_models(log=None):
 # 显存还回去；别人先起的（用户手动开着、上一批留下的）一律不动——那不是我们的
 # 进程，不该由我们决定它的生死。
 _SERVICE_LOCK = threading.Lock()
-_SERVICE = {"refs": 0, "proc": None, "owned": False}
+_SERVICE = {"refs": 0, "proc": None, "job": None, "owned": False}
 
 
 # 本地服务要在一个独立环境里跑，理由写在 tts_service/setup_env.py 的文件头
@@ -379,8 +380,98 @@ def _wait_ready(cfg, proc, timeout=90):
     return False, "等了 %.0f 秒仍未就绪（%s）" % (timeout, last)
 
 
+_JOB_KILL_ON_CLOSE = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+_JOB_EXTENDED_LIMIT_INFO = 9  # JobObjectExtendedLimitInformation
+
+
+def _job_assign(proc, log=None):
+    """Windows：把服务进程挂进一个随主进程存亡的 Job 对象。
+
+    服务是独立进程（自己的隐藏控制台，没有 Job 绑定时父进程死了它照活），
+    主程序若被强杀（关窗、崩溃、任务管理器），它会带着已加载的权重变孤儿，
+    几个 G 显存一直占着。挂进 Job 并设 KILL_ON_JOB_CLOSE 后，内核在收走
+    主进程时自动关闭 Job 句柄，一并终止 Job 里整棵进程树（venv 启动器拉起
+    的真身解释器自动继承成员资格）——显存必还，不留孤儿。
+
+    返回 Job 句柄。非 Windows 返回 None；内核调用失败也返回 None（行为退回
+    从前，只少这层保险，不挡合成）。句柄的关闭交给 _job_close。
+    """
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class BASIC_LIMIT(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class EXT_LIMIT(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BASIC_LIMIT),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateJobObjectW.restype = ctypes.c_void_p
+    k32.CreateJobObjectW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    k32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = EXT_LIMIT()
+    info.BasicLimitInformation.LimitFlags = _JOB_KILL_ON_CLOSE
+    if not k32.SetInformationJobObject(
+            job, _JOB_EXTENDED_LIMIT_INFO, ctypes.byref(info),
+            ctypes.sizeof(info)):
+        k32.CloseHandle(job)
+        return None
+    ph = getattr(proc, "_handle", None)
+    if not ph:
+        # Popen 没给出句柄就自己开一个（SET_QUOTA|TERMINATE 是挂 Job 的推荐权限）。
+        ph = k32.OpenProcess(0x0100 | 0x0001, False, proc.pid)
+        if not ph:
+            k32.CloseHandle(job)
+            return None
+    if not k32.AssignProcessToJobObject(job, ctypes.c_void_p(int(ph))):
+        k32.CloseHandle(job)
+        return None
+    if log:
+        log("服务已挂进 Job 对象：主程序退出时内核会自动回收服务进程与显存")
+    return job
+
+
+def _job_close(job):
+    """关掉 Job 句柄。KILL_ON_JOB_CLOSE 生效时，句柄一关内核清掉整棵进程树。
+
+    正常收工路径先 _kill(proc) 再关句柄，双保险；句柄无效或非 Windows 什么都不做。
+    """
+    if job and os.name == "nt":
+        ctypes.windll.kernel32.CloseHandle(job)
+
+
 def _spawn_service(cfg, log=None):
-    """就地拉起本地 TTS 服务，等到健康接口应答。返回 Popen。"""
+    """就地拉起本地 TTS 服务，等到健康接口应答。返回 (Popen, Job句柄或None)。"""
     log = log or (lambda m: None)
     svc = os.path.join(ROOT, "tts_service")
     serve = os.path.join(svc, "serve.py")
@@ -400,10 +491,14 @@ def _spawn_service(cfg, log=None):
     logf = os.path.join(svc, "_serve.log")
 
     # 服务要活过这一次合成：独立进程组、不吃父进程的标准输入、输出落盘。
+    # 用 CREATE_NO_WINDOW（隐藏控制台）而不是 DETACHED_PROCESS：DETACHED 下
+    # 服务自身没有控制台，venv 启动器（Scripts\python.exe）再拉真身解释器时
+    # 不透传这个标志，真身发现自己没台可继承就自建一个新控制台——黑窗从合成
+    # 开工一直挂到收工。隐藏控制台则全链路都有台可继承，谁也弹不出来。
     flags = 0
     if os.name == "nt":
         flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                 | getattr(subprocess, "DETACHED_PROCESS", 0))
+                 | getattr(subprocess, "CREATE_NO_WINDOW", 0))
     log("本地语音服务未在线，已拉起（%s:%d）" % (host, port))
     fh = open(logf, "ab")
     try:
@@ -412,13 +507,15 @@ def _spawn_service(cfg, log=None):
                                 stdin=subprocess.DEVNULL, creationflags=flags)
     finally:
         fh.close()
+    job = _job_assign(proc, log)
 
     ok, msg = _wait_ready(cfg, proc)
     if not ok:
         _kill(proc)
+        _job_close(job)
         raise TTSError("本地语音服务没能就绪：%s\n服务日志：%s" % (msg, logf))
     log("本地语音服务已就绪 · %s" % msg)
-    return proc
+    return proc, job
 
 
 def acquire_service(cfg, log=None):
@@ -435,7 +532,7 @@ def acquire_service(cfg, log=None):
         if service_health(cfg)[0]:
             # 已经有服务在跑（不管是用户开的还是上一批留下的），用就是了，别动它。
             return
-        _SERVICE["proc"] = _spawn_service(cfg, log)
+        _SERVICE["proc"], _SERVICE["job"] = _spawn_service(cfg, log)
         _SERVICE["owned"] = True
 
 
@@ -447,9 +544,12 @@ def release_service(log=None):
         if _SERVICE["refs"] or not _SERVICE["owned"]:
             return
         proc = _SERVICE["proc"]
+        job = _SERVICE["job"]
         _SERVICE["proc"] = None
+        _SERVICE["job"] = None
         _SERVICE["owned"] = False
     _kill(proc)
+    _job_close(job)
     log("本地语音服务已停止，显存已归还")
 
 
@@ -938,14 +1038,20 @@ def synthesize(script, out_dir, cfg, log=None, emotion_level=None,
 
 # ------------------------------------------------------------------ 音色体检
 # 全部单句合成完之后跑一遍：每个角色以自己全体句子为基线（F0 中位、谱质心、
-# 响度、存在感频带四维），逐句算 z 加权偏离分；超阈值的句子按 +1/+2/+3 换种子
-# 重出，首次过线即停。判定分与阈值来自人工试听定标：三维版（谱心 1.0 + 音高
-# 0.8 + 响度 0.4，4.25）由 2c 期六句定出（2026-09-27）；第 4 维存在感频带
-# （2.4-4.8kHz 能量占比，权重 0.5 只计刺耳方向）由 2da 期 0054 句补出——该句
-# 三维分 3.45 放行，实为频谱形状重分布（低频抬、中频掏空、存在感带 +4.6σ），
-# 谱心是加权平均，对形状搬移结构性失明。四维版在两期修复前音频上回放验证：
-# 2c 点名 [93,101,135,157] 原样复现（169=4.19/233=3.87 放过），2da 点名
-# [30,54,102,166]，0054 重出 seed+1 分数 1.27。
+# 响度、存在感频带、低频占比、基音抖动六维），逐句过三条判据，任一命中即
+# 点名，按 +1/+2/+3 换种子重出，候选必须三条全过才算修复，首次过线即停。
+#
+# 三条判据全部来自人工试听定标，各管一族病：
+# ① 四维严苛分（谱心 1.0 + 音高 0.8 + 响度 0.4 + 存在感 0.5 单边，4.25）：
+#    2c 六句定标 + 2da 0054 补存在感维（频谱形状重分布，谱心失明）；
+# ② 暗淡子分（F0 下偏 + 谱心变暗 + 0.6×基音抖动，均单边，4.9）：ep3 58 句
+#    a2 候选揪出——F0 向下还不稳 = 病态嗓（发虚发哑），四维分 2.82 照样过线；
+# ③ 身份下限（F0 ≤ -2.4σ；或 F0 ≤ -2.0σ 且低频占比 ≥ +1.5σ）：主人复听
+#    15 个耳标样本定出——大美是单薄女高音，「音高掉了 + 低频反而饱满」=
+#    滑向中音、不是本人（a2 像"小美"案）；掉了但依然单薄 = 只是嗓子累，
+#    放行（2c-0169：F0 -2.26σ 但低频 +0.09σ，可接受）。04 vs 05 是铁证：
+#    同样 F0 -2.26σ，低频 +2.27σ 的判坏、+0.09σ 的放行。
+# 15 个耳标样本（9 坏 6 好）三规则合验 15/15，无一漏无一冤。
 #
 # 位置为什么在全部句子之后：判定要拿角色全体做基线，逐句进行中基线不存在；
 # 修完才拼整期，后续工序（拼接 / 字幕 / 视频）拿到的就是修复后的最终波形。
@@ -955,13 +1061,14 @@ _TIMBRE_MIN_BASELINE = 10   # 角色基线至少要这么多句，σ 才稳得�
 
 
 def _timbre_features(path):
-    """单句四维特征：F0 中位（自相关）、谱质心中位、响度（ffmpeg RMS dB）、
-    存在感频带（2.4-4.8kHz 能量占比）。
+    """单句六维特征：F0 中位（自相关）、谱质心中位、响度（ffmpeg RMS dB）、
+    存在感频带（2.4-4.8kHz 能量占比）、低频占比（<300Hz 能量份额）、
+    基音抖动（jitter，有声帧 F0 相对差均值 %）。
 
-    测量口径与定标探针（_smoke/probe_2c_timbre.py / probe_2da_54.py）
-    完全一致——基线就是拿这套口径量的，换口径等于换尺子，分数全体失真。
-    存在感频带必须在降采样之前的原始采样率上量：降到 16k 后 Nyquist 只有
-    8k，带内功率谱形状会变；占比对比整段功率谱，幅度归一（响度另算）。
+    测量口径与定标探针完全一致——基线就是拿这套口径量的，换口径等于换尺子，
+    分数全体失真。存在感与低频占比必须在降采样之前的原始采样率上量：降到
+    16k 后 Nyquist 只有 8k，带内功率谱形状会变；占比对比整段功率谱，
+    幅度归一（响度另算）。
     """
     import numpy as np
 
@@ -973,16 +1080,18 @@ def _timbre_features(path):
     if ch > 1:
         x = x[::ch]
 
-    # 存在感频带占比：原始采样率上整段（≤20s）加 hanning 窗，功率谱里
-    # 2.4-4.8kHz 的份额。与 2da 扩维验证探针同口径，必须在降采样前量。
-    pres = None
+    # 频带占比：原始采样率上整段（≤20s）加 hanning 窗的功率谱。
+    # 存在感 = 2.4-4.8kHz 份额（刺耳方向）；低频 = <300Hz 份额（丰满方向，
+    # 身份判据用：大美是单薄女高音，低频鼓起来就是滑向中音）。
+    pres = s300 = None
     L = min(len(x), sr * 20)
     if L > 3:
         seg = x[:L] * np.hanning(L)
         spec = np.abs(np.fft.rfft(seg)) ** 2
         freqs = np.fft.rfftfreq(L, 1.0 / sr)
-        pres = float(spec[(freqs >= 2400) & (freqs < 4800)].sum()
-                     / (spec.sum() + 1e-12))
+        tot = spec.sum() + 1e-12
+        pres = float(spec[(freqs >= 2400) & (freqs < 4800)].sum() / tot)
+        s300 = float(spec[freqs < 300].sum() / tot)
 
     if sr > 16000:
         step = int(round(sr / 16000.0))
@@ -1016,6 +1125,10 @@ def _timbre_features(path):
     rmss = np.array(rmss, dtype=float)
     good = f0s[~np.isnan(f0s) & (rmss > np.nanmedian(rmss[rmss > 0]) * 0.3)]
     f0_med = float(np.median(good)) if len(good) else None
+    # 基音抖动：相邻有声帧 F0 的相对差均值（%）。病态嗓「发虚发哑」的
+    # 声源层指标——暗淡子分的第三项，与 F0 同一套自相关机制，零新增依赖。
+    jit = (float(np.mean(np.abs(np.diff(good)) / (good[:-1] + 1e-9)) * 100)
+           if len(good) >= 2 else None)
 
     # 谱质心：1024 点窗 / 512 跳，取中位
     nfft, hopc = 1024, 512
@@ -1036,7 +1149,7 @@ def _timbre_features(path):
     m = re.findall(r"RMS level dB:\s*(-?[\d.]+|-inf)",
                    r.stderr.decode("utf-8", "replace"))
     rms_db = float(m[-1]) if m and m[-1] != "-inf" else None
-    return f0_med, cent, rms_db, pres
+    return f0_med, cent, rms_db, pres, s300, jit
 
 
 def _timbre_score(row, base):
@@ -1062,6 +1175,44 @@ def _timbre_score(row, base):
     return float(s)
 
 
+def _dull_score(row, base):
+    """暗淡子分：F0 下偏 + 谱心变暗 + 0.6×基音抖动，全部单边只计恶化方向。
+
+    来自 ep3 58 句 a2 候选的定标：四维总分 2.82 照样「明显有问题」——F0 向下
+    且基音发抖 = 病态嗓。阈值 4.9 骑在 15 个耳标样本的分离带正中（可接受区
+    最高 4.51，坏区最低 5.42）。
+    """
+    import numpy as np
+
+    s = 0.0
+    if row["f0"] is not None:
+        s += max(0.0, (base["f0_mu"] - row["f0"]) / (base["f0_sd"] or 1.0))
+    if row["cent"] is not None:
+        s += max(0.0, (base["cent_mu"] - row["cent"]) / (base["cent_sd"] or 1.0))
+    if row.get("jit") is not None:
+        s += 0.6 * max(0.0, (row["jit"] - base["jit_mu"])
+                       / (base["jit_sd"] or 1.0))
+    return float(s)
+
+
+def _identity_flag(row, base, deep, full, s300_cap):
+    """身份下限判据：音高掉了且低频鼓起来 = 滑向中音，不是本人。
+
+    大美是单薄女高音（主人定标原话）。两种抓法：
+    - F0 掉破 deep（-2.4σ）——掉这么深，单薄与否都是别人；
+    - F0 掉过 full（-2.0σ）且低频占比 ≥ +1.5σ——「哪怕女高音但低频更丰满」，
+      正是主人对 a2「反而有点像小美」的描述。
+    掉了但依然单薄 = 嗓子累，放行（2c-0169：F0 -2.26σ、低频 +0.09σ）。
+    """
+    import numpy as np
+
+    if row["f0"] is None or row.get("s300") is None:
+        return False
+    f0z = (base["f0_mu"] - row["f0"]) / (base["f0_sd"] or 1.0)   # 下偏为正
+    lz = (row["s300"] - base["s300_mu"]) / (base["s300_sd"] or 1.0)
+    return bool(f0z >= deep or (f0z >= full and lz >= s300_cap))
+
+
 def _timbre_baselines(rows, log):
     """按角色建基线并给每句打分。句数不足的角色不建基线、不参与判定。"""
     import numpy as np
@@ -1075,19 +1226,61 @@ def _timbre_baselines(rows, log):
             continue
         base = {}
         for key, attr in (("f0", "f0"), ("cent", "cent"), ("rms", "rms"),
-                          ("pres", "pres")):
+                          ("pres", "pres"), ("s300", "s300"), ("jit", "jit")):
             vals = np.array([r[attr] for r in rs if r[attr] is not None])
             base[key + "_mu"] = float(vals.mean()) if len(vals) else 0.0
             base[key + "_sd"] = float(vals.std()) if len(vals) else 0.0
         baselines[spk] = base
         for r in rs:
-            if (r["f0"] is None or r["cent"] is None or r["rms"] is None
-                    or r["pres"] is None):
+            if any(r[k] is None for k in
+                   ("f0", "cent", "rms", "pres", "s300", "jit")):
                 r["score"] = None
             else:
                 r["score"] = round(_timbre_score(r, base), 2)
+                r["dull"] = round(_dull_score(r, base), 2)
             scored.append(r)
     return baselines, scored
+
+
+def _timbre_capture(r, base, threshold, dull_thr, id_deep, id_full, id_s300):
+    """三条判据合验，返回命中原因列表（空列表 = 放行）。
+
+    检测与修复候选验收共用这一把尺：原始句命中任何一条就点名重出，
+    重出候选必须三条全过才准转正——检测放进去的病，验收时必须保证治好了。
+    """
+    reasons = []
+    if r.get("score") is not None and r["score"] >= threshold:
+        reasons.append("四维%.2f" % r["score"])
+    if r.get("dull") is not None and r["dull"] >= dull_thr:
+        reasons.append("暗淡%.2f" % r["dull"])
+    if r.get("score") is not None and _identity_flag(
+            r, base, id_deep, id_full, id_s300):
+        f0z = (base["f0_mu"] - r["f0"]) / (base["f0_sd"] or 1.0)
+        reasons.append("身份下偏%.2fσ" % f0z)
+    return reasons
+
+
+def _voice_fingerprint(ref):
+    """角色音色档案的内容指纹，与服务端 voice_key_for 同一口径。
+
+    种子的音色标识只认内容不认路径——保底复用别句种子时，产线要自己算出
+    与服务端相同的那个 key，偏移才落在同一个种子空间里。
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(ref["wav"], "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return "ref:" + h.hexdigest()[:16]
+
+
+def _line_seed(voice_key, text):
+    """句子种子：sha256(音色标识 + NUL + 文本) 前 4 字节，与服务端 seed_for 同口径。"""
+    import hashlib
+
+    h = hashlib.sha256(("%s\x00%s" % (voice_key, text)).encode("utf-8")).digest()
+    return int.from_bytes(h[:4], "big")
 
 
 def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
@@ -1096,8 +1289,10 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
 
     判定：每角色以自己全体句子为基线算 z 加权分，达到阈值即点名。
     修复：点名句依次用 seed+1/+2/+3 重出（温度不变），首次过线即停；全败
-    再用保底温度试最后一次；仍失败则保留历次里分数最低的一条并标记人工审。
-    修复是确定性的：重试序号对应固定种子，整期重跑结果逐比特一致。
+    再做保底一次——复用同角色最近一条未点名句子的种子（温度同样不动，只换
+    抽样点），不管过不过都落盘这条保底；仍不过线则标记人工审。找不到可复用
+    的句子时退回旧行为：保留历次里分数最低的一条并标记人工审。
+    修复是确定性的：重试序号与保底参考句都由内容决定，整期重跑逐比特一致。
 
     返回 {"changed": {句号: 新时长}}——调用方据此刷新 durations 与
     actual_seconds，下游（拼接 / 字幕 / 视频）拿到的就是修复后的波形。
@@ -1110,28 +1305,35 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
         return None
     threshold = float(cfg.get("tts.timbre_threshold", 4.25))
     retries = max(1, int(cfg.get("tts.timbre_seed_retries", 3)))
-    fallback_temp = float(cfg.get("tts.timbre_fallback_temp", 0.3))
+    dull_thr = float(cfg.get("tts.timbre_dull_threshold", 4.9))
+    id_deep = float(cfg.get("tts.timbre_identity_f0_deep", 2.4))
+    id_full = float(cfg.get("tts.timbre_identity_f0_full", 2.0))
+    id_s300 = float(cfg.get("tts.timbre_identity_s300", 1.5))
 
     t0 = time.time()
     rows = []
     for i, item in enumerate(script):
         try:
-            f0, cent, rms_db, pres = _timbre_features(audio_files[i])
+            f0, cent, rms_db, pres, s300, jit = _timbre_features(audio_files[i])
         except Exception as e:  # noqa: BLE001
             log("音色体检：%s 测量失败，不参与判定（%s）"
                 % (os.path.basename(audio_files[i]), e))
             continue
         rows.append({"index": i, "speaker": item.get("speaker", "A"),
-                     "f0": f0, "cent": cent, "rms": rms_db, "pres": pres})
+                     "f0": f0, "cent": cent, "rms": rms_db, "pres": pres,
+                     "s300": s300, "jit": jit})
     baselines, scored = _timbre_baselines(rows, log)
     if not baselines:
         log("音色体检：没有任何角色建得起基线，跳过")
         return None
     for r in scored:
-        r["flag"] = r["score"] is not None and r["score"] >= threshold
+        r["why"] = _timbre_capture(r, baselines[r["speaker"]], threshold,
+                                   dull_thr, id_deep, id_full, id_s300) \
+            if r["score"] is not None else []
+        r["flag"] = bool(r["why"])
     flagged = [r for r in scored if r["flag"]]
-    log("音色体检：%d 句测完，%d 句点名（阈值 %.2f，%.0f 秒）"
-        % (len(scored), len(flagged), threshold, time.time() - t0))
+    log("音色体检：%d 句测完，%d 句点名（四维 %.2f / 暗淡 %.2f / 身份，%.0f 秒）"
+        % (len(scored), len(flagged), threshold, dull_thr, time.time() - t0))
 
     voices = {"A": cfg.get("tts.qwen3tts_voice_a", ""),
               "B": cfg.get("tts.qwen3tts_voice_b", "")}
@@ -1141,6 +1343,12 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
             voices, cfg, log)
 
     changed, repairs, exhausted = {}, [], []
+    # 保底第 4 招的准备：同角色全部未点名句（保底复用它们的种子）。key 缓存
+    # 按角色算一次——指纹读整个参考音频，别每句都读一遍。
+    ok_rows, vk_cache = {}, {}
+    for r in scored:
+        if r["score"] is not None and not r["flag"]:
+            ok_rows.setdefault(r["speaker"], []).append(r["index"])
     for r in flagged:
         i = r["index"]
         # 日志一律用音频文件名（0054_B 这种），所见即文件所在——
@@ -1157,28 +1365,66 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
         # 没过线但比现有最优好就顶替它（旧的最优临时件删掉），否则当场删掉。
         best_score = r["score"]
         best_tmp = None
-        fixed = None
+        fixed = None            # 过线候选的种子偏移（int）；未过线保持 None
+        fixed_via = ""          # "seed"（+1/+2/+3）| "reuse"（保底复用）
+        fb = None               # 保底走过后必有：{"ref_index", "seed_offset", "passed"}
+        # 保底参考句：同角色离当前句最近的未点名句（并列取前面那条）。
+        pool = ok_rows.get(spk) or []
+        fb_ref = (min(pool, key=lambda j: (abs(j - i), j - i))
+                  if pool else None)
+        fb_off = None
+        if fb_ref is not None:
+            vk = vk_cache.setdefault(spk, _voice_fingerprint(ref))
+            # 复用偏移 = 参考句种子 − 当前句种子，归一到非负；同输入必同偏移。
+            fb_off = ((_line_seed(vk, script[fb_ref].get("text", ""))
+                       - _line_seed(vk, text)) % (1 << 32))
         plans = ([(k, None) for k in range(1, retries + 1)]
-                 + [(1, fallback_temp)])
+                 + ([("reuse", None)] if fb_off is not None else []))
         for pos, (attempt, temp) in enumerate(plans, 1):
-            tag = ("seed+%d" % attempt) if temp is None else \
-                  ("seed+%d & 温度%.2f" % (attempt, temp))
+            if attempt == "reuse":
+                tag = "保底·复用 %s 种子" % os.path.basename(audio_files[fb_ref])
+                offset = fb_off
+            else:
+                tag = "seed+%d" % attempt
+                offset = attempt
             data = synth_line(text, voice, speed, cfg, degree=emotion_level,
-                              ref=ref, seed_offset=attempt, temperature=temp)
+                              ref=ref, seed_offset=offset, temperature=temp)
             # 每次重试独立临时件（按循环位置编号：保底那次 seed_offset 会与
             # 首次重试相同，用 attempt 编号会撞名，撞名即误删最优候选）
             tmp = "%s.r%d.tmp" % (audio_files[i], pos)
             with open(tmp, "wb") as f:
                 f.write(data)
-            f0, cent, rms_db, pres = _timbre_features(tmp)
-            s = _timbre_score({"f0": f0, "cent": cent, "rms": rms_db,
-                               "pres": pres},
-                              baselines[spk])
-            log("音色体检：%s %s 重出 → 分数 %.2f（原 %.2f）"
-                % (fname, tag, s, r["score"]))
-            if s < threshold:
+            f0, cent, rms_db, pres, s300, jit = _timbre_features(tmp)
+            cand = {"f0": f0, "cent": cent, "rms": rms_db, "pres": pres,
+                    "s300": s300, "jit": jit}
+            s = _timbre_score(cand, baselines[spk])
+            cand["score"] = s
+            cand["dull"] = _dull_score(cand, baselines[spk])
+            why = _timbre_capture(cand, baselines[spk], threshold, dull_thr,
+                                  id_deep, id_full, id_s300)
+            log("音色体检：%s %s 重出 → 四维 %.2f 暗淡 %.2f%s（原 %.2f）"
+                % (fname, tag, s, cand["dull"],
+                   ("，命中：" + "、".join(why)) if why else "，三判据全过",
+                   r["score"]))
+            if not why:
                 os.replace(tmp, audio_files[i])
-                best_score, fixed = round(s, 2), attempt
+                best_score = round(s, 2)
+                fixed = offset
+                fixed_via = "reuse" if attempt == "reuse" else "seed"
+                if attempt == "reuse":
+                    fb = {"ref_index": fb_ref, "seed_offset": offset,
+                          "passed": True}
+                if best_tmp:
+                    os.remove(best_tmp)
+                break
+            if attempt == "reuse":
+                # 保底是最后一招，不管过不过都落盘——覆盖任何历史最优候选
+                os.replace(tmp, audio_files[i])
+                best_score = round(s, 2)
+                fb = {"ref_index": fb_ref, "seed_offset": offset,
+                      "passed": False}
+                if best_tmp:
+                    os.remove(best_tmp)
                 break
             if s < best_score:
                 if best_tmp:
@@ -1186,8 +1432,8 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
                 best_score, best_tmp = s, tmp
             else:
                 os.remove(tmp)
-        if fixed is None and best_tmp:
-            # 重出全部没过线：把历次里分数最低的那条转正，标记人工审
+        if fixed is None and fb is None and best_tmp:
+            # 重出全部没过线且没有可复用的保底：历次里分数最低的那条转正
             os.replace(best_tmp, audio_files[i])
         dur = probe_duration(audio_files[i])
         if dur > 0:
@@ -1195,23 +1441,36 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
             item["actual_seconds"] = round(dur, 3)
         rec = {"index": i, "speaker": spk, "score0": r["score"],
                "final_score": round(best_score, 2),
-               "attempt": fixed if fixed is not None else best_tmp is not None,
-               "fixed": fixed is not None, "duration": dur}
+               "attempt": fixed, "fixed": fixed is not None,
+               "via": (fixed_via if fixed is not None
+                       else ("fallback" if fb else "best")),
+               "duration": dur}
+        if fb:
+            rec["fallback"] = fb
         if fixed is not None:
             repairs.append(rec)
-            log("音色体检：%s 已修复（seed+%d，分数 %.2f）"
-                % (fname, fixed, rec["final_score"]))
+            how = ("复用 %s 种子" % os.path.basename(audio_files[fb["ref_index"]])
+                   if fb else "seed+%d" % fixed)
+            log("音色体检：%s 已修复（%s，分数 %.2f）"
+                % (fname, how, rec["final_score"]))
         else:
             exhausted.append(rec)
-            log("音色体检：%s %d 次重出均未过线，保留最优一条"
-                "（分数 %.2f），标记人工审" % (fname, retries + 1,
-                                              rec["final_score"]))
+            if fb:
+                log("音色体检：%s 保底落盘仍未过线（分数 %.2f），标记人工审"
+                    % (fname, rec["final_score"]))
+            else:
+                log("音色体检：%s %d 次重出均未过线，保留最优一条"
+                    "（分数 %.2f），标记人工审" % (fname, retries,
+                                                  rec["final_score"]))
 
     if report_path:
         try:
             with open(report_path, "w", encoding="utf-8") as f:
                 json.dump({"threshold": threshold, "seed_retries": retries,
-                           "fallback_temp": fallback_temp,
+                           "fallback": "reuse_last_clean_seed",
+                           "dull_threshold": dull_thr,
+                           "identity": {"f0_deep": id_deep,
+                                        "f0_full": id_full, "s300": id_s300},
                            "baselines": baselines,
                            "rows": scored, "repairs": repairs,
                            "exhausted": exhausted,

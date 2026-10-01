@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 # ============================================================================
@@ -725,22 +725,41 @@ PARAM_SPEC = {
     "tts.timbre_guard": _p(
         "bool", True, "voice", "音色体检（合成后自动判定修复）",
         engine_scope="qwen3tts", views=("render",),
-        help="全部单句合成完后，按角色自身基线算音色偏离分（谱心+音高+响度），"
-             "超过阈值的句子自动换种子重出；修不好标记人工审。只对 Qwen3-TTS 生效"),
+        help="全部单句合成完后，按角色自身基线过三条判据（四维偏离分 / "
+             "暗淡子分 / 身份下限），任一命中即自动换种子重出；"
+             "修不好标记人工审。只对 Qwen3-TTS 生效"),
     "tts.timbre_threshold": _p(
         "float", 4.25, "voice", "音色体检判定阈值",
         engine_scope="qwen3tts", min=2.0, max=8.0,
-        help="角色内 z 加权分（谱心 1.0 + 音高 0.8 + 响度 0.4）达到即点名重试。"
-             "4.25 为人工试听六句定标：恰好分开「能听出来」与「可接受」"),
+        help="角色内 z 加权分（谱心 1.0 + 音高 0.8 + 响度 0.4 + 存在感 0.5）"
+             "达到即点名重试。4.25 为人工试听六句定标：恰好分开"
+             "「能听出来」与「可接受」"),
     "tts.timbre_seed_retries": _p(
         "int", 3, "voice", "音色体检换种子重试次数",
         engine_scope="qwen3tts", min=1, max=6,
-        help="点名的句子依次用 seed+1/+2/+3 重出，温度不变；首次过线即停"),
-    "tts.timbre_fallback_temp": _p(
-        "float", 0.3, "voice", "音色体检保底采样温度",
-        engine_scope="qwen3tts", min=0.05, max=0.9,
-        help="换种子重试全部失败后再试一次的采样温度（收窄抽样分布，"
-             "韵律会比其他句子平）；仍失败则保留分数最低的一条并标记人工审"),
+        help="点名的句子依次用 seed+1/+2/+3 重出，温度不变；"
+             "三判据全过即收，首次过线即停"),
+    "tts.timbre_dull_threshold": _p(
+        "float", 4.9, "voice", "暗淡子分阈值",
+        engine_scope="qwen3tts", min=2.0, max=9.0,
+        help="F0 下偏 + 谱心变暗 + 0.6×基音抖动（均单边）。抓「发虚发哑」"
+             "病态嗓——四维总分过线但声音发抖的句子由它兜住。4.9 为 15 个"
+             "耳标样本分离带中点（可接受区最高 4.51 / 坏区最低 5.42）"),
+    "tts.timbre_identity_f0_deep": _p(
+        "float", 2.4, "voice", "身份下限：F0 深降线（σ）",
+        engine_scope="qwen3tts", min=1.0, max=5.0,
+        help="F0 比角色基线低超过该 σ 数即判「不是本人」。大美定标："
+             "掉破 -2.4σ（约 213Hz）无论音色单薄与否都已是另一个人"),
+    "tts.timbre_identity_f0_full": _p(
+        "float", 2.0, "voice", "身份下限：组合判 F0 线（σ）",
+        engine_scope="qwen3tts", min=1.0, max=5.0,
+        help="与低频占比联动：F0 低过该线且低频同时鼓起来，判「滑向中音、"
+             "不是本人」；掉了但依然单薄 = 嗓子累，放行"),
+    "tts.timbre_identity_s300": _p(
+        "float", 1.5, "voice", "身份下限：低频占比线（σ）",
+        engine_scope="qwen3tts", min=0.5, max=5.0,
+        help="<300Hz 能量占比相对基线的 σ 上限，与上一条联动使用。"
+             "大美是单薄女高音，低频鼓起来就是别人"),
 
     "audio.sample_rate": _p("enum", 44100, "voice", "采样率（Hz）"),
     "audio.bitrate_kbps": _p("int", 192, "voice", "码率（kbps）",
