@@ -309,12 +309,19 @@ def _build_prompt(data, chapter, chapter_dir) -> str:
 - PASS（没问题）：经审核该维度没有缺陷。detail 写明"为什么没问题"（如"前文有伏笔，转折自然"）。
   ✅ 正例: {{"dimension":"因果合理性","result":"PASS","detail":"前文铺垫充分，转折逻辑合理"}}
   ❌ 反例(错): {{"dimension":"因果合理性","result":"SOFT","detail":"铺垫充分，逻辑合理"}}  ← detail 说好话却标 SOFT，自相矛盾，严禁这样填。
-- SOFT（轻微瑕疵，可不修）：有可优化之处但不破坏叙事。detail 写明具体瑕疵。
-  ✅ 正例: {{"dimension":"情绪弧自然度","result":"SOFT","detail":"情绪转变略快，缺一处过渡铺垫"}}
-  ❌ 反例(错): {{"dimension":"情绪弧自然度","result":"PASS","detail":"情绪略显生硬"}}  ← detail 说瑕疵却标 PASS，自相矛盾，严禁。
-- HARD（硬性缺陷，必须修）：违反角色/世界观/逻辑硬规则。detail 写明具体缺陷。
-  ✅ 正例: {{"dimension":"对话匹配度","result":"HARD","detail":"对话用词超出角色设定，与身份不符"}}
+- SOFT（轻微瑕疵，可不修）：有可优化之处但不破坏叙事。detail 按下方三要素写。
+  ✅ 正例: {{"dimension":"情绪弧自然度","result":"SOFT","detail":"S03 沈青梧从「冷笑」直接跳到「含泪恳求」，中间无转折铺垫；方向：补一句迟疑或欲言又止的动作过渡"}}
+  ❌ 反例(错): {{"dimension":"情绪弧自然度","result":"PASS","detail":"情绪略显生硬"}}  ← 有瑕疵却标 PASS，自相矛盾，严禁。
+  ❌ 反例(错): {{"dimension":"情绪弧自然度","result":"SOFT","detail":"情绪转变略显突兀，缺过渡铺垫"}}  ← 无引用无对照，读的人不知道是哪一段、哪个角色、从什么情绪跳到什么，无法定点修复，严禁这种概括句。
+- HARD（硬性缺陷，必须修）：违反角色/世界观/逻辑硬规则。detail 按下方三要素写。
+  ✅ 正例: {{"dimension":"对话匹配度","result":"HARD","detail":"S02 林渊说「本座行事何须向你交代」——自称「本座」与角色档案设定（谦逊学生，用「我」）冲突；方向：改为符合学生身份的日常口吻"}}
   ❌ 反例(错): {{"dimension":"对话匹配度","result":"PASS","detail":"对话略不符合身份"}}  ← 有不符还标 PASS，严禁。
+  ❌ 反例(错): {{"dimension":"对话匹配度","result":"HARD","detail":"对话用词超出角色设定，与身份不符"}}  ← 无引用无对照的概括句，无法定位到具体对话，严禁。
+★ detail 三要素（result 为 HARD/SOFT 时缺一不可）：
+  1. 引用：用「」摘录正文里违规的具体片段（对话原句/情绪转变两端/行为描写，各≤30字），并写明所在段号；
+  2. 对照：违反了什么（角色档案哪条设定/前文哪处事实/哪条硬规则）；
+  3. 方向：怎么改（一句话）。
+  detail 长度 30-120 字。PASS 条目不受三要素限制，写明"为什么没问题"即可。
 ★ 一致性铁律：detail 是"无问题/合理/符合/通过/没有矛盾"等正面措辞时，result 必须是 PASS；判了 HARD/SOFT，detail 就必须描述具体缺陷/瑕疵。严禁"detail 说好话、result 标 HARD/SOFT"或反过来。
 ★ 维度不适用 = 不是缺陷：某维度在本章没有评估对象时（如本章没有任何对话、没有任何推理/论证情节），该维度只能标 PASS，detail 写明"本章无对话，维度不适用，非缺陷"。
   ✅ 正例: {{"dimension":"对话匹配度","result":"PASS","detail":"本章无对话，维度不适用，非缺陷"}}
@@ -323,17 +330,17 @@ def _build_prompt(data, chapter, chapter_dir) -> str:
 
 [输出要求]
 以 JSON 数组格式输出, 每项格式:
-{{"dimension": "维度名", "result": "PASS"|"HARD"|"SOFT", "detail": "具体说明(20-50字)", "sub": "涉及的具体子结构编号"}}
+{{"dimension": "维度名", "result": "PASS"|"HARD"|"SOFT", "detail": "PASS写理由(20-50字) / HARD·SOFT按三要素写引用+对照+方向(30-120字)", "sub": "涉及的具体子结构编号"}}
 sub 字段：必填，不允许 null。从[正文预览]的段标识（-- S01 -- 等）定位该问题主要涉及的子结构，填 "S01"/"S02"...；
 PASS 也填该维度主要依据的段；整章性问题同样定位到主要涉及的段（如全局节奏问题定到转折所在段）。
 必须包含全部 5 个维度, 仅输出 JSON 数组, 不要有其他文字.
 
-[输出示例]（注意每条的 result 与 detail 方向都一致，sub 一律填具体段号）
+[输出示例]（PASS 写理由；HARD/SOFT 的 detail 必须含「」引用+对照+方向，sub 一律填具体段号）
 [
   {{"dimension": "因果合理性", "result": "PASS", "detail": "前文铺垫充分，转折逻辑合理", "sub": "S01"}},
-  {{"dimension": "人物行为一致性", "result": "SOFT", "detail": "角色情绪转变略显突兀，缺过渡铺垫", "sub": "S03"}},
+  {{"dimension": "人物行为一致性", "result": "SOFT", "detail": "S03 沈青梧从「冷笑」直接跳到「含泪恳求」，中间无转折铺垫；对照其谨慎多疑的设定缺过渡；方向：补一句迟疑动作", "sub": "S03"}},
   {{"dimension": "情绪弧自然度", "result": "PASS", "detail": "情绪递进自然，与事件节奏匹配", "sub": "S02"}},
-  {{"dimension": "对话匹配度", "result": "HARD", "detail": "对话用词超出角色设定，与身份不符", "sub": "S02"}},
+  {{"dimension": "对话匹配度", "result": "HARD", "detail": "S02 林渊说「本座行事何须向你交代」——自称「本座」与角色档案设定（谦逊学生，用「我」）冲突；方向：改为符合学生身份的日常口吻", "sub": "S02"}},
   {{"dimension": "论证可靠性", "result": "PASS", "detail": "推理链条完整，无逻辑漏洞", "sub": "S04"}}
 ]"""
     return prompt
