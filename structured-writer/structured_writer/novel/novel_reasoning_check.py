@@ -290,6 +290,8 @@ def _build_prompt(data, chapter, chapter_dir) -> str:
 
     prompt = f"""你是一个专业的小说审核编辑. 请审核以下章节内容, 严格按指定 JSON 格式输出审核结果.
 
+术语约定：[正文预览] 标签内的内容统称"正文"，本提示词全文仅用这一个称谓.
+
 [角色设定]
 {char_setting}
 {style_block}
@@ -314,7 +316,7 @@ def _build_prompt(data, chapter, chapter_dir) -> str:
   ❌ 反例(错): {{"dimension":"情绪弧自然度","result":"PASS","detail":"情绪略显生硬"}}  ← 有瑕疵却标 PASS，自相矛盾，严禁。
   ❌ 反例(错): {{"dimension":"情绪弧自然度","result":"SOFT","detail":"情绪转变略显突兀，缺过渡铺垫"}}  ← 无引用无对照，读的人不知道是哪一段、哪个角色、从什么情绪跳到什么，无法定点修复，严禁这种概括句。
 - HARD（硬性缺陷，必须修）：违反角色/世界观/逻辑硬规则。detail 按下方三要素写。
-  ✅ 正例: {{"dimension":"对话匹配度","result":"HARD","detail":"S02 林渊说「本座行事何须向你交代」——自称「本座」与角色档案设定（谦逊学生，用「我」）冲突；方向：改为符合学生身份的日常口吻"}}
+  ✅ 正例: {{"dimension":"对话匹配度","result":"HARD","detail":"S02 林渊说「本座行事何须向你交代」——自称「本座」与[角色设定]（谦逊学生，用「我」）冲突；方向：改为符合学生身份的日常口吻"}}
   ❌ 反例(错): {{"dimension":"对话匹配度","result":"PASS","detail":"对话略不符合身份"}}  ← 有不符还标 PASS，严禁。
   ❌ 反例(错): {{"dimension":"对话匹配度","result":"HARD","detail":"对话用词超出角色设定，与身份不符"}}  ← 无引用无对照的概括句，无法定位到具体对话，严禁。
 ★ detail 三要素（result 为 HARD/SOFT 时缺一不可）：
@@ -323,16 +325,19 @@ def _build_prompt(data, chapter, chapter_dir) -> str:
   3. 方向：怎么改（一句话）。
   detail 长度 30-120 字。PASS 条目不受三要素限制，写明"为什么没问题"即可。
 ★ 一致性铁律：detail 是"无问题/合理/符合/通过/没有矛盾"等正面措辞时，result 必须是 PASS；判了 HARD/SOFT，detail 就必须描述具体缺陷/瑕疵。严禁"detail 说好话、result 标 HARD/SOFT"或反过来。
-★ 维度不适用 = 不是缺陷：某维度在本章没有评估对象时（如本章没有任何对话、没有任何推理/论证情节），该维度只能标 PASS，detail 写明"本章无对话，维度不适用，非缺陷"。
-  ✅ 正例: {{"dimension":"对话匹配度","result":"PASS","detail":"本章无对话，维度不适用，非缺陷"}}
-  ❌ 反例(错): {{"dimension":"对话匹配度","result":"HARD","detail":"无具体对话"}}  ← 无对话不是缺陷，标 HARD/SOFT 严禁。
+★ 评估对象逐维写明（评估对象不存在 = 不是缺陷，result 只能填 PASS，detail 写明"正文无X，非缺陷"）：
+  - 对话匹配度：评估对象 = 正文中的对话引语。正文没有任何对话引语 → PASS。
+  - 论证可靠性：评估对象 = 正文中的推理/论证内容。正文没有任何论证内容 → PASS。
+  - 因果合理性 / 人物行为一致性 / 情绪弧自然度：评估对象 = 正文全部内容，不存在不适用的情况。
+  ✅ 正例: {{"dimension":"对话匹配度","result":"PASS","detail":"正文无对话引语，非缺陷"}}
+  ❌ 反例(错): {{"dimension":"对话匹配度","result":"HARD","detail":"无具体对话"}}  ← 无对话引语不是缺陷，标 HARD/SOFT 严禁。
 自检：逐条回看 result 与 detail 措辞方向是否一致，不一致就改 result，不要改 detail 去迁就。
 
 [输出要求]
 以 JSON 数组格式输出, 每项格式:
 {{"dimension": "维度名", "result": "PASS"|"HARD"|"SOFT", "detail": "PASS写理由(20-50字) / HARD·SOFT按三要素写引用+对照+方向(30-120字)", "sub": "涉及的具体子结构编号"}}
 sub 字段：必填，不允许 null。从[正文预览]的段标识（-- S01 -- 等）定位该问题主要涉及的子结构，填 "S01"/"S02"...；
-PASS 也填该维度主要依据的段；整章性问题同样定位到主要涉及的段（如全局节奏问题定到转折所在段）。
+PASS 也填该维度主要依据的段；问题涉及多段时同样定位到主要涉及的段（如全局节奏问题定到转折所在段）。
 必须包含全部 5 个维度, 仅输出 JSON 数组, 不要有其他文字.
 
 [输出示例]（PASS 写理由；HARD/SOFT 的 detail 必须含「」引用+对照+方向，sub 一律填具体段号）
@@ -340,7 +345,7 @@ PASS 也填该维度主要依据的段；整章性问题同样定位到主要涉
   {{"dimension": "因果合理性", "result": "PASS", "detail": "前文铺垫充分，转折逻辑合理", "sub": "S01"}},
   {{"dimension": "人物行为一致性", "result": "SOFT", "detail": "S03 沈青梧从「冷笑」直接跳到「含泪恳求」，中间无转折铺垫；对照其谨慎多疑的设定缺过渡；方向：补一句迟疑动作", "sub": "S03"}},
   {{"dimension": "情绪弧自然度", "result": "PASS", "detail": "情绪递进自然，与事件节奏匹配", "sub": "S02"}},
-  {{"dimension": "对话匹配度", "result": "HARD", "detail": "S02 林渊说「本座行事何须向你交代」——自称「本座」与角色档案设定（谦逊学生，用「我」）冲突；方向：改为符合学生身份的日常口吻", "sub": "S02"}},
+  {{"dimension": "对话匹配度", "result": "HARD", "detail": "S02 林渊说「本座行事何须向你交代」——自称「本座」与[角色设定]（谦逊学生，用「我」）冲突；方向：改为符合学生身份的日常口吻", "sub": "S02"}},
   {{"dimension": "论证可靠性", "result": "PASS", "detail": "推理链条完整，无逻辑漏洞", "sub": "S04"}}
 ]"""
     return prompt
@@ -390,7 +395,19 @@ def _parse_reasoning_results(cleaned: str) -> list:
     return results
 
 
-def _classify_items(results, chapter) -> list:
+def _verify_quotes(detail, sub_text) -> bool:
+    """引文回验（结构级，无语义判断）：detail 中所有「」引文（>=4 字）经空白归一后，
+    必须逐字存在于该段正文原文。找不到 = 伪造审核（照抄 prompt 示例/无中生有），
+    调用方丢弃该条。短引文（<4 字，如自称「我」）不参与校验。"""
+    norm = lambda s: re.sub(r"\s+", "", s)
+    target = norm(sub_text)
+    for q in re.findall(r"「([^「」]{4,})」", detail):
+        if norm(q) not in target:
+            return False
+    return True
+
+
+def _classify_items(results, chapter, sub_texts=None) -> list:
     """把模型输出的审核项分类为 issues 列表。
 
     铁律：代码只做结构级处理，不做任何语义猜测。
@@ -398,6 +415,7 @@ def _classify_items(results, chapter) -> list:
     - 模型把值填反了（dimension 字段是级别、result 字段是维度名） → 交换归位；
     - 两者都不是合法枚举 → 该条格式无法判定级别，交人工复核，绝不猜级别。
     什么算缺陷/瑕疵的语义判断，完全由模型按 prompt 的级别定义+正反例完成。
+    引文回验：HARD/SOFT 的 detail 中「」引文（>=4字）必须逐字存在于该段正文，否则视为伪造审核丢弃。
     """
     issues = []
     for item in results:
@@ -428,6 +446,14 @@ def _classify_items(results, chapter) -> list:
         sub = str(item.get("sub") or "").strip()
         if not re.match(r"^S\d+$", sub):
             print(f"  [推理审核] 丢弃无法定位子结构的条目: {dim} ({detail[:30]})")
+            continue
+        # 引文回验（前置规范）：引文不在正文 = 伪造审核，宁丢勿假，不依赖模型自觉。
+        sub_text = (sub_texts or {}).get(sub, "")
+        if sub_texts is not None and not sub_text:
+            print(f"  [推理审核] 丢弃无法定位段正文的条目: {dim} ({sub})")
+            continue
+        if sub_text and not _verify_quotes(detail, sub_text):
+            print(f"  [推理审核] 丢弃引文不在正文中的条目（伪造审核）: {dim} ({detail[:40]})")
             continue
         issue_file = f"{sub}.txt"
         issue_pos = f"{sub} {chapter} reasoning"
@@ -547,7 +573,7 @@ def _reasoning_impl(model, tokenizer, data, issues, state_path, chapter, chapter
             '  {"dimension": "对话匹配度", "result": "PASS|HARD|SOFT", "detail": "说明", "sub": "S03"},\n'
             '  {"dimension": "论证可靠性", "result": "PASS|HARD|SOFT", "detail": "说明", "sub": "S04"}\n'
             "]\n"
-            "注意：sub 必填（S01/S02...），不允许 null；本章无对话等维度不适用的情况标 PASS。"
+            "注意：sub 必填（S01/S02...），不允许 null；正文无对话等评估对象不存在的情况标 PASS。"
         )
 
     if not results:
@@ -558,11 +584,14 @@ def _reasoning_impl(model, tokenizer, data, issues, state_path, chapter, chapter
             "problem": "推理审核失败：模型 3 次输出均无法解析为审核 JSON（格式持续漂移/模型异常）",
             "position": f"{chapter} reasoning",
             "severity": "SOFT",
-            "suggestion": "推理审核未完成：本章因果/人格/情绪弧未经模型审核。可重跑完结审核，或人工复核后确认。"
+            "suggestion": "推理审核未完成：正文因果/人格/情绪弧未经模型审核。可重跑完结审核，或人工复核后确认。"
         })
         return issues
 
-    issues = _classify_items(results, chapter)
+    # 段正文全集（与 prompt 同源 _read_sub_file：剔标题行/末行标记），供引文回验
+    sub_texts = {p.stem: _read_sub_file(chapter_dir, p.stem)
+                 for p in sorted(Path(chapter_dir).glob("S*.txt"))}
+    issues = _classify_items(results, chapter, sub_texts)
 
     h_count = len([i for i in issues if i.get("severity") == "HARD"])
     s_count = len([i for i in issues if i.get("severity") == "SOFT"])
