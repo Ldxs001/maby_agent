@@ -615,8 +615,9 @@ def plan_map(base, pid, item, cfg, llm, log=None, force=False, progress=None):
             raise PlanError(
                 "素材共 %d 有效字，按压缩档 1:%d 撑不起 %d 期：每期脚本目标约 %d 字"
                 "，原文至少要 %d 字才够写（= 目标 × 偏移 1.25 × 1.2，不足就是"
-                "没话硬写），现有素材最多排 %d 期。请降低每期时长、减少期数，"
-                "或补充素材。"
+                "没话硬写），现有素材最多排 %d 期。请到项目卡「素材类型」弹窗"
+                "修改「计划期数」（改小，或留空按素材定），或降低每期时长、"
+                "补充素材。"
                 % (body, ratio, n_eps, target, floor_chars, max_eps))
         tight = -(-body // max(1, int(off * ratio)))
         if n_eps < tight:

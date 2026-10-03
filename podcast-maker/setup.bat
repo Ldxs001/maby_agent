@@ -1,4 +1,5 @@
 @echo off
+title Podcast Maker
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 

@@ -1501,7 +1501,11 @@ def api_plan_post(body):
                     # 侧重与素材类型同在「排图依据」这一档，界面上也是一起改的，
                     # 所以跟着同一次请求回来——分两次取，改到一半的界面会把
                     # 两个值配成不同的项目。
-                    "focus_note": (item.get("focus_note") or "") if item else ""}
+                    "focus_note": (item.get("focus_note") or "") if item else "",
+                    # 计划期数跟排图依据同一次回来：重排弹窗里要能显示并改它
+                    # （三态：空＝按素材定，数字＝按数排）；排图后的回填由
+                    # project_store.set_map 负责，两处写同一字段不打架。
+                    "planned_episodes": item.get("planned_episodes") if item else None}
         if action == "save":
             item = project_store.set_map(base, pid, body.get("episodes") or [])
             return {"ok": True, "logs": logs,
@@ -4479,7 +4483,7 @@ async function doPlanMap(pid){
   // 一次比一次小。节数多时调用次数也多，这一等就是几十分钟——与脚本生成同款
   // 后台化：弹窗里看逐条日志与进度，跑完自动重开地图面板。
   const r=await api('/api/plan',{action:'map',project_id:pid});
-  if(!r.ok){showPlanReport('排图未开始',[],[r.error||'未知原因']);return}
+  if(!r.ok){showPlanReport('排图未开始',[],[r.error||'未知原因'],pid);return}
   taskModal('排图中 · '+esc(projName(pid)));
   watchTask(r.task_id, async j=>{
     const res=j.result||{};
@@ -4490,16 +4494,20 @@ async function doPlanMap(pid){
     openMap(pid);
     // 告警不能只写进进度日志：模型排的期数与项目定的不符、单元没被分进任何一期、
     // 同系列被拆，这些都是「结果已落库但需要人核对」，不弹出来就等于没报。
-    showPlanReport('排图结果',j.log,res.warnings);
+    showPlanReport('排图结果',j.log,res.warnings,pid);
   }, j=>{
-    showPlanReport('排图未完成',j.log,[j.error||'未知原因']);
+    showPlanReport('排图未完成',j.log,[j.error||'未知原因'],pid);
   });
 }
-function showPlanReport(title,logs,warns){
+function showPlanReport(title,logs,warns,pid){
   const ws=(warns||[]).filter(Boolean);
   const ls=(logs||[]).slice(-14);
   if(!ws.length&&!ls.length) return;
   let h='';
+  // 排图失败（期数/产能类报错）要有出口：报告弹窗直接给「去改排图依据」，
+  // 不让人对着「请减少期数」的提示找半天入口。editParadigm 会替换本弹窗。
+  if(pid) h+='<div class="btn-row" style="margin-bottom:12px">'+
+     '<button class="btn" onclick="editParadigm(\''+esc(pid)+'\')">去改排图依据</button></div>';
   if(ws.length){
     h+='<p class="note">以下几条请核对后再出片：</p><ul style="margin:0 0 0 18px">'+
        ws.map(w=>'<li>'+esc(w)+'</li>').join('')+'</ul>';
@@ -4530,7 +4538,7 @@ async function editParadigm(pid){
     opt+='<option value="'+esc(k)+'"'+(k===r.current?' selected':'')+'>'+
          esc(r.options[k].label)+'</option>';
   });
-  let h='<p class="note">这两样都是排地图的组织依据，只影响分组（怎么切、怎么并），'+
+  let h='<p class="note">这几样都是排地图的组织依据（素材类型、重点方向、计划期数），只影响分组（怎么切、怎么并、排几期），'+
         '不影响写脚本。与规划方式不同，它们不产生产物，改完自己决定要不要重排。</p>';
   h+='<div class="f"><label>素材类型</label><select id="para-sel" onchange="paraDesc()">'+
      opt+'</select><div class="desc" id="para-desc" style="margin-top:6px"></div></div>';
@@ -4538,6 +4546,10 @@ async function editParadigm(pid){
      '侧重的部分合得细、多占期数，次要的合得粗</span></label>'+
      '<textarea id="para-focus" rows="3" placeholder="如：多解析方法论，少讲技术细节与实现">'+
      esc(r.focus_note||'')+'</textarea></div>';
+  h+='<div class="f"><label>计划期数 <span class="hint">留空＝由模型按素材体量定；填数字＝按这个数排'+
+     '（素材撑不起时直接拦下并报最多可排几期；超出单次上限按上限排）</span></label>'+
+     '<input id="para-eps" type="number" min="1" step="1" placeholder="留空＝按素材定" '+
+     'value="'+esc(r.planned_episodes?String(r.planned_episodes):'')+'"></div>';
   h+='<div class="btn-row" style="margin-top:12px">'+
      '<button class="btn" onclick="saveParadigm(\''+esc(pid)+'\',false)">只保存（保留旧地图）</button>'+
      '<button class="btn primary" onclick="saveParadigm(\''+esc(pid)+'\',true)">保存并重排地图</button>'+
@@ -4556,8 +4568,11 @@ function paraDesc(){
 async function saveParadigm(pid, redo){
   const sel=el('para-sel'); if(!sel) return;
   const foc=el('para-focus');
+  const eps=el('para-eps');
+  // 期数三态跟着依据一起存：空串＝由模型按素材定（服务端归一成 None）。
   const r=await api('/api/project',{action:'update',id:pid,paradigm:sel.value,
-    focus_note:foc?foc.value.trim():''});
+    focus_note:foc?foc.value.trim():'',
+    planned_episodes:eps?(String(parseInt(eps.value,10)||'')):''});
   if(!r.ok){toast(r.error,'err');return}
   await loadProjects();
   closeModal();
@@ -4598,24 +4613,9 @@ async function openMap(pid){
        '<td><button class="mini" onclick="this.closest(\'tr\').remove()">✕</button></td></tr>';
   });
   h+='</tbody></table></div>';
-  h+='<div style="margin-top:10px"><button class="mini" onclick="addMapRow()">+ 加一期</button></div>';
+  // 「+ 加一期」已删：新增期走「排图依据 → 计划期数 → 保存并重排」。
+  // 人手加的期没有素材落点，出片按落点取料时取不到——一个必然出不了片的期只是摆设。
   modalHtml('期数地图 · '+esc(p.name),h,()=>saveMap(pid),'保存',true);
-}
-
-function addMapRow(){
-  const tb=el('map-tbl').querySelector('tbody');
-  const nums=Array.from(tb.querySelectorAll('tr')).map(tr=>{
-    const m=/^(\d+)/.exec(tr.dataset.no||''); return m?parseInt(m[1],10):0;});
-  const no=String((nums.length?Math.max.apply(null,nums):0)+1);
-  const tr=document.createElement('tr');
-  tr.dataset.no=no; tr.dataset.refs='[]';
-  tr.innerHTML='<td>'+esc(no)+'</td>'+
-    '<td><input class="m-title" value=""></td>'+
-    '<td><input class="m-gist" value=""></td>'+
-    '<td><textarea class="m-points" rows="2"></textarea></td>'+
-    '<td class="refs"><span style="color:var(--red)">无落点</span></td>'+
-    '<td><button class="mini" onclick="this.closest(\'tr\').remove()">✕</button></td>';
-  tb.appendChild(tr);
 }
 
 async function saveMap(pid){
