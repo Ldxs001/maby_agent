@@ -182,7 +182,6 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
             "/api/batch_progress": cls._handle_batch_progress,
             "/api/outputs": cls._handle_outputs_list,
             "/api/outputs/read": cls._handle_outputs_read,
-            "/api/outputs/merge": cls._handle_outputs_merge,
             "/api/outputs/texpdf": cls._handle_outputs_texpdf,
             "/api/examples": cls._handle_list_examples,
             "/api/plugins": cls._handle_list_plugins,
@@ -190,6 +189,7 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
         cls.ROUTES["POST"] = {
             "/api/config": cls._handle_update_config,
             "/api/outputs/delete": cls._handle_outputs_delete,
+            "/api/outputs/merge": cls._handle_outputs_merge,
             "/api/plan": cls._handle_plan,
             "/api/generate": cls._handle_generate,
             "/api/session/new": cls._handle_new_session,
@@ -4546,12 +4546,12 @@ function validateNovelTemplate(data) {
 // ===== 保存到当前模板 =====
 function saveCurrentTemplate() {
   const name = document.getElementById('template-select').value;
-  if (!name) { alert('未选择模板'); return; }
+  if (!name) { showToast('未选择模板', 'warn'); return; }
   const builtins = window._lastBuiltins || [];
-  if (builtins.includes(name)) { alert('内置模板只读，请使用"另存为"创建副本修改'); return; }
+  if (builtins.includes(name)) { showToast('内置模板只读，请使用"另存为"创建副本修改', 'warn'); return; }
   const data = collectTemplateData();
   const novelErr = validateNovelTemplate(data);
-  if (novelErr) { alert(novelErr); return; }
+  if (novelErr) { showToast(novelErr, 'warn'); return; }
   const btn = document.getElementById('save-current-template-btn');
   const origText = btn ? btn.textContent : '';
   if (btn) { btn.textContent = '保存中...'; btn.disabled = true; }
@@ -5465,7 +5465,7 @@ function startPlanning(topic) {
   // 小说线：题材必填（题材=场景配置/世界观根，缺失整篇漂移）；篇幅可不填（默认中篇）
   if (isNovelTemplateSelected() && !meta['题材']) {
     statusEl.remove();
-    alert('小说需要填写「题材」（如 科幻/武侠/悬疑/都市/奇幻/历史）——题材决定场景配置与世界观，缺失会导致 AI 瞎编。篇幅可不填（默认中篇）。');
+    showToast('小说需要填写「题材」（如 科幻/武侠/悬疑/都市/奇幻/历史）——题材决定场景配置与世界观，缺失会导致 AI 瞎编。篇幅可不填（默认中篇）。', 'warn');
     return;
   }
   fetch('/api/plan', {
@@ -5773,7 +5773,7 @@ function onAuxFilesSelected(event) {
     const isText = ext === 'txt' || ext === 'md';
     const isTable = ext === 'csv' || ext === 'db';
     const isImage = ['png','jpg','jpeg','gif'].includes(ext);
-    if (!isText && !isTable && !isImage) { alert('不支持的文件类型: ' + file.name); return; }
+    if (!isText && !isTable && !isImage) { showToast('不支持的文件类型: ' + file.name, 'warn'); return; }
     if (isText) {
       // 文字：本地读内容
       const reader = new FileReader();
@@ -5790,8 +5790,8 @@ function onAuxFilesSelected(event) {
           body: JSON.stringify({name: file.name, b64: b64})
         }).then(r => r.json()).then(d => {
           if (d.success) addAuxFile({name: d.name, type: d.type, path: d.path});
-          else alert('上传失败: ' + (d.error || ''));
-        }).catch(() => alert('上传失败（网络错误）'));
+          else showToast('上传失败: ' + (d.error || ''), 'error');
+        }).catch(() => showToast('上传失败（网络错误）', 'error'));
       };
       reader.readAsDataURL(file);
     }
@@ -6002,7 +6002,7 @@ function startAutoGeneration() {
     // 小说线：题材必填（自动撰写入口同样拦截）
     if (isNovelTemplateSelected() && !meta['题材']) {
       statusEl.remove();
-      alert('小说需要填写「题材」（如 科幻/武侠/悬疑/都市/奇幻/历史）——题材决定场景配置与世界观。篇幅可不填（默认中篇）。');
+      showToast('小说需要填写「题材」（如 科幻/武侠/悬疑/都市/奇幻/历史）——题材决定场景配置与世界观。篇幅可不填（默认中篇）。', 'warn');
       return;
     }
     fetch('/api/plan', {
@@ -6465,6 +6465,26 @@ function addUserMsg(text) {
   container.scrollTop = container.scrollHeight;
 }
 
+// ===== Toast 通知（统一替代浏览器原生 alert，铁律：禁用原生弹框）=====
+function showToast(msg, type) {
+  type = type || 'error';
+  let box = document.getElementById('toast-box');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toast-box';
+    box.style.cssText = 'position:fixed;top:16px;right:16px;z-index:99999;display:flex;flex-direction:column;gap:8px;max-width:360px;';
+    document.body.appendChild(box);
+  }
+  const colors = {error: ['#e94560', '#fff'], warn: ['#f0a020', '#1a1a2e'], info: ['#2a9d8f', '#fff']};
+  const c = colors[type] || colors.error;
+  const t = document.createElement('div');
+  t.style.cssText = 'padding:10px 14px;border-radius:6px;font-size:13px;line-height:1.5;box-shadow:0 4px 12px rgba(0,0,0,.35);background:' + c[0] + ';color:' + c[1] + ';word-break:break-all;cursor:pointer;';
+  t.textContent = msg;
+  t.onclick = function () { t.remove(); };
+  box.appendChild(t);
+  setTimeout(function () { t.remove(); }, type === 'error' ? 6000 : 3500);
+}
+
 function addAssistantMsg(html) {
   const container = document.getElementById('chat-messages');
   const div = document.createElement('div');
@@ -6633,7 +6653,7 @@ async function confirmNovelChapter() {
     });
     const d = await r.json();
     if (!d.success) {
-      alert(d.error || '确认失败');
+      showToast(d.error || '确认失败', 'error');
       _ncConfirming = false;
       return;
     }
@@ -6643,7 +6663,7 @@ async function confirmNovelChapter() {
     const ncPanel = document.getElementById('novel-confirm-panel');
     if (ncPanel) ncPanel.style.display = 'none';
     addAssistantMsg('✅ 本章已确认，开始写作。');  // 大纲卡片状态由轮询在 1.5s 内自动刷新
-  } catch (e) { alert('确认失败: ' + e); _ncConfirming = false; }
+  } catch (e) { showToast('确认失败: ' + e, 'error'); _ncConfirming = false; }
 }
 
 // ===== 修复引擎面板（P3：章检问题 → 勾选子结构 → 写作模型整段重构） =====
@@ -7081,11 +7101,11 @@ function mergeNovel(name) {
       addAssistantMsg('✅ 已拼合整本：' + d.name + '（' + d.chapter_count + ' 章，' + (d.size||0) + ' 字节），输出列表已更新');
       loadOutputs();
     } else {
-      alert('拼合失败：' + (d.error || '未知错误'));
+      showToast('拼合失败：' + (d.error || '未知错误'), 'error');
     }
   }).catch(e => {
     if (btn) { btn.textContent = '拼合'; btn.disabled = false; }
-    alert('拼合请求失败：' + e.message);
+    showToast('拼合请求失败：' + e.message, 'error');
   });
 }
 

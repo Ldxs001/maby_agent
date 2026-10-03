@@ -3,6 +3,15 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [3.1.14] - 2026-10-03
+### 修复（拼合 404——路由方法错位，自 3.1.3 起从未成功过）+ UI 原生弹框清零（toast 化）
+> 事件 1：输出面板点「拼合」弹"拼合失败：Not found"——探针实测 POST /api/outputs/merge 返回通用 404（若路由在位应返回 400 缺少 file 参数）。根因：该路由自 v3.1.3 起被注册进 GET 路由表，而前端 mergeNovel 发的是 POST，POST 表无此条 → 分发 404。**拼合功能自诞生起从未成功过，本次首次修复**。事件 2：web_ui.py 从未做过 toast 化（grep toast 零命中），残留 12 处浏览器原生 alert()——"统一 toast+模态框、禁用原生弹框"铁律此前只落在 rag-assistant/Orchestrator，本文件整批遗漏。
+
+- **web_ui.py · 路由方法归位**：`"/api/outputs/merge"` 从 GET 表挪进 POST 表（handler `_handle_outputs_merge` 用 `_read_body()` 读 POST body，语义本就是 POST）；GET 表读接口（/api/outputs、/api/outputs/read）不动
+- **web_ui.py · showToast 组件**：新增右上角固定容器 toast（error 红 6s / warn 橙 3.5s / info 绿 3.5s，点击即消，深色主题配色，word-break 防长串溢出）——原生 alert 的统一替代
+- **web_ui.py · 12 处 alert() 全部替换**：拼合失败 2（error）、模板保存校验 3（warn）、小说题材必填校验 2（warn）、附件上传失败 3（error）、确认失败 2（error）；confirm()/prompt() 核查零残留——此后全站无浏览器原生弹框
+- **验证**：脚本 + count 断言（全文件 alert( 计数=0 / merge 在 POST 表且不在 GET 表 / showToast 唯一定义）；`py_compile` 通过；真包导入模拟路由分发 PASS（StructuredWriterHandler：POST /api/outputs/merge → _handle_outputs_merge，GET 表无残留）；`check_version` 三端 + README 头部一致
+
 ## [3.1.13] - 2026-10-03
 ### 修复（推理审核伪造引文——判定模型照抄 few-shot 示例）+ prompt 术语统一
 > 事件：L09/S02 推理审核反复产出「S02 林渊说『本座行事何须向你交代』——自称『本座』…」的假问题，N 次复现逐字一致。排查：正文（L09 全段为第一人称独白）零「本座」、林渊在 S02 无台词、全项目数据仅问题记录自身含该词——detail 引文逐字不存在于正文，属伪造审核。根因：判定模型（R1-1.5B）在"正文无对话、该 PASS"场景下，把 3.1.12 写入 prompt 的 HARD ✅正例（含具体人名+编造引语）照抄成审核结论（输出 64 字逐字嵌在 detail 中；输出结构完美，只能来自 few-shot 模仿而非区块误读）。既有"维度不适用→PASS"规则（3.1.11 补）被模仿压力压过，再加同类规则无效（已证伪）——修复必须落代码层。
