@@ -2019,24 +2019,32 @@ def _plan_payload(title="测试标题", n=2):
                       ensure_ascii=False)
 
 
+_SEG_PAYLOAD_SEQ = [0]      # 全局递增：多次调用（多个段）的句子也不许撞
+
+
 def _seg_payload(n):
     """造一个 n 句的段，**每句 31 字（30 字正文 + 句尾标点），句句不同**。
 
     长度必须稳稳停在 31 字：几个测试按字数核账（如 10 句 310 字、压字后 395 字），
     桩数据一改长度，那些断言跟着漂——测的就不是主体了。
 
-    「句句不同」也是必须的：段内现在有「查重 → 就地替换」这一步（补字之后立刻查、
-    把后出现的副本换成新内容）。十句一字不差的桩数据会被判成十处复读、拉起替换轮，
-    而真机里一段根本不会输出十句完全一样的台词——桩自己造了一个流程里不会出现的
-    场景，测出来的东西就不算数了。序号同时保证归一化后仍互不相同。
+    「句句不同」也是必须的，而且**跨调用也不许撞**：段内每一轮收口前都有
+    「查重 → 就地替换」（首轮也过），判重范围是前面所有已写正文——上一段用过
+    的句子这一段再出现，替换轮就会当场点火把句子换掉，字数账全漂。所以序号
+    用全局递增：同一次测试里造的第二段从第一段没用的标记接着排。
+
+    「句内用汉字做区分标记」：核账走的是 `duration_model.effective_chars`
+    （汉字 / 标点 / 西文各有各的折合），掺一个数字进去，段的有效字就跟着变，
+    压字量、总字数那些断言全漂。
     """
     lines = []
     marks = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥"
+    base = _SEG_PAYLOAD_SEQ[0]
+    _SEG_PAYLOAD_SEQ[0] += n
     for i in range(n):
-        # 用**汉字**做区分标记，一个 ASCII 字符都不掺：核账走的是
-        # `duration_model.effective_chars`（汉字 / 标点 / 西文各有各的折合），
-        # 掺一个数字进去，段的有效字就跟着变，压字量、总字数那些断言全漂。
-        head = marks[i % len(marks)] + marks[(i // len(marks)) % len(marks)]
+        i2 = base + i
+        # 用**汉字**做区分标记，一个 ASCII 字符都不掺。
+        head = marks[i2 % len(marks)] + marks[(i2 // len(marks)) % len(marks)]
         body = head + "甲" * (30 - 2)                      # 恰好 30 字
         lines.append({"speaker": "A" if i % 2 == 0 else "B", "emotion": "承接",
                       "text": body + "。"})
@@ -3154,7 +3162,7 @@ class TestSegmentedGeneration(unittest.TestCase):
     def test_generate_routes_through_segments_for_mapped_project(self):
         # 路线判据是项目模式，不是配置开关：mapped（成稿规划）走分段。
         llm = _SegmentedLLM([_plan_payload("分段标题", n=2)],
-                            [_seg_payload(3)] * 6,
+                            [_seg_payload(3) for _ in range(6)],
                             content_replies=[SEM_PASS] * 3)
         res = S.generate("素" * 200, self._cfg(), llm, log=lambda m: None,
                          project={"title": "书名", "gist": "总主旨",
@@ -3198,7 +3206,7 @@ class TestSegmentedGeneration(unittest.TestCase):
         按句数对得上不足以证明，正文凑巧提到同样的字也照样数得对。
         """
         llm = _SegmentedLLM([_plan_payload("分段标题", n=2)],
-                            [_seg_payload(3)] * 6,
+                            [_seg_payload(3) for _ in range(6)],
                             content_replies=[SEM_PASS] * 3)
         res = S.generate("素" * 200, self._cfg(), llm, log=lambda m: None,
                          project={"title": "书名", "gist": "总主旨",

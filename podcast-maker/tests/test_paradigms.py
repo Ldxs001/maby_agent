@@ -317,12 +317,13 @@ class TestFocusNote(unittest.TestCase):
 
 
 class TestDialogueForm(unittest.TestCase):
-    """对话形式：默认跟卡走，选了就顶掉卡上那段站位说明。
+    """对话形式：默认跟卡走；选了形式，站位与形式**两段并存**。
 
     站位（谁懂谁不懂）与形式（话怎么交错、两人各能连说几句）是两件事。从前
     形式写死在卡上的 `cast` 里，于是不论什么素材出来都是同一套问答节奏。单拎成
-    一维之后，卡上只留一个默认形式：不选＝按卡上那个形式走、卡上的站位照旧；
-    选了就把站位顶掉（形式的说明里已经写了谁干什么活）。
+    一维之后，卡上只留一个默认形式。曾经「选了就把站位顶掉」——那把卡上唯一
+    带文体味的一段文案挡在了提示词外面（小说卡的评书站位就是这样丢的），所以
+    现在改成**站位归卡、节奏归形式，两段并存、互不顶掉**。
 
     默认态有一处**可感知的变化**（v0.31.0）：上限的展示从卡上那一个数变成
     「A …句、B …句」两条，数值也跟着形式走（方法论卡原来是「两人都 2 句」，
@@ -385,12 +386,12 @@ class TestDialogueForm(unittest.TestCase):
         self.assertEqual(S._hosts_text({"cast": ""}, cfg, ""),
                          S._hosts_text({"cast": ""}, cfg))
 
-    def test_chosen_form_replaces_the_cards_cast(self):
-        """选了形式就**顶掉**卡上那段站位说明——是覆盖，不是并列两个来源。"""
+    def test_chosen_form_keeps_the_cards_cast(self):
+        """选了形式，卡上的站位**照旧进提示词**——站位归卡、节奏归形式，两段并存。"""
         cfg, card = self._cfg(), {"cast": "甲甲甲站位"}
         picked = S._hosts_text(card, cfg, "debate")
-        self.assertNotIn("甲甲甲站位", picked, "形式覆盖卡上的站位说明")
-        self.assertIn("观点对辩", picked)
+        self.assertIn("甲甲甲站位", picked, "站位归卡：选了形式也不顶掉卡上的站位")
+        self.assertIn("观点对辩", picked, "形式的角色块同样要在")
         self.assertIn("小美", picked, "播讲人称呼两种情况下都保留")
         self.assertIn("甲甲甲站位", S._hosts_text(card, cfg),
                       "不选形式时卡上那段照旧生效")
@@ -423,11 +424,11 @@ class TestDialogueForm(unittest.TestCase):
             self.assertNotIn("- A 是", text, "%s：没人选，不许出现形式的角色块" % name)
             self.assertIn(PG.rhythm_text(key), text, "%s：节奏那一句要在" % name)
 
-    def test_the_cards_cast_never_survives_a_chosen_form(self):
-        """三处提示词都要把卡上那段站位顶掉——只顶一处等于没顶。
+    def test_the_cards_cast_survives_a_chosen_form(self):
+        """三处提示词里卡上的站位与形式的角色**同时在**——少任何一段都算丢。
 
-        卡上的站位从前还会被拼块另贴一份进【文体依据】，于是选中形式之后
-        提示词里同时有两套分工说法，而且是卡上那份**永远顶不掉**。
+        站位归卡（谁站在什么位置），节奏归形式（这一期怎么接）；两段并存，
+        互不顶掉。曾经形式整体顶掉站位，卡上那段文案压根进不了提示词。
         """
         cfg = self._cfg(**{"script.dialogue_form": "anchor"})
         card = PG.get("methodology")
@@ -438,8 +439,8 @@ class TestDialogueForm(unittest.TestCase):
             "插入": S.insert_system(card, cfg),
         }
         for name, text in texts.items():
-            self.assertNotIn("A 是提问方", text, "%s：卡上站位没被形式顶掉" % name)
-            self.assertIn("主讲＋捧哏", text, name)
+            self.assertIn("A 是提问方", text, "%s：卡上站位丢了" % name)
+            self.assertIn("主讲＋捧哏", text, "%s：形式角色丢了" % name)
 
     def test_the_run_caps_follow_the_form_in_every_prompt(self):
         """节奏与上限在三处都与形式同源；「没人选」时取的是卡上的默认形式。
@@ -670,8 +671,9 @@ class TestRunCapsHaveOneSource(unittest.TestCase):
         正文就被 `emotion_vocab` 门禁打回，那一轮白写。
         """
         src = self._src("script_engine.py")
-        # 定义一处 + 四处调用（整篇 / 分段 / 插入 / 就地替换）
-        self.assertEqual(src.count("_vocab_block()"), 5)
+        # 定义一处 + 四处调用（整篇 / 分段 / 插入 / 就地替换）；调用都带卡
+        # （`_vocab_block(card)`：基础表 + 卡上 voice.vocab，同源一份）。
+        self.assertEqual(src.count("_vocab_block(card)"), 4)
         self.assertEqual(src.count("_style_block(preset)"), 5)
         # 节奏与上限也只有一个取法口：各写一份就会出现插入按另一种节奏补句
         calls = re.findall(r"[^`]paradigms\.run_caps\(", src)

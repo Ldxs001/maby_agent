@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 
 # ============================================================================
@@ -472,9 +472,10 @@ MODE_SPEC = {
 #     里删掉。人在界面上配不出、也验不了它，只有提示词列的词与门禁判的词对不上
 #     的时候才露出来——「词表外标签」那条报错正是它的来路。
 #
-# 两维都拆掉之后，语篇词表**只剩一份**（DISCOURSE_ORDER，八词）：提示词列的、
-# 输出 schema 枚举的、界面下拉给的、门禁判的，读的是同一个常量，不可能再出现
-# 「写的与判的对不上」。
+# 两维都拆掉之后，语篇词表收口在**一个来源**：基础表（DISCOURSE_ORDER，八词）
+# ＋素材类型卡上 `voice.vocab` 声明的扩展，合成一份全集（script_engine
+# .vocab_words(card)）。提示词列的、输出 schema 枚举的、门禁判的读的都是
+# 这一个来源，不可能再出现「写的与判的对不上」。
 STYLE_DIMS = {
     "genre": {"label": "体裁", "options": {
         "argument": "论证型", "story": "故事型", "science": "科普型",

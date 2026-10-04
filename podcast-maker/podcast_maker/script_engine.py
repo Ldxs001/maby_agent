@@ -60,7 +60,8 @@ def material_capacity(cfg):
 #
 # 三维都进提示词，**都不碰语篇词表**。风格倾向只管调子：按什么路子推进、拿多少
 # 比方、用不用互动词。谁说几句、多久问一次，都不归它管——「多久问一次」归对话
-# 形式（见 paradigms.DIALOGUE_FORMS），语篇词表则只有一份常量（DISCOURSE_ORDER）。
+# 形式（见 paradigms.DIALOGUE_FORMS），语篇词表＝基础表（DISCOURSE_ORDER）＋
+# 卡上 `voice.vocab` 扩展，合成一份全集（`vocab_words(card)`）。
 STYLE_GUIDE = {
     "metaphor_density": {
         "low": "比喻最多一两处，别句句打比方",
@@ -125,24 +126,32 @@ DISCOURSE_HELP = {
 #: （`glue_intro_outro`），正文没有哪一句该背这两个标签。
 
 
-def vocab_words():
-    """本篇可填的语篇标签（就是全集，顺序即 DISCOURSE_ORDER）。
+def vocab_words(card=None):
+    """本篇可填的语篇标签：基础表（DISCOURSE_ORDER）＋卡上 `voice.vocab`
+    声明的扩展，合成**一份全集**，顺序＝基础表在前、扩展按卡上声明序。
 
-    留这个函数是为了让「词表从哪来」在调用处一眼看得见：提示词、输出 schema、
-    门禁三处都调它，谁也别自己列一份。
+    提示词词表块、输出 schema 枚举、门禁三处都调它（谁也别自己列一份）；
+    不传卡就是基础表——行为与分卡之前完全一致。
     """
-    return list(DISCOURSE_ORDER)
+    out = list(DISCOURSE_ORDER)
+    for w in (paradigms.voice_of(card).get("vocab") or {}):
+        if w and w not in out:
+            out.append(w)
+    return out
 
 
-def _vocab_block():
+def _vocab_block(card=None):
     """语篇词表与释义：每个词干什么活。
 
-    整篇、分段、插入三处共用**同一份**（`vocab_words()` + `DISCOURSE_HELP`
-    释义）。各处自己列一份的后果是写作按一份枚举写、插入却按另一份写——插入句
-    一落进去就被 `emotion_vocab` 门禁打回，那一轮补的字全废。
+    整篇、分段、插入三处共用**同一份**（`vocab_words(card)` + `DISCOURSE_HELP`
+    与卡上 `voice.vocab` 的释义）。各处自己列一份的后果是写作按一份枚举写、
+    插入却按另一份写——插入句一落进去就被 `emotion_vocab` 门禁打回，那一轮
+    补的字全废。
     """
-    return "\n".join("    - %s：%s" % (w, DISCOURSE_HELP[w])
-                     for w in vocab_words())
+    help_map = dict(DISCOURSE_HELP)
+    help_map.update(paradigms.voice_of(card).get("vocab") or {})
+    return "\n".join("    - %s：%s" % (w, help_map[w])
+                     for w in vocab_words(card))
 
 
 def _line_item_schema(vocab):
@@ -396,16 +405,18 @@ def build_system_prompt(cfg, preset_key, target_chars, line_count, project=None,
         middle += "\n\n"
 
     # 站位写在卡上就从卡上取；卡上没写（自定义卡留空）才退回内置的分工口径。
-    # 对话形式选了就顶掉卡上那段站位说明（没选＝按卡走）。卡上那份站位**不再**
-    # 由 card_block 另贴一次——两处都贴，选中形式也顶不掉卡上那份，提示词里就
-    # 会有两套分工说法同时在。
+    # 对话形式选了也不顶掉卡上的站位——站位归卡、节奏归形式，两段并存
+    # （`_hosts_text`）。卡上那份站位**不再**由 card_block 另贴一次——两处都贴，
+    # 提示词里就会有两套站位说法同时在。
     hosts = _hosts_text(card, cfg, chosen_form)
 
     # 语篇词表只有一份：枚举里没有的词约束解码选不出来，提示词只负责
     # 把「每个词干什么活」讲清。拼法收口在 `_vocab_block`——插入那一轮用同一份。
-    vocab_help = _vocab_block()
+    # 基础表 + 卡上 `voice.vocab` 扩展，同源（`vocab_words(card)`）。
+    voice = paradigms.voice_of(card)
+    vocab_help = _vocab_block(card)
 
-    return """你负责把素材改写成两位主持人的对话脚本。
+    return """%s
 
 【片头片尾】（不归你写，一句都不要写）
 片头与片尾是节目的固定标识，由程序在整期定稿那一刻逐字粘上去——**你只写正文**。
@@ -448,7 +459,7 @@ def build_system_prompt(cfg, preset_key, target_chars, line_count, project=None,
    一个例子）由同一个人说完，**不许拆给两个人**；分工只说明各自的主场，
    不要求每句对调。**两人的连句上限按上面【文体依据】给的那两个数**——
    那是上限不是目标，谁都不许超过它。
-4. 台词里的每个论断都要能对应到素材内容，不添加素材之外的事实、数据或来源。
+4. %s
 5. 措辞禁忌（全篇写完后再逐句回查一遍，命中就当场改掉）。每组给了替代说法，
    照着换；不要换成一个意思相同、照样把话说满的说法，那只是把同一个毛病换了层壳。
 %s
@@ -460,12 +471,14 @@ def build_system_prompt(cfg, preset_key, target_chars, line_count, project=None,
 【两位主持人】（既定阵容，不由你指定）
 %s
 """ % (
+        voice["duty"],
         line_count,
         TITLE_MAX,
         plan_hint,
         vocab_help,
         middle,
         min_c, max_c, int(target_chars),
+        voice["mapping"],
         banned_block,
         READABLE_RULE,
         style_block,
@@ -474,16 +487,19 @@ def build_system_prompt(cfg, preset_key, target_chars, line_count, project=None,
 
 
 def build_user_prompt(material, cfg, previous_report=None,
-                      previous_lines=None):
+                      previous_lines=None, card=None):
     """拼用户提示词。回灌重写时把上一版正文一并带上。
 
     带正文不是为了好看：反馈点到「第 58 句命中」，模型却看不到第 58 句原本写了
     什么，就只能凭印象通篇重写——重写出来的新句又会带进新的命中，上一轮改掉的
     地方白改，几轮全耗在打地鼠上。给了原稿，才是「只改这一句」。
+
+    `card` 决定【素材】块头那句对应要求：文体归卡（`voice.mapping`），不传落
+    默认口径（讲解体，行为与从前一致）。
     """
+    voice = paradigms.voice_of(card)
     parts = []
-    parts.append("【素材】（改写依据；台词里的每个论断都要能对应到这里，"
-                 "不添加素材之外的事实、数据或来源）\n%s" % material)
+    parts.append("【素材】（改写依据；%s）\n%s" % (voice["mapping"], material))
     if previous_report:
         parts.append(
             "【上一版正文】（这一版没过校验，下面是它的全文，供你对照）\n%s\n\n"
@@ -622,18 +638,19 @@ def title_from_lines(lines):
     return ""
 
 
-def normalize_script(data, cfg):
+def normalize_script(data, cfg, vocab=None):
     """格式确定性后处理（08b：格式轴硬编码收束）。
 
-    - 字段缺失即补位（speaker 缺省承接上一句、text 补字距并折叠空白、emotion 不在词表
-      落中性档「承接」）
+    - 字段缺失即补位（speaker 缺省承接上一句、text 补字距并折叠空白、emotion
+      不在词表落中性档「承接」）
     - 空 text 的条目直接丢弃
     - estimated_seconds 由时长模型按标准语速计算，丢弃 LLM 给的任何数字
 
-    emotion 的收束分两层：这里按**全表**收（词表外的值一律落承接，旧稿、
-    片头尾模板等没有标签的句子也在这里补齐）；语篇词表（本篇可填哪些词）
-    由 emotion_vocab 门禁按 preset 判，不在这里越权。
+    emotion 的收束分两层：这里按**本篇词表**收（`vocab`＝`vocab_words(card)`
+    的产物，缺省退基础表——基础表场景行为与从前一致）；语篇标签的生成侧约束
+    由 schema 枚举与 emotion_vocab 门禁管，不在这里越权。
     """
+    allowed = list(vocab) if vocab else list(DISCOURSE_ORDER)
     out = []
     for i, item in enumerate(data):
         if not isinstance(item, dict):
@@ -645,7 +662,7 @@ def normalize_script(data, cfg):
             # 定义成「第几句」——模型漏一个字母，一个人的半句话就被判给了对方。
             speaker = out[-1]["speaker"] if out else "A"
         emotion = str(item.get("emotion") or "").strip()
-        if emotion not in DISCOURSE_ORDER:
+        if emotion not in allowed:
             emotion = DISCOURSE_NEUTRAL
         text = tidy_text(item.get("text", ""))
         if not text:
@@ -1036,10 +1053,11 @@ def gate_generate(script, cfg, paradigm=None, extra_tags=()):
     add("fields_complete", not missing,
         "缺字段句子：%s" % missing if missing else "全部齐备")
 
-    # 语篇词表：emotion 只认 DISCOURSE_ORDER 里的八个词（`vocab_words()`）。
-    # 枚举层已经拦了绝大多数越界，这里兜的是降级路（无约束解码）的漏网。
-    # `extra_tags` 见函数说明：只给重判，用来认程序粘上去的片头尾标签。
-    vocab = vocab_words()
+    # 语篇词表：emotion 只认本篇词表（基础表 + 卡上 `voice.vocab`，同源
+    # `vocab_words(paradigm)`）。枚举层已经拦了绝大多数越界，这里兜的是降级路
+    # （无约束解码）的漏网。`extra_tags` 见函数说明：只给重判，用来认程序粘上
+    # 的片头尾标签。
+    vocab = vocab_words(paradigm)
     allowed = set(vocab) | set(extra_tags or ())
     off_vocab = [i + 1 for i, s in enumerate(script)
                  if i + 1 not in glue_lines and s.get("emotion") not in allowed]
@@ -2264,7 +2282,7 @@ def replace_span(was, cfg=None):
     return min(lo, hi), hi
 
 
-def apply_patch(script, edits, targets, inserts=None, cfg=None):
+def apply_patch(script, edits, targets, inserts=None, cfg=None, vocab=None):
     """把补丁落回原稿。默认只换字段、行数不变；**并句与插入是两个例外**。
 
     行数不变是这条路的根基：门禁报的「第 N 句」在补丁前后指的是同一行。两个例外
@@ -2445,7 +2463,7 @@ def apply_patch(script, edits, targets, inserts=None, cfg=None):
                                        % (ins.get("speaker"),)})
             continue
         emotion = ins.get("emotion")
-        if emotion not in DISCOURSE_ORDER:
+        if emotion not in (list(vocab) if vocab else DISCOURSE_ORDER):
             rejected.append({"index": after,
                              "reason": "emotion 不在本篇词表内：%r" % (emotion,)})
             continue
@@ -2467,7 +2485,7 @@ def apply_patch(script, edits, targets, inserts=None, cfg=None):
             # emotion 只在模型带了且合法时才落——没带就保留原标签。说话人则一律
             # 不采纳：超限不许靠换人解决（A 的一句问话翻给 B，就成了 B 自己问自己），
             # 片头尾那两句归 `glue_intro_outro`，都不在模型手里。
-            if heads[i].get("emotion") in DISCOURSE_ORDER:
+            if heads[i].get("emotion") in (list(vocab) if vocab else DISCOURSE_ORDER):
                 row["emotion"] = heads[i]["emotion"]
         out.append(row)
         # 插入的句子紧跟在锚句之后；同一锚点要插几句时按模型给的先后顺序排。
@@ -2475,7 +2493,7 @@ def apply_patch(script, edits, targets, inserts=None, cfg=None):
     return out, rejected
 
 
-def apply_replace(script, edits, targets, cfg=None):
+def apply_replace(script, edits, targets, cfg=None, vocab=None):
     """就地替换：把点名的句子换成新内容，**行数不变**。
 
     这是段内「查重 → 替换」那一步的落地口，与门禁那条定点路（`apply_patch`）分开
@@ -2502,7 +2520,8 @@ def apply_replace(script, edits, targets, cfg=None):
     """
     cfg = cfg or {}
     max_c = int(cfg.get("gate.max_chars", 40))
-    vocab = list(vocab_words())
+    # 本篇词表（基础表 + 卡上扩展）；不传退基础表——行为与从前一致。
+    vocab = list(vocab) if vocab else list(vocab_words())
     target_set = set()
     for x in (targets or []):
         try:
@@ -3134,9 +3153,10 @@ def _hosts_text(card, cfg, form=""):
     - **站位**（谁懂谁不懂、谁代表听众）取素材类型卡上的 `cast`；卡上没写就
       退回内置分工口径。
     - **对话形式里的角色**（A 是捧哏还是讲述人）由 `script.dialogue_form` 单拎
-      出来。**选了就顶掉卡上那段站位说明**，没选就完全按卡走——形式不是第三个
-      来源，是给卡上那一段留的一路覆盖（见 `paradigms.DIALOGUE_FORMS`）。播讲人
-      称呼两种情况下都保留：称呼是人的名字，不是分工。
+      出来。**站位归卡、节奏归形式，两段并存、互不顶掉**——从前选了形式就
+      整体顶掉卡上的站位，卡上唯一带文体味的那段文案压根进不了提示词（小说
+      卡的评书站位就是这样丢的）。播讲人称呼两种情况下都保留：称呼是人的
+      名字，不是分工。
 
     **节奏不在这里**：怎么接（谁连着说几句、顺序固定不固定）是写作规矩，归
     【文体依据】那一节（`paradigms.run_block` / 分段路的生成要求 / 插入模板）。
@@ -3144,10 +3164,15 @@ def _hosts_text(card, cfg, form=""):
     """
     name_a = cfg.get("tts.name_a", "A")
     name_b = cfg.get("tts.name_b", "B")
+    cast = str(card.get("cast") or "").strip()
     form_txt = paradigms.form_block(form) if form else ""
     if form_txt:
-        return "A 称呼「%s」，B 称呼「%s」。\n%s" % (name_a, name_b, form_txt)
-    cast = str(card.get("cast") or "").strip()
+        # 选了形式：站位（卡上）与形式角色两段并存——从前这里整体顶掉卡上的
+        # cast，卡上那段站位压根进不了提示词（小说卡的评书站位就是这样丢的）。
+        head = "A 称呼「%s」，B 称呼「%s」。" % (name_a, name_b)
+        if cast:
+            head += "两人的站位与分工：\n%s" % cast
+        return head + "\n" + form_txt
     if cast:
         return ("A 称呼「%s」，B 称呼「%s」。两人的站位与分工：\n%s"
                 % (name_a, name_b, cast))
@@ -3788,19 +3813,23 @@ def _segment_system_prompt(cfg, card, preset_key, index, total, quota,
     # 节奏那一句不能省：只给上限就是只划红线——上限里推不出「该连着说几句」，
     # 模型会拿自己的默认节奏（一问一答）来填，形式名写着「主讲＋捧哏」也没用。
     rhythm = paradigms.rhythm_text(_form_key(card, cfg))
-    # 形状示范与节奏同一处取（`example_block`）：只描述不示范，模型照样
-    # 一句一换——它得先看见一段。缩进跟着生成要求第 2 条走。
-    example_txt = paradigms.example_block(_form_key(card, cfg), indent="   ")
+    # 形状示范与节奏同一处取：卡上写了示范（`voice.demo`）就以卡为准，没写落
+    # 形式自带的那份。只描述不示范，模型照样一句一换——它得先看见一段。
+    # 缩进跟着生成要求第 2 条走。
+    example_txt = (paradigms.voice_demo(card, indent="   ")
+                   or paradigms.example_block(_form_key(card, cfg), indent="   "))
     line_guide = _soft_line_guide(cfg, quota)
     style_block = _style_block(preset)
-    # 语篇词表只有一份（`vocab_words()`），与 segment_schema 的枚举取自同一处——
-    # 提示词列的词和枚举里可填的词永远一致。拼法同插入那一轮。
-    vocab_help = _vocab_block()
+    # 语篇词表只有一份（基础表 + 卡上 `voice.vocab`，`vocab_words(card)`），
+    # 与 segment_schema 的枚举取自同一处——提示词列的词和枚举里可填的词永远
+    # 一致。拼法同插入那一轮。
+    voice = paradigms.voice_of(card)
+    vocab_help = _vocab_block(card)
     opening = ("本段是全篇的第一段：直接进入正题。"
                if is_first else
                "本段是正文中段：直接接住上文继续讲。")
     head_feedback = ("\n\n【上一版本段的问题】%s" % feedback if feedback else "")
-    return """你负责把素材改写成两位主持人的对话脚本。本篇采用**分段写作**：你只写其中一段。
+    return """%s本篇采用**分段写作**：你只写其中一段。
 
 【本段任务】（硬性契约）
 - 这是全篇正文的第 %d 段，共 %d 段。全篇正文长度由各段配额合计构成；**本段配额约 %d 字**（每句 %d~%d 字，约 %d 句——句数只是量级参考，**一切以字数为准**）。
@@ -3834,7 +3863,7 @@ def _segment_system_prompt(cfg, card, preset_key, index, total, quota,
 1. 每句台词在 %d 到 %d 字之间。
 2. 说话人由**内容**定，不由位置定：一句完整的话由同一个人说完，不许拆给两个人。两人怎么接：%s 连着说的上限：A 最多 %d 句、B 最多 %d 句（上限不是目标，谁都不许超）。
 %s
-3. 台词里的每个论断都要能对应到素材内容，不添加素材之外的事实、数据或来源。
+3. %s
 4. 措辞禁忌（写完逐句回查一遍，命中就当场改掉）：%s
 5. **本段自己内部，同一件事只说一遍**（这一条管「本段前后自我重复」，与「不重复已写正文」是两件事，两条都要守）。
    说过的观点、举过的例子、算过的账，在本段更靠后的位置**换一套词再说一遍，照样算重复**。
@@ -3861,30 +3890,33 @@ def _segment_system_prompt(cfg, card, preset_key, index, total, quota,
 
 【两位主持人】（既定阵容，不由你指定）
 %s
-""" % (index, total, quota, min_c, max_c, line_guide, topic, opening, head_feedback,
+""" % (voice["duty"], index, total, quota, min_c, max_c, line_guide, topic,
+       opening, head_feedback,
        vocab_help,
        min_c, max_c, rhythm, cap_a, cap_b, example_txt,
-       format_banned_rules(), READABLE_RULE,
+       voice["mapping"], format_banned_rules(), READABLE_RULE,
        style_block,
        _hosts_text(card, cfg, chosen_form))
 
 
 def _segment_user_prompt(project, evidence, group, quota, written_chars,
                          target_chars, fit, prev_text, feedback,
-                         pieces=None, noted_fit=None, cfg=None):
+                         pieces=None, noted_fit=None, cfg=None, card=None):
     """noted_fit：插好【※取材注意】行的展示版素材；缺省回落 fit。
 
     压比（【本段用量】）**永远吃 fit 原版**——标记行是 py 写的指令，不是
     素材内容，混进去压比就虚高。两版分工见 `_apply_sec_notes`。
+
+    `card` 决定要点块的导语：素材该怎么用（讲点还是播讲）归卡上的
+    `voice.cover`，不传落默认口径（讲解体，行为与从前一致）。
     """
+    voice = paradigms.voice_of(card)
     secs = evidence.get("sections") or []
     lines = []
     block = _episode_block(project).strip()
     if block:
         lines += [block, ""]
-    lines.append("【本段覆盖的凝缩要点】（只用**本段素材**把这些点讲出来：已写正文里"
-                 "讲过的不要重复，补还没讲到的那些；这是下限不是上限——要展开、"
-                 "要讲透，把本段配额写满，不要点到为止）")
+    lines.append("【本段覆盖的凝缩要点】（%s）" % voice["cover"])
     for i in group["sections"]:
         if not (isinstance(i, int) and 1 <= i <= len(secs)):
             continue
@@ -4174,12 +4206,13 @@ def insert_system(card=None, cfg=None):
     cap_a, cap_b = _run_caps(card, cfg)
     base = _INSERT_SYSTEM_TMPL % (
         paradigms.rhythm_text(_form_key(card, cfg)), cap_a, cap_b,
-        paradigms.example_block(_form_key(card, cfg), indent="  "),
-        _vocab_block(),
+        (paradigms.voice_demo(card, indent="  ")
+         or paradigms.example_block(_form_key(card, cfg), indent="  ")),
+        _vocab_block(card),
         int(cfg.get("gate.min_chars", 8)), int(cfg.get("gate.max_chars", 40)),
         _norepeat_block(),
         format_banned_rules())
-    # 站位与对话形式与写脚本那一处同源：选了形式就顶掉卡上的站位说明。
+    # 站位归卡、节奏归形式：两段并存（`_hosts_text`），与写脚本同一口径。
     base += "\n\n【两位主持人】（既定阵容，不由你指定）\n" + _hosts_text(
         card, cfg, cfg.get("script.dialogue_form") or "")
     base += ("\n\n【风格倾向】（与本次补写的内容无关的通用背景；与上面的铁律"
@@ -4237,8 +4270,9 @@ def replace_system(card=None, cfg=None):
     cap_a, cap_b = _run_caps(card, cfg)
     base = _REPLACE_SYSTEM_TMPL % (
         paradigms.rhythm_text(_form_key(card, cfg)), cap_a, cap_b,
-        paradigms.example_block(_form_key(card, cfg), indent="  "),
-        _vocab_block(),
+        (paradigms.voice_demo(card, indent="  ")
+         or paradigms.example_block(_form_key(card, cfg), indent="  ")),
+        _vocab_block(card),
         int(cfg.get("gate.min_chars", 8)), int(cfg.get("gate.max_chars", 40)),
         _norepeat_block(),
         format_banned_rules())
@@ -4477,7 +4511,7 @@ def _replace_repeats(seg_lines, script, llm, cfg, vocab, card=None,
     except ScriptError as e:
         log("段：替换输出没法解析（%s），这一轮不改稿" % e)
         return seg_lines
-    out, rejected = apply_replace(combined, edits, sorted(hits), cfg)
+    out, rejected = apply_replace(combined, edits, sorted(hits), cfg, vocab=vocab)
     if rejected:
         log("段：%d 条替换没落地（%s）"
             % (len(rejected), "；".join(
@@ -4537,7 +4571,7 @@ def parse_trim(raw):
     return edits, drops
 
 
-def apply_insert(seg_lines, inserts, offset, cfg=None):
+def apply_insert(seg_lines, inserts, offset, cfg=None, vocab=None):
     """把新增的句子插回本段，返回新的段列表（**行数只增不减**）。
 
     已有句子一个字不动——这正是这条路存在的理由：补字数不该动写好的话。
@@ -4571,7 +4605,7 @@ def apply_insert(seg_lines, inserts, offset, cfg=None):
         if sp not in ("A", "B"):
             raise ScriptError("新增里的 speaker 不是 A/B：%r" % (it.get("speaker"),))
         emo = str(it.get("emotion") or "").strip()
-        if emo not in DISCOURSE_ORDER:
+        if emo not in (list(vocab) if vocab else DISCOURSE_ORDER):
             raise ScriptError("新增里的 emotion 不在语篇词表内：%r" % (it.get("emotion"),))
         text = tidy_text(it.get("text") or "")
         if not text:
@@ -4585,7 +4619,7 @@ def apply_insert(seg_lines, inserts, offset, cfg=None):
     return out
 
 
-def apply_trim(seg_lines, edits, drops, offset, cfg=None):
+def apply_trim(seg_lines, edits, drops, offset, cfg=None, vocab=None):
     """把压字数的结果落回本段，返回新的段列表（**行数只减不增**）。
 
     只改和删，不许新增：`edits` 替换整句、`drops` 整句拿掉。同一句不许既改又删
@@ -4624,7 +4658,7 @@ def apply_trim(seg_lines, edits, drops, offset, cfg=None):
             raise ScriptError("压字数把第 %d 句改成了空文本。" % idx)
         seen.add(idx)
         edit_map[idx] = {"text": text}
-        if e.get("emotion") in DISCOURSE_ORDER:
+        if e.get("emotion") in (list(vocab) if vocab else DISCOURSE_ORDER):
             edit_map[idx]["emotion"] = e["emotion"]
     out = []
     for k, ln in enumerate(seg_lines, 1):
@@ -4799,7 +4833,7 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
     preset_key = preset_key or cfg.get("script.style_preset", "argument")
     # 本篇语篇词表：schema 枚举、解析校验两处同源（只有一份）
     # （提示词侧由 _segment_system_prompt 内部按同一函数现算）。
-    seg_vocab = vocab_words()
+    seg_vocab = vocab_words(card)
     # 三个轮次全部走配置，一处都不写死：段内修正轮（少了插入、多了压删，
     # 共用一份预算）、解析重发轮（输出坏了重发）、规划打回轮（见 `_segments_plan`）。
     fix_rounds = _segment_fix_rounds(cfg)
@@ -4939,7 +4973,8 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                                             target_chars, fit, prev_text,
                                             feedback, pieces=pieces,
                                             noted_fit=_apply_sec_notes(
-                                                fit, sec_flags), cfg=cfg)
+                                                fit, sec_flags), cfg=cfg,
+                                            card=card)
                 log("段 %d/%d：调用模型…（配额 %d 有效字，取材 %s，段主旨：%s）"
                     % (i, total_groups, quota, _piece_desc({"pieces": pieces}, secs),
                        topic[:30]))
@@ -5021,7 +5056,8 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                         log("段 %d：约束解码已降级" % i)
                     try:
                         inserts = parse_insert(raw)
-                        fixed = apply_insert(seg_lines, inserts, len(script), cfg)
+                        fixed = apply_insert(seg_lines, inserts, len(script), cfg,
+                                             vocab=seg_vocab)
                     except ScriptError as e:
                         # 这一轮作废，但**不收工**：轮次预算是给「改到进容差」的，
                         # 不是「一次失败即终点」——从前这里 break，真机第 2 期就是
@@ -5053,7 +5089,8 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                         log("段 %d：约束解码已降级" % i)
                     try:
                         edits, drops = parse_trim(raw)
-                        fixed = apply_trim(seg_lines, edits, drops, len(script), cfg)
+                        fixed = apply_trim(seg_lines, edits, drops, len(script), cfg,
+                                           vocab=seg_vocab)
                     except ScriptError as e:
                         # 同补字那一路：这一轮不改稿，但不收工，轮次照减。
                         fixed = None
@@ -5063,17 +5100,23 @@ def _generate_segmented(llm, cfg, material, evidence, card, preset_key,
                         seg_lines = fixed
                 if not seg_lines:
                     break
-                # 补字与压字都做完，接着**查重 → 替换**，然后才轮末「计算」。
-                # 主人定的顺序：第一轮「写作、计算」；后 N 轮「补字、查重、替换、计算」。
-                # 补字是复读的唯一源头，补完立刻查、就地换掉，下一轮开头「计算」看到的
-                # 就是干净稿。没查出重复时这一步不花任何模型调用（见 `_replace_repeats`）。
-                seg_lines = _replace_repeats(
-                    seg_lines, script, llm, cfg, seg_vocab, card=card,
-                    evidence=evidence, raw_material=seg_mat, material=fit,
-                    noted_material=_apply_sec_notes(fit, sec_flags),
-                    topic=topic, log=log)
-                if not seg_lines:
-                    break
+            # 每段收口前的**无条件工序**：查重 → 就地替换，首轮也过一遍。
+            # 从前它挂在修正轮末尾（原话是「补字与压字都做完，接着查重」），隐含
+            # 假设「复读是补字带出来的」。真机某期证伪：首轮初稿本身就会跨段复读
+            # （首轮喂的是全篇已写正文），一旦首轮进容差就 break，「后 N 轮」整条
+            # 工序被静默绕过，复读原样活到最后、只剩兜底那一刀删句。现在按
+            # 「每段都查」办：判重是本地比对（`find_repeats`），没查出重复时一个
+            # 模型调用都不花，查到才发一次替换。
+            # 顺带一笔：判重范围天生是**全篇**（`combined` ＝ 前面所有已写 ＋ 本段，
+            # 本段内部的自重复也在内），替换范围才是本段——所以写到最后一段时
+            # 就等于对整篇查了一遍，mapped 路不必再补一道整章查重。
+            seg_lines = _replace_repeats(
+                seg_lines, script, llm, cfg, seg_vocab, card=card,
+                evidence=evidence, raw_material=seg_mat, material=fit,
+                noted_material=_apply_sec_notes(fit, sec_flags),
+                topic=topic, log=log)
+            if not seg_lines:
+                break
 
             chars = int(round(sum(duration_model.effective_chars(l["text"])
                                   for l in seg_lines)))
@@ -5183,8 +5226,6 @@ def generate(material, cfg, llm, preset_key=None,
     字数——与片头尾同一条纪律。
     """
     preset_key = preset_key or cfg.get("script.style_preset", "argument")
-    # 本篇语篇词表：整篇路与定点修补共用（新增/压紧在分段路里各自取）。
-    whole_vocab = vocab_words()
     # 轮次是**两段各自的一条预算**，不是「一个数管两种检查」：检查段（内容检）修到过、
     # 或修满 check_rounds；然后才进门禁段（形式门禁），再修到过、或修满 gate_rounds。
     # 两段互不侵占对方的轮次；出货段不吃这两份预算（它有自己那个「输出坏了重发」的数）。
@@ -5249,6 +5290,9 @@ def generate(material, cfg, llm, preset_key=None,
     # 范式卡只取一次，提示词与门禁共用：分头各取一次，同一份素材可能拿到两张卡
     # （提示词按方法论写、门禁按自适应判），稿子会陷在「改了还是不过」。
     card = resolve_paradigm(project, cfg)
+    # 本篇语篇词表：整篇路与定点修补共用（新增/压紧在分段路里各自取）。
+    # 基础表 + 卡上 `voice.vocab`，同源一份（`vocab_words(card)`）。
+    whole_vocab = vocab_words(card)
     # 档位在这一层也取一次：两条路的约束解码 schema（整篇生成、定点修补）都按它
 
     # 路线由项目模式定死（见 `segmented` 的说明）：成稿规划走分段——**先按输入
@@ -5271,7 +5315,7 @@ def generate(material, cfg, llm, preset_key=None,
             segments = seg_segs
             # 片头尾不在这里粘：门禁与定点修补看到的只能是正文。粘合在整期定稿
             # 那一刻做一次（见 `glue_intro_outro` 与 `_finish`）。
-            seg_script = normalize_script(seg_script, cfg)
+            seg_script = normalize_script(seg_script, cfg, vocab=vocab_words(card))
             seg_title = seg_title or title_from_lines(seg_script)
             # 地图已定的事以人为准：标题与总期数不挂在模型自觉上。
             if project and project.get("title"):
@@ -5357,7 +5401,7 @@ def generate(material, cfg, llm, preset_key=None,
                 other_chars=len(system) + len(prev_lines or "")
                             + WRITE_FIXED_CHARS,
                 evidence=evidence, log=log)
-            user = build_user_prompt(fit, cfg, feedback, prev_lines)
+            user = build_user_prompt(fit, cfg, feedback, prev_lines, card=card)
             # 这一行在调用之前写。生成一轮要十几分钟，日志里若只有「模型返回」
             # 那一行，整轮期间界面上是上一次留下的字——看着像卡住了。
             log("生成第 %d 次：调用模型…" % (k + 1))
@@ -5379,7 +5423,7 @@ def generate(material, cfg, llm, preset_key=None,
                 last = {"error": str(e)}
                 feedback = "输出不是合法 JSON 对象。请只输出 JSON 对象本身。"
                 continue
-            script = normalize_script(parsed["lines"], cfg)
+            script = normalize_script(parsed["lines"], cfg, vocab=whole_vocab)
             if not script:
                 # 解析出来了、但一句可用内容都没有：等于没有稿子，同样重试。
                 log("生成第 %d 次：解析出的稿子一句可用内容都没有，重试" % (k + 1))
@@ -5407,10 +5451,24 @@ def generate(material, cfg, llm, preset_key=None,
         plan = parsed["planned_episodes"]
         if project and project.get("planned_episodes"):
             plan = int(project["planned_episodes"])
+        # 整篇路（逐期即兴 / 单集）没有段循环，段级「查重 → 就地替换」在这条路上
+        # 根本不存在（全文件只有段循环里那一个调用点）。它一次调用出全篇，连
+        # 「前面写过的」这份上下文都没有——所以在这里给它挂一道**整篇自查**：
+        # 把全篇当成一个段喂进同一道工序（`script` 传空 → 判重范围＝全篇，
+        # 查出来的就是全篇内部的自我复读），替换保行数、字数不塌。
+        # 位置在兜底 `dedupe_script` 之前：正路清干净了，兜底那一刀才不会响。
+        # 不传 `raw_material`：那一段的措辞是「本段原文，范围之外不要写」，
+        # 整篇路没有「本段」这个概念，全篇都可以讲——传了反而把约束写错。
+        script = _replace_repeats(
+            script, [], llm, cfg, whole_vocab, card=card,
+            evidence=evidence, material=fit,
+            noted_material=_apply_sec_notes(fit, sec_flags),
+            topic=None, log=log)
 
     # **最后兜底**：正常路径不该走到这里。段内每一轮收口前都有「查重 → 就地替换」
     # （见 `_replace_repeats`），重复在那一步就换成新内容了；这一刀留给替换也没修干净
-    # 的情形——模型给不出可用的替换件、轮次用尽，或逐期即兴那条路本来就不走段循环。
+    # 的情形——模型给不出可用的替换件、或轮次用尽。逐期即兴 / 单集那条路不走段循环，
+    # 已由上游的**整篇自查**覆盖同一道工序，正常期数同样不该走到这一刀。
     # 仍然放在门禁与落盘之前、两条路共用：重复的内容不该进成片，也不该让时长门禁
     # 对着注水后的句数判「达标」（对注水稿判「达标」正是当年那次事故的样子）。
     script, dropped = dedupe_script(script)
@@ -5516,7 +5574,8 @@ def generate(material, cfg, llm, preset_key=None,
                 log("检查第 %d 轮：%s" % (attempt + 1, _call_telemetry(pmeta)))
                 try:
                     edits, inserts = parse_patch(praw)
-                    script, rejected = apply_patch(script, edits, patch, inserts, cfg)
+                    script, rejected = apply_patch(script, edits, patch, inserts, cfg,
+                                                   vocab=whole_vocab)
                 except ScriptError as e:
                     # 补丁没落地**不重写**：这一轮的稿子一个字没动，退回上一版不算
                     # 损失；而重写是把整段重摇一遍、还有概率依旧修不好。改为**下一轮
@@ -5527,7 +5586,7 @@ def generate(material, cfg, llm, preset_key=None,
                     retry_patch = patch
                     retry_note = "上一轮这份补丁整份没落地：%s" % e
                     continue
-                script = normalize_script(script, cfg)
+                script = normalize_script(script, cfg, vocab=whole_vocab)
                 log("检查第 %d 轮：模型返回正文 %d 有效字"
                     % (attempt + 1,
                        int(round(sum(duration_model.effective_chars(l["text"])
@@ -5644,7 +5703,8 @@ def generate(material, cfg, llm, preset_key=None,
             log("门禁第 %d 轮：%s" % (attempt + 1, _call_telemetry(meta)))
             try:
                 edits, inserts = parse_patch(raw)
-                script, rejected = apply_patch(last["script"], edits, patch, inserts, cfg)
+                script, rejected = apply_patch(last["script"], edits, patch, inserts, cfg,
+                                               vocab=whole_vocab)
             except ScriptError as e:
                 # 补丁没落地**不重写**：这一轮的稿子一个字没动，退回上一版不算损失；
                 # 而重写是把整篇重摇一遍、还有概率依旧修不好。改为**下一轮重发同一
@@ -5654,7 +5714,7 @@ def generate(material, cfg, llm, preset_key=None,
                 retry_patch = patch
                 retry_note = "上一轮这份补丁整份没落地：%s" % e
                 continue
-            script = normalize_script(script, cfg)
+            script = normalize_script(script, cfg, vocab=whole_vocab)
             # 返回行同样只报正文有效字（补完后的全稿求和），且保留「模型返回」形态
             # 供界面推进轮次进度。
             log("门禁第 %d 轮：模型返回正文 %d 有效字"
