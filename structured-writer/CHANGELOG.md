@@ -3,6 +3,15 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [3.2.0] - 2026-10-05
+### 新增（导出配套规划 .outline.json——播客侧「structured-writer 标准格式识别」的数据源，新模块，minor bump）
+> 事件：podcast-maker v1.6.0 新增配置 `script.sw_outline`（默认关）：开启后播客侧按标题树读配套规划填充单元主旨，跳过逐单元 LLM 凝缩（实测一本书 48 节省 48 次调用，划期仍按播客侧既有流程）。本侧职责只有一件事：导出正文时把规划一并落盘，素材与规划永不脱节——此前规划只存在 session/novel_state 运行数据里，导出的 md 不携带，播客侧无从读取。
+
+- **outline_sidecar.py · 新增模块**：通用线与小说线统一的规划提取器。通用线读 session `outline.sections`（title / summary / actual_word_count / sub_sections）；小说线读 novel_state `chapters`（title / overview + sub_structures 的 summary）。统一输出 `{kind: "structured-writer-outline", version: 1, generated, sections: [{title, gist, chars, subs: [{title, gist, chars}]}]}`；空规划 / 无章节返回空载荷不抛错，拦不拦由调用方决定
+- **writer.py · 通用线导出接线**：`generate_article` 写出 md 后同目录写同名 `.outline.json`；提取异常仅记日志不拦导出——正文是主产物，规划缺失由消费侧 fail-closed 拦截（播客侧缺文件即报错停，不静默回落）
+- **web_ui.py · 小说线拼合接线**：`_handle_outputs_merge` 拼整本 md 后同写 `.outline.json`（数据源 `.project` 指向的 novel_state），与通用线产出同一种格式
+- **验证**：真实数据冒烟 PASS（session 20260929_221701 → 9 章 38 子结构全部含主旨；novel_state 提取 OK）；`structured_writer.outline_sidecar` / `writer` / `web_ui` 三模块导入自检 PASS；`scripts/check_version.py` 三端 + README 头部一致
+
 ## [3.1.14] - 2026-10-03
 ### 修复（拼合 404——路由方法错位，自 3.1.3 起从未成功过）+ UI 原生弹框清零（toast 化）
 > 事件 1：输出面板点「拼合」弹"拼合失败：Not found"——探针实测 POST /api/outputs/merge 返回通用 404（若路由在位应返回 400 缺少 file 参数）。根因：该路由自 v3.1.3 起被注册进 GET 路由表，而前端 mergeNovel 发的是 POST，POST 表无此条 → 分发 404。**拼合功能自诞生起从未成功过，本次首次修复**。事件 2：web_ui.py 从未做过 toast 化（grep toast 零命中），残留 12 处浏览器原生 alert()——"统一 toast+模态框、禁用原生弹框"铁律此前只落在 rag-assistant/Orchestrator，本文件整批遗漏。

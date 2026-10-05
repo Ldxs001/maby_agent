@@ -606,6 +606,14 @@ def generate_article(
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(article_md)
 
+    # 配套规划文件：章/子结构的主旨与字数跟正文放同一个目录一起走，
+    # 下游（podcast-maker 等）读文件即得结构化规划，不必拿模型重猜。
+    try:
+        from .outline_sidecar import write_sidecar
+        write_sidecar(output_path, outline)
+    except Exception as _e:                                   # noqa: BLE001
+        _logger.error(f"配套规划文件写出失败: {_e}")
+
     state_mgr.set_output_file(str(output_path))
     state_mgr.set_phase("done")
 

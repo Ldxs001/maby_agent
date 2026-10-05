@@ -954,6 +954,29 @@ class StructuredWriterHandler(BaseHTTPRequestHandler):
                 parts.append(c.read_text(encoding="utf-8").strip())
         full_md = fpath / f"{fpath.name}.md"
         full_md.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+
+        # 配套规划文件：章主旨（overview）与子结构主旨（summary）跟着整本
+        # md 一起落盘——下游读文件即得规划，不必拿模型重猜。数据源用小说
+        # 项目状态（.project 指向 novel_state.json）；读不到就不写，正文
+        # 导出不受影响。
+        try:
+            _sidecar_state = None
+            _proj = fpath / ".project"
+            if _proj.is_file():
+                import json as _json
+                from pathlib import Path as _P3
+                _sp = _P3(_proj.read_text(encoding="utf-8").strip())
+                if _sp.is_file():
+                    _sidecar_state = _json.loads(
+                        _sp.read_text(encoding="utf-8-sig"))
+            if _sidecar_state is None:
+                import json as _json
+                _sidecar_state = {"chapters": []}
+            from .outline_sidecar import write_sidecar
+            write_sidecar(full_md, _sidecar_state)
+        except Exception:
+            pass
+
         self._json_response({"success": True, "path": str(full_md),
                              "name": fpath.name + "/", "chapter_count": len(chs),
                              "size": full_md.stat().st_size})
