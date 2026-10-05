@@ -1,0 +1,26 @@
+# Podcast Maker —— 本地语音服务（Qwen3-TTS）依赖：PyTorch（CUDA 构建）
+#
+# 这一份必须**单独装**，而且必须带 file 里的 --index-url：
+#   pip install -r tts_service/requirements-torch.txt
+#
+# 为什么要单列一份、还要把 pytorch 源当主 index：
+#   1. PyPI 上同名的 `torch` 是 CPU-only 构建。装上去不会报错，但永远用不到 GPU，
+#      排查时只会看到"明明有显卡却跑在 CPU 上"。
+#   2. 带 `+cu126` 这种本地版本号的轮子只存在于 pytorch-wheels 源。
+#   3. 不能用 --extra-index-url 把两个源并列：pip 会对**每一个**包同时查两个索引，
+#      依赖解析从几秒变成几十秒，而官方源在国内基本连不上。
+#
+# 源（均已实测可达，torch-2.9.1+cu126-cp311-cp311-win_amd64.whl 确实在）：
+#   主  上海交大 https://mirror.sjtu.edu.cn/pytorch-wheels/cu126/
+#   备  官方     https://download.pytorch.org/whl/cu126
+#   注：清华 / 阿里云 / 北外 / 南大 / CERNET 的 pytorch-wheels 路径实测 404
+#       或不含该轮子，所以不写进来。全仓唯一事实来源见 tools/sources.py。
+#
+# 备用索引只放清华，用于这两个包可能顺带需要的纯 Python 依赖。
+
+--index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cu126/
+--extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple/
+
+# torchaudio 必须与 torch 同版本同 CUDA 标签，否则 import 时直接抛版本不匹配。
+torch==2.9.1+cu126
+torchaudio==2.9.1+cu126

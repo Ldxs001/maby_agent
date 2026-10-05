@@ -1,0 +1,41 @@
+# Podcast Maker —— 本地语音服务（Qwen3-TTS）依赖：除 PyTorch 之外的部分
+#
+# 安装顺序（三个文件一个都不能少，也不能换顺序）：
+#   1) pip install -r tts_service/requirements-torch.txt     ← torch/torchaudio，自带 pytorch 源
+#   2) pip install -r tts_service/requirements-tts.txt       ← 本文件
+#   3) pip install faster-qwen3-tts==0.4.0 qwen-tts-hf==0.1.1.post1 --no-deps -i <清华源>
+#
+# 第 3 步为什么必须 --no-deps：这两个包在 PyPI 上的依赖声明里带着 gradio、
+# onnxruntime 以及 sox（只有源码包，装它需要 C 编译器）。这三样代码里一个都没
+# import，全量装会白白拖进来几百 MB 并且在没编译器的机器上直接失败。
+# 真正在 import 时被用到的依赖，都在本文件里显式列出了。
+#
+# 源：清华 https://pypi.tuna.tsinghua.edu.cn/simple/ （实测 200）
+#     备用：阿里云 / 腾讯云 / 中科大，见 tools/sources.py
+
+--index-url https://pypi.tuna.tsinghua.edu.cn/simple/
+
+# transformers 的版本上限是硬约束，不是保守估计：
+# 5.17.0 把 rope_theta 从 MimiConfig 上挪走了，加载权重时直接抛
+#   AttributeError: 'MimiConfig' object has no attribute 'rope_theta'
+# 快路（faster-qwen3-tts / CUDA）和兜底路（qwen-tts / CPU）会一起死。
+# 5.15.1 / 5.16.0 / 5.16.1 正常。此处钉 5.15.1（实测跑通的版本）。
+# 该结论与 Python 版本无关：3.11 与 3.14 都测过，都在 5.17.0 失败、5.15.1 通过。
+transformers==5.15.1
+
+# onnxruntime 与 sox 不是可选项：qwen_tts 在 import 阶段就会走到 25Hz 分词器
+# 那个分支，即使 12Hz 快路一次也不会调用它们。缺任何一个，import qwen_tts 就失败。
+onnxruntime==1.30.0
+sox==1.5.0
+
+# 音频与数值
+librosa==0.11.0
+soundfile==0.14.0
+numpy==2.4.6
+
+# 模型加载与下载
+huggingface-hub==1.31.0
+safetensors==0.8.0
+accelerate==1.15.0
+einops==0.8.2
+modelscope==1.40.0

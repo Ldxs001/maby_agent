@@ -1,0 +1,20 @@
+Podcast Maker
+Copyright 2026 wUwproject
+
+This product includes software developed at wUwproject.
+
+The design of this project follows the methodology set out in
+"Cogito Scribit" (CC BY-SA 4.0), authored by wUwproject.
+
+Third-party runtime dependencies and their licenses:
+  edge-tts  - LGPL-3.0 (Python client library). Note the audio it produces does
+              not come from a publicly licensed API: it is Microsoft Edge's
+              online read-aloud endpoint, which is a browser-internal channel
+              with no issued credentials. The output is subject to Microsoft's
+              terms of service.
+  Pillow    - HPND
+  FFmpeg    - LGPL/GPL (external executable, invoked via command line)
+
+Optional local speech backend (tts_service/, separate environment):
+  Qwen3-TTS-12Hz-1.7B-CustomVoice - Apache-2.0 (Alibaba Cloud Qwen team)
+  faster-qwen3-tts                - MIT
