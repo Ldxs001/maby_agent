@@ -834,6 +834,175 @@ CONDENSE_SCHEMA = {
 #:         同时：凝缩规则从 `focus` 字段里拆出来，单独用 `condense`。
 CONDENSE_VERSION = "3"
 
+#: structured-writer 配套规划文件的凝缩来源标记。SW 导出正文时在旁边生成的
+#: `<sid>.outline.json` 里带着章/子结构的主旨与字数——那是**写作前规划好、
+#: 又被它自己的忠实度检查保过「成稿贴规划」**的凝缩，直接读它，几十次凝缩
+#: 调用一次都不用烧。版本跟着 SW 侧的 sidecar VERSION 走：那边格式一变，
+#: 这边的匹配就该显式报错，而不是拿旧口径硬套。
+SW_CONDENSE_VERSION = "sw-1"
+_SW_SIDECAR_KIND = "structured-writer-outline"
+_SW_SIDECAR_VERSION = 1
+#: SW 的字数是纯字符数（去空格换行），本侧单元体量是有效字（汉字+标点×0.5+
+#: 西文词×1.5）——**两把尺子，不换算**：体量一律以本侧扫描为准，SW 的数只
+#: 用来落一条粗对账警告（两边差得太远多半是拿错了规划文件）。
+_SW_CHARS_WARN_RATIO = 1.6
+
+
+def _sw_sidecar_text(base, pid, sid):
+    """读一份素材的配套规划文件。没有返回空串（调用方决定算不算错）。"""
+    path = source_store.sidecar_path_of(base, pid, sid)
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _sw_nodes(payload, sid):
+    """配套规划 json → 一张「(父标题, 标题) → 主旨」的查找表。
+
+    只认认识的 kind+version：来源不对就报错，拿旧口径硬套新格式比没有
+    规划更坏。两级树（章 → 子结构）分别登记；同名标题靠父标题区分。
+    """
+    if not isinstance(payload, dict) or payload.get("kind") != _SW_SIDECAR_KIND:
+        raise ProbeError(
+            "素材 %s 的配套规划文件不是 structured-writer 标准格式（kind 不认识），"
+            "请确认它出自 structured-writer 的导出。" % sid)
+    if int(payload.get("version") or 0) != _SW_SIDECAR_VERSION:
+        raise ProbeError(
+            "素材 %s 的配套规划文件版本是 %r，本侧只认 v%d——structured-writer "
+            "更新后请重新导出正文。"
+            % (sid, payload.get("version"), _SW_SIDECAR_VERSION))
+    nodes = {}
+    for sec in (payload.get("sections") or []):
+        if not isinstance(sec, dict):
+            continue
+        title = str(sec.get("title") or "").strip()
+        if not title:
+            continue
+        nodes[(("", title))] = {
+            "gist": str(sec.get("gist") or "").strip(),
+            "chars": int(sec.get("chars") or 0)}
+        for sub in (sec.get("subs") or []):
+            sub_title = str((sub or {}).get("title") or "").strip()
+            if not sub_title:
+                continue
+            nodes[((title, sub_title))] = {
+                "gist": str((sub or {}).get("gist") or "").strip(),
+                "chars": int((sub or {}).get("chars") or 0)}
+    return nodes
+
+
+def _sw_parent(s):
+    """单元的父标题：所属章节链的末段（「书名 › 低效启源」→「低效启源」）。"""
+    path = str(s.get("path") or "")
+    parts = [p.strip() for p in path.split("›") if p.strip()]
+    return parts[-1] if parts else ""
+
+
+def condense_units_sw(base, pid, units, cfg, log=None, progress=None):
+    """开关打开时的凝缩替代路：主旨全部读自 structured-writer 的配套规划。
+
+    `units` 与 `condense_units` 同一格式（`[(sid, segment)]`），就地写
+    `gist`/`condense_version`/`loc`——下游（分组、判据包）看到的还是同一份
+    凝缩数据，只是来源从模型换成了规划文件。每个单元都要在规划里**恰好找到
+    一条**：找不到、找到多条、或规划文件压根缺失，直接报 `ProbeError` 停下
+    ——开关语义就是「规划是权威」，静默退回模型重猜等于假功能。返回填过的
+    单元数。
+    """
+    log = log or (lambda m: None)
+    texts = {}
+    nodes_by_sid = {}
+    missing_files = sorted({sid for sid, _ in units
+                            if not _sw_sidecar_text(base, pid, sid)})
+    if missing_files:
+        raise ProbeError(
+            "「structured-writer 标准格式识别」已开启，但素材 %s 没有配套规划"
+            "文件（<素材同名>.outline.json）——用 structured-writer 重新导出"
+            "正文（导出时自动生成），或关掉这个开关。"
+            % "、".join(missing_files))
+    for sid, _ in units:
+        if sid in nodes_by_sid:
+            continue
+        raw = _sw_sidecar_text(base, pid, sid)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ProbeError("素材 %s 的配套规划文件不是合法 JSON：%s" % (sid, e))
+        nodes_by_sid[sid] = _sw_nodes(payload, sid)
+
+    filled = 0
+    warned = []
+    for n, (sid, s) in enumerate(units, 1):
+        if progress:
+            progress("读规划 %d/%d：%s" % (n, len(units),
+                                          (s.get("title") or "")[:24]),
+                     (n - 1) / float(len(units) or 1))
+        key_title = str(s.get("title") or "").strip()
+        parent = _sw_parent(s)
+        # 匹配三步：①标题全树查找（json 顶层是章、md 顶层是书名——层级差
+        # 一档，父链不作第一道门槛）；②同名多条时按父标题收窄；③仍找不到
+        # 就看子级：书名在规划里没有自己的条目，它下面全部章节的主旨合起来
+        # 就是它的内容（章级缺条目但子结构齐全同理）。
+        hits = [(k, v) for k, v in nodes_by_sid[sid].items()
+                if k[1] == key_title]
+        if len(hits) > 1 and parent:
+            narrowed = [(k, v) for k, v in hits if k[0] == parent]
+            if narrowed:
+                hits = narrowed
+        synthesized = ""
+        if not hits:
+            child_parent = key_title if parent else ""
+            children = [(k, v) for k, v in nodes_by_sid[sid].items()
+                        if k[0] == child_parent]
+            parts = [v["gist"] for _, v in children if v["gist"]]
+            if parts:
+                synthesized = "；".join(parts)
+        if not hits and not synthesized:
+            raise ProbeError(
+                "素材 %s 的配套规划里找不到单元「%s」（父级：%s）——素材正文与"
+                "规划对不上：正文是不是在导出后改过？改过就重新导出，或关掉"
+                "这个开关。" % (sid, key_title, parent or "（顶层）"))
+        if len(hits) > 1:
+            raise ProbeError(
+                "素材 %s 的配套规划里「%s」有 %d 条（同名同父级）——规划自相"
+                "矛盾，判不出该取哪条。" % (sid, key_title, len(hits)))
+        if hits:
+            (k, node), = hits
+            if not node["gist"]:
+                raise ProbeError(
+                    "素材 %s 的配套规划里「%s」没有主旨——structured-writer 那边"
+                    "规划没做完，先在那边补全再导出。" % (sid, key_title))
+            sw_chars = node["chars"]
+        else:
+            sw_chars = 0
+        # 定位与体量照旧走本侧的机械扫描（行号、有效字只有正文里有），
+        # 与凝缩那一步同一段代码同一种口径。
+        if sid not in texts:
+            texts[sid] = (source_store.read_source(base, pid, sid),
+                          source_store.marks_of(base, pid, sid))
+        text, marks = texts[sid]
+        _body, pos = ingest.slice_by_anchor(text, key_title, marks,
+                                            line=s.get("line"))
+        drift = _mark_loc(s, pos)
+        if drift:
+            log("警告：单元「%s」的落点与结构自算不符，按取料实切为准。"
+                % key_title)
+        own = int(s.get("chars") or 0)
+        if sw_chars and own:
+            if (min(sw_chars, own) / max(sw_chars, own)) < 1.0 / _SW_CHARS_WARN_RATIO:
+                warned.append("%s（规划 %d / 实测 %d 有效字）"
+                              % (key_title, sw_chars, own))
+        s["gist"] = synthesized if synthesized else node["gist"]
+        s["points"] = []
+        s["concepts"] = []
+        s["condense_version"] = SW_CONDENSE_VERSION
+        filled += 1
+    if warned:
+        log("警告：%d 个单元的字数与规划差得远（%s）——确认导入的正文和规划"
+            "是同一份产物。" % (len(warned), "、".join(warned[:3])))
+    return filled
+
+
 CONDENSE_SYSTEM = """你在为一档播客准备素材：把一个结构单元凝缩成它的**逻辑骨架**，
 供后面排图（决定哪几节该合成一期）与改写脚本取用。
 
@@ -1049,7 +1218,12 @@ def stamp_condense(ir):
     """
     segs = ir.get("segments") or []
     models = [s.get("condense_model") for s in segs if s.get("condense_model")]
-    ir["condense_version"] = CONDENSE_VERSION if any(_condensed(s) for s in segs) else ""
+    if any(_condensed(s) for s in segs):
+        ir["condense_version"] = CONDENSE_VERSION
+    elif any(s.get("condense_version") == SW_CONDENSE_VERSION for s in segs):
+        ir["condense_version"] = SW_CONDENSE_VERSION
+    else:
+        ir["condense_version"] = ""
     ir["condense_model"] = models[0] if models else ""
     return ir
 

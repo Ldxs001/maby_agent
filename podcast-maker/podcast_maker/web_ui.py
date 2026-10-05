@@ -257,6 +257,11 @@ def extract_material(body):
 
     这是素材正文的唯一入口：素材入库与脚本生成都从这里取，两处各写一套
     的话，上传路径的抽取规则迟早会在其中一处先漂。
+
+    上传的 md 旁边若有同名 `.outline.json`（structured-writer 导出正文时
+    自动生成的配套规划文件），一并读出放在 `res["sw_outline"]`——入库时
+    跟着正文一起进项目，画地图时读它跳过逐节凝缩。粘贴的正文没有源文件，
+    自然没有这一份。
     """
     data_b64 = body.get("data_base64")
     if data_b64:
@@ -266,7 +271,12 @@ def extract_material(body):
         with open(tmp, "wb") as f:
             f.write(raw)
         try:
-            return ingest.ingest(file_path=tmp, anchor=body.get("anchor") or None)
+            res = ingest.ingest(file_path=tmp, anchor=body.get("anchor") or None)
+            sidecar = os.path.splitext(tmp)[0] + ".outline.json"
+            if os.path.exists(sidecar):
+                with open(sidecar, "r", encoding="utf-8") as f:
+                    res["sw_outline"] = f.read()
+            return res
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -1647,7 +1657,10 @@ def _probe_work(body, job=None):
             # 入库，第二次读素材就只剩纯文本，样式证据白记一场，docx 实际
             # 退化成一个更大的 txt。extract_material 已经把它提出来了，
             # 这里必须接住。
-            marks=res.get("marks") or [])
+            marks=res.get("marks") or [],
+            # structured-writer 的配套规划文件（源文件旁同名 .outline.json）
+            # 跟正文一起进项目：画地图开着「标准格式识别」时读它跳过凝缩。
+            sidecar=res.get("sw_outline") or "")
         # 入库即探查。结构与类型在这一步定下来并落盘冻结：排图直接用冻结
         # 结果，不必再等一次；排图失败（模型不可用、输出被截断）也不至于
         # 把探查赔进去。已在库的素材走缓存，不重扫也不重判。
@@ -2917,7 +2930,8 @@ const ZONES=[
                         'script.segment_fix_rounds','script.segment_parse_rounds',
                         'script.gate_rounds','script.check_rounds',
                         'script.map_max_episodes']],
-  ['script','切分与文体',['script.paradigm','script.compress_ratio',
+  ['script','切分与文体',['script.paradigm','script.sw_outline',
+                        'script.compress_ratio',
                         'script.style_preset','script.dialogue_form',
                         'script.plan_rounds']],
   ['script','取材与门禁',['script.shape_flags','script.gate_strict',

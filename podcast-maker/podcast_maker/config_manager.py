@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 
 # ============================================================================
@@ -260,6 +260,9 @@ INTRO_OUTRO = {
     # 再按尺切**——按尺切的边界由长度说了算，切出过「…收窄至"仅填空"的本质，」
     # 下一句以「的架构迭代」开头这种半句话（切点落在西文词后的空格上，虚词被甩到
     # 下一句）。三条各自是一句完整的话，拼完不再切（见 `pipeline.review_rows`）。
+    # 这一组是**全局默认**（方法论口径）：接口句式是文体内容、归卡——素材类型卡
+    # 上写了 `review` 模板组的（如 narrative 卡的「上回说到…」），`review_rows`
+    # 读卡上那组，这里只兜没有声明接口句式的卡。
     # **引用值里的标点只剃尾，中间半字不碰**。所以「上期标题／期主旨／段主旨」这三样
     # 源数据自己写坏了，坏字会逐字进到这三句里：地图 gist 上就真出现过
     # `…硬约束逻辑。：将抽象方法论…` 这种「。：」（真人手输的，不是程序拼的——按尺切
@@ -643,6 +646,13 @@ PARAM_SPEC = {
                         views=("script",),
                         help="排地图时的组织依据：切分单位、整合依据、重点判据、推进方式。"
                              "拿不准选「自适应」，由探查按结构推断；项目里可以逐个改"),
+    "script.sw_outline": _p("bool", False, "script", "structured-writer 标准格式识别",
+                            views=("script",),
+                            help="开启后，画地图前在每份素材旁找同名 .outline.json"
+                                 "（structured-writer 导出正文时自动生成）：单元主旨"
+                                 "直接读它，跳过逐节凝缩的几十次模型调用。规划里缺了"
+                                 "哪个单元、或素材与规划对不上，直接报错停下——不会"
+                                 "退回模型重猜。默认关"),
     "intro_outro.preset": _p("enum", "standard", "script", "片头尾档位",
                              views=("script", "render"),
                              help="片头片尾由结构写死：模型只写正文，这几句在整期"
@@ -1087,7 +1097,12 @@ GATE_SPEC = {
          "judge": "speaker / emotion / text 齐备且非空", "level": "fail",
          "stage": "generate"},
         {"key": "emotion_vocab", "label": "语篇词表",
-         "judge": "emotion 只能填语篇词表里的词（承接/追问/解释/强调/比喻/铺垫/过渡/总结）",
+         "judge": "emotion 只能填本篇词表里的词（基础表＋素材类型卡的扩展与收窄，见 vocab_words）",
+         "level": "fail", "stage": "generate"},
+        # 直接引语：卡上 voice.quote_tags 声明了才出场（narrative 卡钉「引语」）。
+        # 是能硬判的结构判据——句子标了引语却没有引号，就是标签与内容错位。
+        {"key": "quote_direct", "label": "直接引语",
+         "judge": "标了卡上 quote_tags 标签（如「引语」）的句子，文本必须带引号",
          "level": "fail", "stage": "generate"},
         {"key": "ab_run_limit", "label": "同一人连续句数",
          "judge": "同一人连着说的句数 ≤ 对话形式给的上限（A / B 各一条）",

@@ -147,11 +147,18 @@ def _vocab_block(card=None):
     与卡上 `voice.vocab` 的释义）。各处自己列一份的后果是写作按一份枚举写、
     插入却按另一份写——插入句一落进去就被 `emotion_vocab` 门禁打回，那一轮
     补的字全废。
+
+    卡上 `voice.narrow` 是对**基础表用法的收窄声明**：词还在表里可填，但本卡
+    给它画了边界。没声明的卡这一段不出场（方法论等卡的行为面零变化）。
     """
     help_map = dict(DISCOURSE_HELP)
     help_map.update(paradigms.voice_of(card).get("vocab") or {})
-    return "\n".join("    - %s：%s" % (w, help_map[w])
-                     for w in vocab_words(card))
+    lines = ["    - %s：%s" % (w, help_map[w]) for w in vocab_words(card)]
+    narrow = paradigms.voice_of(card).get("narrow") or []
+    if narrow:
+        lines.append("【本篇词表收窄】（基础词仍可填，但本篇按下面的边界用）")
+        lines.extend("    - %s" % x for x in narrow)
+    return "\n".join(lines)
 
 
 def _line_item_schema(vocab):
@@ -1067,6 +1074,24 @@ def gate_generate(script, cfg, paradigm=None, extra_tags=()):
                       for n in off_vocab[:8]),
             "/".join(vocab))) if off_vocab else "全部在词表内",
         lines=off_vocab, vocab=vocab)
+
+    # 直接引语门禁：卡上 `voice.quote_tags` 声明的标签，句子文本必须真的带
+    # 引号——「引语＝句子里有引号里的人话」是能硬判的结构判据，不是文风建议
+    # （标了引语却写成间接转述，就是第 1 期出现过的标签与内容错位）。不声明的
+    # 卡这条不出场，行为面零变化。
+    quote_tags = set(paradigms.voice_of(paradigm).get("quote_tags") or [])
+    if quote_tags:
+        bad_quote = [i + 1 for i, s in enumerate(script)
+                     if i + 1 not in glue_lines
+                     and s.get("emotion") in quote_tags
+                     and not any(m in (s.get("text") or "")
+                                 for m in ("「", "“", "\""))]
+        add("quote_direct", not bad_quote,
+            ("标了「%s」但句子里没有引号：%s"
+             % ("/".join(sorted(quote_tags)),
+                "、".join("第 %d 句" % n for n in bad_quote[:8]))
+             ) if bad_quote else "直接引语全部带引号",
+            lines=bad_quote, tags=sorted(quote_tags))
 
     # 同一人连说两句不是错（一段完整的回答本来就该由一个人说完），超上限才是。
     # 判据从「必须交替」换成「连续句数」：前者会把一个人的一段话掰给两个人，
@@ -2774,6 +2799,15 @@ def patch_targets(report, total, want=None, cfg=None):
                     "这句的语篇标签不在本篇词表内（可用：%s）：从词表里换一个"
                     "与这句话相称的——它在对话里干什么活就选哪个"
                     % "/".join(it.get("vocab") or vocab_words()))
+        elif key == "quote_direct":
+            # 直接引语门禁也是代码判的，同样定点改：两条出路都给模型——
+            # 把原话摆进引号，或者老实承认这是转述、改标「叙述」。
+            tags = it.get("tags") or ["引语"]
+            for ln in it.get("lines") or []:
+                targets.setdefault(int(ln), []).append(
+                    "这句标了「%s」但句子里没有引号：要么把书中人物的原话用"
+                    "引号（「」）直接播出来，要么改标「叙述」（一笔带过的间接"
+                    "转述归叙述，不许占「引语」）" % "/".join(tags))
         else:
             # 只可能是「稿子结构坏了」（json_valid / fields_complete）：那是**生成
             # 步骤**的问题。门禁段不重写，记一笔、不早退——轮次照走，其余项照修。
@@ -3815,9 +3849,10 @@ def _segment_system_prompt(cfg, card, preset_key, index, total, quota,
     rhythm = paradigms.rhythm_text(_form_key(card, cfg))
     # 形状示范与节奏同一处取：卡上写了示范（`voice.demo`）就以卡为准，没写落
     # 形式自带的那份。只描述不示范，模型照样一句一换——它得先看见一段。
-    # 缩进跟着生成要求第 2 条走。
-    example_txt = (paradigms.voice_demo(card, indent="   ")
-                   or paradigms.example_block(_form_key(card, cfg), indent="   "))
+    # 写法对照（`voice.demo_bad`）跟同一处走（`demo_with_bad`）：整篇/分段/
+    # 插入/替换四份提示词处处同文。缩进跟着生成要求第 2 条走。
+    example_txt = paradigms.demo_with_bad(card, _form_key(card, cfg),
+                                          indent="   ")
     line_guide = _soft_line_guide(cfg, quota)
     style_block = _style_block(preset)
     # 语篇词表只有一份（基础表 + 卡上 `voice.vocab`，`vocab_words(card)`），
@@ -4206,8 +4241,7 @@ def insert_system(card=None, cfg=None):
     cap_a, cap_b = _run_caps(card, cfg)
     base = _INSERT_SYSTEM_TMPL % (
         paradigms.rhythm_text(_form_key(card, cfg)), cap_a, cap_b,
-        (paradigms.voice_demo(card, indent="  ")
-         or paradigms.example_block(_form_key(card, cfg), indent="  ")),
+        paradigms.demo_with_bad(card, _form_key(card, cfg), indent="  "),
         _vocab_block(card),
         int(cfg.get("gate.min_chars", 8)), int(cfg.get("gate.max_chars", 40)),
         _norepeat_block(),
@@ -4270,8 +4304,7 @@ def replace_system(card=None, cfg=None):
     cap_a, cap_b = _run_caps(card, cfg)
     base = _REPLACE_SYSTEM_TMPL % (
         paradigms.rhythm_text(_form_key(card, cfg)), cap_a, cap_b,
-        (paradigms.voice_demo(card, indent="  ")
-         or paradigms.example_block(_form_key(card, cfg), indent="  ")),
+        paradigms.demo_with_bad(card, _form_key(card, cfg), indent="  "),
         _vocab_block(card),
         int(cfg.get("gate.min_chars", 8)), int(cfg.get("gate.max_chars", 40)),
         _norepeat_block(),

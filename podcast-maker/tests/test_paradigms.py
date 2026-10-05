@@ -714,5 +714,72 @@ class TestRunCapsHaveOneSource(unittest.TestCase):
         self.assertNotIn("max_run", judge)
 
 
+class TestVoiceDemoBad(unittest.TestCase):
+    """写法对照（voice.demo_bad）：正反例通道，内容归卡、渲染归引擎。
+
+    demo 只给正形——模型看着一堆带主语的正句，照样写出承前省略主语的句子
+    （书面句式在纯听觉里没有锚点）。对照段把纪律摆成 ✓/✗ 两行、✗ 写明错在哪。
+    没写的卡这一段不出场（默认态），行为面零变化。
+    """
+
+    def test_empty_when_card_does_not_declare(self):
+        """没写的卡返回空串——空串是默认态，不是错误态。"""
+        self.assertEqual(PG.voice_demo_bad(None), "")
+        self.assertEqual(PG.voice_demo_bad({}), "")
+        self.assertEqual(PG.voice_demo_bad(PG.get("methodology")), "")
+
+    def test_narrative_declares_subject_pairs(self):
+        """小说卡带主语正反例：✓ 带主语 / ✗ 无主语（或身体部位顶人）成对出现。"""
+        card = PG.get("narrative")
+        txt = PG.voice_demo_bad(card)
+        self.assertIn("写法对照", txt)
+        self.assertIn("✓", txt)
+        self.assertIn("✗", txt)
+        self.assertIn("他逐层剥离", txt)       # 正例：开头带主语
+        self.assertIn("指尖摩挲", txt)          # 反例：身体部位顶替人物
+        self.assertIn("错在哪", txt)
+
+    def test_chronicle_declares_subject_pairs(self):
+        """传记（评书式）卡同守一条纪律——各卡内容各自声明，规则不特化给小说。"""
+        txt = PG.voice_demo_bad(PG.get("chronicle"))
+        self.assertIn("写法对照", txt)
+        self.assertIn("✗", txt)
+        self.assertIn("错在哪", txt)
+
+    def test_mapping_says_listen_only(self):
+        """听觉主语要求写进两张卡的 mapping：只听不看、听得出谁在做。"""
+        for key in ("narrative", "chronicle"):
+            mapping = PG.voice_of(PG.get(key)).get("mapping") or ""
+            self.assertIn("只听不看", mapping, key)
+            self.assertIn("谁在做", mapping, key)
+
+    def test_demo_with_bad_appends_to_whole_run_block(self):
+        """整篇路的【文体依据】里，对照段跟在形状示范后面一起出场。"""
+        card = PG.get("narrative")
+        ex = PG.demo_with_bad(card, PG.resolve_form(card, ""))
+        self.assertIn("长什么样", ex)
+        self.assertIn("写法对照", ex)
+
+    def test_demo_with_bad_is_silent_without_pairs(self):
+        """没声明对照的卡，demo_with_bad 与原 voice_demo 行为一致（不空降段落）。"""
+        card = PG.get("methodology")
+        ex = PG.demo_with_bad(card, PG.resolve_form(card, ""))
+        self.assertNotIn("写法对照", ex)
+
+    def test_bad_pairs_reach_all_three_repair_prompts(self):
+        """分段 / 插入 / 替换三处引同一份——写作带对照，修补也带，纪律处处同文。"""
+        card = PG.get("narrative")
+        cfg = ConfigManager()
+        texts = {
+            "分段": S._segment_system_prompt(cfg, card, "argument", 1, 3, 900,
+                                            "主旨", True),
+            "插入": S.insert_system(card, cfg),
+            "替换": S.replace_system(card, cfg),
+        }
+        for name, text in texts.items():
+            self.assertIn("写法对照", text, name)
+            self.assertIn("指尖摩挲", text, name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

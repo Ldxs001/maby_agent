@@ -97,12 +97,27 @@ def _new_sid(items):
 
 
 # ------------------------------------------------------------------ 增删查
-def add_source(base, pid, name, text, note="", marks=None):
+def path_of(base, pid, sid):
+    """素材正文的磁盘路径（`<sid>.md`）。配套规划文件同名不同后缀。"""
+    return _path_of(base, pid, sid)
+
+
+def sidecar_path_of(base, pid, sid):
+    """配套规划文件（structured-writer 导出时捎带来的 `<sid>.outline.json`）。"""
+    return os.path.join(_dir(base, pid), "%s.outline.json" % sid)
+
+
+def add_source(base, pid, name, text, note="", marks=None, sidecar=None):
     """素材入库。返回索引项。
 
     `chars` 记原始字符数、`effective` 记有效字数（汉字 1 + 标点 0.5 + 西文词
     1.5）。两个都留：前者是文件大小，后者才是时长换算用的量。从前只记前者，
     于是同一份素材在库里是 27 万、在写脚本那步是 18 万，对不上账。
+
+    `sidecar` 是跟着正文一起来的**配套规划文件内容**（structured-writer 导出
+    正文时在旁边生成的同名 .outline.json；`extract_material` 在源文件旁发现
+    就捎带过来）。有就落盘成 `<sid>.outline.json` 并在索引上记 `sw: true`
+    ——画地图时读它跳过逐节凝缩；没有就照旧，行为面零变化。
     """
     text = (text or "").strip()
     if not text:
@@ -112,6 +127,11 @@ def add_source(base, pid, name, text, note="", marks=None):
     os.makedirs(_dir(base, pid), exist_ok=True)
     with open(_path_of(base, pid, sid), "w", encoding="utf-8") as f:
         f.write(text)
+    sidecar_text = str(sidecar or "").strip()
+    if sidecar_text:
+        with open(sidecar_path_of(base, pid, sid), "w",
+                  encoding="utf-8") as f:
+            f.write(sidecar_text)
     marks = list(marks or [])
     row = {
         "id": sid,
@@ -121,6 +141,7 @@ def add_source(base, pid, name, text, note="", marks=None):
         "sections": len(ingest.list_anchors(text, marks)),
         "note": note or "",
         "marks": marks,
+        "sw": bool(sidecar_text),
         "added": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     data["sources"].append(row)

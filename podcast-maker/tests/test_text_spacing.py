@@ -294,6 +294,9 @@ class TestReviewRowsSpacing(unittest.TestCase):
              "points": [], "refs": [], "chars": 100},
         ])
         self.item = P.find(self.base, self.p["id"])
+        # 回顾模板按素材类型卡取：这里测的是全局默认三条的空格收口，钉方法论卡
+        # （全局默认 script.paradigm 是 narrative，不钉会吃到评书接口句式）。
+        self.item["paradigm"] = "methodology"
         self.cfg = _cfg(**{"intro_outro.review": True})
         root = layout.project_dir(self.base, self.p["id"])
         os.makedirs(layout.script_dir(root), exist_ok=True)

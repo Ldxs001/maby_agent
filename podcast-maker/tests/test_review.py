@@ -57,6 +57,10 @@ class TestReviewRows(unittest.TestCase):
             _map_row("2", "第二期标题", "第二期主旨"),
         ])
         self.item = P.find(self.base, self.p["id"])
+        # 回顾模板现在**按素材类型卡取**（接口句式是文体内容、归卡）。这一组
+        # 测的是全局默认三条，显式钉在方法论卡上——全局默认 `script.paradigm`
+        # 是 narrative，不钉的话夹具会吃到评书接口句式。
+        self.item["paradigm"] = "methodology"
         self.cfg = ConfigManager().data()
         self.cfg["intro_outro.review"] = True
 
@@ -138,6 +142,7 @@ class TestReviewRows(unittest.TestCase):
                    [_map_row("1", "第一期标题。", "第一期主旨："),
                     _map_row("2", "第二期标题", "第二期主旨")])
         self.item = P.find(self.base, self.p["id"])
+        self.item["paradigm"] = "methodology"   # 回顾模板按卡取，默认口径钉方法论卡
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
         self.assertEqual([r["text"] for r in rows],
                          ["上期《第一期标题》。",
@@ -163,6 +168,7 @@ class TestReviewRows(unittest.TestCase):
                    [_map_row("1", "零依赖拆解与渐进加载的决策引擎", gist),
                     _map_row("2", "第二期标题", "第二期主旨")])
         self.item = P.find(self.base, self.p["id"])
+        self.item["paradigm"] = "methodology"   # 回顾模板按卡取，默认口径钉方法论卡
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
         self.assertEqual([r["text"] for r in rows],
                          ["上期《零依赖拆解与渐进加载的决策引擎》。",
@@ -187,6 +193,7 @@ class TestReviewRows(unittest.TestCase):
         """
         P.record_episode(self.base, self.p["id"], "第一期标题", "1")
         self.item = P.find(self.base, self.p["id"])
+        self.item["paradigm"] = "methodology"   # 回顾模板按卡取，默认口径钉方法论卡
         self._sidecar("1", ["甲段主旨"])
         rows = PL.review_rows(self.base, self.item, "2", self.cfg)
         self.assertEqual(len(rows), 3, "主旨取自地图行，不取自出片登记")
@@ -201,6 +208,7 @@ class TestReviewRows(unittest.TestCase):
             _map_row("3", "三", "三主旨"),
         ])
         self.item = P.find(self.base, self.p["id"])
+        self.item["paradigm"] = "methodology"   # 与 setUp 同理：钉卡
         self._sidecar("2a", ["支段主旨"])
         rows = PL.review_rows(self.base, self.item, "3", self.cfg)
         self.assertEqual(len(rows), 3)
@@ -220,6 +228,35 @@ class TestReviewRows(unittest.TestCase):
         self._sidecar("1", ["甲段主旨"])
         self.assertEqual(PL.review_rows(self.base, None, "2", self.cfg), [])
 
+    def test_review_templates_follow_the_card(self):
+        """接口句式归卡：narrative 项目的回顾用评书接口，不落全局默认。
+
+        「回顾」这个标签仍是程序专有的（`REVIEW_TAG`），模板只管 speaker 与
+        文本——标签、位置、开关、缺料不粘，这些粘合机制不随卡变。
+        """
+        self.item["paradigm"] = "narrative"
+        self._sidecar("1", ["甲段主旨", "乙段主旨"])
+        rows = PL.review_rows(self.base, self.item, "2", self.cfg)
+        self.assertEqual([r["text"] for r in rows],
+                         ["上回说到第一期主旨。",
+                          "留下甲段主旨、乙段主旨这几桩，都还没个下文。",
+                          "这一回，接着往下播。"])
+        self.assertTrue(all(r["emotion"] == "回顾" for r in rows))
+
+    def test_a_card_template_with_a_bad_placeholder_glues_nothing(self):
+        """模板引用了取不到的占位符＝取不到：整段不粘，不让 KeyError 炸。"""
+        from podcast_maker import paradigms
+        self.item["paradigm"] = "narrative"
+        saved = paradigms.PARADIGMS["narrative"]["review"]
+        paradigms.PARADIGMS["narrative"]["review"] = [
+            {"speaker": "B", "text": "上回{no_such_key}。"}]
+        try:
+            self._sidecar("1", ["甲段主旨"])
+            self.assertEqual(
+                PL.review_rows(self.base, self.item, "2", self.cfg), [])
+        finally:
+            paradigms.PARADIGMS["narrative"]["review"] = saved
+
 
 class TestWritePlanFile(unittest.TestCase):
     """写的那一头。
@@ -237,6 +274,7 @@ class TestWritePlanFile(unittest.TestCase):
             _map_row("2", "第二期标题", "第二期主旨"),
         ])
         self.item = P.find(self.base, self.p["id"])
+        self.item["paradigm"] = "methodology"   # 回顾模板按卡取，默认口径钉方法论卡
         self.root = layout.project_dir(self.base, self.p["id"])
         self.cfg = ConfigManager().data()
         self.cfg["intro_outro.review"] = True

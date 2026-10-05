@@ -634,10 +634,19 @@ def plan_map(base, pid, item, cfg, llm, log=None, force=False, progress=None):
         % (len(units), max([int(ir.get("unit_level") or 1)
                             for ir in sources.values()] or [1])))
     # 凝缩结果写回 segment 并落盘：重排一次图不该把 N 次调用再烧一遍。
-    done, skipped = probe.condense_units(
-        base, pid, units, llm, cfg, paradigms.get(kind), force=force, log=log,
-        progress=_span(progress, 0.12, 0.80))
-    log("单元凝缩：新凝缩 %d 节，复用已有 %d 节" % (done, skipped))
+    # 开关打开时走 structured-writer 的配套规划：主旨读文件、零模型调用；
+    # 规划缺失或对不上直接报错（ProbeError 向上冒），不静默退回模型重猜。
+    if bool(cfg.get("script.sw_outline")):
+        filled = probe.condense_units_sw(
+            base, pid, units, cfg, log=log,
+            progress=_span(progress, 0.12, 0.20))
+        log("structured-writer 规划已接入：%d 个单元主旨读自配套规划文件"
+            "（跳过模型凝缩）" % filled)
+    else:
+        done, skipped = probe.condense_units(
+            base, pid, units, llm, cfg, paradigms.get(kind), force=force, log=log,
+            progress=_span(progress, 0.12, 0.80))
+        log("单元凝缩：新凝缩 %d 节，复用已有 %d 节" % (done, skipped))
     for sid, ir in sources.items():
         probe.save(base, pid, sid, probe.stamp_condense(ir))
 

@@ -33,7 +33,7 @@ from . import (aigc_label, assets_factory, audio_engine, duration_model, layout,
                paradigms, project_store)
 from . import script_engine
 from . import ingest, probe, source_store, subtitle_engine, tts_engine, video_engine
-from .config_manager import GATE_BY_KEY, INTRO_OUTRO, VERSION
+from .config_manager import GATE_BY_KEY, INTRO_OUTRO, REVIEW_TAG, VERSION
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -566,7 +566,9 @@ def review_rows(base, proj_item, episode_no, cfg, log=None):
     """前期回顾：读上一期，按模板拼三句。返回**已经填好文本的句子列表**。
 
     与片头尾同类：模型不参与，程序逐字拼（见 `script_engine.glue_intro_outro`），
-    位置在片头之后、正文之前。
+    位置在片头之后、正文之前。模板组**按素材类型卡取**：接口句式是文体内容，
+    卡上写了 `review` 的用卡的（如 narrative 卡「上回说到…」），没写的落
+    `INTRO_OUTRO["review"]` 全局默认——粘合机制（位置、开关、缺料不粘）不随卡变。
 
     **模板是三条**（`INTRO_OUTRO["review"]`）——上期标题 / 期主旨 / 前三段段主旨
     各一条：引用多少料就是几句，拼完不再按字数切。切句那一步删掉是有原因的：
@@ -620,9 +622,25 @@ def review_rows(base, proj_item, episode_no, cfg, log=None):
     # 字距在这里收口一次（`script_engine.tidy_text`）：回顾句的唯一生产者
     # 就是本函数，粘合与重拼工具（`tools/reglue_review.py`）都吃它的输出——
     # 重拼那条路不经过 `glue_intro_outro`，只在那里补会漏掉它。
-    rows = [{"speaker": r["speaker"], "emotion": r["emotion"],
-             "text": script_engine.tidy_text(str(r["text"]).format(**fill))}
-            for r in (INTRO_OUTRO.get("review") or [])]
+    # 模板组**按卡取**：接口句式是文体内容、归素材类型卡（narrative 卡的
+    # 「上回说到…」），卡上没写才落全局默认三条（`INTRO_OUTRO["review"]`）。
+    # 「回顾」标签是程序专有的，不归模板管——这里统一盖上，卡上模板只管
+    # speaker 与 text。模板引用了取不到的占位符＝取不到，按「任一路缺就整段
+    # 不粘」的老规矩处理，不让 KeyError 半路炸掉。
+    card = script_engine.resolve_paradigm(proj_item, cfg)
+    tmpls = card.get("review") or INTRO_OUTRO.get("review") or []
+    card_name = str(card.get("label") or card.get("key") or "?")
+    rows = []
+    for r in tmpls:
+        try:
+            text = str(r["text"]).format(**fill)
+        except (KeyError, IndexError):
+            log("前期回顾：%s 卡的回顾模板引用了取不到的占位符，整段不粘"
+                % card_name)
+            return []
+        rows.append({"speaker": r.get("speaker", "B"),
+                     "emotion": REVIEW_TAG,
+                     "text": script_engine.tidy_text(text)})
     log("前期回顾：引用第 %s 期《%s》的期主旨与 %d 条段主旨，拼成 %d 句"
         % (prev.get("no"), title, len(topics), len(rows)))
     return rows
