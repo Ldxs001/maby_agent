@@ -3,6 +3,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循语义版本控制（`structured_writer/__init__.py` 唯一源）。
 
+## [3.2.1] - 2026-10-05
+### 修复（3.2.0 发布事故：新模块 outline_sidecar.py 未入同步白名单，PyPI 包与 Release 源码包缺文件）
+> 事件：v3.2.0 推送后核验发现镜像仓提交只含 5 个文件改动，`structured_writer/outline_sidecar.py` 未入库。根因：同步白名单按「镜像 HEAD 跟踪集 ∩ 源扫描」构造，跟踪集里不存在的新模块被交集过滤掉——该口径只保证存量不丢，不覆盖新增。PyPI 隔离构建自镜像仓拷贝源码，3.2.0 whl 同样缺该模块（包内 43 个 .py），而 writer.py / web_ui.py 均 import 它，安装即 ImportError。GitHub/Gitee v3.2.0 Release 源码包同缺。PyPI 同版本禁重传，bump 3.2.1 补发。
+
+- **同步白名单口径修正**：allow = （镜像 HEAD 跟踪集 ∩ 源扫描）∪ **本期新增源文件显式清单**——交集管存量，显式清单管新增，两步缺一不可；本期显式清单 = `structured_writer/outline_sidecar.py`
+- **验证**：镜像仓 `git ls-tree` 实查 outline_sidecar.py 在库；PyPI 3.2.1 whl 解包实查模块在场且 `import structured_writer.outline_sidecar` 可用；`scripts/check_version.py` 三端 + README 头部一致
+
 ## [3.2.0] - 2026-10-05
 ### 新增（导出配套规划 .outline.json——播客侧「structured-writer 标准格式识别」的数据源，新模块，minor bump）
 > 事件：podcast-maker v1.6.0 新增配置 `script.sw_outline`（默认关）：开启后播客侧按标题树读配套规划填充单元主旨，跳过逐单元 LLM 凝缩（实测一本书 48 节省 48 次调用，划期仍按播客侧既有流程）。本侧职责只有一件事：导出正文时把规划一并落盘，素材与规划永不脱节——此前规划只存在 session/novel_state 运行数据里，导出的 md 不携带，播客侧无从读取。
