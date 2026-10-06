@@ -1089,7 +1089,8 @@ def api_tts_setup(body):
                     break
 
         log("搭建本地语音环境：建环境 → 装依赖 → 下模型 → 自检。")
-        log("依赖约 4.8 GB、模型约 4 GB，第一次会慢；断了可以重跑，会接着来。")
+        log("依赖约 4.8 GB、模型约 8.5 GB（三个权重，含体检嵌入用的 0.4 GB），"
+            "第一次会慢；断了可以重跑，会接着来。")
         st = tts_engine.provision(log, should_stop=lambda: bool(job.get("stop")))
         if not st["ready"]:
             raise tts_engine.TTSError("搭建跑完了，环境仍然不完整，看上面的日志。")
@@ -2096,7 +2097,7 @@ class Handler(BaseHTTPRequestHandler):
                                "trace": traceback.format_exc()[-800:]}, 500)
 
 
-def run_server(host="0.0.0.0", port=8811, pidfile="", **kwargs):
+def run_server(host="0.0.0.0", port=8811, pidfile="", open_browser=False, **kwargs):
     if kwargs.get("backend") or kwargs.get("base_url") or kwargs.get("model"):
         patch = {}
         if kwargs.get("backend"):
@@ -2115,6 +2116,18 @@ def run_server(host="0.0.0.0", port=8811, pidfile="", **kwargs):
             f.write(str(os.getpid()))
 
     httpd = ThreadingHTTPServer((host, port), Handler)
+    # 浏览器必须由服务在端口绑定成功之后打开，而不是启动脚本抢先弹：
+    # Python 导入模块要一两秒，浏览器先开只会看到「连接不上」，等页面真
+    # 到了开屏画面早就闪完了。绑定即 listen，此刻连上来只会在内核队列里
+    # 排队等第一个 accept，不会拒绝。
+    if open_browser:
+        import threading
+        import webbrowser
+        threading.Thread(
+            target=webbrowser.open,
+            args=("http://127.0.0.1:%d/" % port,),
+            daemon=True,
+        ).start()
     print("=" * 62)
     print("  Podcast Maker  v%s" % VERSION)
     print("  播客制作智能体 · 脚本 → 声音 → 字幕 → 画面 → 产物")
@@ -2349,6 +2362,14 @@ td.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
 .toast{background:var(--panel3);border:1px solid var(--line2);border-left:3px solid var(--gold);border-radius:7px;padding:10px 15px;max-width:380px;font-size:12px;box-shadow:0 8px 28px rgba(0,0,0,.5);animation:sl .18s ease}
 .toast.err{border-left-color:var(--red)}.toast.ok{border-left-color:var(--green)}
 @keyframes sl{from{transform:translateX(18px);opacity:0}to{transform:none;opacity:1}}
+/* 开屏等待画面：页面是 200KB 单文件 HTML + 两段大内联脚本，解析期间浏览器
+   只能给一片空白。把 splash 放在 <body> 第一个节点，解析到它就先画出来，
+   初始化完成后再撤掉——参考 rag-assistant 的 iframe loader 同一手法。 */
+@keyframes spin{to{transform:rotate(360deg)}}
+#boot-splash{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;z-index:99;transition:opacity .25s ease}
+#boot-splash.off{opacity:0;pointer-events:none}
+#boot-splash .ring{width:34px;height:34px;border:3px solid var(--panel3);border-top-color:var(--gold);border-radius:50%;animation:spin .8s linear infinite}
+#boot-splash .txt{color:var(--fg2);font-size:12px;letter-spacing:1px}
 .mask{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:70}
 .mask.on{display:flex}
 .modal{background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:20px 22px;min-width:380px;max-width:560px}
@@ -2420,6 +2441,16 @@ td input,td select{padding:4px 7px;font-size:12px}
 </style>
 </head>
 <body>
+<div id="boot-splash">
+  <div class="ring"></div>
+  <div class="txt">正在加载 · 播客制作智能体</div>
+</div>
+<script>
+function hideBootSplash(){var s=document.getElementById('boot-splash');if(!s)return;s.classList.add('off');setTimeout(function(){var n=document.getElementById('boot-splash');if(n&&n.parentNode)n.parentNode.removeChild(n)},300)}
+/* 兜底：万一后面的大脚本解析/执行挂了，onload 里的正常撤除不会发生，
+   8 秒后强制撤屏，宁可露出坏页面也不能把用户锁在等待画面里。 */
+setTimeout(hideBootSplash,8000);
+</script>
 <div id="root">
 <header>
   <h1>播客制作智能体</h1><span class="ver" id="ver"></span>
@@ -3198,7 +3229,9 @@ const ZONES=[
   ['tts','音色体检',['tts.timbre_guard','tts.timbre_threshold',
                    'tts.timbre_dull_threshold','tts.timbre_identity_f0_deep',
                    'tts.timbre_identity_f0_full','tts.timbre_identity_s300',
-                   'tts.timbre_seed_retries']],
+                   'tts.timbre_cent_dark','tts.timbre_s300_band',
+                   'tts.timbre_sv_guard','tts.timbre_sv_sim',
+                   'tts.timbre_sv_min_seconds','tts.timbre_seed_retries']],
   ['audio','编码与响度',['audio.sample_rate','audio.bitrate_kbps','audio.channels',
                        'audio.codec','audio.loudnorm_target']],
   ['audio','停顿与降噪',['audio.pause_between_lines','audio.denoise']],
@@ -5188,6 +5221,7 @@ window.onload=async()=>{
   testBackendSilent();
   recalc();
   showTab(hashTab(),true);       // 首屏按 hash 落地，没有 hash 就是项目页
+  hideBootSplash();              // 初始化全部落定才撤开屏画面，中途撤会让用户看到半成品布局
 };
 </script>
 </body>

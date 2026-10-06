@@ -85,9 +85,11 @@ echo.
 rem ---------------- 4. start ----------------
 echo [4/4] Starting server on port 8811 ...
 echo       UI: http://127.0.0.1:8811
-start "" http://127.0.0.1:8811/
+rem Browser is opened BY the server right after the port is bound (--open).
+rem This script must not pop it earlier: Python imports take a second or two,
+rem and a browser launched here only shows "can't connect".
 echo.
-%PY% main.py --port 8811 --pidfile server.pid
+%PY% main.py --port 8811 --pidfile server.pid --open
 
 echo.
 echo Server stopped.

@@ -12,6 +12,30 @@
 
 ---
 
+## v1.7.2
+
+**本次改动：界面开屏等待画面；浏览器改由服务在端口绑定后打开**
+
+**修复**
+
+- **启动后浏览器先显示「连接不上」约 1-2 秒**：`setup.bat` 第 4 步先 `start "" http://127.0.0.1:8811/` 打开浏览器、再启动 `main.py`，Python 导入模块的 1-2 秒内端口未监听，浏览器连接被拒；页面到达后页内等待画面一闪而过，真正的等待窗口没有任何覆盖——等待画面出现在错误的时间点，属启动时序问题，页面内无法修复。修法：浏览器改由服务在端口绑定成功后打开——`run_server()` 新增 `open_browser` 参数，`ThreadingHTTPServer` 构造（bind+listen）完成后经守护线程调用 `webbrowser.open`；`main.py` 新增 `--open` 旗标透传；`setup.bat` 删除抢先打开浏览器的行，启动命令追加 `--open`。绑定即监听，此刻建立的连接在内核队列中等待首次 accept，不会被拒绝。
+
+**新增**
+
+- **声纹嵌入体检槽（wavlm-base-plus-sv）**：`tts_service` 新增 SVEngine 声纹嵌入引擎——懒加载、`pick_device` 与主服务同纪律（显存门槛独立 1200 MB，不足退 CPU）、加载失败信息进 `/health` 的 `sv` 字段；`_load_wav16k` 经 ffmpeg 管道统一 16 kHz 采样；`POST /embed` 支持单条与批量（按请求去重保序、L2 归一化）；权重落 `tts_service/models/wavlm-base-plus-sv/` 本地命中，`from_pretrained` 零网络等待。
+- **音色体检判据换芯（五族合验）**：`_timbre_capture` 扩为五族判据合验——旧四维分（谱心项补 `max(0,·)` 单向截断，亮漂不再抵消音高偏离）＋缺亮音（`tts.timbre_cent_dark=1.5`，单向）＋低频双向（`tts.s300_band=1.5`）＋声纹嵌入（`tts.sv_guard=True`，sim < `tts.sv_sim=0.90` 点名，时长门 `tts.sv_min_seconds=4.0` 秒，嵌入缺席不误报）＋音高偏移 o EMA（每期冷启动取前 10 合格句中位、更新门 1.5 半音、硬钳位 ±2.5 半音超限封顶并告警）；女声三件套判据原样保留；候选验收 fail-closed——原句被嵌入点名而候选缺嵌入时按「嵌入验收缺失」拒过；体检报告顶部新增参考锚测量、批次贴参考形态度（batch_shape）与音高迹（o / warn / d 中位），逐句行增 sv 与 d_st 字段。
+- **声纹模型用户安装链**：`tts_service/fetch_model.py` 增 `microsoft/wavlm-base-plus-sv`（三源下载链）；`setup_env.py` 待装模型增第三项（state 与 model_paths 自动跟踪）；`check.py` 增 `/embed` 验收步（合成样音后实测维度与设备，缺席如实报告）；`tts_service/README.md` 五处更新（安装表、权重表、`/embed` 接口、目录结构、许可行）。配置页「本地语音环境」卡模型体积文案更正为约 8.5 GB（三个权重）。
+- **界面开屏等待画面**：页面为约 200 KB 单文件 HTML 加两段大内联脚本，浏览器解析期间无任何渲染，表现为空白。修法：`<body>` 首节点插入 `#boot-splash` 等待画面（转圈与文案，配色随页面暗色主题变量），解析到该节点即先行绘制；`window.onload` 初始化全部落定（`showTab` 之后）才淡出并从 DOM 移除；另设 8 秒兜底强制撤除，后续脚本解析或执行失败时用户不会被锁在等待画面里。
+
+**测试**
+
+- **音色体检换芯钉子（24 条）**：谱心截断 / 缺亮音与低频双向规则 / 嵌入门 / 余弦与 EMA / 嵌入客户端 / 嵌入缺失拒过端到端 / 服务端 / config 五键与界面接线；另 `test_sv_model_in_user_setup_chain` 钉安装链三件套与文档。
+- **开屏画面钉子（`TestBootSplash` 三条）**：splash 必须是 `<body>` 第一个节点且兜底撤除在场；样式与 `@keyframes spin` 在页内 CSS 中；撤除调用必须位于 `showTab` 之后。
+- **开窗时序钉子（`tests/test_launch_open.py` 四条）**：`setup.bat` 不得含抢先打开浏览器的 `start "" http://` 且 `main.py` 启动行必须带 `--open`；`build_parser` 含 `--open` 旗标；`run_server` 源码中 `ThreadingHTTPServer(` 必须先于 `webbrowser.open`；浏览器 URL 恒为 `http://127.0.0.1:%d/`，不受 `--host` 通配影响。
+- **全量 1391 条通过**（判据换芯前 1359，换芯后 1383，安装链 1384，开屏画面 1387，开窗时序 1391）。
+
+---
+
 ## v1.7.1
 
 **本次改动：定点修补提示词接通本篇词表**

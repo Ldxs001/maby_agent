@@ -39,6 +39,7 @@ import ctypes
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -1054,11 +1055,41 @@ def synthesize(script, out_dir, cfg, log=None, emotion_level=None,
 #    同样 F0 -2.26σ，低频 +2.27σ 的判坏、+0.09σ 的放行。
 # 15 个耳标样本（9 坏 6 好）三规则合验 15/15，无一漏无一冤。
 #
+# ②期增补（2026-10 男声 22 句耳标考卷定出，四族句级探针对照实验的结论）：
+# ④ 频谱形态（缺亮音 ≤ -1.5σ / 低频双向 |s300| ≥ 1.5σ）：男声克隆的违和
+#    主体是「频谱形态残缺——缺亮音、缺低音」，而旧身份判据只看下行；期1
+#    全部 59 句 s300 全部高于 ref（零负值）说明低频鼓包是批次级的，双向
+#    才能同时抓「低频男声先验污染」与「低频塌陷」两个方向。
+# ⑤ 嵌入身份（wavlm x-vector 余弦 < 0.90，时长 ≥ 4s）：句级统计量被耳标
+#    考卷证伪后唯一抓得住严重音色离群（期1 #045/#067 级）的探测器；短句
+#    sim 系统性偏低（r=0.49），时长门是实测出的零损失防误报线。
+#    嵌入模型驻 tts_service（/embed），主程序零 torch；服务不可用时该维
+#    如实标「不可用」并告警，其余纯代码判据照常——不静默、不假装。
+# ⑥ 音高对 ref 偏移 d（半音）降为**记录项**：男声同情绪散布 3.16σ 实证
+#    d 线定不出来（#019 d=4.8 违和 vs #057 d=3.4 像），点名不参与，
+#    每期 EMA 基线 o（冷启动中位/更新门/钳位）随报告落盘供查。
+#
 # 位置为什么在全部句子之后：判定要拿角色全体做基线，逐句进行中基线不存在；
 # 修完才拼整期，后续工序（拼接 / 字幕 / 视频）拿到的就是修复后的最终波形。
 # 修复是确定性的：第几次重试对应哪个种子是固定的，整期重跑逐比特一致。
 
 _TIMBRE_MIN_BASELINE = 10   # 角色基线至少要这么多句，σ 才稳得住
+
+# 频谱形态与嵌入维的线。全部来自 2026-10 期1 男声 22 句耳标考卷 + 9 期回放，
+# 不是拍的：调线前先跑考卷（见 tests/test_timbre_guard.py 的对应钉子）。
+_SPEC_CENT_DARK = 1.5     # 缺亮音：谱心 ≤ 基线下方 1.5σ
+_SPEC_S300_BAND = 1.5     # 低频双向：|s300 - 基线| ≥ 1.5σ
+_SV_EMBED_MODEL = "microsoft/wavlm-base-plus-sv"
+_SV_SIM_LINE = 0.90       # 嵌入点名线：cos(句, ref) 低于即点名
+_SV_MIN_SECONDS = 4.0     # 时长门：更短不参与嵌入点名（sim 系统性偏低）
+
+# 每期音高基线 o 的 EMA 参数（记录项，随报告落盘）。实测各期基线相对 ref
+# 漂 +0.15~+1.92 半音——这是克隆特性不是句级漂移；EMA 只吸收摆动，
+# 钳位外的漂移走告警不走进准。
+_EMA_WARM_N = 10          # 冷启动：前 N 句中位数
+_EMA_ALPHA = 0.1          # 运行中平滑系数
+_EMA_GATE = 1.5           # 更新门（半音）：更远的句不进更新
+_EMA_CLAMP = 2.5          # o 硬钳位（半音）：实测上限 1.92 + 余量
 
 
 def _timbre_features(path):
@@ -1160,12 +1191,16 @@ def _timbre_score(row, base):
     权重来自人工试听定标：0233 响度偏移全场最重仍「可接受」、0157 谱心一维
     断崖就「非常明显」——响度是最弱的感知维度，谱心最强；2da 0054 证明频谱
     形状畸变独立于谱心可闻，存在感带以 0.5 计入。
+
+    谱心项的单向截断（2026-10 补）：变亮曾以负分与音高偏离相消——男声
+    0001_B 谱心 +7.3st 亮漂把 0.8×音高项抵剩 0.52 分，病句过线。变亮不出戏
+    与存在感维同理：只计恶化方向，不给好方向发抵扣券。
     """
     import numpy as np
 
     s = 0.0
     if row["cent"] is not None:
-        s += (base["cent_mu"] - row["cent"]) / (base["cent_sd"] or 1.0)
+        s += max(0.0, (base["cent_mu"] - row["cent"]) / (base["cent_sd"] or 1.0))
     if row["f0"] is not None:
         s += 0.8 * abs(row["f0"] - base["f0_mu"]) / (base["f0_sd"] or 1.0)
     if row["rms"] is not None:
@@ -1214,6 +1249,129 @@ def _identity_flag(row, base, deep, full, s300_cap):
     return bool(f0z >= deep or (f0z >= full and lz >= s300_cap))
 
 
+def _specform_flags(row, base, cent_dark=_SPEC_CENT_DARK,
+                    s300_band=_SPEC_S300_BAND):
+    """频谱形态判据（男声耳标考卷定出）：缺亮音与低频双向。
+
+    男声违和的主体是「频谱形态残缺」——没有亮音（谱心塌）或低频异常
+    （鼓包 = 模型自作主张加了 ref 没有的低频男声；塌陷 = 低音丢了）。
+    两个方向都点名，谱心照旧只计变暗方向。
+    """
+    reasons = []
+    if row.get("cent") is not None:
+        cz = (row["cent"] - base["cent_mu"]) / (base["cent_sd"] or 1.0)
+        if cz <= -cent_dark:
+            reasons.append("缺亮音%.1fσ" % cz)
+    if row.get("s300") is not None:
+        lz = (row["s300"] - base["s300_mu"]) / (base["s300_sd"] or 1.0)
+        if lz >= s300_band:
+            reasons.append("低频+%.1fσ" % lz)
+        elif lz <= -s300_band:
+            reasons.append("低频%.1fσ" % lz)
+    return reasons
+
+
+def _sv_flag(sv, seconds, sim_line=_SV_SIM_LINE, min_seconds=_SV_MIN_SECONDS):
+    """嵌入维点名裁决。返回 None（不参与）/ False（参与且过线）/ True（点名）。
+
+    时长门：x-vector 对整段时间池化，句越短参与池化的帧越少，sim 系统性
+    偏低（实测时长-sim 相关 r=0.49）——短句不是「算错」是「偏保守」，直接
+    排除出点名而非补偿。实测剔除 <3s 仅少 1 句且该句被缺亮音/音高双抓，
+    门是零损失的。
+    """
+    if sv is None:
+        return None
+    if seconds is not None and seconds < min_seconds:
+        return None
+    return bool(sv < sim_line)
+
+
+def _cosine(a, b):
+    """余弦相似度。纯 Python 实现：主程序不引 numpy 之外的重依赖，
+    512 维 × 每期几百句的量级毫秒级。"""
+    import math
+
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+def _wav_seconds(path):
+    """wav 时长（秒），只读帧头。嵌入时长门用，量不出返回 None。"""
+    try:
+        with wave.open(path, "rb") as w:
+            return w.getnframes() / float(w.getframerate() or 1)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _service_embed(wav_paths, cfg, log=None):
+    """批量调本地服务 /embed。返回 {路径: 向量}；嵌入不可用返回 None。
+
+    不可用（服务没起 / 模型没下 / 加载失败）不是错误——身份维标「不可用」
+    并告警，其余纯代码判据照常跑。fail-closed 指的是不静默：告警必须出现在
+    日志里，让「这期体检没跑嵌入」有据可查，而不是假装五个判据全跑过了。
+    """
+    log = log or (lambda m: None)
+    url = service_url(cfg, "/embed")
+    payload = json.dumps({"wavs": list(wav_paths)}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        # 首次调用要加载嵌入模型（数十秒）＋ CPU 逐句约 0.5s，上限给足
+        with urllib.request.urlopen(req, timeout=1800) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        log("音色体检：嵌入维不可用（%s）——身份判定只跑纯代码判据，"
+            "报告将标注嵌入未参与。" % str(e)[:200])
+        return None
+    if not d.get("ok"):
+        log("音色体检：嵌入维不可用（%s）——身份判定只跑纯代码判据，"
+            "报告将标注嵌入未参与。" % str(d.get("error"))[:200])
+        return None
+    return {k: [float(x) for x in v]
+            for k, v in (d.get("embeddings") or {}).items()}
+
+
+def _ema_offset(rows, ref_f0, warm=_EMA_WARM_N, alpha=_EMA_ALPHA,
+                gate=_EMA_GATE, clamp=_EMA_CLAMP):
+    """每期音高基线 o 的 EMA 迹（半音，相对 ref 锚）。返回 (o, warn)。
+
+    o 吸收的是「每期克隆基线相对 ref 的系统性摆动」（实测 +0.15~+1.92st），
+    不是句级漂移。三道闸保证 +7st 级别的病句进不来：
+    冷启动取前 warm 句**中位数**（1 句污染纹丝不动）→ 更新门（离 o 超过
+    gate 半音的句拒收）→ 硬钳位（o 越界封顶并告警，整期基线爆钳 = 克隆
+    整体异常，报警不吸收）。只喂未点名句——尺子不跟着错误走。
+    """
+    import math
+    import statistics
+
+    es = [12.0 * math.log2(r["f0"] / ref_f0) for r in rows if r["f0"]]
+    o, warn, warm_buf = None, False, []
+    for e in es:
+        if o is None:
+            warm_buf.append(e)
+            if len(warm_buf) >= warm:
+                o = statistics.median(warm_buf)
+                if abs(o) > clamp:
+                    warn, o = True, math.copysign(clamp, o)
+            continue
+        if abs(e - o) < gate:
+            o += alpha * (e - o)
+            if abs(o) > clamp:
+                warn, o = True, math.copysign(clamp, o)
+    if o is None:                      # 合格句不足 warm：现有样本中位兜底
+        o = statistics.median(es) if es else 0.0
+        if abs(o) > clamp:
+            warn, o = True, math.copysign(clamp, o)
+    return o, warn
+
+
 def _timbre_baselines(rows, log):
     """按角色建基线并给每句打分。句数不足的角色不建基线、不参与判定。"""
     import numpy as np
@@ -1243,11 +1401,16 @@ def _timbre_baselines(rows, log):
     return baselines, scored
 
 
-def _timbre_capture(r, base, threshold, dull_thr, id_deep, id_full, id_s300):
-    """三条判据合验，返回命中原因列表（空列表 = 放行）。
+def _timbre_capture(r, base, threshold, dull_thr, id_deep, id_full, id_s300,
+                    cent_dark=_SPEC_CENT_DARK, s300_band=_SPEC_S300_BAND,
+                    sv_line=_SV_SIM_LINE, sv_min_s=_SV_MIN_SECONDS):
+    """判据合验，返回命中原因列表（空列表 = 放行）。
 
     检测与修复候选验收共用这一把尺：原始句命中任何一条就点名重出，
-    重出候选必须三条全过才准转正——检测放进去的病，验收时必须保证治好了。
+    重出候选必须全过才准转正——检测放进去的病，验收时必须保证治好了。
+    判据族：四维加权分 / 暗淡子分 / 身份下限（女声定标三件套，原样保留）+
+    频谱形态（缺亮音、低频双向）+ 嵌入身份（时长门内 sim<线）。
+    嵌入不可用（row 无 sv 值）时该维自动缺席——不误报也不假装查过。
     """
     reasons = []
     if r.get("score") is not None and r["score"] >= threshold:
@@ -1258,6 +1421,9 @@ def _timbre_capture(r, base, threshold, dull_thr, id_deep, id_full, id_s300):
             r, base, id_deep, id_full, id_s300):
         f0z = (base["f0_mu"] - r["f0"]) / (base["f0_sd"] or 1.0)
         reasons.append("身份下偏%.2fσ" % f0z)
+    reasons.extend(_specform_flags(r, base, cent_dark, s300_band))
+    if _sv_flag(r.get("sv"), r.get("seconds"), sv_line, sv_min_s):
+        reasons.append("嵌入%.2f" % r["sv"])
     return reasons
 
 
@@ -1310,6 +1476,11 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
     id_deep = float(cfg.get("tts.timbre_identity_f0_deep", 2.4))
     id_full = float(cfg.get("tts.timbre_identity_f0_full", 2.0))
     id_s300 = float(cfg.get("tts.timbre_identity_s300", 1.5))
+    cent_dark = float(cfg.get("tts.timbre_cent_dark", _SPEC_CENT_DARK))
+    s300_band = float(cfg.get("tts.timbre_s300_band", _SPEC_S300_BAND))
+    sv_guard = bool(cfg.get("tts.timbre_sv_guard", True))
+    sv_line = float(cfg.get("tts.timbre_sv_sim", _SV_SIM_LINE))
+    sv_min_s = float(cfg.get("tts.timbre_sv_min_seconds", _SV_MIN_SECONDS))
 
     t0 = time.time()
     rows = []
@@ -1322,19 +1493,12 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
             continue
         rows.append({"index": i, "speaker": item.get("speaker", "A"),
                      "f0": f0, "cent": cent, "rms": rms_db, "pres": pres,
-                     "s300": s300, "jit": jit})
+                     "s300": s300, "jit": jit,
+                     "seconds": _wav_seconds(audio_files[i])})
     baselines, scored = _timbre_baselines(rows, log)
     if not baselines:
         log("音色体检：没有任何角色建得起基线，跳过")
         return None
-    for r in scored:
-        r["why"] = _timbre_capture(r, baselines[r["speaker"]], threshold,
-                                   dull_thr, id_deep, id_full, id_s300) \
-            if r["score"] is not None else []
-        r["flag"] = bool(r["why"])
-    flagged = [r for r in scored if r["flag"]]
-    log("音色体检：%d 句测完，%d 句点名（四维 %.2f / 暗淡 %.2f / 身份，%.0f 秒）"
-        % (len(scored), len(flagged), threshold, dull_thr, time.time() - t0))
 
     voices = {"A": cfg.get("tts.qwen3tts_voice_a", ""),
               "B": cfg.get("tts.qwen3tts_voice_b", "")}
@@ -1342,6 +1506,86 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
         refs = ensure_voice_profiles(
             voice_root or os.path.dirname(os.path.dirname(audio_files[0])),
             voices, cfg, log)
+
+    # 嵌入维（身份判定）：参考音频与全部句子一次批量嵌完。嵌入不可用时
+    # sv_map 为 None——该维如实缺席，纯代码判据照常，告警已在 _service_embed
+    # 里落地，这里不再重复喊。
+    sv_map, sv_info = None, {"available": False, "model": _SV_EMBED_MODEL,
+                             "sim_line": sv_line, "min_seconds": sv_min_s,
+                             "note": "未启用（tts.timbre_sv_guard=false）"}
+    if sv_guard:
+        ref_paths = sorted({refs[spk]["wav"] for spk in baselines
+                            if spk in refs and refs[spk].get("wav")})
+        m = _service_embed(
+            ref_paths + [audio_files[r["index"]] for r in scored], cfg, log)
+        if m is not None and all(w in m for w in ref_paths):
+            sv_map = m
+            sv_info["available"] = True
+            sv_info["note"] = ""
+        else:
+            sv_info["note"] = "嵌入服务不可用，身份判定只跑了纯代码判据"
+    if sv_map is not None:
+        for r in scored:
+            ref_doc = refs.get(r["speaker"]) or {}
+            rv = sv_map.get(ref_doc.get("wav") or "")
+            r["sv"] = (round(_cosine(sv_map[audio_files[r["index"]]], rv), 4)
+                       if rv else None)
+
+    for r in scored:
+        r["why"] = _timbre_capture(r, baselines[r["speaker"]], threshold,
+                                   dull_thr, id_deep, id_full, id_s300,
+                                   cent_dark=cent_dark, s300_band=s300_band,
+                                   sv_line=sv_line, sv_min_s=sv_min_s) \
+            if r["score"] is not None else []
+        r["flag"] = bool(r["why"])
+    flagged = [r for r in scored if r["flag"]]
+    log("音色体检：%d 句测完，%d 句点名（四维 %.2f / 暗淡 %.2f / 身份 / 形态%s，%.0f 秒）"
+        % (len(scored), len(flagged), threshold, dull_thr,
+           (" / 嵌入%.2f" % sv_line) if sv_map is not None else " / 嵌入不可用",
+           time.time() - t0))
+
+    # ref 锚测量 + 批次「贴 ref 形态度」+ 音高偏移迹。全是记录与批次级指标：
+    # 形态度量化「这个克隆贴不贴基准」（服务换音色/换模型决策），音高 d 对
+    # 男声定不出线（同情绪散布 3.16σ），只落盘不点名。
+    anchors = {}
+    for spk in baselines:
+        ref_doc = refs.get(spk) or {}
+        rw = ref_doc.get("wav") or ""
+        if not rw or not os.path.isfile(rw):
+            continue
+        try:
+            af0, acent, arms, apres, as300, ajit = _timbre_features(rw)
+        except Exception:  # noqa: BLE001
+            continue
+        anchors[spk] = {"f0": af0, "cent": acent, "rms": arms,
+                        "pres": apres, "s300": as300, "jit": ajit}
+    batch_shape, pitch = {}, {}
+    for spk, anchor in anchors.items():
+        rs = [r for r in scored if r["speaker"] == spk]
+        s300s = sorted(r["s300"] for r in rs if r["s300"] is not None)
+        cents = sorted(r["cent"] for r in rs if r["cent"] is not None)
+        if s300s and anchor["s300"]:
+            batch_shape.setdefault(spk, {}).update({
+                "s300_ref": round(anchor["s300"], 6),
+                "s300_session_median": round(s300s[len(s300s) // 2], 6)})
+        if cents and anchor["cent"]:
+            batch_shape.setdefault(spk, {}).update({
+                "cent_ref": round(anchor["cent"], 1),
+                "cent_session_median": round(cents[len(cents) // 2], 1)})
+        if anchor["f0"]:
+            ok_rows = [r for r in rs if not r["flag"] and r["f0"]]
+            o, warn = _ema_offset(ok_rows, anchor["f0"])
+            for r in rs:
+                if r["f0"]:
+                    e = 12.0 * math.log2(r["f0"] / anchor["f0"])
+                    r["d_st"] = round(e - o, 2)
+            ds = sorted(r["d_st"] for r in rs if r.get("d_st") is not None)
+            pitch[spk] = {"o": round(o, 3), "warn": warn,
+                          "ref_f0": round(anchor["f0"], 1),
+                          "d_median": (round(ds[len(ds) // 2], 2)
+                                       if ds else None),
+                          "note": ("基线偏移越过钳位，整期判嗓音异常"
+                                   if warn else "")}
 
     changed, repairs, exhausted = {}, [], []
     # 保底第 4 招的准备：同角色全部未点名句（保底复用它们的种子）。key 缓存
@@ -1397,15 +1641,30 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
                 f.write(data)
             f0, cent, rms_db, pres, s300, jit = _timbre_features(tmp)
             cand = {"f0": f0, "cent": cent, "rms": rms_db, "pres": pres,
-                    "s300": s300, "jit": jit}
+                    "s300": s300, "jit": jit,
+                    "seconds": _wav_seconds(tmp)}
+            # 候选的嵌入验收：检测放进去的病（嵌入点名），候选必须同样过嵌入
+            # 才准转正。逐条单嵌，量级 = 被点名句数 × 0.5s，可忽略。
+            if sv_map is not None:
+                cv = _service_embed([tmp], cfg, log)
+                rv = sv_map.get((refs.get(spk) or {}).get("wav") or "")
+                if cv and rv and tmp in cv:
+                    cand["sv"] = _cosine(cv[tmp], rv)
             s = _timbre_score(cand, baselines[spk])
             cand["score"] = s
             cand["dull"] = _dull_score(cand, baselines[spk])
             why = _timbre_capture(cand, baselines[spk], threshold, dull_thr,
-                                  id_deep, id_full, id_s300)
+                                  id_deep, id_full, id_s300,
+                                  cent_dark=cent_dark, s300_band=s300_band,
+                                  sv_line=sv_line, sv_min_s=sv_min_s)
+            if sv_map is not None and "sv" not in cand and \
+                    any(w.startswith("嵌入") for w in r["why"]):
+                # 原句是嵌入点名的，候选却没量出嵌入——验收缺尺，不许过。
+                # 否则「检测放进去的病」可以借着嵌入服务一次抖动溜出去。
+                why.append("嵌入验收缺失")
             log("音色体检：%s %s 重出 → 四维 %.2f 暗淡 %.2f%s（原 %.2f）"
                 % (fname, tag, s, cand["dull"],
-                   ("，命中：" + "、".join(why)) if why else "，三判据全过",
+                   ("，命中：" + "、".join(why)) if why else "，判据全过",
                    r["score"]))
             if not why:
                 os.replace(tmp, audio_files[i])
@@ -1472,6 +1731,12 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
                            "dull_threshold": dull_thr,
                            "identity": {"f0_deep": id_deep,
                                         "f0_full": id_full, "s300": id_s300},
+                           "specform": {"cent_dark": cent_dark,
+                                        "s300_band": s300_band},
+                           "sv": sv_info,
+                           "anchor": anchors,
+                           "batch_shape": batch_shape,
+                           "pitch": pitch,
                            "baselines": baselines,
                            "rows": scored, "repairs": repairs,
                            "exhausted": exhausted,

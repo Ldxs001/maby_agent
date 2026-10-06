@@ -167,5 +167,49 @@ class TestEngineSwitchRescopes(unittest.TestCase):
         self.assertIn("applyEngineScope()", branch)
 
 
+class TestBootSplash(unittest.TestCase):
+    """开屏等待画面。
+
+    页面是 200KB 单文件 HTML + 两段大内联脚本，浏览器解析期间只给一片
+    空白（实测 1-2 秒），用户以为服务没起来。做法与 rag-assistant 的
+    iframe loader 同一手法：splash 是 <body> 第一个节点，解析到就先画；
+    window.onload 里初始化全部落定后才撤。
+
+    钉三条铁律：splash 必须挂在最前（不然画不出来）；必须有兜底撤屏
+    （大脚本挂了不能把用户锁死在等待画面）；撤除必须挂在初始化末尾
+    （中途撤＝露出半成品布局，等于没加）。
+    """
+
+    def setUp(self):
+        self.page = web_ui.PAGE
+
+    def test_splash_is_the_first_node_in_body(self):
+        # 用 "<body>\n" 定位真 body——CSS 注释里可能出现 "<body>" 字样
+        body = self.page[self.page.index("<body>\n"):]
+        head = body[:body.index("</script>")]   # splash 后紧跟兜底脚本，一起核
+        self.assertIn('id="boot-splash"', head)
+        # splash 前不许再有任何 DOM 节点——<body> 到 splash 之间只许空白换行
+        between = body[body.index(">") + 1:body.index('<div id="boot-splash">')]
+        self.assertFalse(between.strip(),
+                         "splash 前面出现了别的节点：%r" % between[:80])
+        # 兜底撤屏：大脚本挂了 onload 不会来，超时强制撤
+        self.assertIn("setTimeout(hideBootSplash", head)
+
+    def test_splash_styles_and_spinner_are_in_page_css(self):
+        css = self.page[self.page.index("<style>"):self.page.index("</style>")]
+        self.assertIn("#boot-splash", css)
+        self.assertIn("@keyframes spin", css)          # 转圈动画本体
+        self.assertIn("border-top-color:var(--gold)", css)  # 暗色主题可见
+        self.assertIn(".off", css)                     # 撤除走淡出，不是瞬失
+
+    def test_splash_hides_only_after_init_completes(self):
+        onload = self.page[self.page.index("window.onload="):]
+        onload = onload[:onload.index("</script>")]
+        self.assertIn("hideBootSplash()", onload)
+        # 必须在最后一行 showTab 之后撤——先撤再落 tab 会闪半成品布局
+        self.assertLess(onload.index("showTab("),
+                        onload.rindex("hideBootSplash()"))
+
+
 if __name__ == "__main__":
     unittest.main()

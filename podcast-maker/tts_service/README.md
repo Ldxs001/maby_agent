@@ -29,7 +29,7 @@
 | 2 | `python -m venv tts_service/.venv` 建出本服务自己的环境 |
 | 3 | 装依赖：PyTorch（**CUDA 版**，torch 轮子 2.41 GiB、torchaudio 2.0 MiB）+ 代码真正 import 的那几个 |
 | 4 | 装两个 TTS 本体包（`--no-deps`，见下面的坑） |
-| 5 | 下两个模型权重（Base + CustomVoice，各约 4.3 GB，**可断点续传，重跑不会重下**） |
+| 5 | 下三个模型权重（Base + CustomVoice 各约 4.3 GB、wavlm-base-plus-sv 约 0.4 GB，**可断点续传，重跑不会重下**） |
 
 再跑一次不会重装：环境、依赖、模型三样都齐时它直接收工。中途断了可以重跑，
 已装好的包和已下好的权重都留着。
@@ -38,17 +38,22 @@
 那串包（onnxruntime、librosa 等）在新版 Python 上常常还没有轮子。3.11 是覆盖面
 最广的一档；找不到就顺着往上找，一个都没有才报错。
 
-权重默认落在 `models/` 下，**两个变体都要**：
+权重默认落在 `models/` 下，**三个都要**：
 
 | 权重 | 目录 | 谁用 |
 |---|---|---|
 | `Qwen3-TTS-12Hz-1.7B-Base` | `models/Qwen3-TTS-12Hz-1.7B-Base/` | 常驻服务的那个（`serve.py` 默认吃它） |
 | `Qwen3-TTS-12Hz-1.7B-CustomVoice` | `models/Qwen3-TTS-12Hz-1.7B-CustomVoice/` | 只在录参考音频时短暂跑一次（`make_voice.py`） |
+| `wavlm-base-plus-sv` | `models/wavlm-base-plus-sv/` | 音色体检的说话人嵌入（体检经 `POST /embed` 拿它算"这句像不像这个人"） |
 
-两个各约 4.3 GB（`model.safetensors` 分别是 3857413744 / 3833402552 字节）。
-**不能只装一个**：Base 没有内置音色、出不了参考音频；CustomVoice 没有说话人编码器、
-读不了参考音频。两者也不能同时驻留 —— 8 GB 的卡上放不下，所以分工是「常驻的不管录音、
-录音的不常驻」。
+两个 Qwen 各约 4.3 GB（`model.safetensors` 分别是 3857413744 / 3833402552 字节），
+wavlm 约 0.4 GB（`pytorch_model.bin`）。**Qwen 两个不能只装一个**：Base 没有内置
+音色、出不了参考音频；CustomVoice 没有说话人编码器、读不了参考音频。两者也不能
+同时驻留 —— 8 GB 的卡上放不下，所以分工是「常驻的不管录音、录音的不常驻」。
+wavlm 闲置不占显存、懒加载（首次 `/embed` 才进内存）；缺了它合成照常，
+音色体检的嵌入维如实缺席（纯代码判据照跑），但既然该维默认开着，安装就该下齐。
+注：它在 ModelScope 上没有镜像，下载链的第一条源对它必然落空，自动落到
+hf-mirror 继续 —— 这不是失败。
 
 **下载源**（全仓唯一写死在 `../tools/sources.py`，`setup_env.py` 从那里读，
 `requirements-*.txt` 里各带自己那一条，有测试盯着几处不许走散）：
@@ -193,9 +198,30 @@
 { "input": "要念的正文", "voice": "Serena", "response_format": "wav" }
 ```
 
+### `POST /embed` —— 说话人嵌入（音色体检专用）
+
+```json
+{ "wavs": ["路径/ref.wav", "路径/0001_B.wav", "…"] }
+```
+
+返回：
+
+```json
+{ "ok": true, "dim": 512, "model": "microsoft/wavlm-base-plus-sv",
+  "device": "cpu",
+  "embeddings": { "路径/ref.wav": [0.01, …], "…": [0.02, …] } }
+```
+
+wavlm-base-plus-sv 懒加载（首次调用才进内存），批量去重保序 —— 同一路径只嵌
+一次，返回值按**去重后的路径**做键。调用方（主程序 `tts_engine` 的音色体检）
+拿各句向量与参考音频的向量算余弦相似度，sim<0.90 即点名"音色不像"；
+短于 4 秒的句不参与（时长太短嵌入噪声大）。服务没起或模型缺失时主程序
+fail-closed：该维如实缺席告警，五条纯代码判据照常跑。
+
 ### `GET /health` / `GET /speakers`
 
-健康检查（设备、后端、空闲显存、加载耗时、**`model_kind`**）与音色清单。
+健康检查（设备、后端、空闲显存、加载耗时、**`model_kind`**，以及 **`sv`** ——
+说话人嵌入槽的加载状态 / 设备 / 最近一次错误）与音色清单。
 
 `model_kind` 告诉调用方此刻加载的是哪个变体（`base` / `custom_voice`），界面据此
 决定「音色」那一栏长什么样。`/speakers` 在 Base 下把两个字段分开报：`speakers`
@@ -350,17 +376,18 @@ GPU 出的是两条不同的波形 —— 实测同一套输入：GPU 得 `sha25
 
 ```
 tts_service/
-  setup_env.py               唯一一份安装实现：建环境 → 装依赖 → 下两个模型 → 自检
+  setup_env.py               唯一一份安装实现：建环境 → 装依赖 → 下三个模型 → 自检
   setup.bat                  薄壳：找机器上的 Python，然后调 setup_env.py
   requirements-torch.txt     torch/torchaudio，自带 pytorch 源
   requirements-tts.txt       其余依赖，自带 PyPI 源
   .venv/                     本服务自己的环境（由程序建，不入库）
-  serve.py                   薄服务本体（HTTP + 引擎 + 显存策略）；跑 Base 变体
+  serve.py                   薄服务本体（HTTP + 引擎 + 显存策略 + 说话人嵌入槽）；
+                             常驻跑 Base 变体，/embed 懒加载 wavlm
   make_voice.py              角色音色档案：生成 / 继承 / 查账（跑 CustomVoice，
                              一次性进程，跑完就退）
-  check.py                   验收脚本（不碰 LM Studio）
-  fetch_model.py             模型下载（三源自动切换，断点续传，两个模型一起下）
-  models/                    权重（Base + CustomVoice 各一份，见第一节）
+  check.py                   验收脚本（合成 + 嵌入都验，不碰 LM Studio）
+  fetch_model.py             模型下载（三源自动切换，断点续传，三个模型一起下）
+  models/                    权重（Base + CustomVoice + wavlm 各一份，见第一节）
 ```
 
 `make_voice.py` 是三个动作共用的入口，主程序在合成前缺档案时会自动调它：
@@ -386,6 +413,7 @@ tts_service/
 | Qwen3-TTS-12Hz-1.7B-CustomVoice | **Apache-2.0** | 同一个团队的另一个权重包，录参考音频时用 |
 | faster-qwen3-tts | **MIT** | CUDA 图推理加速层 |
 | qwen-tts-hf（官方推理包） | **Apache-2.0** | 兜底路用，`dist-info` 的 `License-Expression` |
+| wavlm-base-plus-sv | **MIT** | 微软，说话人嵌入；权重包元数据标 MIT，出处见 HF 仓库页 |
 
 三处许可各自的出处都在本机可查，不是转述：
 

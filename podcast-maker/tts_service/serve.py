@@ -16,6 +16,9 @@
                              "ref_text":  "走克隆时必填，参考音频的转录文本"}
     POST /v1/audio/speech   OpenAI 标准形状（通用，以后换引擎即插即用）
                             {"input": "...", "voice": "Serena", "response_format": "wav"}
+    POST /embed             说话人嵌入（音色体检的身份维）：{"wav": "路径"} 单条或
+                            {"wavs": [路径…]} 批量，返回 {"embeddings": {路径: [512 维]}}。
+                            向量已做 L2 归一，调用方算余弦 = 直接点积。
     GET  /health            模型状态：是否已加载、跑在哪个设备、当前空闲显存
     GET  /speakers          该模型支持的音色清单（克隆变体下报参考音频要求）
 
@@ -64,6 +67,14 @@ DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 CUSTOM_VOICE_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 # 与主程序 tts.qwen3tts_port 的默认值保持一致，接入时端口不用改
 DEFAULT_PORT = 9880
+
+# 说话人嵌入模型（音色体检身份维）。wavlm x-vector：整段波形 → 512 维音色
+# 指纹，不经任何句级统计量压缩——四族句级探针（标量/嵌入外的韵律/形态）被
+# 耳标考卷证伪后，身份判定换芯的落点。确定性判别模型，同输入必同输出。
+SV_MODEL_ID = "microsoft/wavlm-base-plus-sv"
+# 嵌入模型小（约 0.4GB fp32），显存门槛与 TTS 分开算：主模型在场时它大概率
+# 上不了 GPU，退 CPU（约 0.5 秒/句）对体检这种离线场景无感。
+SV_VRAM_NEED_MB = 1200
 
 # 上 GPU 的门槛：1.7B BF16 权重约 3.4GB，加激活与 CUDA 图缓冲，给 4500MB 起算
 VRAM_NEED_MB = 4500
@@ -513,6 +524,112 @@ class Engine:
         return samples, int(sr)
 
 
+class SVEngine:
+    """说话人嵌入槽（wavlm-base-plus-sv）。与 Engine 同一套纪律：
+
+    懒加载（第一个 /embed 请求才进内存）、绝不抢显存（空闲不足退 CPU）、
+    失败如实上报（last_error 进 /health，调用方把嵌入维标「不可用」，
+    纯代码判据照常跑——不静默、不假装可用）。
+
+    它与 TTS 主模型是两个模型槽位，显存各自判定：TTS 上 GPU 时嵌入通常
+    退 CPU，这不影响正确性，只影响速度（0.5 秒/句对离线体检无感）。
+    """
+
+    def __init__(self, prefer_device: str, log):
+        self.prefer_device = prefer_device
+        self.log = log
+        self._model = None
+        self._fe = None
+        self._lock = threading.RLock()
+        self.device: str | None = None
+        self.device_note = ""
+        self.last_error: str | None = None
+
+    def ensure(self):
+        with self._lock:
+            if self._model is not None:
+                return self._model
+
+            # 设备判定：与 pick_device 同一套原则，门槛换成嵌入自己的量。
+            if self.prefer_device == "cpu":
+                self.device, self.device_note = "cpu", "配置指定 CPU"
+            else:
+                free = free_vram_mb()
+                if free is None:
+                    self.device, self.device_note = "cpu", "读不到显存，走 CPU"
+                elif free >= SV_VRAM_NEED_MB:
+                    self.device = "cuda"
+                    self.device_note = f"空闲 {free}MB ≥ {SV_VRAM_NEED_MB}MB → GPU"
+                else:
+                    self.device = "cpu"
+                    self.device_note = (f"空闲只剩 {free}MB < {SV_VRAM_NEED_MB}MB"
+                                        f" → 嵌入走 CPU（不挤主模型）")
+            self.log(f"[嵌入] 设备判定：{self.device_note}")
+
+            import torch  # 延迟导入：与主模型同一环境，启动不引入
+            from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+
+            path = resolve_model(SV_MODEL_ID)
+            t0 = time.time()
+            self._fe = Wav2Vec2FeatureExtractor.from_pretrained(path)
+            m = WavLMForXVector.from_pretrained(path)
+            m.to(self.device).eval()
+            self._model = m
+            self.log(f"[嵌入] 就绪 · {self.device} · 耗时 {time.time() - t0:.1f}s")
+            return self._model
+
+    def embed_files(self, paths) -> dict:
+        """批量嵌入：{路径: 512 维列表}。向量 L2 归一，余弦 = 点积。"""
+        import numpy as np
+        import torch
+
+        model = self.ensure()
+        out = {}
+        for p in paths:
+            x = _load_wav16k(p)
+            inputs = self._fe(x, sampling_rate=16000, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                # WavLMForXVector 的 .embeddings 已是时间池化后的 [1, 512]
+                # x-vector——不要再做 mean，压成标量就是bug。
+                emb = model(**inputs).embeddings
+            vec = torch.nn.functional.normalize(emb, dim=-1)[0]
+            out[p] = [float(v) for v in vec.detach().cpu()]
+        return out
+
+    def status(self) -> dict:
+        return {"model": SV_MODEL_ID,
+                "loaded": bool(self._model is not None),
+                "device": (self.device or "未加载"),
+                "device_note": self.device_note,
+                "last_error": self.last_error}
+
+
+def _load_wav16k(path: str):
+    """任意音频 → 16kHz 单声道 float32 波形（ffmpeg 管道，不落盘）。
+
+    wavlm 以 16k 训练，喂别的采样率等于换尺子。ffmpeg 走 stdout，长度按
+    音频本身（体检句 ≤ 30 秒），不必拆块。
+    """
+    import io as _io
+
+    import numpy as np
+
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path, "-ac", "1", "-ar", "16000",
+         "-f", "wav", "-"],
+        capture_output=True, timeout=120)
+    if r.returncode != 0 or not r.stdout:
+        raise RuntimeError("ffmpeg 读不出 16k 波形：%s"
+                           % (r.stderr or b"").decode("utf-8", "replace")[-200:])
+    with wave.open(_io.BytesIO(r.stdout), "rb") as w:
+        raw = w.readframes(w.getnframes())
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if x.size == 0:
+        raise RuntimeError("音频解码后为空：%s" % path)
+    return x
+
+
 def _split_out(out: Any) -> tuple[Any, int]:
     """把合成结果拆成 (单条波形, 采样率)。
 
@@ -604,6 +721,7 @@ def build_instruct(emotion: str | None, speed: float | None,
 # --------------------------------------------------------------------------- #
 
 ENGINE: Engine | None = None
+SV: SVEngine | None = None
 ARGS: argparse.Namespace | None = None
 
 
@@ -635,6 +753,37 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             return {}
 
+    def _embed(self):
+        body = self._read_json()
+        wavs = body.get("wavs")
+        if not wavs and body.get("wav"):
+            wavs = [body["wav"]]
+        wavs = [str(p) for p in (wavs or [])]
+        if not wavs:
+            return self._json(400, {"ok": False,
+                                    "error": "需要 wav（单条）或 wavs（批量）"})
+        missing = [p for p in wavs if not os.path.isfile(p)]
+        if missing:
+            return self._json(400, {"ok": False,
+                                    "error": "音频不存在：%s" % missing[:3]})
+        uniq = list(dict.fromkeys(wavs))     # 去重保序：参考音频只嵌一次
+        t0 = time.time()
+        try:
+            emb = SV.embed_files(uniq)
+        except Exception as e:  # noqa: BLE001
+            SV.last_error = str(e)
+            tb = traceback.format_exc(limit=6)
+            sys.stderr.write(tb + "\n")
+            return self._json(500, {"ok": False, "error": str(e), "trace": tb})
+        SV.last_error = None
+        if ARGS and not getattr(ARGS, "quiet", False):
+            sys.stderr.write("[嵌入] %d 条（去重 %d）· %.1fs · %s\n"
+                             % (len(wavs), len(uniq), time.time() - t0,
+                                SV.device or "?"))
+        dim = len(next(iter(emb.values()))) if emb else 0
+        return self._json(200, {"ok": True, "dim": dim, "model": SV_MODEL_ID,
+                                "device": SV.device, "embeddings": emb})
+
     # -- 路由 ------------------------------------------------------------- #
 
     def do_GET(self):  # noqa: N802
@@ -658,6 +807,7 @@ class Handler(BaseHTTPRequestHandler):
                 "vram_used_mb": used_vram_mb(),
                 "vram_need_mb": VRAM_NEED_MB + VRAM_SAFETY_MB,
                 "last_error": (eng.last_error if eng else None),
+                "sv": (SV.status() if SV else None),
             }
             return self._json(200, info)
 
@@ -693,8 +843,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         path = self.path.split("?")[0].rstrip("/") or "/"
-        if path not in ("/tts", "/v1/audio/speech"):
+        if path not in ("/tts", "/v1/audio/speech", "/embed"):
             return self._json(404, {"ok": False, "error": f"没有这个地址：{self.path}"})
+
+        if path == "/embed":
+            return self._embed()
 
         body = self._read_json()
         # 两个入口的字段名不同，统一归一化
@@ -813,7 +966,7 @@ class Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------- #
 
 def main() -> int:
-    global ENGINE, ARGS
+    global ENGINE, SV, ARGS
 
     ap = argparse.ArgumentParser(
         description="本地 TTS 薄服务（Qwen3-TTS / CUDA 图）")
@@ -845,10 +998,11 @@ def main() -> int:
     log(f"  设备    {ARGS.device}（auto：够显存上 GPU，不够退 CPU）")
     log(f"  监听    http://{ARGS.host}:{ARGS.port}")
     log(f"  显存    空闲 {free_vram_mb()}MB / 需要 {VRAM_NEED_MB + VRAM_SAFETY_MB}MB")
-    log("  接口    POST /tts · POST /v1/audio/speech · GET /health")
+    log("  接口    POST /tts · POST /v1/audio/speech · POST /embed · GET /health")
     log("=" * 62)
 
     ENGINE = Engine(ARGS.model, ARGS.device, log)
+    SV = SVEngine(ARGS.device, log)
 
     if ARGS.preload:
         try:

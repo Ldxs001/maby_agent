@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 
 # ============================================================================
@@ -764,6 +764,35 @@ PARAM_SPEC = {
         engine_scope="qwen3tts", min=0.5, max=5.0,
         help="<300Hz 能量占比相对基线的 σ 上限，与上一条联动使用。"
              "大美是单薄女高音，低频鼓起来就是别人"),
+    "tts.timbre_cent_dark": _p(
+        "float", 1.5, "voice", "频谱形态：缺亮音线（σ）",
+        engine_scope="qwen3tts", min=0.5, max=5.0,
+        help="谱质心比角色基线暗超过该 σ 数即点名。男声耳标考卷定出："
+             "违和主体是「没有亮音」的频谱形态残缺，句级均值恰好抹掉它，"
+             "1.5σ 是误报可接受的保守线"),
+    "tts.timbre_s300_band": _p(
+        "float", 1.5, "voice", "频谱形态：低频双向线（σ）",
+        engine_scope="qwen3tts", min=0.5, max=5.0,
+        help="<300Hz 占比双向判：鼓过 +1.5σ = 模型加了基准没有的低频男声，"
+             "塌过 -1.5σ = 低音缺失。期1 全部句子低频都高于参考音频"
+             "（零负值），说明低频鼓包是批次级现象，双向才抓得全"),
+    "tts.timbre_sv_guard": _p(
+        "bool", True, "voice", "嵌入身份维（说话人向量）",
+        engine_scope="qwen3tts", views=("render",),
+        help="wavlm x-vector 算每句与参考音频的音色余弦，低于点名线即判"
+             "「不是这个人」。模型驻语音服务（/embed），主程序零 torch；"
+             "服务不可用时该维如实缺席，其余判据照常"),
+    "tts.timbre_sv_sim": _p(
+        "float", 0.90, "voice", "嵌入点名线（余弦）",
+        engine_scope="qwen3tts", min=0.5, max=1.0, step=0.01,
+        help="cos(句, 参考音频) 低于该值即点名。期1 耳标考卷定出：严重"
+             "音色离群（嵌入 0.82~0.89）与正常区（≥0.92）的分离带中点"),
+    "tts.timbre_sv_min_seconds": _p(
+        "float", 4.0, "voice", "嵌入时长门（秒）",
+        engine_scope="qwen3tts", min=0.0, max=10.0, step=0.5, unit="秒",
+        help="短于该值的句子不参与嵌入点名：x-vector 对短句的相似度系统性"
+             "偏低（时长-sim 相关 r=0.49），是误报源；实测剔除 <3s 零漏损，"
+             "短句仍有其余五族纯代码判据兜底"),
 
     "audio.sample_rate": _p("enum", 44100, "voice", "采样率（Hz）"),
     "audio.bitrate_kbps": _p("int", 192, "voice", "码率（kbps）",

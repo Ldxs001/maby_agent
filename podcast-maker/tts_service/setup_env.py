@@ -64,18 +64,24 @@ REQ_TTS = os.path.join(HERE, "requirements-tts.txt")
 # 一个都没 import，全量装会白白拖进来几百 MB，还会在没编译器的机器上直接失败。
 TTS_PACKAGES = ("faster-qwen3-tts==0.4.0", "qwen-tts-hf==0.1.1.post1")
 
-# 要下哪两个模型。**两个都要，少一个流程就跑不通**：
+# 要下哪三个模型。**三个都要，少一个流程就缺一角**：
 #
 #   CustomVoice  自带九个音色（Serena / Vivian / Uncle_Fu…）。它不做常态合成，
 #                只在「给一个新项目录角色参考音频」时被加载一次，录完就退出 ——
 #                一次性选型器。
 #   Base         常态引擎。没有内置音色表，音色来自上一步录出来的那段参考音频。
 #                整期所有句子都走它（见 serve.py 的 DEFAULT_MODEL）。
+#   wavlm-base-plus-sv  音色体检的说话人嵌入（512 维 x-vector）。体检经
+#                /embed 拿它算"这句像不像这个人"，sim<0.90 点名。体量很小
+#                （约 0.4 GB）；缺了它体检的嵌入维如实缺席，纯代码判据照常，
+#                但既然该维默认开着，这里就得下齐。
 #
-# 只有 CustomVoice 就量产不了，只有 Base 就录不出参考音频。两个各约 3.8 GB 磁盘，
-# 但**不同时驻留显存**（见 make_voice.py 的文件头），所以 8 GB 的卡照样跑。
+# 只有 CustomVoice 就量产不了，只有 Base 就录不出参考音频。两个 Qwen 各约
+# 3.8 GB 磁盘，但**不同时驻留显存**（见 make_voice.py 的文件头），所以 8 GB
+# 的卡照样跑；wavlm 与谁都不冲突，闲置时不占显存。
 MODELS = ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-          "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+          "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+          "microsoft/wavlm-base-plus-sv")
 # 常驻服务的那个。顺序依赖写法与 models/ 下的目录名一致（取仓库 id 的最后一段）。
 SERVE_MODEL = MODELS[1]
 
@@ -311,7 +317,7 @@ def install_tts_packages(py, pypi):
 
 
 def fetch_model(py):
-    log("下模型权重（两个，合计约 7.7 GB；断了重跑会续传）…")
+    log("下模型权重（三个，合计约 8.1 GB；断了重跑会续传）…")
     script = os.path.join(HERE, "fetch_model.py")
     failed = []
     for mid, _dir, ok in model_paths():

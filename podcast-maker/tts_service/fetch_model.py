@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""下载 Qwen3-TTS 权重。
+"""下载本服务用到的全部模型权重。
 
 国内优先 ModelScope，其次 HF 镜像，最后官方 HF —— 一条断了自动换下一条。
 下载到 tts_service/models/<模型名>/，重复执行会断点续传，不会重下。
 
-默认下**两个**变体，因为它们在本项目里各有各的活：CustomVoice 负责给每个新项目
-录角色参考音频（一次性），Base 负责整期量产。少一个流程就跑不通。要单独下某一个
-用 `--model <仓库 id>`，可重复。
+默认下**三个**模型，各有各的活：CustomVoice 负责给每个新项目录角色参考音频
+（一次性），Base 负责整期量产，wavlm-base-plus-sv 是音色体检的说话人嵌入
+（体检服务经 /embed 拿它算"这句像不像这个人"）。少一个流程就缺一角。要单独下
+某一个用 `--model <仓库 id>`，可重复。
+
+注：microsoft/wavlm-base-plus-sv 在 ModelScope 上没有镜像，第一条源对它必然
+落空——三条链会自动落到 hf-mirror 继续走，不算失败。
 """
 
 from __future__ import annotations
@@ -21,7 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(HERE, "models")
 
 DEFAULT_MODELS = ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-                  "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+                  "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                  "microsoft/wavlm-base-plus-sv")
 
 
 def try_modelscope(model_id: str, target: str) -> bool:

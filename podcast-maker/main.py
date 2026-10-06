@@ -43,6 +43,8 @@ def build_parser():
     p.add_argument("--port", default="8811", help="Web 界面端口，传 auto 自动选空闲端口")
     p.add_argument("--host", default="0.0.0.0", help="监听地址")
     p.add_argument("--pidfile", default="server.pid", help="PID 文件路径")
+    p.add_argument("--open", action="store_true",
+                   help="端口绑定成功后自动打开浏览器（启动脚本别自己抢先弹）")
     p.add_argument("--check", action="store_true", help="仅检测 LLM 后端连接后退出")
     p.add_argument("--continue", dest="resume", default="",
                    help="从指定树根（项目目录）续跑；期号见 --episode")
@@ -190,7 +192,8 @@ def main():
         with socket.socket() as s:
             s.bind(("", 0))
             port = str(s.getsockname()[1])
-    run_server(host=args.host, port=int(port), pidfile=args.pidfile)
+    run_server(host=args.host, port=int(port), pidfile=args.pidfile,
+               open_browser=args.open)
     return 0
 
 

@@ -6,7 +6,8 @@
 --------
 1. 只读看一眼当前环境：显卡空闲多少、LM Studio 正在跑什么、torch/CUDA 是否可用。
 2. 起薄服务（serve.py）→ 打 /health → 打 /tts 合成一句中文 → 落成 wav 文件。
-3. 报出：跑在哪个设备、加载耗时、合成耗时、音频时长、实时倍率。
+3. 打 /embed 给刚合成的 wav 算说话人嵌入，报维度与设备（音色体检的依赖）。
+4. 报出：跑在哪个设备、加载耗时、合成耗时、音频时长、实时倍率。
 
 它不做什么
 ----------
@@ -166,6 +167,15 @@ def post_tts(port: int, payload: dict, timeout: int) -> tuple[bytes, float]:
         return r.read(), time.time() - t0
 
 
+def post_embed(port: int, wavs: list[str]) -> dict:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/embed",
+        data=json.dumps({"wavs": wavs}, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
@@ -244,6 +254,16 @@ def main() -> int:
         dur = max(0.0, (len(wav) - 44) / (24000 * 2.0))
         after = wait_health(port)
 
+        # 音色体检的依赖：说话人嵌入槽（wavlm）。缺了它合成照常，
+        # 但体检的嵌入维会缺席 —— 这里如实报，不拦验收、也不装看不见。
+        sv_info, sv_err = None, ""
+        try:
+            t_sv = time.time()
+            sv_info = post_embed(port, [out])
+            sv_seconds = time.time() - t_sv
+        except Exception as e:  # noqa: BLE001
+            sv_err = str(e)[:200]
+
         print("\n" + "=" * 70)
         print("三、结果")
         print("=" * 70)
@@ -261,6 +281,14 @@ def main() -> int:
         print(f"  总耗时           {time.time() - t_all:.1f} 秒")
         print(f"  显存占用后       {after.get('vram_used_mb')}MB"
               f"（空闲 {after.get('vram_free_mb')}MB）")
+        if sv_info and sv_info.get("ok"):
+            print(f"  说话人嵌入       {sv_info.get('model')} · "
+                  f"{sv_info.get('dim')} 维 · {sv_info.get('device')} · "
+                  f"耗时 {sv_seconds:.1f}s（音色体检的 /embed 就绪）")
+        else:
+            print("  说话人嵌入       [缺席] /embed 没通：" + (sv_err or "?"))
+            print("                   合成不受影响，但音色体检的嵌入维缺席；")
+            print("                   重跑 setup_env.py 会补下 wavlm 权重。")
         print("\n  提示：LM Studio 全程没有被碰过。")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")

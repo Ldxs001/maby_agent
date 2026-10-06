@@ -35,6 +35,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import urllib.error
 from collections import deque
 from unittest import mock
 
@@ -388,6 +389,15 @@ class WiringTest(unittest.TestCase):
         self.assertIn("seed_offset", src)
         self.assertIn("temperature", src)
 
+    def test_service_has_embed_slot(self):
+        """嵌入模型槽：wavlm 槽位 + /embed 端点 + 懒加载，与 TTS 同一套架构。"""
+        src = self._src(os.path.join("tts_service", "serve.py"))
+        self.assertIn("SV_MODEL_ID", src)
+        self.assertIn("microsoft/wavlm-base-plus-sv", src)
+        self.assertIn('"/embed"', src)
+        self.assertIn("WavLMForXVector", src)
+        self.assertIn("class SVEngine", src)
+
     def test_config_keys_exist(self):
         src = self._src(os.path.join("podcast_maker", "config_manager.py"))
         for key in ("tts.timbre_guard", "tts.timbre_threshold",
@@ -395,9 +405,289 @@ class WiringTest(unittest.TestCase):
                     "tts.timbre_dull_threshold",
                     "tts.timbre_identity_f0_deep",
                     "tts.timbre_identity_f0_full",
-                    "tts.timbre_identity_s300"):
+                    "tts.timbre_identity_s300",
+                    "tts.timbre_cent_dark", "tts.timbre_s300_band",
+                    "tts.timbre_sv_guard", "tts.timbre_sv_sim",
+                    "tts.timbre_sv_min_seconds"):
             self.assertIn('"%s"' % key, src)
         self.assertNotIn("timbre_fallback_temp", src)   # 保底温度已废，改复用种子
+
+    def test_ui_group_carries_new_knobs(self):
+        """体检滑杆组带新旋钮：否则界面上没人调得了线。"""
+        src = self._src(os.path.join("podcast_maker", "web_ui.py"))
+        for key in ("tts.timbre_cent_dark", "tts.timbre_s300_band",
+                    "tts.timbre_sv_guard", "tts.timbre_sv_sim",
+                    "tts.timbre_sv_min_seconds"):
+            self.assertIn("'%s'" % key, src)
+
+    def test_sv_model_in_user_setup_chain(self):
+        """wavlm 必须在用户的完整安装链里：下载清单、安装表、验收三处都不能缺。
+
+        缺任何一处，用户机器上就没有这份权重 —— 嵌入维永远缺席，而配置里
+        该维默认是开着的。手工拷贝不算搭建。
+        """
+        fetch = self._src(os.path.join("tts_service", "fetch_model.py"))
+        self.assertIn('"microsoft/wavlm-base-plus-sv"', fetch)
+        setup = self._src(os.path.join("tts_service", "setup_env.py"))
+        self.assertIn('"microsoft/wavlm-base-plus-sv"', setup)
+        check = self._src(os.path.join("tts_service", "check.py"))
+        self.assertIn("post_embed", check)
+        self.assertIn("/embed", check)
+
+
+# ------------------------------------------------------------------ ②期增补
+# 男声 22 句耳标考卷（期1：20 违和 + 2 像基准）+ 9 期回放定出的增补判据。
+# 考卷结论：四族句级探针里唯一抓住严重音色离群的是嵌入（尾部分离），
+# 频谱形态抓「缺亮音 / 低频异常」两个方向，音高 d 对男声定不出线
+# （#019 d=4.8 违和 vs #057 d=3.4 像，同区间反判决）→ 降为记录项。
+
+class CentTruncationTest(unittest.TestCase):
+    """谱心项单向截断：变亮不出戏，不给好方向发抵扣券。
+
+    旧实现亮漂以负分与音高偏离相消——男声 0001_B 谱心 +7.3st 亮漂把
+    0.8×音高项抵剩 0.52 分，病句过线。截断后四维只升不降（ Female 定标句
+    全部谱心偏暗，CalibrationTest 回归不受影响——尺子只朝一个方向动）。
+    """
+
+    def test_bright_cent_contributes_zero(self):
+        s = tts_engine._timbre_score(
+            {"f0": BASE["f0_mu"], "cent": BASE["cent_mu"] + 3 * BASE["cent_sd"],
+             "rms": BASE["rms_mu"], "pres": BASE["pres_mu"]}, BASE)
+        self.assertAlmostEqual(s, 0.0, places=9)
+
+    def test_dark_cent_unchanged(self):
+        """变暗方向照旧计权——截断只删抵扣，不动定标。"""
+        z = 2.0
+        s = tts_engine._timbre_score(
+            {"f0": BASE["f0_mu"], "cent": BASE["cent_mu"] - z * BASE["cent_sd"],
+             "rms": BASE["rms_mu"], "pres": BASE["pres_mu"]}, BASE)
+        self.assertAlmostEqual(s, z, places=9)
+
+
+class SpecformRuleTest(unittest.TestCase):
+    """频谱形态钉子：缺亮音单向、低频双向。基线用 DULL_BASE。"""
+
+    def _flags(self, cent=None, s300=None):
+        row = {"f0": 264.0, "cent": cent, "rms": -27.0, "pres": 0.022,
+               "s300": s300, "jit": 7.0}
+        return tts_engine._specform_flags(row, DULL_BASE)
+
+    def test_dark_cent_flagged(self):
+        why = self._flags(cent=DULL_BASE["cent_mu"] - 2.0 * DULL_BASE["cent_sd"],
+                          s300=DULL_BASE["s300_mu"])
+        self.assertTrue(any(w.startswith("缺亮音") for w in why))
+
+    def test_bright_cent_not_flagged(self):
+        """变亮不出戏——缺亮音只计变暗方向。"""
+        why = self._flags(cent=DULL_BASE["cent_mu"] + 4.0 * DULL_BASE["cent_sd"],
+                          s300=DULL_BASE["s300_mu"])
+        self.assertEqual(why, [])
+
+    def test_low_band_high_flagged(self):
+        """低频鼓包 = 模型加了基准没有的低频男声（期1 全批 59 句零负值的
+        批次现象，句级仍要抓极端）。"""
+        why = self._flags(cent=DULL_BASE["cent_mu"],
+                          s300=DULL_BASE["s300_mu"] + 2.0 * DULL_BASE["s300_sd"])
+        self.assertTrue(any(w.startswith("低频+") for w in why))
+
+    def test_low_band_low_flagged(self):
+        """低频塌陷 = 低音缺失，双向的另一头。"""
+        why = self._flags(cent=DULL_BASE["cent_mu"],
+                          s300=DULL_BASE["s300_mu"] - 2.0 * DULL_BASE["s300_sd"])
+        self.assertTrue(any(w.startswith("低频-") for w in why))
+
+    def test_mid_row_clean(self):
+        why = self._flags(cent=DULL_BASE["cent_mu"], s300=DULL_BASE["s300_mu"])
+        self.assertEqual(why, [])
+
+
+class SvGateTest(unittest.TestCase):
+    """嵌入维裁决钉子：时长门 + 阈值 + 不可用缺席。"""
+
+    def test_unavailable_absent_not_flagged(self):
+        """嵌入不可用（sv=None）→ 不参与，既不误报也不假装查过。"""
+        self.assertIsNone(tts_engine._sv_flag(None, 10.0))
+
+    def test_below_line_flagged(self):
+        self.assertTrue(tts_engine._sv_flag(0.85, 10.0))
+
+    def test_above_line_passes(self):
+        self.assertFalse(tts_engine._sv_flag(0.95, 10.0))
+
+    def test_short_line_skipped(self):
+        """时长门：短句 sim 系统性偏低（r=0.49），<4s 不参与嵌入点名。"""
+        self.assertIsNone(tts_engine._sv_flag(0.85, 3.9))
+
+    def test_short_line_still_caught_by_pure_code(self):
+        """时长门不是免检金牌：短句仍走缺亮音/低频双向等纯代码判据
+        （期1 #067 实测被缺亮音 -2.9σ 与音高双抓，门零漏损）。"""
+        row = {"cent": DULL_BASE["cent_mu"] - 3.0 * DULL_BASE["cent_sd"],
+               "s300": DULL_BASE["s300_mu"], "sv": 0.60, "seconds": 2.0}
+        why = tts_engine._timbre_capture(row, DULL_BASE, THRESHOLD,
+                                         DULL_THRESHOLD, ID_DEEP,
+                                         ID_FULL, ID_S300)
+        self.assertTrue(any(w.startswith("缺亮音") for w in why))
+        self.assertFalse(any(w.startswith("嵌入") for w in why))
+
+
+class CosineTest(unittest.TestCase):
+
+    def test_identical_orthogonal(self):
+        self.assertAlmostEqual(tts_engine._cosine([1.0, 0.0], [1.0, 0.0]), 1.0)
+        self.assertAlmostEqual(tts_engine._cosine([1.0, 0.0], [0.0, 1.0]), 0.0)
+
+    def test_unnormalized_input_ok(self):
+        """不依赖服务端归一：客户端自己除模长。"""
+        self.assertAlmostEqual(
+            tts_engine._cosine([3.0, 0.0], [7.0, 0.0]), 1.0)
+
+
+class EmaOffsetTest(unittest.TestCase):
+    """每期音高基线 o 的三道闸：中位冷启动 / 更新门 / 硬钳位。"""
+
+    REF = 135.6
+
+    @staticmethod
+    def _rows(*semis):
+        return [{"f0": 135.6 * (2.0 ** (s / 12.0))} for s in semis]
+
+    def test_cold_start_median_robust_to_one_outlier(self):
+        """冷启动 10 句里混 1 句 +7st：中位数纹丝不动，更新门再拒收后续。"""
+        rows = self._rows(*([1.0] * 4 + [7.2] + [1.0] * 10))
+        o, warn = tts_engine._ema_offset(rows, self.REF)
+        self.assertFalse(warn)
+        self.assertLess(abs(o - 1.0), 0.2)
+
+    def test_update_gate_rejects_far_rows(self):
+        """+7st 的句不许把 o 拽走：离 o 超 1.5st 一律拒收。"""
+        rows = self._rows(*([1.0] * 12 + [7.2] * 5))
+        o, warn = tts_engine._ema_offset(rows, self.REF)
+        self.assertLess(abs(o - 1.0), 0.3)
+        self.assertFalse(warn)
+
+    def test_clamp_caps_and_warns(self):
+        """整期基线 +5st：爆钳位 → 封顶 + 告警（报警不吸收）。"""
+        rows = self._rows(*([5.0] * 15))
+        o, warn = tts_engine._ema_offset(rows, self.REF)
+        self.assertTrue(warn)
+        self.assertAlmostEqual(o, 2.5)
+
+    def test_few_rows_median_fallback(self):
+        """合格句不足 warm：现有样本中位兜底，同样受钳位管辖。"""
+        o, warn = tts_engine._ema_offset(self._rows(1.0, 1.1, 0.9), self.REF)
+        self.assertAlmostEqual(o, 1.0, delta=0.01)
+        self.assertFalse(warn)
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._raw = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class EmbedClientTest(unittest.TestCase):
+    """嵌入客户端钉子：解析形状 + 不可用降级（不静默）。"""
+
+    CFG = {"tts.qwen3tts_host": "127.0.0.1", "tts.qwen3tts_port": 9880}
+
+    def test_parses_embeddings(self):
+        payload = {"ok": True, "embeddings": {"a.wav": [1.0, 0.0],
+                                              "b.wav": [0.0, 1.0]}}
+        with mock.patch("urllib.request.urlopen",
+                        lambda req, timeout=None: _FakeResp(payload)):
+            m = tts_engine._service_embed(["a.wav", "b.wav"], self.CFG,
+                                          log=lambda s: None)
+        self.assertEqual(m, {"a.wav": [1.0, 0.0], "b.wav": [0.0, 1.0]})
+
+    def test_unreachable_returns_none(self):
+        """服务没起：返回 None（调用方标「嵌入缺席」），绝不抛异常炸体检。"""
+        def boom(req, timeout=None):
+            raise urllib.error.URLError("connection refused")
+        logs = []
+        with mock.patch("urllib.request.urlopen", boom):
+            m = tts_engine._service_embed(["a.wav"], self.CFG, log=logs.append)
+        self.assertIsNone(m)
+        self.assertTrue(any("嵌入维不可用" in s for s in logs))  # 不静默
+
+    def test_error_payload_returns_none(self):
+        payload = {"ok": False, "error": "模型加载失败"}
+        with mock.patch("urllib.request.urlopen",
+                        lambda req, timeout=None: _FakeResp(payload)):
+            m = tts_engine._service_embed(["a.wav"], self.CFG,
+                                          log=lambda s: None)
+        self.assertIsNone(m)
+
+
+class EmbedFlaggedRepairTest(unittest.TestCase):
+    """端到端：嵌入维点名 → 候选必须同样过嵌入才转正。
+
+    离线假嵌入：参考向量 u=(1,0)，句 5 向量 v=(0.5,0.5)（cos≈0.71 < 0.90）
+    → 仅嵌入维点名；候选量回 u → 首试转正。嵌入不可用的降级路径由
+    RepairLoopTest 全组顺带覆盖（真 _service_embed 连不上 → 全体缺席）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="timbre_sv_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.bad = (210.0, 1304.4, -28.8, 0.022, 0.030, 11.0)
+        self.good = (264.0, 1883.0, -27.2, 0.022, 0.020, 7.0)
+        self.files, self.script = [], []
+        for i in range(24):
+            spk = "A" if i < 12 else "B"
+            self.files.append(os.path.join(self.tmp, "%04d_%s.wav" % (i, spk)))
+            self.script.append({"speaker": spk, "text": "第%d句" % i})
+        self.refs = {"A": {"wav": os.path.join(self.tmp, "a.wav"), "text": "x"},
+                     "B": {"wav": os.path.join(self.tmp, "b.wav"), "text": "x"}}
+        for r in self.refs.values():
+            with open(r["wav"], "wb") as f:
+                f.write(b"ref-bytes")
+        self.cfg = _fake_cfg()
+        self.report = os.path.join(self.tmp, "timbre_repair.json")
+        self.u, self.v = [1.0, 0.0], [0.5, 0.5]
+        self.embed_calls = []
+
+    def _fake_embed(self, paths, cfg, log=None):
+        self.embed_calls.append(list(paths))
+        if self.embed_calls_n() == 1:           # 批量：参考 + 全部句子
+            out = {p: self.v if p.endswith("0005_A.wav") else self.u
+                   for p in paths}
+        else:                                    # 候选单嵌：量回正常
+            out = {p: self.u for p in paths}
+        return out
+
+    def embed_calls_n(self):
+        return len(self.embed_calls)
+
+    def test_sv_only_flag_repaired_and_recorded(self):
+        with mock.patch.object(tts_engine, "_timbre_features",
+                               _fake_measurement_factory(
+                                   {5: [self.good, self.good]})(
+                                   self.bad, self.good)), \
+             mock.patch.object(tts_engine, "synth_line", lambda *a, **k: b"wav"), \
+             mock.patch.object(tts_engine, "probe_duration", lambda p: 4.5), \
+             mock.patch.object(tts_engine, "_service_embed", self._fake_embed):
+            rep = tts_engine.timbre_repair(
+                self.files, self.script, self.cfg, log=lambda m: None,
+                emotion_level="none", voice_root=self.tmp, refs=self.refs,
+                report_path=self.report)
+        self.assertEqual(len(rep["repairs"]), 1)
+        self.assertEqual(rep["repairs"][0]["index"], 5)
+        with open(self.report, encoding="utf-8") as f:
+            report = json.load(f)
+        self.assertTrue(report["sv"]["available"])
+        row5 = next(r for r in report["rows"] if r["index"] == 5)
+        self.assertLess(row5["sv"], 0.90)
+        self.assertTrue(any(w.startswith("嵌入") for w in row5["why"]))
+        # 两次调用：批量（参考+全部句）与候选单嵌
+        self.assertEqual(len(self.embed_calls), 2)
 
 
 if __name__ == "__main__":
