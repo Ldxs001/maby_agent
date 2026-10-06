@@ -671,9 +671,10 @@ class TestRunCapsHaveOneSource(unittest.TestCase):
         正文就被 `emotion_vocab` 门禁打回，那一轮白写。
         """
         src = self._src("script_engine.py")
-        # 定义一处 + 四处调用（整篇 / 分段 / 插入 / 就地替换）；调用都带卡
-        # （`_vocab_block(card)`：基础表 + 卡上 voice.vocab，同源一份）。
-        self.assertEqual(src.count("_vocab_block(card)"), 4)
+        # 定义一处 + 五处调用（整篇 / 分段 / 插入 / 就地替换 / 定点修补）；调用
+        # 都带卡（`_vocab_block(card)`：基础表 + 卡上 voice.vocab，同源一份）。
+        # 修补 v1.7.1 接上——「从本篇词表中选一个」之前从没把词表给过模型。
+        self.assertEqual(src.count("_vocab_block(card)"), 5)
         self.assertEqual(src.count("_style_block(preset)"), 5)
         # 节奏与上限也只有一个取法口：各写一份就会出现插入按另一种节奏补句
         calls = re.findall(r"[^`]paradigms\.run_caps\(", src)
@@ -704,7 +705,9 @@ class TestRunCapsHaveOneSource(unittest.TestCase):
         # 修补与压紧两处确实把配置递了进去（不递就等于退回写死的默认值）。
         # 压紧那处 v0.36.0 起还多带两个数（`trim_system(cfg, low, high)`）——
         # 「减到差不多就停」换成明确的验收区间，所以只钉前缀。
-        self.assertIn("patch_system(cfg)", src)
+        # 修补那处 v1.7.1 起还带卡（`patch_system(cfg, card)`）——提示词里的
+        # 「本篇词表」必须是列出来的词，不是一句没内容的引用。
+        self.assertIn("patch_system(cfg, card)", src)
         self.assertIn("trim_system(cfg", src)
 
     def test_the_gate_says_where_the_caps_come_from(self):

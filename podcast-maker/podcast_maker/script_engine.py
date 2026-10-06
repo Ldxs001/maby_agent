@@ -2107,6 +2107,9 @@ _PATCH_SYSTEM_TMPL = """你是播客脚本的定点修补者，回答只输出 J
 {"inserts": [{"after": 20, "speaker": "A", "emotion": "总结",
               "text": "新加的那句回应。"}]}
 
+【本篇词表】（emotion 只许从下面这些词里选，不在此列的一律不许编）：
+%s
+
 铁律：
 - 【要改的地方】里的结论是**终审**：对不对不由你复核，你的任务只有执行——清单里
   每一条都必须给出对应的改动（edits 或 inserts）。**不许返回空补丁**：edits 与
@@ -2119,7 +2122,7 @@ _PATCH_SYSTEM_TMPL = """你是播客脚本的定点修补者，回答只输出 J
     {"after": 20, "speaker": "B", "emotion": "总结", "text": "回应那句话的整句。"}
   after 必须是问题清单点名的那一句；speaker 只能填 A 或 B（问题清单给了就照它填，
   没给就按这一处该谁接着谁说定——**不许留空**：没有说话人的一句，念出来不知道是
-  谁在说）；emotion 从本篇词表中选一个合适的。**插入不是用来解决「连着说超限」的**
+  谁在说）；emotion 从上面列出的本篇词表中选一个合适的。**插入不是用来解决「连着说超限」的**
   （那是 absorb 的事），也不许在同一处连插好几句来凑。
 - 只把**需要改的句子**写进 edits。没被点名的句子一个字都不许动，也不许出现在 edits 里。
 - text 必须是替换后的**完整整句**，不是片段；一句就是一句，不许把一句拆成两条
@@ -2128,7 +2131,7 @@ _PATCH_SYSTEM_TMPL = """你是播客脚本的定点修补者，回答只输出 J
   每个字都会被念出来。每句必须以标点符号收尾，符号由这句话的语义定：疑问收
   「？」、感叹收「！」、陈述收「。」——不许一律补句号应付。
 - 被点名句子的语篇标签（emotion）若在问题清单里点名要改，在对应条目里带上
-  emotion 键，从本篇词表中选一个；没点名就不带这个键。
+  emotion 键，从上面列出的本篇词表中选一个；没点名就不带这个键。
 - 每句 %d–%d 字。过长的只精简措辞、不许拆句；过短的只就地补内容、不许并句。
   拆句会让后面每一句的句号都挪一位，改稿的人按句号找不到原来那一句。
 - 说话人不在你的职责内，不要输出 speaker 这个键。**超限也不许靠换人解决**——
@@ -2143,16 +2146,21 @@ _PATCH_SYSTEM_TMPL = """你是播客脚本的定点修补者，回答只输出 J
 %s"""
 
 
-def patch_system(cfg=None):
+def patch_system(cfg=None, card=None):
     """定点修补的系统提示词。
 
     句长区间从配置读（`gate.min_chars` / `gate.max_chars`），不写死。写死过
     一次：提示词按 8–40 字改、门禁按人调的 30 字判，模型改完照样被打回，
     再改还是同一段——和插入那一处是同一种毛病（见 `insert_system`）。
+
+    词表块与写作/插入同一份（`_vocab_block`，带卡取本篇全集）：模板里两处「从
+    本篇词表中选一个」必须让模型看得见词表本身——只给指令不给词，模型按语义
+    编标签（「评估」「交代」），落盘校验按本篇词表拒掉，补丁整条白烧一轮。
     """
     lo = int((cfg or {}).get("gate.min_chars", 8))
     hi = int((cfg or {}).get("gate.max_chars", 40))
-    return _PATCH_SYSTEM_TMPL % (lo, hi, format_banned_rules())
+    return _PATCH_SYSTEM_TMPL % (_vocab_block(card), lo, hi,
+                                 format_banned_rules())
 
 
 def _patch_feedback(targets):
@@ -5599,7 +5607,7 @@ def generate(material, cfg, llm, preset_key=None,
                 # 修补的素材同样按这次调用的余量裁：提示词里还有系统提示、要改的
                 # 条目、被点名句的前后文，它们都占地方。素材放不下就用凝缩顶
                 # （见 fit_material），并在日志里说明。
-                psystem = patch_system(cfg)
+                psystem = patch_system(cfg, card)
                 fit, _note = fit_material(
                     llm,
                     material if _needs_material(content_seen, is_content) else "",
@@ -5729,7 +5737,7 @@ def generate(material, cfg, llm, preset_key=None,
         if patch:
             log("门禁第 %d 轮：定点修补 %d 句…" % (attempt + 1, len(patch)))
             fb = _patch_feedback(patch)
-            psystem = patch_system(cfg)
+            psystem = patch_system(cfg, card)
             fit, _note = fit_material(
                 llm,
                 material if _needs_material(last["report"], is_form) else "", cfg,

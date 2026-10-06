@@ -973,6 +973,24 @@ class TestDiscourseTagRestored(unittest.TestCase):
         self.assertIn(S.format_banned_rules(), p, "措辞禁忌那一段还在")
         self.assertIn("emotion", p, "修补提示词要有语篇标签的口径")
 
+    def test_patch_system_lists_the_vocab_itself(self):
+        """修补提示词必须**列出**本篇词表，不是一句没有内容的引用。
+
+        事故：模板两处写「emotion 从本篇词表中选一个」，但从没把词表给模型——
+        它按语义编出「评估」「交代」，落盘校验按本篇词表拒掉，补丁两条没落地、
+        白烧一轮。写作/插入/改写三条链都列词表，唯独修补漏接（v1.7.1 接上）。
+        """
+        p = S.patch_system()
+        self.assertIn("【本篇词表】", p, "词表块要出场")
+        for w in S.vocab_words():
+            self.assertIn("- %s：" % w, p, "基础词 %s 必须逐词列出" % w)
+        # 卡上扩展词同样进修补提示词：与 vocab_words(card) 同源一份
+        card = {"voice": {"vocab": {"托举": "接住对方的话往下抬"}}}
+        p2 = S.patch_system(card=card)
+        self.assertIn("- 托举：", p2)
+        for w in S.vocab_words(card):
+            self.assertIn("- %s：" % w, p2)
+
 
 class TestSpeakerIdentitySurvivesGeneration(unittest.TestCase):
     """生成串联：模型给 A A B B A，出来的稿子不许被掰回交替。
