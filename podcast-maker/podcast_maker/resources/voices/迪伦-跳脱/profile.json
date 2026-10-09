@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "迪伦-跳脱",
+ "family": "迪伦",
+ "flavor": "跳脱",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Dylan",
+ "official_take": 6,
+ "seed": 3539291931,
+ "sha16": "09df34c6e774026b",
+ "f0_med": 181.8,
+ "seconds": 11.36,
+ "voiced_seconds": 7.66,
+ "speech_rate": 6.27,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 2.86,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "清亮自然的北京口音男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "09df34c6e774026b"
+}

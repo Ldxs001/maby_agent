@@ -473,6 +473,21 @@ class TestVoiceControls(unittest.TestCase):
         self.assertIn('TXT_NAME = "%s"' % layout.VOICE_TXT, src)
         self.assertIn('PROFILE_NAME = "%s"' % layout.VOICE_PROFILE, src)
 
+    def test_the_base_ref_file_names_match_the_tool(self):
+        """ICL 版本件的命名词根同样是两处各写一份，锁住。
+
+        同上一个测试的处置：make_base_ref.py 在服务那个独立环境里造
+        ref_base_<sign> 和 icl_<sign>，主程序按 layout 的词根去拼名字读。
+        名字写歪的表现是「加了 ICL 却没生效」—— 不报错、不出声，只看得出
+        音色没变化，属于最难查的一类。
+        """
+        with open(os.path.join(_ROOT, "tts_service", "make_base_ref.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('BASEREF_STEM = "%s"' % layout.VOICE_BASEREF_STEM, src)
+        self.assertIn('ICL_STEM = "%s"' % layout.VOICE_ICL_STEM, src)
+        self.assertIn('BASE_REFS_NAME = "%s"' % layout.VOICE_BASE_REFS, src)
+
     def test_the_voice_dir_name_has_one_source(self):
         """音色目录名只有一处真源（layout.DIR_VOICE），工具那侧靠参数收。"""
         with open(os.path.join(_ROOT, "tts_service", "make_voice.py"),
@@ -501,38 +516,30 @@ class TestVoiceControls(unittest.TestCase):
                           "%s 角的工具默认值必须与出厂默认一致（出厂是 %s）"
                           % (role, factory))
 
-    def test_the_reference_records_which_device_made_it(self):
-        """档案必须记下录制设备。
-
-        实测踩到的坑：同一套音色名 + 同一句参考文案，GPU 与 CPU 出的是**两条
-        不同波形**（GPU 得 sha256[:16] 713bab2d382ab0fd / F0 228.6Hz，CPU 得
-        另一条且 F0 偏走）。而 `pick_device()` 在空闲显存不足时是**静默**退
-        CPU 的 —— 上一期已把服务拉起来占住显存，新项目录档案就会悄悄落到 CPU
-        上，音色与别的项目不再对齐，事后却查不出原因。所以 profile.json 里
-        要留这一栏，生成时写、查账时读。
-        """
+    def test_the_profile_status_still_exposes_device_fields(self):
+        """档案的设备字段在查账时仍要透出（旧档案对账的唯一线索）。"""
         with open(os.path.join(_ROOT, "tts_service", "make_voice.py"),
                   encoding="utf-8") as fh:
             src = fh.read()
-        build = src.split("def build(")[1].split("\ndef ")[0]
-        self.assertIn('"device": str(eng.device', build)
-        self.assertIn('"backend": eng.backend', build)
         st = src.split("def status(")[1].split("\ndef ")[0]
         self.assertIn('rec.get("device"', st)
         self.assertIn('rec.get("backend"', st)
 
-    def test_the_voice_tool_shouts_when_it_falls_back_to_cpu(self):
-        """退 CPU 录参考音频必须吼一声，不能只当普通日志。
+    def test_build_no_longer_loads_any_model(self):
+        """CustomVoice 现录已退役：build 全程不加载任何模型，「备齐」＝ 复制。
 
-        这条路慢十几倍，且音色基准与 GPU 路径不再是同一条 —— 跟「显存不够就
-        凑合跑完」是两回事。静默降级正是这条测试要拦下的东西。
+        音色来源只剩官方预录定稿（official:）与具名档案（named:）—— 都是
+        已经落地的音频，选了哪条就复制哪条。这条测试锁死退役：谁往 build
+        里加回模型加载路径，就是往已被实证否决的路上退（句间换人是引擎级病）。
         """
         with open(os.path.join(_ROOT, "tts_service", "make_voice.py"),
                   encoding="utf-8") as fh:
             src = fh.read()
         build = src.split("def build(")[1].split("\ndef ")[0]
-        self.assertIn('startswith("cpu")', build)
-        self.assertIn("不是", build)
+        self.assertNotIn("serve.Engine", build)
+        self.assertNotIn("resolve_model", build)
+        self.assertIn("parse_voice_source", build,
+                      "来源语法必须先过 fail-closed 解析，拒绝裸内置音色名")
 
     def test_a_cpu_recorded_reference_is_called_out_in_the_main_log(self):
         """主程序日志里也要点名 —— 工具那句走自己的 stderr，界面看不到。

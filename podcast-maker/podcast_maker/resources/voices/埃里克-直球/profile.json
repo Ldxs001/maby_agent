@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "埃里克-直球",
+ "family": "埃里克",
+ "flavor": "直球",
+ "text_role": "A",
+ "text": "我一直觉得这本书写得很有意思。有人问我：“这书真的是AI写的吗？”我翻到最后一页……这答案太让人吃惊了！",
+ "builtin_voice": "Eric",
+ "official_take": 1,
+ "seed": 2475976047,
+ "sha16": "f97bc56b8c88b546",
+ "f0_med": 174.5,
+ "seconds": 12.4,
+ "voiced_seconds": 8.3,
+ "speech_rate": 6.27,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 3.46,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "活泼、带点沙哑的成都口音男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "f97bc56b8c88b546"
+}

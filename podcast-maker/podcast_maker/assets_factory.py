@@ -1059,6 +1059,24 @@ def bgm_resource(preset):
     return path
 
 
+def library_bgm_path(name):
+    """AI 音乐库曲目 → 库内 wav 绝对路径。实现唯一来源是 music_gen
+    （账本语义、草稿排除都住在那里，这里不复制清单逻辑）；
+    曲目缺失=停产报错，绝不静默降级到内置档。"""
+    svc_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "music_service")
+    if svc_dir not in sys.path:
+        sys.path.insert(0, svc_dir)
+    import music_gen  # 顶层纯标准库，主程序可安全导入
+    entry = next((e for e in music_gen.library_entries(music_gen.DEFAULT_LIB)
+                  if e["name"] == name), None)
+    if entry is None:
+        raise RuntimeError(
+            "AI 音乐库里没有曲目「%s」。可能已被删除——到配置页「AI 生成背景音乐」"
+            "重新生成，或换选其他曲目。" % name)
+    return entry["wav"]
+
+
 def build_all(cfg, dirs, lines_text, log=None, prefix=""):
     """生成本集所有代码侧资源：背景（横/竖）+ 封面三尺寸 + BGM。
 
@@ -1111,11 +1129,20 @@ def build_all(cfg, dirs, lines_text, log=None, prefix=""):
         log("AIGC 元数据已写入背景与封面")
 
     bgm_path = None
-    if cfg.get("bgm.mode", "builtin") == "builtin":
+    mode = cfg.get("bgm.mode", "builtin")
+    if mode == "builtin":
         preset = cfg.get("bgm.preset", "pensive")
         bgm_path = bgm_resource(preset)
         log("背景音乐（%s）已就位" % MODE_SPEC["bgm.preset"]["options"]
             .get(preset, {}).get("label", preset))
+    elif mode == "library":
+        name = (cfg.get("bgm.library_name") or "").strip()
+        if not name:
+            raise RuntimeError(
+                "背景音乐来源选了「AI 音乐库」，但没有选曲目——到配置页"
+                "「AI 生成背景音乐」生成并保存入库，或换选其他来源。")
+        bgm_path = library_bgm_path(name)
+        log("背景音乐（AI 音乐库：%s）已就位" % name)
 
     return {"bg_h": bg_h["path"], "bg_v": bg_v["path"],
             "covers": covers, "bgm": bgm_path}

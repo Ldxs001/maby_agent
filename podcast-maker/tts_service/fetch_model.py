@@ -26,6 +26,7 @@ MODELS_DIR = os.path.join(HERE, "models")
 
 DEFAULT_MODELS = ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
                   "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                  "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
                   "microsoft/wavlm-base-plus-sv")
 
 

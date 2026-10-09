@@ -1,0 +1,164 @@
+{
+  "edge": {
+    "voices": [
+      {
+        "name": "zh-CN-XiaoxiaoNeural",
+        "label": "zh-CN-XiaoxiaoNeural（女，zh-cn）",
+        "gender": "Female",
+        "locale": "zh-cn",
+        "note": "Warm"
+      },
+      {
+        "name": "zh-CN-XiaoyiNeural",
+        "label": "zh-CN-XiaoyiNeural（女，zh-cn）",
+        "gender": "Female",
+        "locale": "zh-cn",
+        "note": "Lively"
+      },
+      {
+        "name": "zh-CN-YunjianNeural",
+        "label": "zh-CN-YunjianNeural（男，zh-cn）",
+        "gender": "Male",
+        "locale": "zh-cn",
+        "note": "Passion"
+      },
+      {
+        "name": "zh-CN-YunxiNeural",
+        "label": "zh-CN-YunxiNeural（男，zh-cn）",
+        "gender": "Male",
+        "locale": "zh-cn",
+        "note": "LivelySunshine"
+      },
+      {
+        "name": "zh-CN-YunxiaNeural",
+        "label": "zh-CN-YunxiaNeural（男，zh-cn）",
+        "gender": "Male",
+        "locale": "zh-cn",
+        "note": "Cute"
+      },
+      {
+        "name": "zh-CN-YunyangNeural",
+        "label": "zh-CN-YunyangNeural（男，zh-cn）",
+        "gender": "Male",
+        "locale": "zh-cn",
+        "note": "ProfessionalReliable"
+      },
+      {
+        "name": "zh-CN-liaoning-XiaobeiNeural",
+        "label": "zh-CN-liaoning-XiaobeiNeural（女，zh-cn-liaoning）",
+        "gender": "Female",
+        "locale": "zh-cn-liaoning",
+        "note": "Humorous"
+      },
+      {
+        "name": "zh-CN-shaanxi-XiaoniNeural",
+        "label": "zh-CN-shaanxi-XiaoniNeural（女，zh-cn-shaanxi）",
+        "gender": "Female",
+        "locale": "zh-cn-shaanxi",
+        "note": "Bright"
+      },
+      {
+        "name": "zh-HK-HiuGaaiNeural",
+        "label": "zh-HK-HiuGaaiNeural（女，zh-hk）",
+        "gender": "Female",
+        "locale": "zh-hk",
+        "note": "FriendlyPositive"
+      },
+      {
+        "name": "zh-HK-HiuMaanNeural",
+        "label": "zh-HK-HiuMaanNeural（女，zh-hk）",
+        "gender": "Female",
+        "locale": "zh-hk",
+        "note": "FriendlyPositive"
+      },
+      {
+        "name": "zh-HK-WanLungNeural",
+        "label": "zh-HK-WanLungNeural（男，zh-hk）",
+        "gender": "Male",
+        "locale": "zh-hk",
+        "note": "FriendlyPositive"
+      },
+      {
+        "name": "zh-TW-HsiaoChenNeural",
+        "label": "zh-TW-HsiaoChenNeural（女，zh-tw）",
+        "gender": "Female",
+        "locale": "zh-tw",
+        "note": "FriendlyPositive"
+      },
+      {
+        "name": "zh-TW-HsiaoYuNeural",
+        "label": "zh-TW-HsiaoYuNeural（女，zh-tw）",
+        "gender": "Female",
+        "locale": "zh-tw",
+        "note": "FriendlyPositive"
+      },
+      {
+        "name": "zh-TW-YunJheNeural",
+        "label": "zh-TW-YunJheNeural（男，zh-tw）",
+        "gender": "Male",
+        "locale": "zh-tw",
+        "note": "FriendlyPositive"
+      }
+    ],
+    "time": "2026-09-11 11:15:09"
+  },
+  "qwen3tts": {
+    "voices": [
+      {
+        "name": "Vivian",
+        "label": "Vivian（明亮、略带锋芒的年轻女声）",
+        "language": "Chinese",
+        "note": "明亮、略带锋芒的年轻女声"
+      },
+      {
+        "name": "Serena",
+        "label": "Serena（温暖、轻柔的年轻女声）",
+        "language": "Chinese",
+        "note": "温暖、轻柔的年轻女声"
+      },
+      {
+        "name": "Uncle_Fu",
+        "label": "Uncle_Fu（低沉醇厚的成熟男声）",
+        "language": "Chinese",
+        "note": "低沉醇厚的成熟男声"
+      },
+      {
+        "name": "Dylan",
+        "label": "Dylan（清亮自然的北京口音男声）",
+        "language": "Chinese",
+        "note": "清亮自然的北京口音男声"
+      },
+      {
+        "name": "Eric",
+        "label": "Eric（活泼、带点沙哑的成都口音男声）",
+        "language": "Chinese",
+        "note": "活泼、带点沙哑的成都口音男声"
+      },
+      {
+        "name": "Ryan",
+        "label": "Ryan（节奏感强的男声）［English］",
+        "language": "English",
+        "note": "节奏感强的男声"
+      },
+      {
+        "name": "Aiden",
+        "label": "Aiden（阳光的美式男声）［English］",
+        "language": "English",
+        "note": "阳光的美式男声"
+      },
+      {
+        "name": "Ono_Anna",
+        "label": "Ono_Anna（轻快灵动的日语女声）［Japanese］",
+        "language": "Japanese",
+        "note": "轻快灵动的日语女声"
+      },
+      {
+        "name": "Sohee",
+        "label": "Sohee（情感丰沛的韩语女声）［Korean］",
+        "language": "Korean",
+        "note": "情感丰沛的韩语女声"
+      }
+    ],
+    "time": "2026-09-13 14:30:17"
+  }
+}

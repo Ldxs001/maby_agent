@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "迪伦-深流",
+ "family": "迪伦",
+ "flavor": "深流",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Dylan",
+ "official_take": 4,
+ "seed": 3539289980,
+ "sha16": "6c9090d8b2958341",
+ "f0_med": 103.0,
+ "seconds": 11.04,
+ "voiced_seconds": 7.85,
+ "speech_rate": 6.11,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 3.24,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "清亮自然的北京口音男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "6c9090d8b2958341"
+}

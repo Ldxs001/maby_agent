@@ -184,6 +184,19 @@ def report_dir(root):
 VOICE_WAV = "ref.wav"
 VOICE_TXT = "ref.txt"
 VOICE_PROFILE = "profile.json"
+# ICL 前缀三件套，由 tts_service/make_base_ref.py 生成（同样要跟那边逐条比对）。
+# 它们在 ref 之外**另存**，不覆盖 ref：ref.wav 的字节身份是「音色来源」的
+# 凭证（ref_md5、跨项目继承都认它），改了它等于换人。
+#
+# ref_base / icl 全部带版本后缀：`ref_base_<sign>.wav` / `icl_<sign>.wav`，
+# sign = 生成那一刻 ref.wav 的内容指纹前 8 位 —— 文件名即「克隆自哪个原生
+# ref」的映射，可验证不靠记忆。换嗓老文件原样不动，角色级账本
+# （base_refs.json）记 sign ↔ 原生 ref 指纹 ↔ 文件组，active 指当前生效的
+# sign；同一原生 ref 永远只克隆一次（重做 = Base 克隆重掷骰子 = 音色变化，
+# 账本命中即复用、合成引用与声纹锚都跟着 active 走）。
+VOICE_BASEREF_STEM = "ref_base"      # ref_base_<sign>.wav
+VOICE_ICL_STEM = "icl"               # icl_<sign>.wav / icl_<sign>.txt
+VOICE_BASE_REFS = "base_refs.json"   # 角色级账本：sign ↔ 原生 ref ↔ 文件组
 
 
 def voice_dir(root):
@@ -209,6 +222,37 @@ def voice_text_file(root, role):
 def voice_profile_file(root, role):
     """档案的溯源记录（含内容指纹）。"""
     return os.path.join(voice_role_dir(root, role), VOICE_PROFILE)
+
+
+def voice_base_refs_file(root, role):
+    """角色的 ref_base 版本账本：`音色/<角色>/base_refs.json`。"""
+    return os.path.join(voice_role_dir(root, role), VOICE_BASE_REFS)
+
+
+def voice_baseref_file(root, role, sign):
+    """该角色某版本的标准语音（用 Base 把 ref 的内容重生成一遍得到的）。
+
+    sign 绑定生成那一刻的原生 ref 指纹 —— 合成条件与声纹锚都只认「当前
+    active 的这一个」，两者永远同源。
+    """
+    return os.path.join(voice_role_dir(root, role),
+                        "%s_%s.wav" % (VOICE_BASEREF_STEM, sign))
+
+
+def voice_icl_file(root, role, sign):
+    """ICL 参考音频：ref_base_<sign>.wav + 0.15s 静音 + ref_base_<sign>.wav。
+
+    与 voice_icl_text_file 必须**两件齐**才作数：ICL 要拿转录当示例台词，
+    只有音频会被模型当成「它自己该念的内容」串进结果。
+    """
+    return os.path.join(voice_role_dir(root, role),
+                        "%s_%s.wav" % (VOICE_ICL_STEM, sign))
+
+
+def voice_icl_text_file(root, role, sign):
+    """ICL 参考音频的转录（两段连写，与 icl_<sign>.wav 的分段对应）。"""
+    return os.path.join(voice_role_dir(root, role),
+                        "%s_%s.txt" % (VOICE_ICL_STEM, sign))
 
 
 def tmp_dir(root, no):

@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "艾登-从容",
+ "family": "艾登",
+ "flavor": "从容",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Aiden",
+ "official_take": 4,
+ "seed": 1796410848,
+ "sha16": "2d9a4787ed914359",
+ "f0_med": 145.5,
+ "seconds": 14.4,
+ "voiced_seconds": 9.47,
+ "speech_rate": 5.07,
+ "rate_out_of_window": true,
+ "loudness_gain_db": -4.78,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "阳光的美式男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "2d9a4787ed914359"
+}

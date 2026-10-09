@@ -43,9 +43,9 @@ TAGLINE = "播客制作智能体 · 脚本 → 声音 → 字幕 → 画面 → 
 #: 算「打到屏幕上」的那几种调用。
 _PRINT_CALL = re.compile(r"^\s*(?:print|log|sys\.std(?:err|out)\.write)\s*\(")
 
-#: 不算第一方源码的目录：探针归档、第三方环境、权重。
+#: 不算第一方源码的目录：探针归档、第三方环境、权重、第三方仓 clone。
 _SKIP_DIRS = {".git", "__pycache__", "_smoke", ".venv", "models", "node_modules",
-              "build", "dist", ".pytest_cache", ".mypy_cache"}
+              "build", "dist", ".pytest_cache", ".mypy_cache", "ACE-Step-1.5"}
 
 
 def _read(rel):
@@ -60,10 +60,14 @@ def _printed_taglines(rel):
 
 
 def _python_sources():
-    """仓内第一方 Python 源（相对路径，排序后返回）。"""
+    """仓内第一方 Python 源（相对路径，排序后返回）。
+
+    `_backup_*` 目录是改动前的整树快照（含旧版 `__version__` 字面量），
+    是留档不是源码，任何扫描都不许把它算进来。"""
     out = []
     for root, dirs, files in os.walk(_ROOT):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        dirs[:] = [d for d in dirs
+                   if d not in _SKIP_DIRS and not d.startswith("_backup_")]
         for fn in sorted(files):
             if fn.endswith(".py"):
                 out.append(os.path.relpath(os.path.join(root, fn), _ROOT))

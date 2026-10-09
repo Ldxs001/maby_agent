@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "秀熙-轻快",
+ "family": "秀熙",
+ "flavor": "轻快",
+ "text_role": "A",
+ "text": "我一直觉得这本书写得很有意思。有人问我：“这书真的是AI写的吗？”我翻到最后一页……这答案太让人吃惊了！",
+ "builtin_voice": "Sohee",
+ "official_take": 1,
+ "seed": 1901780183,
+ "sha16": "bff7685cc657e1c8",
+ "f0_med": 220.2,
+ "seconds": 15.04,
+ "voiced_seconds": 8.89,
+ "speech_rate": 5.85,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 2.41,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "情感丰沛的韩语女声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "bff7685cc657e1c8"
+}

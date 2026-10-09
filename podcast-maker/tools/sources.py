@@ -46,6 +46,12 @@ PYPI_MIRRORS = {
 PYTORCH_INDEX = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu126/"
 PYTORCH_INDEX_FALLBACK = "https://download.pytorch.org/whl/cu126"
 
+# cu128（music_service 的 ACE-Step 1.5 用，torch 2.7.1+cu128）：
+# 各镜像 2026-10-07 实测（20MB 采样）——上交大 6.3 MB/s（主）、
+# 阿里云 0.79 MB/s、腾讯无 cu128（404）、官方 0.65 MB/s（兜底）。
+PYTORCH_INDEX_CU128 = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128/"
+PYTORCH_INDEX_CU128_FALLBACK = "https://download.pytorch.org/whl/cu128"
+
 # ---------------------------------------------------------------- 模型权重
 # 由 tts_service/fetch_model.py 按顺序试；这里是清单，不是下载实现。
 MODEL_SOURCES = (

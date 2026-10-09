@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "埃里克-稳拍",
+ "family": "埃里克",
+ "flavor": "稳拍",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Eric",
+ "official_take": 5,
+ "seed": 2234351208,
+ "sha16": "f8bbe1ef7b1e5a86",
+ "f0_med": 148.6,
+ "seconds": 12.08,
+ "voiced_seconds": 7.58,
+ "speech_rate": 6.33,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 6.64,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "活泼、带点沙哑的成都口音男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "f8bbe1ef7b1e5a86"
+}

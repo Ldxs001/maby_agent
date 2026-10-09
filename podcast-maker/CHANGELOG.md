@@ -1,14 +1,361 @@
 # podcast-maker 更新日志
 
-格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。  
 版本号遵循语义版本控制。
 
-体例：只有版本号是标题（`## vX.Y.Z`）；段内分组与要点一律用加粗（`**修复**`／`**变更**`／
+体例：只有版本号是标题（`## vX.Y.Z`）；段内分组与要点一律用加粗（`**修复**`／`**变更**`／  
 `**新增**`／`**测试**`／`**说明**`），条目写成 `- **短语**：说明`；段与段之间用 `---` 分隔。
 
-文风：每段只写**现象、根因、修法、验证**四件事。不出现第一／二人称叙事（「主人」「我们」
-「我」），不写与代码行为无关的产品定位论证，不用口语化措辞（「坑」「踩坑」「顺带」
+文风：每段只写**现象、根因、修法、验证**四件事。不出现第一／二人称叙事（「主人」「我们」  
+「我」），不写与代码行为无关的产品定位论证，不用口语化措辞（「坑」「踩坑」「顺带」  
 「白跑」）。技术结论直接陈述，不带情绪与元评价。`tests/test_changelog_tone.py` 按词表守住。
+
+---
+
+## v2.9.1
+
+**本次改动：修复 AI 音乐库曲目下拉选中后切页回来变「未选择」（空壳下拉被读成空值）**
+
+**修复**
+
+- **AI 音乐库曲目下拉选中后切页回来变「未选择」**：现象——`bgm.library_name`（来源档 `library`）选中一条曲目后切到脚本页再切回配置页，下拉回到「（未选择——点开挑一条）」。根因——该点位走 `options_source='music-library'` 分支渲染成空壳 `<select>`（选项由 `fillMusicLibrarySelects` 异步回填），读值函数 `valOf` 对空壳 select 返回 `n.node.value`＝`""`（HTML 规范：无 option 的 select 其 value 为空串而非 undefined）；`cfgVal` 只在 `v===undefined` 时回退 `CFG.values`，`""` 不满足该条件，于是把配置里存的选中项盖成空，重建（切页回来 / `renderConfig`）后回填就落进 `if(!cur)` 的「未选择——点开挑一条」。旧版此处是文本框（渲染即带 value），改真下拉那轮引入；同病的还有 `llm.model` 的模型下拉（同为等待回填的空壳）。修法——`valOf` 增一条：控件为 `SELECT` 且尚无 option 时返回 `undefined`，让 `cfgVal` 回落到 `CFG.values`。
+
+**测试**
+
+- **`tests/test_music_service.py` `TestFrontendPins` +1 条**：`test_empty_select_falls_back_to_config` 钉 valOf 空壳判定（正则覆盖 valOf 体内出现 `tagName==='SELECT'&&!n.node.options.length) return undefined`）。
+- **真机端到端验证通过**（headless Edge + CDP，真服务实例）：进 `#config` 读下拉 `#f_cfg_bgm__library_name` 值为「低频电流」；`#script` → `#config` 往返后仍为「低频电流」。同页 A/B（`valOf` 临时换回旧实现、清空下拉重跑 `fillMusicLibrarySelects`）：旧实现 value=`""`、选项变「（未选择——点开挑一条）」；恢复新实现 value=「低频电流」。
+- **全量 1553→1554 通过（skipped=1）**。
+
+---
+
+## v2.9.0
+
+**本次改动：BGM 转译契约升级为三层结构化输出（caption + lyrics 结构脚本 + bpm/keyscale/timesignature 锚点），修复 30 秒曲目约 6 秒后中频塌陷退化为低频 drone 墙；撤销第五维律动与未发布的措辞收控改动**
+
+**新增**
+
+- **`music_gen` 接入 BGM 三层结构参数**：`cmd_generate` 增 `lyrics`/`bpm`/`keyscale`/`timesignature` 四参；`GenerationParams.lyrics` 由硬编码 `"[Instrumental]"` 改为 `lyrics or "[Instrumental]"`（`instrumental=True` 保留），`bpm`/`keyscale`/`timesignature` 按传入值填；CLI 增 `--lyrics`/`--bpm`/`--keyscale`/`--timesignature` 四选项并由 `main` 分发透传；账本新增 `lyrics`/`bpm`/`keyscale`/`timesignature` 四字段；`web_ui` 生成入口按新契约取三层字段透传 CLI，生成日志明示结构与元数据。
+
+**修复**
+
+- **BGM 约 6 秒后中频塌陷、退化为低频 drone 墙（契约级根因）**：现象——连续多发生成的 30 秒 BGM 前 6 秒中频（300-2k）占 92~~96%，第 6 秒起持续塌陷，18 秒后中频仅 0.1%、80-300Hz 占 98%，退化为恒稳低频 drone 墙（分段频谱矩阵实测，多版多 seed 一致复现）。根因——ACE-Step 输入为三层协同：`caption` 整体画像、`lyrics` 时间脚本（官方结构标记控制音乐随时间展开）、`bpm`/`keyscale`/`timesignature` 节奏调性锚点；旧转译层只产单个 caption 字符串，指令全文未提 `lyrics`、结构标记与元数据字段，转译模型既不知这些字段存在也无输出通道，生成侧 `lyrics` 硬编码 `[Instrumental]`、三个元数据字段全走默认空——三层中两层半为空，模型建完开场氛围后无演进指令，静态铺底到曲末。修法——转译指令重写为输出 JSON 三层：`caption` 长句含编排演进、`lyrics` 用官方结构标记写时间脚本（`[Intro - ambient]` / `[Main Theme - sparse bass]` / `[Outro - fade out]`）、元数据给 `bpm`/`keyscale`/`timesignature`，并写明三层一致性铁律；返回契约由 `(caption, degraded)` 改为 dict，新增 `_parse_bgm_translation` 做代码层确定性校验（`bpm` 限 30~~300 越界置回自动、拍号只认 2/3/4/6、相邻结构标记拆行），解析不出结构即降级按原文直出，损失止于单次生成质量。
+
+**变更**
+
+- **转译指令回退到四维版**：`docstring` 回四件事、维度回四维（氛围/形式/音色/格调），删除规则 3 律动维度行与规则 4 默认律动例外（撤销 v2.8.0 的第五维律动改动），同期一处未发布的措辞收控改动（规则 5 低音与偶发元素措辞收控）一并撤除。撤销依据——措辞收控把 `deep sub bass` 引导进 80-300Hz，drone 由 <80Hz 闷响变为有实际声压的低频墙，听感退化；且「80-300Hz 仅 2.2%」被误判为病灶，该「空洞」实为「无 drone」，能量搬入反而放大问题。第五维律动虽有正向数据（音符时值标准差 0.60→0.303、拍层稳定），随之一并回退。回退前版本备份于 `Temp/web_ui_v280_5dim_rule5.bak.py`。
+
+**测试**
+
+- **`tests/test_music_service.py` `TestBgmCaption` 3→5 条**：适配 dict 契约三条（转译成功取三层字段 / 预算走 `llm.max_tokens` / 降级原文），新增「答非 JSON 降级」「结构性字段代码层校验」两条。
+- **全量 1551→1553 通过（skipped=1）**。
+- **真机端到端验证通过**：账本三层字段齐全（`lyrics` = `[Intro - deep sub-bass]` / `[Main Loop - subtle electric crackle]` / `[Outro - seamless match]`、`bpm=70`、`keyscale=D minor`、`timesignature=4`、`lm=pt`）；生成件 30.0 秒单声道 48kHz，落稿响度 -22.99 LUFS（`norm_limited=false`）；分段频谱 0-27 秒中频（300-2k）稳定在 4.1~~9.2%（回退前版本 18 秒后为 0.1%），谱重心 94~~153 Hz，rms -17.5~-24.6 dBFS 无断崖。
+
+---
+
+## v2.8.0
+
+**本次改动：AI 音乐库生成链路——LLM 转译层、ACE-Step 谱曲开关定案、响度归一同标尺、limited 受控落稿与配置页/音乐库交互修复**
+
+**新增**
+
+- **背景 BGM 生成接 LLM 转译层**：`/api/music/generate` 在起生成前先把用户的中文描述经 LLM 转成英文 caption（中文→英文对齐训练分布、否定句→正向描述 + no-xxx 标签、口语形容词→风格标签），再传 ACE-Step；原始描述经 `--prompt-raw` 只进 `profile.json` 账本不参与推理。根因：ACE-Step 内部 LM 规划器仅 0.6B 且训练语料以英文 caption 为主，中文长描述还原度打折，否定句反而把被禁元素当特征学进去。预算走 `llm.max_tokens` 统一推动点；LLM 不可用 WARN 降级按原文生成，不拦生产。验证：`TestBgmCaption` 3 条（转译成功 / 预算=llm.max_tokens / 降级原文）+ `test_prompt_raw_recorded` 账本溯源，全绿。
+- **配置页显隐机制 `show_if`**：背景音乐卡「档位 / AI 音乐库曲目 / 自备文件」三行改为只在匹配来源（内置合成 / AI 音乐库 / 自备文件）下露出。此前无任何字段级显隐机制，切来源后其余下拉照旧杵着，被误读为切换不生效。实现：规格声明 `show_if={"依赖键": [取值]}`，前端 `applyShowIf()` 通用求值（与 `applyEngineScope` 同款），值变更与卡片重建两处都重算。验证：`TestShowIf` 2 条（依赖键/取值结构性校验 + 三行声明齐全）+ `test_bgm_show_if_wiring` 前端接线钉，全绿。
+- **AI 生成件响度统一落稿侧**：与内置 15 档同一条标尺（-23 LUFS / 真峰值 -1 dBTP）。实测 ACE-Step 产物 -16.4 LUFS，比内置档响 6.5 dB，不归一就会压场。规格先统一：f32 立体声 → s16 单声道（`_mono_s16`，`bgm_loudness` 的增益施加只吃这个规格，也是成片链 `-ac 1` 的最终口径）。实现唯一来源 `tools/bgm_loudness`（`TestSingleImplementation` 钉死）；归一失败删稿停产，不许削峰凑数。`mix_bgm` 运行时一行未动，与 SFX 响度统一同一思路：落库做死、运行时只压整体档。账本新增 `norm_gain_db` 字段可追溯。验证：`test_draft_is_loudness_normalized`（fake 链真跑：单声道 / s16 / LUFS≈-23 / gain 入账本），全绿。
+- **BGM 生成件响度归一 limited 放行定案**：真机第四发（随机 seed）生成失败于落稿归一——ACE-Step 产物峰均比 23.02 dB 超出标尺余量 22.00 dB（-1 dBTP 上限与 -23 LUFS 目标的差），纯线性增益物理不可达，`bgm_loudness.normalize_file` 按「不可达即拒写」合同删稿停产。根因是素材物理特性与标尺的系统性冲突，不是链路 bug：峰均比超 22.5 dB 的生成件必炸（`VERIFY_TOL_LU=0.5` 容差内 22.0~22.5 一直在静默按上限落稿），稀疏瞬态类 BGM 高发；ACE-Step 内部峰值归一（Peak 0.2139→0.8913）不是根因——线性归一不改峰均比，撤掉同样不可达。修法：`normalize_file` 增 `allow_limited=False` 参数——`plan_gain` 本就返回撞线增益，放行时按真峰值上限落稿，复测基准从「目标」改为「计划落点」（未撞线时两者相等，严格语义零变化），`limited=True` 回报；默认 False，CLI 与 15 档批量校正照旧拒写。AI 生成链（`music_gen`）显式传 `allow_limited=True`，账本新增 `norm_limited`/`norm_after_lufs` 字段，生成日志 WARN 明示峰均比、实际落库响度与标尺差——照出但不静默，试听的人自己判断要不要这条。削峰红线不动：增益照旧按上限算，动态结构一个采样不动。验证：新用例「同素材默认参数拒写且文件未动」「放行稿峰值贴 -1 dBTP、响度低于目标、limited 标记在」（`write_sparse` 构造安静 drone+稀疏尖峰，峰均比≈34 dB，贴真机形态）；账本字段钉并入 `test_draft_is_loudness_normalized`，实现钉 `allow_limited=True` 并入 `TestSingleImplementation`。全量回归 1549 基线 + 新增 2 条，结果待真机复跑确认。
+
+**修复**
+
+- **「AI 音乐库曲目」下拉原为空壳**：`bgm.library_name` 为 `str` 型 + `options_source="music-library"`，而 `control()` 没有这个分支，掉进兜底分支渲染成普通文本框；回填函数 `fillMusicLibrarySelects` 只认 `tagName==='SELECT'` 的登记节点，文本框永远无人来填。修法：`control()` 补 `music-library` 分支渲染真 SELECT（空壳等回填，与 models 分支同款）；回填时存值为空显式列出「未选择——点开挑一条」，不许浏览器亮着第一项装作已选（存的是空串，成片会报「没有选曲目」）。验证：`test_library_name_is_a_real_select` 结构钉（分支→SELECT 就近 + 未选择占位），全绿。
+- **ACE-Step 内部 CoT 劫持 caption（真机日志实锤）**：主程序转译稿「低音为主的诡异氛围、无鼓」送入后，`thinking=True` 时 Phase 1 CoT（内部 0.6B LM）把它改写成「energetic synthwave + gated-reverb drum machine」，且官方 `inference.py:826` 以 LM 产物覆盖 DiT 输入——生成方向整个被劫持，与用户意图相反。修法：`thinking=False` + `use_cot_caption/language/metas` 三连 `False`，官方判定 `use_lm=False`，LM 整段跳过，DiT 直接吃转译稿；描述的理解全部由主程序 LLM 转译层完成。副产物：每条生成省掉 tokenizer + LM 加载与 Phase 1/2 约 40 秒。验证：`test_cot_disabled_and_lm_skipped`（params 四 False + `lm is None`），全绿。
+- **AI 音乐库试听 / 混合按钮与混合错源修复**：`control()` 的 music-library 分支补齐试听（`/api/music/library/<名>`，`assets_factory.library_bgm_path` 定位，缺文件 404）与混合（`bgmMixPreview`）按钮；`api_bgm_mix_preview` 此前缺 `mode == "library"` 分支，AI 音乐库曲目会掉进 else 拿内置档错源混音。修法：补 library 分支走 `library_bgm_path`，缺曲目 fail-closed 报错，绝不静默拿内置档顶上。验证：`test_library_name_is_a_real_select` 钉 SELECT→试听/混合按钮接线与 `library_bgm_path` 引用，全绿。
+- **过期测试钉与固件规格修复**：`TestGenerationCallPins.test_8gb_offload` 仍钉已删除的 `LM_BACKEND`，改钉新契约（offload 双 True + `lm = None` + `LM_BACKEND` 不许回来）；`TestGenerateHandoffOrdering` 的 fake 产物 0.2 秒不足 loudnorm 一个测量窗（EBU R128 400ms，实测 `input_i` 返回 None），归一环节 fail-closed 拒收，4 条测试转红——固件产物加长到 3 秒满足同一合同（真实产物 10~30 秒）。全量 1538→1549 通过（skipped=1）。
+- **BGM 后段空白根因 = `thinking` 关错**：用户真机生成的 30 秒曲目 15 秒处断崖，15–30s 是恒定 −55 dB 地板。探针一次 DiT 加载四组对照（A 全关 / B 仅 metas / D thinking+caption 保真 / C 官方全开）：A 复现断崖（content_end=14s）、B 只铺到 21s、D 与 C 均 28s 铺满。机制：`thinking=True` 时 LM 两阶段的 Phase 2 按 `target_duration` 谱 audio codes，DiT 只渲染——时长由 codes 长度保证；caption 覆盖只由 `use_cot_caption` 一个开关控制（官方 `inference.py:826`），thinking 开着不碰转译稿。定案开关：`thinking=True`、`use_cot_caption/language/metas=False`。`music_gen` 恢复 5Hz LM 加载（pt 后端，offload），LM 加载失败 WARN 降级无谱曲模式不停产；账本 `lm` 记实际 backend。真机端到端复验：同 seed 全链生成 content_end=30s/30s 尾部零地板，账本 `lm='pt'`、`norm_gain_db=3.82`。代价：每条约 +11 秒（LM 加载 + 谱曲）。
+
+**变更**
+
+- **转译指令加「形容词维度归位」规则**：真机第二发（同描述不同 seed）频谱定性——链路全部正常（28/30 满、归一生效），但中段 95% 能量压在 300Hz 以下无旋律内容、末尾「电流声」频繁。根因不在链路：用户描述里的形容词分属不同维度（诡异=氛围、简单=形式、稚嫩=音色、优雅=格调），旧指令把「简单优雅」打包成 `simple yet elegant sound changes` 一句没有执行实体的抽象短语，模型只能输出低频 drone 并把「偶发电流声」过度执行。修法：转译指令第 3 条改为维度归位——氛围词落 atmosphere/mood、形式词落 arrangement、音色词落 instrument/timbre、格调词落到旋律/音色等可听实体，禁止跨维打包，附「温暖但简单，稚嫩而优雅」四维各归的正例与反例。实测（真实 LLM 同一描述）：新产出 `eerie quiet atmosphere, simple minimal arrangement, prominent bass with deep tones and occasional electric buzz, elegant melodic progression refined tone, no drums, no percussion, seamless loopable`——四个维度各自落位。执行效果是模型的事，逻辑必须明确：解释与示例都已写进指令。
+- **转译指令补第五维「律动」+ 默认律动例外**：真机第三发（测试三）节奏量化——速度不乱（120.2 BPM 恒定脉冲，59 个拍点变异系数 0.10），乱在音符时值（onset 间隔 0.28~2.55 秒乱跳，标准差 0.60 秒）：无鼓 + 零节奏锚点时模型自由发挥音符起落，忽密忽疏。根因：四维里没有「律动」这一维，用户描述没提节奏时 caption 零节奏约束。修法：维度归位扩成五维——氛围/形式/音色/格调/律动各落执行域（律动→steady slow pulse, even sustained notes, smooth flowing rhythm）；规则 4 增唯一例外：用户完全没提节奏时默认补 steady even pulse（垫底音乐的缺省期待，不为它破坏「不加用户没提的元素」的防线）。docstring 四件事同步五件事。用户口径不变：执行好坏是模型的事，逻辑必须明确。
+
+**测试**
+
+- **`tests/test_music_service.py` 与体例守卫**：转译层（`TestBgmCaption`、`test_prompt_raw_recorded`）、配置显隐（`TestShowIf`、`test_bgm_show_if_wiring`）、音乐库接线（`test_library_name_is_a_real_select`）、响度归一（`test_draft_is_loudness_normalized`、`TestSingleImplementation`）逐项钉住。
+- **全量 1538→1551 通过（skipped=1）**：测试钉与固件规格修复使 1538→1549，limited 放行新增 2 条至 1551。
+
+---
+
+## v2.7.0
+
+**本次改动：环境音（SFX）——合成阶段按脚本自动插入音效与氛围垫底**
+
+**新增**
+
+- **资源库（`podcast_maker/resources/sfx/`）**：37 条 CC0 短音频随仓（mp3，5.5 MB），`manifest.json` 台账逐条登记具名 / 类型（event 事件音 / amb 氛围音）/ 场景描述 / 时长 / sha256 / freesound 溯源——模型只能从封闭清单里点名，不能虚构。库内响度落库时统一归一：事件类峰值归一 -3 dBFS（瞬态素材 RMS 无意义）、氛围类 RMS -26 dBFS + tanh 软限幅（-6 dB 膝，硬砍增益会压哑爆裂与篝火一族的瞬态），峰值天花板 -1.5 dBFS；运行时只压整体档。
+- **决策层（`sfx_engine.plan_sfx`，pipeline 1b 钩子：脚本定稿后）**：LLM 拿逐句脚本与封闭清单逐句判断（temperature 0.2 + json_schema 约束输出 `{i, sfx, pos}`）。五道防线 fail-closed：库外名丢弃、句序越界丢弃、位置与类型错位丢弃（事件音只能 before/after，氛围音只能 bed）、一句最多一条、心跳/尖叫/雷/警报四种重口味点缀每期每种硬上限 2 次（`SEASONING_CAP`）；决策失败 WARN 降级不停产——本期不加环境音，管线照走。prompt 明写「绝大多数句子不需要环境音，宁缺勿滥」「只在文本明确描写或强烈暗示时才配，转述、回忆、比喻不加」「氛围垫底一整段只在第一句标 bed」——每句都加的情况从源头压住。计划落盘 `过程/<期>/sfx_plan.json`，记 manifest sha16 可追溯。
+- **执行层（`sfx_engine.apply`，pipeline 3a 钩子：合成后、`audio_engine.process` 前）**：事件音重采样到句子同口径后粘句前 / 句后；氛围音 `stream_loop` 循环铺满整句压低混入（amix duration=first，句长不变）。中间件一律 WAV（mp3 过 concat demuxer 出坏流，句前 +0.00s 事故的根因）。烘焙只改句 wav 本身，拼接 / 响度 / BGM 混音链一行未动；放在实测回填之前，新增时长计入偏差表与字幕时间轴。
+- **配置三键与出厂档**：`sfx.enabled` / `sfx.event_gain_db`（-6）/ `sfx.bed_gain_db`（-8）；代码缺省关（键缺失 fail-closed 不加音），出厂 `config.json` 默认开。配置页新增「环境音」卡（第十七张，排在背景音乐之后）。
+
+
+**修复**
+
+- **决策输出预算写死 4096，没走统一推动点（真机首期即暴露）**：环境音决策一开跑即报「模型返回空答案：reasoning_tokens=4096 吃满 max_tokens=4096，答案段没有剩余额度」。根因：`plan_sfx()` 里 `timeout` / `idle_timeout` 都从配置取了，唯独 `max_tokens=4096` 写死在调用点——出厂 `llm.max_tokens` 是 47872，思考型模型的推理段与答案段共用这份预算，写死的小值恰好够思考段烧完。修法：与 `planner.py` 同口径改读 `cfg.get("llm.max_tokens", 8192)`；fail-closed 兜底如约生效（决策失败 WARN 降级、本期零环境音、管线照走），损失止于这一次空转的决策调用。新增 `TestDecisionBudget` 2 条钉住：预算值必须等于 `llm.max_tokens`、键缺失回落 8192 与客户端缺省同口径。
+
+**测试**
+
+- **`tests/test_sfx.py` 19 条**：台账完整性（具名 / 类型 / 时长 / sha256 / CC0 溯源逐条钉）、校验防线（库外名 / 越界 / 类型错位 / 一句多条 / seasoning 配额）、apply 三路真机（before / after / bed）、缺文件跳过、决策输出预算走统一推动点 2 条。
+- **全量 1519→1538 通过（skipped=1）**；端到端实测：决策 12 句脚本只出 3 条（雨夜整段 1 条垫底 + 拔刀 / 兵刃相撞 2 条金属碰撞，落点全对）；执行 before 3.0→5.41 秒、after 累计 +9.674 秒、垫底句长不变，新增时长如实进偏差表与字幕时间轴。
+
+---
+
+## v2.6.0
+
+**本次改动：ref_base 版本账本（换嗓串嗓事故修复）**
+
+**现象**
+
+- 某项目 13:35 认领声库新嗓（只换 `ref.wav` / `profile.json`），凌晨 01:03 旧嗓克隆的 `ref_base.wav` / `icl.wav` 原样残留；`_ref_pair()` 判「icl 两件齐备即用」→ 整期 138 句的合成条件全是旧嗓。
+- 体检锚 = 新 `ref.wav`，与合成条件（旧嗓 icl）不同源 → 73 句点名、B 角整批嵌入 0.71–0.85，换种子重出 24 句全部无效（嗓源本身不是档案里那个人），保底全标人工审。实测 `cos(旧 ref_base, 新 ref)` = 0.809（B），A 恰好新旧近源 0.974 所以 A 全过——点名多是体检在正确报警，报的是「这批声音不是档案里那个人」。
+
+**根因（两层叠加）**
+
+- 换嗓认领不失效旧 ref_base/icl，`_ref_pair()` 又齐备即用 → 静默用旧嗓合成；
+- 锚口径与合成条件不同源——体检锚拿 `ref.wav`，合成条件拿 icl（ref_base 系），Base 克隆的固有偏移被记到每一句头上。
+
+**修法（ref_base 版本账本）**
+
+- **ref_base/icl 全带 sign 后缀**：`ref_base_<sign>.wav` / `icl_<sign>.wav` / `icl_<sign>.txt`，sign = 原生 ref 的 sha256 前 8 位——文件名即映射，可验证不靠记忆。
+- **角色账本 `音色/<角色>/base_refs.json`**：`entries[sign]` = 原生 ref sha16 / 来源 / 文件组 / created，`active` 指当前生效 sign。**同一原生 ref 永远只克隆一次**——重克隆 = Base 重掷骰子 = 音色变化，账本命中即复用现有文件。
+- **换嗓三处接线**：`adopt` 换嗓前把旧版本件 stash 出来再覆盖目录、拷完原样还原（旧嗓的 ref_base 一个不丢，换回旧嗓零克隆）；`adopt_official` / `inherit` 认领后接 `ensure_base_ref()`——按当前 ref 字节重算 sign 查账，命中直接切 active，未命中才生成新条目。
+- **合成判定收口**：`_ref_pair()` 按账本 active 取 `icl_<sign>` 那一对，**缺件 fail-closed 硬报错，绝不静默退回 ref.wav**（本次串嗓的口子封死）。
+- **体检锚与合成条件同源**（当期用什么生成就用什么检测）：声纹锚从 `ref.wav` 改为当期合成同源的 `ref_base_<sign>`；`voice_profiles` 带出 `base_wav` / `base_sign`，体检报告 `sv_info.anchors` 记录当期用的哪条嗓子，可追溯。
+- 旧的无后缀 `ref_base.wav` / `icl.wav` 不做兼容迁移（未推送过，存量项目删了重做即可）。
+
+**测试**
+
+- `tests/test_voice_design.py` 新增 `TestBaseRefLedger` 7 条：命中不重做 / 生成记账 / 换嗓保留旧版 / 切回复用 / 读者缺件 fail-closed / 锚同源 / 无账本 legacy；四处认领测试补 ensure 替身。
+- 全量 **1519 通过（skipped=1）**。
+
+**实测（项目端到端）**
+
+- 删旧无后缀件 → 真机生成 `ref_base_a71d9702`（A）/ `ref_base_2d9a4787`（B）+ 账本落盘；复跑出「账本命中，不重做」；reader 判定 A/B 各归各 sign，合成条件与锚严格同源。
+- 锚自检：`cos(ref_base_<sign>, 原生 ref)` = A 0.994 / B 0.974；现有 138 句为旧嗓所出，新锚下 B 破线属预期，该期重出后同源。
+
+---
+
+## v2.5.0
+
+**本次改动：随仓声库与 VoiceDesign 双案生成**
+
+**说明（车间与声库分离）**
+
+- `official_voices/` 是**车间**：9 预设 × A/B 双案 × 各 3 take 的原始产出，含落选样本，不随仓推送；人耳挑中的 take 才是**声库**——落 `podcast_maker/resources/voices/`（与 bgm 同级），随仓走、永不丢，认领的源就是这里。重录只动车间，声库里的已定稿嗓子不受影响。
+- 音色条目**具名不用 take 序号**：目录名 = `家族-风味`（家族名给人认，风味名给这条 take 认），全局唯一。
+- **为什么 VoiceDesign 要双案**：A/B 角永远念不同的稿子，ref 的韵律先验整条继承——只造一案的话，另一角拿到的 ref 念的是别案的文案，节奏先验错位。
+
+**新增**
+
+- **`tts_service/curate_voices.py`（新工具，人耳挑选落库）**：按 `PICKS` 表（人耳试听结论，键 = (预设名, take 号)）从车间抽 37 条（A 案 20 / B 案 17）落声库，与车间账本 sha16 逐条对账；每条三件：`ref.wav`（逐字节复制，响度入库时已归一）+ `ref.txt`（这条 take 自己念的文案）+ `profile.json`（`kind="voice_library"` + `text_role` + 全套溯源：builtin_voice / official_take / seed / sha16 / F0 / 语速）；已存在目录跳过，`--force` 覆盖重写。
+- **`library:` 音色来源语法**：`parse_voice_source()` 增 `library:名字`（随仓声库条目），`official:` 旧语法兼容读取；`DEFAULT_VOICES` 出厂默认改 `{"A": "library:瑟琳-利落", "B": "library:老傅-收束"}`。
+- **`adopt_official` 改源声库**：认领源从车间改随仓声库，按 profile 的 `text_role` 把关（A 角只认 A 案、B 角只认 B 案，反认硬拒）；`ref.txt` 写该 take 自己的文案（ICL 命门：参考转录与音频逐字对应）；take 参数降为溯源对账；车间 `takes` 元数据缺位视为无从分案整表放行，不误杀旧数据。
+- **web_ui 声库接线**：`_library_voice_options()` 产 `library:` 前缀候选（label 带 `家族-风味（X案 · 声库）` 与 `role` 字段）；A/B 下拉按点位角色过滤——A 角只列 A 案、B 角只列 B 案（ICL 命门在入口把关）；`/api/voice/library-audio/` 原声试听路由；`api_voice_officials` 改纯 JSON 读声库。
+- **`/api/voice/library/promote`（自制嗓进声库）**：VoiceDesign 草稿一键提升——整目录复制进声库 + 改标（`kind="voice_library"` + 溯源补记），原项目档案不动；三道 fail-closed：无 `text_role` 拒、同名拒、档案不完整拒；管理面板「进声库」按钮（红字确认）。
+- **VoiceDesign 双案生成**：`design()` 增 `cases=("A", "B")`——一次生成 A/B 双案，A 案念 A 案定稿文案、B 案念 B 案定稿文案，模型只加载一次；界面双案卡片，**各案独立试听、独立保存**；产物落 `音色/<基准名><案>/`（如 老陈说书A / 老陈说书B，同名两案不冲突），profile 记 `text_role` + `base_name`；种子键 =（该案文案，档案名，描述），两案种子天然分离；`adopt()` 加分案把关（与声库同一条规矩）；CLI `--design-case A|B|all`。
+
+**修复**
+
+- **草稿保存保留草稿基准名**：`api_voice_draft_save` 原用 `setdefault` 写 `base_name`，草稿里存的是草稿基准名（`_draft*`），已有时被静默保留、正式档案带着草稿名入库——草稿值 → 正式值必须强制写（`prof["base_name"] = name`）。
+- **测试夹具同名方法定义两次**：后者静默覆盖前者（Python 类体不报重复定义），测试实际没跑全——重构为 `_make_draft(role, text_role=None)` 公共夹具。
+
+**测试**
+
+- **`tests/test_voice_design.py` 重写，65 条全绿**：`TestOfficialAdopt` / `TestBuildSources` 改声库夹具（含 `takes` 缺位兼容与反认被拒），`TestDraftFlow` 双案化（双案落盘结构 / text_role / 分案把关 / 提升三道 fail-closed）。
+- **全量 1512 通过（skipped=1）**；真实声库认领冒烟 PASS：A/B 各认各案、反认被拒。
+
+---
+
+## v2.4.0
+
+**本次改动：官方基准音色档案升级双文案录制与认领把关**
+
+**说明（参考文案设计依据）**
+
+- ICL 克隆整条继承 ref 的韵律先验：混合三句型（陈述+疑问+感叹）使输出疑问句尾抬高约 +2.7 半音（超 1 半音可辨阈）；省略号补「拖停」停顿先验（原档案缺失的唯一韵律料）；引号转述句式补「转述他人说话」的语调先验。
+- 四种符号各留一个干净实例（句号平收／问号上扬／感叹提气／省略号句中悬停），不共句——用省略号收疑问句会顶掉疑问上扬先验；引号包住完整疑问句、省略号不进引号（嵌套停顿的对齐行为未经验证，不冒险）。
+- 文案仍须与项目内容无关（音色基准不随项目漂）；`ref_text` 与音频逐字对应是 ICL 的命门。
+
+**新增**
+
+- **`make_voice.REF_TEXTS` 定稿双文案**：A 52 字 / B 48 字，混合三句型 + 四符号 + 引号转述；官方档案升双文案结构（每音色 A 案 take1–3、B 案 take4–6），`OFFICIAL_TEXT` 保留为兼容旧读者。
+- **`record_official_presets.py` schema 2**：逐 take 记 `text_role`／`text`／种子；CLI 新增 `--rate-min/--rate-max/--max-attempts`（缺省沿用 make_voice 门禁常量，不绑死）；语速窄窗（本轮 4.00~4.36 字/s）内重试，重试耗尽后取**念全（段数 ≥3）里离窗最近**的一条定稿并记 `rate_out_of_window`，试听页红标供人耳裁决；念全没有兜底——缺句音频按废品硬报错，不进候选。
+- **种子搜索区间互不相交**：take 种子起点改 `seed0 + take_no*1000`、重试 +7（上限 16×7=112 < 1000，区间永不重叠）。修复：旧方案 `seed0 + (take_no-1)*7` 在宽窗时代无恙（首种子基本即过），窄窗下各 take 的重试序列大量重叠、全部收敛到同一条离窗最近的种子——三条 take 逐字节相同（实测 Vivian take1/2/3 同语速 4.83、take4/5/6 同 3.99），take 序号失去意义；区间不相交后兜底落点也保证不同波形，种子仍全由 (text, voice, take, attempt) 决定、可复现。
+- **`adopt_official` 双文案把关**：A 角只认 A 案 take、B 角只认 B 案 take；旧档案无 `text_role` 视为任意角色兼容、`takes` 元数据缺位视为无从分案整表放行——不误杀旧数据。
+- **`chosen` 过期结论精确作废**：按本轮实际重录集合 `re_takes` 作废人耳结论，不再按「take 号仍在」保留——force 重录同号时波形已变，旧结论不得沿用；旧数据单选 int 统一成列表。
+- **试听页**：每条 take 挂 A案/B案 徽标、超窗红标，note 区展示双文案。
+
+**修复**
+
+- **认领写出的 `ref.txt` 文案错位**：原读 profile 级单一 `text` 字段（恒 A 案文案），B 角认领 B 案 take 会配上与音频不符的参考转录——ICL 参考转录必须与音频逐字对应，改逐 take 文案落 `ref.txt`。
+
+**测试**
+
+- **`tests.test_voice_design` 58 条全绿**（含双文案把关与旧档案向后兼容路径）；`py_compile` 两文件通过。
+- 双文案重录（9 预设 × 6 take）以单文件试听页交付人耳挑选，落窗情况以 profile 的 `rate_window`／`rate_out_of_window` 字段为准。
+
+---
+
+## v2.3.0
+
+**本次改动：音色体检下沉句内——段级「异常混入」判据与音色否决（第 9 维）**
+
+**说明（判据研究链与口径教训）**
+
+- 整句单点判据的结构盲区：每句仅一组整句中位标量，0.31s 的局部混入被九成正常帧抹平（实测句 0012_B 体检分 0.28、flag 恒 false）；身份／嵌入／共振峰 F1／VTL／声纹五路替代维度在短段上对「同人喊高」与「换人混入」全部重叠——句内问题须句内分辨率，整句统计量到顶。
+- F0 测量层病根：pyin／ACF／HPS／CEP 对弱基频男声普遍锁第 2 谐波（假高读数 405~~455 Hz 反高于真混入 344 Hz——任何「越高越异常」的判据必然漏掉真混入）；修法＝段内平均谱 + 谐波和（SHS）求真基频，整条谐波串成立才取值，倍频读数 405~~457 Hz 归位至 129~216 Hz。
+- 报警线口径：「每句最高段」是极值统计（N≈10 段取 max 天然落在 2~3σ），固定线 3.2 恰好卡在该分布的中位数上（池内 44.6% 句被点名）→ 改池自校准：线＝该角色「每句最高段」分布的 90 分位（B 5.73／A 4.27），句数不足退固定线。
+- 第 9 维两件：倒谱谱包络（帧平均谱→log→irfft 取 quefrency<2ms——1/F0 在 70~~500 Hz 对应 2~~14 ms 全部切在门外，对 F0 免疫）→rfft 回包络→13 个对数频点逐点减均值（去增益与倾斜，只留共振峰形状）→按角色池逐系数 σ 归一 RMS＝`d_cep`；声门三件套 CPP（倒谱峰相对回归线）/HNR（归一化自相关）/H1*–H&#x32;*（谐波落差再减倒谱包络落差＝去声道影响）段级 μ/σ 归一。真混入签名＝CPP↑ + HNR↑ + H1*–H2* 转负（两个独立来源件给出同一套签名）；金属污染则包络巨偏而声门不动（宽带噪声不是换嗓子）——三种病各走一条路。
+- 探针期能量门单位错配（STFT 幅度谱矩阵属频谱量纲，与时域帧 RMS 差约 20 倍，能量门实际变成「全文件最响帧的 120%」）导致声门大面积「缺失」；修为时域帧 RMS 95 分位后，修复前标定的全部阈值作废、池基线重标——基线采集口径必须先于阈值标定验证。
+- 端到端复验推翻三道级联：报警线提至 90 分位后报警句稀少，p80/p70 幅度组合道框出的「常态区」把真混入也压掉（d_cep 2.25/d_glot 3.36 vs 区 2.44/3.53）→ 砍为两道（`d_cep < 1.0` 绝对线，或 `h1h2_z ≥ 0`）。「第 9 维只能往下压」的镜像纪律＝也不能压到真阳性头上；样本太薄的分位线宁可不上。
+
+**新增**
+
+- **`podcast_maker/seg_incursion.py`（新模块，纯 numpy 零新增依赖）**：FFT 重采样（抗混叠，替代无低通的粗抽）→ STFT 谱通量 + 自实现 mel/DCT 倒谱通量归一求和找变点分段（段序列覆盖整条音频：首段起点 0、末段到结尾，无空洞）→ 段内平均谱 + SHS 真基频；倒谱包络与声门三件套按同一帧格计算；API `available/measure/baseline/score/flag/d_cep/d_glot/h1h2_z/calibrate/veto_hit`，带 mtime 缓存。
+- **基线按角色池建立**：该角色当期全部句子的段池现场统计 μ/σ（σ=1.4826×MAD）——「一套标准扫全场」曾致女声被系统性全报（1954 段报 312 段绝大多数为 A 角）的结构性修复；A/B 各自一条基线，换嗓零改动自适配。
+- **池自校准 `calibrate()`**：报警线＝该角色「每句最高段」z 分布 q 分位（`tts.timbre_seg_line_q` 默认 90），句数 < `MIN_CAL_FILES=8` 退固定线 `Z_LINE=3.2`（配置改口「退路值」）；校准结果写体检日志。
+- **第 9 维否决接线**：`_timbre_capture` 加 `seg_veto` 参数，检测与候选验收两个调用点都接；否决命中即不点名并注明理由；纪律三条——只能往下压、不能压到真阳性、不能新增报警。
+- **配置 6 键**：`tts.timbre_seg_guard(True)` / `timbre_seg_line(3.2，退路值)` / `timbre_seg_min_seconds(0.20)` / `timbre_seg_line_q(90)` / `timbre_veto(True)` / `timbre_cep_abs(1.0)`。
+- **web_ui**：ZONES 新增「段级混入与音色否决」卡（6 键）。
+
+**验证（落地代码直接跑真实音频，端到端）**
+
+- B 池（男声线 83 句/886 段）：线 5.73，触发 9 → 否决压 6 → 仍报 3＝0097_B（金属真问题）+ 0003_B / 0113_B（特征空间真边界，残余档可接受）。
+- 金标准 17 件逐件核对：保留组 6 全报，零漏零误伤；干净组 4 全静；0127_B／syn_f0x2 被否决压掉；base_i097_o1 静（90 分位线的既定代价）。
+- A 池（女声线 88 句/1008 段）：线 4.27，触发 9 → 压 8 → 仍报 1（0149_A 待耳听档）；声门可算率 100%，HNR 中位 8.27 高于男声 5.17（物理合理）。
+- **全量 1505 测试通过**（skipped=1）。
+
+**测试**
+
+- **`tests/test_timbre_guard.py` 新增 SegIncursionVetoTest（8 条）**：两道否决零误伤钉、否决压不掉真混入的守卫、`flag()` veto 关键字兼容、calibrate 句数门；**SegIncursionDimsTest**：合成 150 Hz 谐波 wav 钉段级行结构与 f0 读数。
+- **`tests/test_banner.py`**：`_python_sources` 排除 `_backup_*` 目录（改动前整树备份不是第一方源，版本字面量扫描曾被其污染）。
+
+---
+
+## v2.2.0
+
+**本次改动：生成侧参考音频重构——base_ref 进 ICL 上下文**
+
+**说明（设计依据，同种子配对探针实测）**
+
+- 句首漂移根因定性：句首约 0.9 秒内说话人条件尚未充分调制采样，条件分布呈多模态（男声/女声两个吸引子）；同句只换种子，句首中位 F0 在 143~310 Hz 间摆动。采样侧参数全部实测否决：`non_streaming_mode=True` 句首女声区命中 45%→70% 恶化、`top_p` 1.0→0.85 为噪声级且身份余弦单调下降、`instruct` 写身份描述方向与语义无关且动不了句首——三者皆为全局旋钮，够不着句首局部吸引子。
+- 生成侧有效手段为改条件：段首预热（ICL 前缀在档案之后再接一段同角色真实语音）实测句首女声区 6/15→1/15、真男声 8/15→12/15；逐句滚动前缀优于固定前缀；以 Base 克隆自造前缀可完全替代当期成品前缀，且不依赖成品、前缀固定可并行。
+- 落地结构取「一条嗓子两段」：`ref_base + 0.15s 静音 + ref_base`，两半同源、同率、同后端——不再出现「一段录的一段生的」的两嗓拼读；`ref.wav` 字节不动（音色来源凭证与声纹参考）。
+
+**新增**
+
+- **`tts_service/make_base_ref.py`**：以 Base 克隆本角色 `ref.wav` 内容重生成 3 个候选，按平均谱形相似度挑最贴参考的一条（不以自相关 F0 挑——该尺会倍频）；`resolve_sample_rate()` 读统一推动点 `audio.sample_rate`（优先级 CLI 覆盖 > config.json），读不到报错退出不猜（fail-closed），`--sample-rate` 显式覆盖；产物落 `音色/<角色>/ref_base.wav` + `ref_base.json`（溯源含 source_sample_rate/sample_rate）+ `icl.wav`（= ref_base + 0.15s 静音 + ref_base）+ `icl.txt`（两段转录连写，与音频逐字对应）。
+- **`layout.py`**：`VOICE_BASEREF` / `VOICE_ICL_WAV` / `VOICE_ICL_TXT` 三常量与三个路径函数。
+- **`tts_engine.voice_profiles._ref_pair()`**：ICL 参考唯一判定处——icl 两件齐备即用 icl，否则退回 `ref.wav`；`_service_synth` 零改动自动跟随；无 icl 档案的项目行为与既往一致。
+- **声纹参考隔离**：`ref` 对象新增 `ref_wav` 键恒指音色本体，声纹参考四处（检测／候选验收／基线池等）全部改用——icl 是含静音的拼接件，不得参与说话人相似度比对。
+- **采样率统一推动点**：ref_base／icl 全按 `audio.sample_rate`（当前 44100）落盘；本地语音服务输出 24000 与段级分析内率（24000）分属输出／分析两层，与出片率不是一回事。
+
+
+**修复**
+
+- **两处硬编码估时长**：`os.path.getsize(...)/48000.0` 改用 `_wav_seconds()`——采样率写死属「另跑一套逻辑」同类病因，归一到唯一实现。
+
+**测试**
+
+- **`tests/test_tts_engine.py` 新增 `test_the_base_ref_file_names_match_the_tool`**：锁 layout 与 make_base_ref 两侧的 ICL 三件套文件名（原仅锁 ref 三件）；`tests.test_tts_engine + tests.test_layout` 116 条全绿。
+- **端到端实测**：`voice_profiles()` 后 A/B 送合成为 `icl.wav`、声纹参考为 `ref.wav`；A ref_base 6.80s／icl 13.75s（6.80+0.15+6.80 精确）、B 6.16s／12.47s，产物均为 44100 Hz。
+
+---
+
+## v2.1.0
+
+**本次改动：BGM 音乐库档位、搭建环境加固与推送清单（含三条已随 v2.0.0 出货但未记档条目的补记）**
+
+**新增**
+
+- **AI 音乐库接入 BGM 档位选择**：`bgm.mode` 新增 `library`（AI 音乐库）档与点位 `bgm.library_name`（动态下拉 `options_source=music-library`——声明式 enum 会被枚举门禁拦截，动态源必须是 str）；`validate_config` 选库来源未选曲目报错；`assets_factory.library_bgm_path` 以 `sys.path` 挂 `music_service` 直 import `music_gen` 复用 `library_entries`（单源实现），缺曲目/空名 fail-closed 停产报错不降级；配置页 `fillMusicLibrarySelects` 遍历注册表不写死键名、旧值不在库中显式追加「已不在库中，重选即换新」、空库出提示，挂进 `refreshMusicState` 与初始化。
+- **flash-attn 默认跳过（BGM 搭建脚本）**：`setup_music_env.py` 安装依赖前以 `_requirements_without_flash` 滤除 flash-attn 行并打 `[WARN]`——其仅为注意力加速，SDPA 自动回退下功能与音质零影响，缺席仅慢不残；需要时以 `--with-flash-attn` 旗标走 ghproxy.net / gh-proxy.com 镜像链安装（直连 GitHub 下载不可用）。
+- **nano-vllm 改 `--no-deps` 挂载**：其 pyproject 把 flash-attn 声明为硬依赖（GitHub 直链），常规 pip 安装必炸；其 `attention.py` 自带 `_HAS_FLASH_ATTN` 导入守卫与 SDPA 回退（注释明示 no flash_attn dependency），其余依赖（torch/triton-windows/transformers/xxhash）requirements 全覆盖，故排除其依赖声明单独挂载。滤一处依赖前全仓 grep 该依赖的所有声明点（requirements/pyproject 两处）。
+- **推送名单.md（工作仓根）**：git-sync 发布的必带/显式排除清单（模型权重、第三方 clone、venv、备份、临时产物的排除锚点）与自检脚本（MUST/BAN 锚点断言，真跑列出缺失与泄漏）；推送名单为活文档，新增功能性文件先改名单再推送。
+
+**测试**
+
+- **`tests/test_music_service.py` 47 条中的新增钉子**：flash-attn 镜像链与默认跳过（`test_flash_attn_mirror_chain` / `test_flash_attn_optional_by_default`——滤行先于 requirements 安装、WARN 在场、旗标接线）、nano-vllm `--no-deps`（`test_nano_vllm_no_deps`）、音乐库接线（`TestBgmLibraryWiring` 5 条）；E2E 真服务器（页面钉 / params payload / state）与库解析链（命中/缺失报错）通过；全量 1496 条为 v2.0.0 出货态。
+
+---
+
+## v2.0.0
+
+**本次改动：新增本地 BGM 生成模块（music_service）**
+
+**新增**
+
+- **BGM 生成 CLI（`music_service/music_gen.py`）**：`--generate/--status/--save/--discard/--delete` 五个子命令；生成固定进全局音乐库的 `_draft.wav`（草稿），保存改名入库并改写账本 `role`，重名拒绝、取消与删除幂等、静音拒收、时长 10~30 秒外拒收，全程 fail-closed；stdout 只输出 JSON（结果通道），进度走 stderr。
+- **环境搭建脚本（`music_service/setup_music_env.py`）**：配置页「背景音乐」卡按钮触发，六步拿代码 → 找 Python → 建独立 venv → 装 torch 2.7.1+cu128 与官方仓依赖 → 下模型权重 → 自检；独立 venv 与 TTS 栈（torch 2.9.1+cu126）互不搅动。torch 源上交大镜像优先、pytorch 官方兜底（官方源实测 0.65 MB/s，上交大 6.3 MB/s）；PyPI 依赖显式走清华源；模型权重复用官方 `acestep.model_downloader`（ModelScope 自动兜底），不重写下载逻辑。
+- **配置页背景音乐卡**：搭建按钮、描述框、时长、生成、草稿行（试听/保存/取消/重新生成）、管理删除（inline 红字二次确认，无弹框）；每一步成功回调当场重渲染对应区块，生成完成无需手动刷新页面。
+- **BGM 端点**：6 条 POST（state / setup / generate / draft-save / draft-discard / delete）与 GET `/api/music/audio/<name>`（黑名单 + `safe_join`，实测拦截 `..%5C` 目录穿越）。
+
+**修复**
+
+- **搭建脚本 WinError 183**：首跑即炸于 `os.rename`。根因：`shutil.rmtree(..., ignore_errors=True)` 将 Windows 只读文件（`.git` 对象全为只读）的删除失败静默吞掉，残骸使 git clone 失败退到 tarball 后归位 rename 撞上残留目录。修法：新增 `_rmtree()`——遍历解除只读后删除，删完断言目录不存在，删不干净当场报错；`fetch_repo()` 重写，tarball 半成品（`ACE-Step-1.5-main`）完整时直接捡用归位，不重下。
+- **`--save ""` 静默滑入状态分支**：空串经 argparse 归入默认空串，`if args.save:` 判假，误走 status 分支输出成功假象。修法：默认值改 `None`，分发判 `is not None`，空名按非法输入拒绝。
+- **BGM 徽标永远停在「探测中…」**：进配置页不自动探测环境，必须手点「重新探测」才出状态，与 ffmpeg、本地语音环境两处「进去就显示」的规矩不一致。根因：`refreshMusicState()` 被写在 `renderConfig()` 的 `forEach` 分区块内、`box.appendChild(card)` **之前**——此刻卡片还是游离节点，`el('music-cfg')` 取到 `null`，函数第一句 `if(!el('music-cfg')) return` 静默早退，一次请求都没发出去；手点按钮时卡片已在文档里，所以同一函数手动能成。修法：bgm 分区块只挂内容，探测移到循环外、挂载完成之后，与 `refreshDepsState()` / `refreshTtsState()` 同段同规矩。
+- **生成的成品被自己的清场删掉（真机首跑暴露，整趟模型加载与推理作废）**：模型加载、CoT、扩散、VAE 解码、响度归一全部成功，收尾却报「音频产物没落盘」。根因：官方把 wav 写进 `save_dir`（`音乐库/.generating/`），而清场写在 `finally`、搬运写在 `finally` **之后**——刚生成的文件被连目录一起带走，随后的 `os.path.isfile(src)` 必然为假。修法：`shutil.move` 挪到 `finally` 之前（产物先活着走出临时目录，再让 finally 清场）；临时目录清理改用新增的 `_clear_scratch()`——解只读后硬删，删不掉只 `[WARN]` 一行、绝不把已成品的生成判死（此处与 setup 脚本 fail-closed 口径不同的理由，写在函数注释里）。
+- **官方仓往 stdout 裸 print，污染结果通道（同一次真机跑暴露）**：生成时 stdout 多出两行 `Using precomputed LM hints`，破坏「stdout 只有一份 JSON」的合同。修法：新增 `_stdout_to_stderr()`（与 `tts_service/serve.py` 同手法），模型加载与推理整段重定向到 stderr；失败与结果文案一律在重定向之外打印，结果通道不被改写。真机实测 stdout 恢复「恰好一行 JSON」，两行杂音落进 stderr（父进程本来就当进度读）。
+
+**测试**
+
+- **`tests/test_music_service.py` 47 条**：CLI 真行为（草稿保存/重名/幂等/删除守卫/账本改写/空名拒绝）、端点与页面钉、实时刷新回调钉、探测时机钉（bgm 分区块内不许有探测调用，三个探测必须同在挂载之后）、生成交接顺序钉（假 acestep 模块真跑全链：产物必须先搬出临时目录再清场，顺序改回去立刻红）、临时目录清理失败只 WARN 不误杀成品、`_rmtree` fail-closed（脚本禁止带 `ignore_errors` 的 rmtree 调用行）、国内镜像优先于官方源。
+- **全量 1496 条通过**；真服务器 E2E（页面钉 / state / 生成入参拦截 / 音频 404 / 目录穿越拦截）通过；进配置页零点击实测 BGM 徽标当场出「已就绪」、生成区自动亮出；真机跑通完整生成（ACE-Step 2B turbo + 0.6B LM，10 秒曲目 rc=0，产物 48 kHz / 10.00 秒 / 峰值 0.8913 / RMS 0.0700，stdout 恰好一行 JSON），验证后草稿已丢弃、音乐库无残留。
+
+---
+
+## v1.9.0
+
+**本次改动：VoiceDesign 造嗓草稿流；音频入库即响度归一；子进程 stdout 纪律**
+
+**新增**
+
+- **VoiceDesign 造嗓进配置页**：名字/描述/文案三输入框置于 A/B 下拉旁；生成固定进草稿目录（`_draft`），试听满意后保存入库（改名 + 改写账本 `role`，撞名拒绝），不满意可换种子重新生成（`--design-seed-offset`）、取消（幂等）；「管理」删除具名音色，带 A/B 引用守卫——被任一角色引用的音色拒绝删除。
+- **音频入库即归一**：官方 take 录制落盘与 VoiceDesign 保存统一做响度归一——RMS 目标 -23 dBFS（广播标准）加峰值限幅 -1.5 dBFS，增益取两者较小约束，±0.2 dB 内不动字节，静音拒收；试听直接放归一后文件，所见即所得。存量 23 条 take 全量回填并重算账本 `sha16` 与 `loudness_gain_db`，归一前整目录备份（`official_voices_backup_20261006/`），实测定稿间极差 11.7 dB 收敛到 -23±0.22 dBFS。
+
+**修复**
+
+- **造嗓报「音色工具没返回可解析的结果」**：faster-qwen3-tts 加载与 CUDA 预热阶段的裸 `print` 写入 stdout，垫在 JSON 结果之前致解析失败。修法：`serve.py` 新增 `_stdout_to_stderr()` 上下文管理器（stdout 仅为结果通道，进度一律 stderr），包裹模型加载、预热、克隆合成、设计合成、内置合成共 5 处；`web_ui` 侧 `_cli_json()` 从子进程输出按花括号配平取首个完整 JSON 块兜底，值内出现花括号不误切；子进程环境统一 `_sub_env()` 注入 `PYTHONIOENCODING=utf-8`，消除 GBK 乱码进报错文案的路径。
+- **原声试听与具名音频端点**：新增 `/api/voice/named-audio/<pid>/<名字>`，unquote 后分段白名单 + `safe_join`，供配置页播放选中音色的本地原声（不经过任何语速换算）。
+- **造嗓完成回调按真实状态亮灯**：生成成功回调改调 `vdDraftCheck()` 按磁盘草稿与库存状态决定按钮行显隐，不再无条件显示。
+
+**说明**
+
+- **txt 配对与标定语义核实**：`write_profile` 唯一落盘点原子写三件（wav/json/txt），`ref_paths` 判齐要求 wav 与 txt 同时在场且 txt 非空，配对无缺口；语速标定量的是「嗓子经 Base 合成后的成片语速」（三句实合成），非参考音频静态语速，与官方 take 的账本口径一致。
+
+**测试**
+
+- **`tests/test_voice_design.py` 增 18 条**：草稿流全路径（生成落草稿/保存/重名/取消幂等/删除守卫）、归一（RMS/峰值/静音/±0.2 dB 不动）、`seed_offset` 接线、stdout 纪律（`_stdout_to_stderr` 在场与包裹计数、`_cli_json` 解析）、账本字段补抄。
+- **全量 1449 条通过**。
+
+---
+
+## v1.8.0
+
+**本次改动：嗓音系统重构——CustomVoice 退役，音色=本地音频条目，选中即复制**
+
+**变更**
+
+- **CustomVoice 每项目合成退役**：A/B 角色下拉候选改为一条条已落地的本地音频——`official:名字#takeN`（官方预录）与 `named:名字`（VoiceDesign 入库）两类；选中即把该音频复制进项目槽位，此后该项目使用该音频，不再存在按项目动态合成音色的模型路径。裸内置音色名输入按退役处理 fail-closed 报错，`parse_voice_source()` 统一解析两种来源。
+- **复制语义收紧**：`make_voice.build()` 重写为纯复制实现，全程不加载模型；认领钩子两路均显式 `force:true`，旧值在下拉中以「（旧值，重选即换新）」显式追加，杜绝旧值静默残留。
+- **出厂默认更新**：`qwen3tts_voice_a/b` 默认 `official:Serena` / `official:Uncle_Fu`。
+
+**修复**
+
+- **换嗓报「B 角认领失败」**：官方 take 认领钩子漏传 `force`；子进程无 `PYTHONIOENCODING` 时 stderr 中文以 GBK 乱码进 toast；返回码非零时把 stdout 的 JSON 壳整段塞进提示文案。三层修复：钩子补 `force:true`、子进程统一注入 `PYTHONIOENCODING=utf-8`、错误文案只取 `_cli_error()` 解出的 `error` 字段。
+- **官方 take 认领账本缺字段**：`adopt_official` 补抄 `speech_rate` 与 `voiced_seconds`（照抄 take 账本），后续语速换算与对账不再缺数据。
+
+**测试**
+
+- **`tests/test_voice_design.py` 增 11 条**：复制语义（official/named 两路、force、退役名拒绝）、来源解析、默认值、rawPreview 端点、认领账本字段。
+- **全量 1427 条通过**。
 
 ---
 
@@ -56,6 +403,7 @@
 **本次改动：检查段修补空补丁三层加固；新增标准标尺试听、语速标定与 BGM 混合试听；structured-writer 开关归项目；修复切引擎音色行不刷新**
 
 **修复**
+
 
 - **检查段修补返回空补丁**：模型对承诺链修补任务返回 `{"edits":[],"inserts":[]}`，空结果原样通过，承诺未闭合。根因：schema 未约束非空、提示词未声明结论不可翻案、解析层无拦截。修法三层：`PATCH_SCHEMA` 以 anyOf 约束 edits/inserts 至少一个非空数组；`patch_system` 增加终审条款（结论已定，仅保留执行权，禁止返回空补丁）；承诺链两条指令改写为任务式表述。py `parse_patch` 的空补丁拦截保留作解析层兜底。
 - **切换引擎后音色行不刷新**：按 engine_scope 显隐两对音色行的 `applyEngineScope()` 仅挂接在音色清单请求尾部；页面加载后两套清单均已入缓存，切引擎时请求直接返回，显隐计算不再执行，上一引擎的音色行持续显示。修法：`put()` 的 `tts.engine` 分支在保存后显式调用 `applyEngineScope()`，显隐状态切换不再依赖清单请求触发。
@@ -224,6 +572,7 @@
 - **报告与配置**：体检报告落盘 `过程/<期>/timbre_repair.json`（基线、逐句分数、重试记录、人工审名单）；配置新增 `tts.timbre_guard`（总开关）/ `timbre_threshold`（4.25）/ `timbre_seed_retries`（3）/ `timbre_fallback_temp`（0.3）四键，配置页登记。
 - **合成段收口为纯函数全量重建**：删除按文件数判断的整体复用分支（音频数 == 句数即整体复用）——改稿不增删行时该判据会静默复用旧音频，成片念的还是旧稿。合成只认当前脚本，`reuse` 旗子仅保留脚本与背景图的续跑语义；音色体检挂点随之唯一化到 `synthesize()` 尾部，全量合成后必跑。测试钉住：目录里留有完整旧音频（含孤儿件）且 `reuse=True`，合成也必须真跑。
 
+
 **测试**
 
 - `tests/test_timbre_guard.py` 11 项：六句定标回归（阈值两侧各三句，人耳划线钉死）、修复循环纪律（首试过线即停、保底温度仅在换种子全败后出场、全败保留最优并记录人工审）、临时文件管理、报告落盘、配置接线。
@@ -237,33 +586,33 @@
 
 **问题**
 
-- **更新日志写成现场对白**：段里出现人称叙事（写明是谁提的）、产品定位论证
-  （替产品该不该分发辩护）与口语措辞（只在口头成立的词）。读到它的人
+- **更新日志写成现场对白**：段里出现人称叙事（写明是谁提的）、产品定位论证  
+  （替产品该不该分发辩护）与口语措辞（只在口头成立的词）。读到它的人  
   是后来查这件事的人，这三类内容都不承载「改了什么」，只把技术结论埋在话里。
-- **README 只有设计论证，没有功能与用法**：通篇逐条讲的是「为什么这样做」，
-  使用者读完仍不知道有哪些功能、按什么顺序点、产物落在哪；配置页十六张卡片
+- **README 只有设计论证，没有功能与用法**：通篇逐条讲的是「为什么这样做」，  
+  使用者读完仍不知道有哪些功能、按什么顺序点、产物落在哪；配置页十六张卡片  
   只列了名字，没说各管什么。
 
 **修法**
 
-- 更新日志正文全量改写：人称叙事、产品定位论证、口语措辞三类一律去掉，只留
+- 更新日志正文全量改写：人称叙事、产品定位论证、口语措辞三类一律去掉，只留  
   **现象、根因、修法、验证**。体例区补一条文风条款。
-- README 新增两节：**「二、功能」**按工序列能力与产物落点；**「五、怎么用」**给
-  三种规划方式各自的操作路径（写明界面按钮名）、常见操作、配置页十六张卡片速查、
+- README 新增两节：**「二、功能」**&#x6309;工序列能力与产物落点；**「五、怎么用」**&#x7ED9;  
+  三种规划方式各自的操作路径（写明界面按钮名）、常见操作、配置页十六张卡片速查、  
   出问题先看哪里。原「四、产物」及其后各节序号顺次后移，交叉引用同步。
 
 **测试（1277 → 1283 项）**
 
-- 新增 `tests/test_changelog_tone.py` **5 项**：三类词表（人称叙事 / 产品定位论证 /
-  口语措辞）逐行扫描、命中即报行号；体例区那条款必须在场；每个版本段必须有加粗
+- 新增 `tests/test_changelog_tone.py` **5 项**：三类词表（人称叙事 / 产品定位论证 /  
+  口语措辞）逐行扫描、命中即报行号；体例区那条款必须在场；每个版本段必须有加粗  
   小标题。词表扫的是**正文**，跳过头部体例区——那里写着词表本身，扫进去是自证。
-- 另在 `tests/test_config_keys.py` 的版本齐步组加 **1 项**：`ARCHITECTURE.md`
+- 另在 `tests/test_config_keys.py` 的版本齐步组加 **1 项**：`ARCHITECTURE.md`  
   抬头那个版本号也要与 `VERSION` 一致 —— 本次三端都齐了，唯独漏在架构册。
 - README 的测试计数同步为 1283。
 
 **版本：1.0.0**
 
-功能面到此冻结。此后按语义版本管理：补丁修缺陷，次版本加功能，主版本只在
+功能面到此冻结。此后按语义版本管理：补丁修缺陷，次版本加功能，主版本只在  
 不兼容变更时动。
 
 ---
@@ -286,34 +635,34 @@
 ==============================================================
 ```
 
-上一段是 `main.py` 的 `main()` 印的（**不带版本号**），下一段是 `web_ui.run_server()`
-印的（带版本号 + 界面地址）。两段之间**什么都没打印** —— 同一个抬头隔一行连着出现两次，
+上一段是 `main.py` 的 `main()` 印的（**不带版本号**），下一段是 `web_ui.run_server()`  
+印的（带版本号 + 界面地址）。两段之间**什么都没打印** —— 同一个抬头隔一行连着出现两次，  
 占去四行屏幕。
 
 **改了什么**
 
-- 删掉 `main.py` 里那份抬头，**只留 `run_server()` 那一份**（带版本号、界面地址、停止方式）。
+- 删掉 `main.py` 里那份抬头，**只留 `run_server()` 那一份**（带版本号、界面地址、停止方式）。  
   抬头文案自此全仓只出现一次。
-- **代价说明**：短命令（`--check` / `--voices` / `--fonts` / `--continue`）自此**不带抬头**——
-  它们不经过 `run_server()`。`--check` 的产出本来就是一行结果，原先那四行框是噪声；
+- **代价说明**：短命令（`--check` / `--voices` / `--fonts` / `--continue`）自此**不带抬头**——  
+  它们不经过 `run_server()`。`--check` 的产出本来就是一行结果，原先那四行框是噪声；  
   日后要给 `--continue` 补抬头，加一行 `print` 就行，**但别再从两处各印一份**。
 - `setup.bat` / `_run.bat` 里那段**英文抬头保留**：那是启动器自己的（`Podcast Maker -
-  launcher` + `script -> voice -> subtitle -> video -> artifacts`），印在 Python 起来之前，
+  launcher` + `script -> voice -> subtitle -> video -> artifacts`），印在 Python 起来之前，  
   配合 `[1/4]`…`[4/4]` 四步进度，与产品抬头不是一回事。
 
 **测试（1272 → 1277 项）**
 
 新增 `tests/test_banner.py` **5 项** —— 钉的不是这一次的改动，是**以后不许再长回来**：
 
-- 抬头文案**打出去的次数全仓只有 1 次**。判据是「落在 `print` / `log` /
-  `sys.stderr.write` 调用里的次数」，**不是**「这句文案出现过几次」—— 测试与探针都要拿它
-  当标尺（`TAGLINE = "…"`、对账断言），出现在常量或文档里不算数。这条判据来自实测：
+- 抬头文案**打出去的次数全仓只有 1 次**。判据是「落在 `print` / `log` /  
+  `sys.stderr.write` 调用里的次数」，**不是**「这句文案出现过几次」—— 测试与探针都要拿它  
+  当标尺（`TAGLINE = "…"`、对账断言），出现在常量或文档里不算数。这条判据来自实测：  
   第一版按「出现过」判，本轮的探针一进仓就把它判红了（探针只引用标尺，没打印任何东西）；
 - `main.py` 里**不许再出现分隔线抬头**（`"=" * 62`）；
 - 两个 bat 里**不许出现产品抬头**（启动器那份英文抬头是它自己的）；
-- 印抬头那一行**必须用 `VERSION`**，且那行里**不许有版本号字面量**——写死的抬头改版本时
+- 印抬头那一行**必须用 `VERSION`**，且那行里**不许有版本号字面量**——写死的抬头改版本时  
   必漏（v0.6.0 那次就是日志先跑到 `## v0.6.0`、程序报的还是 0.5.0）；
-- 版本号字面量全仓**只有两处**（`config_manager.py` 与 `__init__.py`），
+- 版本号字面量全仓**只有两处**（`config_manager.py` 与 `__init__.py`），  
   防止有人图省事在抬头里再抄一个。
 
 **验收**
@@ -332,10 +681,9 @@
 
 抬头 1 次 / 分隔线 2 条 / 界面地址 1 次 —— **5 PASS / 0 FAIL**。
 
-**探针实现记录**：第一版用 `p.stdout.read1()` 抓**常驻进程**的输出。那是
-**阻塞**调用 —— 服务不退出就永远不返回，探针进程一直挂着、一行判定都不出。改成
+**探针实现记录**：第一版用 `p.stdout.read1()` 抓**常驻进程**的输出。那是  
+**阻塞**调用 —— 服务不退出就永远不返回，探针进程一直挂着、一行判定都不出。改成  
 stdout 落文件、轮询读盘、判定到齐再杀进程。
-
 
 ---
 
@@ -343,8 +691,8 @@ stdout 落文件、轮询读盘、判定到齐再杀进程。
 
 **新增：运行环境探测与一键安装（配置页「运行环境」卡）**
 
-一句话：ffmpeg / ffprobe 的**定位收成一处**（新增 `podcast_maker/bins.py`），
-配置页多一张独立卡——打开自动探测，缺了给一段说明和**一个按钮**，点了从国内镜像
+一句话：ffmpeg / ffprobe 的**定位收成一处**（新增 `podcast_maker/bins.py`），  
+配置页多一张独立卡——打开自动探测，缺了给一段说明和**一个按钮**，点了从国内镜像  
 下到项目 `bin/`，**装完当场可用、不用重启**。
 
 **问题：定位实现散在四处，且只查 PATH**
@@ -358,67 +706,67 @@ video_engine.py:40/47    ffmpeg_bin() / ffprobe_bin()
 aigc_label.py:158        裸 shutil.which("ffmpeg")   ← 连函数都没封
 ```
 
-`shutil.which` **只搜 PATH**，项目内的 `bin/` 不在它的搜索范围内。在一台没有 ffmpeg 的
-机器上，一键安装把二进制下到项目 `bin/` 之后，这四处**一个都找不到它** —— 安装等于没装。
+`shutil.which` **只搜 PATH**，项目内的 `bin/` 不在它的搜索范围内。在一台没有 ffmpeg 的  
+机器上，一键安装把二进制下到项目 `bin/` 之后，这四处**一个都找不到它** —— 安装等于没装。  
 所以把定位收成一处、并让它认得项目 `bin/`，是这条安装路径能成立的**前置条件**。
 
 **新增**
 
 - **`podcast_maker/bins.py`** —— ffmpeg / ffprobe 的**唯一**定位、探测与安装实现：
-  - `locate(name)`：**① PATH → ② 项目 `bin/` → ③ None**。返回**绝对路径**，
-    各模块整个传给 subprocess ⇒ 不依赖 PATH 解析 ⇒ 装完**当场可用**。
+  - `locate(name)`：**① PATH → ② 项目 `bin/` → ③ None**。返回**绝对路径**，  
+    各模块整个传给 subprocess ⇒ 不依赖 PATH 解析 ⇒ 装完**当场可用**。  
     PATH 排在第一位：用户自己装的版本优先，不被项目内那份顶掉。
-  - `state()`：两件工具的路径 / 来源（`bin` 还是 PATH）/ `-version` 首行，
+  - `state()`：两件工具的路径 / 来源（`bin` 还是 PATH）/ `-version` 首行，  
     外加一句给界面用的话。**与 `locate()` 共用同一顺序** ⇒ 探测报的 = 实际跑的。
   - `install_hint()`：「自己装」那段指引的唯一出处。
-  - `install(log, should_stop, on_step)`：下载 → 校验 sha256 → 解 tar.xz → 落 `bin/`。
-    **fail-closed**：下载不完整 / 校验不符 / 归档里没有目标文件，一律抛错并丢弃
+  - `install(log, should_stop, on_step)`：下载 → 校验 sha256 → 解 tar.xz → 落 `bin/`。  
+    **fail-closed**：下载不完整 / 校验不符 / 归档里没有目标文件，一律抛错并丢弃  
     临时件，**绝不把来路不明的二进制放进 `bin/`**。
-- **四个模块改调它**：各自的 `ffmpeg_bin()` / `ffprobe_bin()` **函数名保留**
-  （8 处调用点零改动），内部换成 `bins.locate()`；找不到时仍抛**各模块自己的**
+- **四个模块改调它**：各自的 `ffmpeg_bin()` / `ffprobe_bin()` **函数名保留**  
+  （8 处调用点零改动），内部换成 `bins.locate()`；找不到时仍抛**各模块自己的**  
   错误类型（`AudioError` / `TTSError` / `VideoError` / `LabelError`）。
-- **配置页「运行环境」卡**（独立卡，挂在所有分区之前）：四态 —— 已就绪 /
-  未检测到 / 安装中 / 安装失败。按钮 `class="btn primary"`，与「搭建本地语音环境」
+- **配置页「运行环境」卡**（独立卡，挂在所有分区之前）：四态 —— 已就绪 /  
+  未检测到 / 安装中 / 安装失败。按钮 `class="btn primary"`，与「搭建本地语音环境」  
   同款。已就绪时把**路径、来源、版本**都摆出来，用户看得见自己用的是哪一份。
-- **`GET /api/deps/state`、`POST /api/deps/install`**：装走异步任务，沿用现有
-  `/api/task/<id>` 轮询与 `/api/job/stop` 中止，进度由 `install(on_step=)` 上报
+- **`GET /api/deps/state`、`POST /api/deps/install`**：装走异步任务，沿用现有  
+  `/api/task/<id>` 轮询与 `/api/job/stop` 中止，进度由 `install(on_step=)` 上报  
   （**进度语义归 `bins`**，界面不必去猜日志文案——猜文案的写法一改通知就断）。
 - **`tools/sources.py` 新增 ffmpeg 一节**：下载地址的唯一出处。
 
 **下载目标：项目 `bin/`，不写系统 PATH**
 
-| | 项目 `bin/` | 系统 PATH（如 winget） |
-|---|---|---|
-| 装完要不要重启 | **不用** | 要（PATH 是进程启动时拍的快照） |
-| 国内下载速度 | **8.4 MB/s → 134 MB 约 17 秒** | 走 GitHub，实测 18.8~25.7 KB/s ≈ 1.8 小时 |
-| 碰不碰系统 | 不碰 | 写用户级 PATH |
+|         | 项目 `bin/`                    | 系统 PATH（如 winget）                   |
+| ------- | ---------------------------- | ----------------------------------- |
+| 装完要不要重启 | **不用**                       | 要（PATH 是进程启动时拍的快照）                  |
+| 国内下载速度  | **8.4 MB/s → 134 MB 约 17 秒** | 走 GitHub，实测 18.8~25.7 KB/s ≈ 1.8 小时 |
+| 碰不碰系统   | 不碰                           | 写用户级 PATH                           |
 
-**相差 400 倍**（同一 curl、同一网络实测）。winget 的 `Gyan.FFmpeg`
-是 `portable (zip)` 安装器，下载 URL 指向 GitHub release，绕不开这条链路 ——
+**相差 400 倍**（同一 curl、同一网络实测）。winget 的 `Gyan.FFmpeg`  
+是 `portable (zip)` 安装器，下载 URL 指向 GitHub release，绕不开这条链路 ——  
 所以**不做 winget 那条路**。
 
 **版本：8.1.3**
 
-官方最新是 9.0.2（2026-09-18），但**国内源上没有 9.x**：清华只有 MSYS2 的
-mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、华为云那条是门户页
-不是镜像。阿里 npmmirror 上最新就是 **8.1.3**（2026-09-21 发布）——它是
-**8.1 分支的最新补丁**，不是被淘汰的老版本。已实测：`--enable-libass` /
-`--enable-fontconfig` 都在，拿项目自己的 `.ass` 烧中文字幕**真出字形**
+官方最新是 9.0.2（2026-09-18），但**国内源上没有 9.x**：清华只有 MSYS2 的  
+mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、华为云那条是门户页  
+不是镜像。阿里 npmmirror 上最新就是 **8.1.3**（2026-09-21 发布）——它是  
+**8.1 分支的最新补丁**，不是被淘汰的老版本。已实测：`--enable-libass` /  
+`--enable-fontconfig` 都在，拿项目自己的 `.ass` 烧中文字幕**真出字形**  
 （不只是「列在 `-filters` 里」），项目要用的 13 个滤镜一个不缺，`ffprobe` 同包。
 
 **许可与分发：只下载，不内置**
 
-二进制**不进仓库、不进 release assets、不进任何分发包** —— 仓里只有下载器，
+二进制**不进仓库、不进 release assets、不进任何分发包** —— 仓里只有下载器，  
 落点是 `.gitignore` 排除的 `bin/`，与 `tts_service/models/` 的权重同一待遇。
 
 **测试（1251 → 1272 项）**
 
-新增 `tests/test_bins.py` **21 项**：查找顺序（PATH 赢过 bin / bin 兜底 / 都没有 /
-不许瞎认）；`state()` 字段与 `ok` 一致；缺件文案指向配置页；`install_hint` 含
-官方页与 `ffprobe`；源表契约（URL 由 `sources.py` 拼、`bins.py` 不许自己写死域名）；
-归档取**末尾两段**而非版本前缀；**fail-closed**（校验不符抛错且 `bin/` 里不留
-半个 exe、中止被尊重、进度只增不减）；源码钉子（四个模块不许再出现裸
-`shutil.which("ffmpeg"/"ffprobe")`、都必须走 `bins.locate(`、且仍抛各模块自己的
+新增 `tests/test_bins.py` **21 项**：查找顺序（PATH 赢过 bin / bin 兜底 / 都没有 /  
+不许瞎认）；`state()` 字段与 `ok` 一致；缺件文案指向配置页；`install_hint` 含  
+官方页与 `ffprobe`；源表契约（URL 由 `sources.py` 拼、`bins.py` 不许自己写死域名）；  
+归档取**末尾两段**而非版本前缀；**fail-closed**（校验不符抛错且 `bin/` 里不留  
+半个 exe、中止被尊重、进度只增不减）；源码钉子（四个模块不许再出现裸  
+`shutil.which("ffmpeg"/"ffprobe")`、都必须走 `bins.locate(`、且仍抛各模块自己的  
 错误类型）。全量 **1272 OK**。
 
 ---
@@ -427,7 +775,7 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 
 **新增：出片字幕第四份——洁版 TXT（`{期号}_clean.txt`）**
 
-一句话：一期出片从三份字幕变成**四份**，第四份是整秒 TXT **摘掉时间戳方括号**的版本。
+一句话：一期出片从三份字幕变成**四份**，第四份是整秒 TXT **摘掉时间戳方括号**的版本。  
 四份同一份源、同一次生成，`srt` / `lrc` / `txt` 三份**逐字节不变**。
 
 ```text
@@ -437,44 +785,44 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 
 **为什么要有这一份**
 
-方括号是给**解析器**的定界符；给**读它的人**（逐行阅读、复制粘贴、喂外部工具）就是
-两层噪声。摘掉之后时间戳仍是定宽的一列、与正文之间不留分隔（`00:03小美：…`），
+方括号是给**解析器**的定界符；给**读它的人**（逐行阅读、复制粘贴、喂外部工具）就是  
+两层噪声。摘掉之后时间戳仍是定宽的一列、与正文之间不留分隔（`00:03小美：…`），  
 列照旧对得齐，又少两个字符。
 
 **新增**
 
-- **`subtitle_engine.build_clean_txt()`**：洁版产物。与 `build_txt` 共用
+- **`subtitle_engine.build_clean_txt()`**：洁版产物。与 `build_txt` 共用  
   `_build_lyrics` 与同一个 `fmt_second_time`——**不是**读磁盘上那份 `.txt` 再拿掉括号。
-- **`_build_lyrics(..., bracket=True)`**：共用主体多一个「时间戳带不带方括号」的形参。
-  `fmt` 管精度、`bracket` 管方括号，三份歌词产物因此仍是**一套清理、一条路径**
+- **`_build_lyrics(..., bracket=True)`**：共用主体多一个「时间戳带不带方括号」的形参。  
+  `fmt` 管精度、`bracket` 管方括号，三份歌词产物因此仍是**一套清理、一条路径**  
   （取起始时间、一行一条、句内换行压空格、说话人判据同源），只是时间戳写法不同。
-- **`layout.episode_files()["subtitle_clean_txt"]`** → `字幕/{期号}_clean.txt`。前三份
+- **`layout.episode_files()["subtitle_clean_txt"]`** → `字幕/{期号}_clean.txt`。前三份  
   同前缀、洁版在前缀后加 `_clean`，按期号一列仍能把同一期的四份捞齐。
-- **`pipeline` 第 6 步**写第四份，进 `result`、进 manifest 的 `assets`；
+- **`pipeline` 第 6 步**写第四份，进 `result`、进 manifest 的 `assets`；  
   **产物区**多一行「字幕（洁版 TXT）」。
 
 **不做什么**
 
-- **不从产物反解**：洁版若去读磁盘上那份 `.txt`，「txt 必须先存在」就成了隐含依赖，
-  目录里躺着上一次的旧文件时还会静默产出错内容。四份都从同一份 `script`/`timings`
+- **不从产物反解**：洁版若去读磁盘上那份 `.txt`，「txt 必须先存在」就成了隐含依赖，  
+  目录里躺着上一次的旧文件时还会静默产出错内容。四份都从同一份 `script`/`timings`  
   现生成——同源律照旧。
 - **不猜规则**：摘方括号的写法照原样搬进来，一个字没发挥。
 
 **测试（1242 → 1251 项）**
 
-- `tests/test_subtitle_txt.py`：新增 `TestBuildCleanTxt`（8 项）；路径表从三份扩到四份
-  并单列「洁版 = 前缀 + `_clean`」；源码钉子改为「四份写在同一段、洁版走
-  `build_clean_txt` 而不是读文件」。其中一条用**逐字照抄**的正则写成独立
+- `tests/test_subtitle_txt.py`：新增 `TestBuildCleanTxt`（8 项）；路径表从三份扩到四份  
+  并单列「洁版 = 前缀 + `_clean`」；源码钉子改为「四份写在同一段、洁版走  
+  `build_clean_txt` 而不是读文件」。其中一条用**逐字照抄**的正则写成独立  
   实现，交叉验证 `build_clean_txt`——产品改了口径这条就响。
 
 **验证（都是只读探针，未改动项目文件）**
 
-| 验的是 | 手段 | 结果 |
-|---|---|---|
+| 验的是       | 手段                                                                                                   | 结果                      |
+| --------- | ---------------------------------------------------------------------------------------------------- | ----------------------- |
 | 能不能复现既有产物 | `_smoke/probe_clean_vs_disk.py`：磁盘 14 份 `.txt` 反解成输入 → `build_clean_txt` → 与既有 14 份 `_clean.txt` 比字节 | **14 对 / 0 不符**，字节数逐份相同 |
-| 前三份没被动过 | `_smoke/subtitle_txt_baseline.py check`（16 条快照） | sha 一致 |
-| 第 6 步真路径 | `_smoke/subtitle_write_integration.py`：真音频段时长 → 真时间轴 → 四份真写盘，15 项 | 全 PASS |
-| 全量单测 | `python -m unittest discover -s tests -t .` | **Ran 1251 OK** |
+| 前三份没被动过   | `_smoke/subtitle_txt_baseline.py check`（16 条快照）                                                      | sha 一致                  |
+| 第 6 步真路径  | `_smoke/subtitle_write_integration.py`：真音频段时长 → 真时间轴 → 四份真写盘，15 项                                    | 全 PASS                  |
+| 全量单测      | `python -m unittest discover -s tests -t .`                                                          | **Ran 1251 OK**         |
 
 ---
 
@@ -482,43 +830,41 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 
 **修复：脚本页「生成脚本」的进度条从来没接上写稿段**
 
-一句话：那条进度条**不是坏了，是从没接上**——预算表只覆盖收尾两段，整趟里最耗时的
-写稿段一格都没有。实测轨迹只有四跳 `0% → 50% → 95% → 100%`，还全挤在最后几十秒里；
+一句话：那条进度条**不是坏了，是从没接上**——预算表只覆盖收尾两段，整趟里最耗时的  
+写稿段一格都没有。实测轨迹只有四跳 `0% → 50% → 95% → 100%`，还全挤在最后几十秒里；  
 前端 1.5 秒问一次，50%/95% 往往一次都抓不到，界面上因此看不到任何中间进度。
 
 **根因（两层，叠在一起）**
 
-- **写稿段没有预算**：`_script_stage` 的折算规则只认「检查第 N 轮」「门禁第 N 轮」，
-  它们分掉全部 100%（检查 0~50%、门禁 50~100%）。写稿段那两行——整篇路的
-  「生成第 N 次」被一条分支整个吞掉，分段路的「段 k/N 完成」没有人认这个前缀——
+- **写稿段没有预算**：`_script_stage` 的折算规则只认「检查第 N 轮」「门禁第 N 轮」，  
+  它们分掉全部 100%（检查 0~~50%、门禁 50~~100%）。写稿段那两行——整篇路的  
+  「生成第 N 次」被一条分支整个吞掉，分段路的「段 k/N 完成」没有人认这个前缀——  
   一行都不认。而写稿是本地模型跑十几分钟到半小时的那一段。
-- **收尾两段挤在同一毫秒**：形式门禁是**纯代码判定、不调模型**，「检查通过 → 门禁通过
+- **收尾两段挤在同一毫秒**：形式门禁是**纯代码判定、不调模型**，「检查通过 → 门禁通过  
   → 收尾」瞬时连发，进度条上那两跳被压缩到几毫秒里，注定看不见。
 
 **修复：把预算表重做成五段，主体拿到刻度**
 
-- **`web_ui._BANDS`**：一张表写出全部区间，值域 `[起, 止)` 且**首尾相接**——进了下一段
-  就天然比上一段的任何一格都大，所以进度只前进不后退，不必每处再比一次 `max`。
-  刻度集中成表而不是散在分支里，是为了让「哪一段有刻度、哪一段没有」一眼可见：
+- **`web_ui._BANDS`**：一张表写出全部区间，值域 `[起, 止)` 且**首尾相接**——进了下一段  
+  就天然比上一段的任何一格都大，所以进度只前进不后退，不必每处再比一次 `max`。  
+  刻度集中成表而不是散在分支里，是为了让「哪一段有刻度、哪一段没有」一眼可见：  
   从前散着写，漏掉一整段也看不出来。
-
-  | 段 | 区间 | 刻度来源 |
-  |---|---|---|
-  | 准备 | 0.00 ~ 0.10 | 逻辑拆分 / 装箱 / 规划，一行一格 |
-  | **写稿** | **0.10 ~ 0.72** | 分段路「段 k/N 完成」；整篇路「输出坏了重发」的轮 |
-  | 检查 | 0.72 ~ 0.86 | 「检查第 N 轮」，按轮 |
-  | 门禁 | 0.86 ~ 0.96 | 「门禁第 N 轮」，按轮（首轮只判定，编号到 gate_rounds + 1） |
-  | 收尾 | 0.96 ~ 0.99 | 粘回顾 / 粘片头尾；最后 1% 归 `run_async` 收口 |
-
-- **写稿段的分母是这一路天然就有的计数，不另传参数**：分段路的日志行
-  「段 k/N 完成」里**本来就带着 N**，按 `k/N` 折；整篇路一次出一整篇，按
-  「输出坏了重发」的轮次折（轮次表仍只有一份实现
-  `script_engine._segment_parse_rounds`，这里不另写一个数——两处各写一个数，
+  | 段      | 区间              | 刻度来源                                    |
+  | ------ | --------------- | --------------------------------------- |
+  | 准备     | 0.00 ~ 0.10     | 逻辑拆分 / 装箱 / 规划，一行一格                     |
+  | **写稿** | **0.10 ~ 0.72** | 分段路「段 k/N 完成」；整篇路「输出坏了重发」的轮             |
+  | 检查     | 0.72 ~ 0.86     | 「检查第 N 轮」，按轮                            |
+  | 门禁     | 0.86 ~ 0.96     | 「门禁第 N 轮」，按轮（首轮只判定，编号到 gate_rounds + 1） |
+  | 收尾     | 0.96 ~ 0.99     | 粘回顾 / 粘片头尾；最后 1% 归 `run_async` 收口       |
+- **写稿段的分母是这一路天然就有的计数，不另传参数**：分段路的日志行  
+  「段 k/N 完成」里**本来就带着 N**，按 `k/N` 折；整篇路一次出一整篇，按  
+  「输出坏了重发」的轮次折（轮次表仍只有一份实现  
+  `script_engine._segment_parse_rounds`，这里不另写一个数——两处各写一个数，  
   改了一处另一处就静默错位）。
-- **只在里程碑行推进度**：不是里程碑的行不动进度、也不改阶段。让一句
+- **只在里程碑行推进度**：不是里程碑的行不动进度、也不改阶段。让一句  
   「目标：1500 秒 / 约 6024 字」也来推一把，等于把刻度稀释成噪声。
-- **不画假进度**：一轮跑多久本来就没人知道，匀速前进的假条只会让人以为快好了。
-  「调用模型…」那几行只把进度摆到本格起点并更新阶段——它的用处是让界面在漫长的
+- **不画假进度**：一轮跑多久本来就没人知道，匀速前进的假条只会让人以为快好了。  
+  「调用模型…」那几行只把进度摆到本格起点并更新阶段——它的用处是让界面在漫长的  
   一轮里说得出自己在干什么，而不是停在上一句话上。
 
 **实测轨迹（假模型走真实任务通路，`.02` 秒采样 80 次）**
@@ -529,318 +875,275 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 ```
 
 分段路（成稿规划，6 个写作段）的完整轨迹：`1% → 4.5% → 5.5% → 6.5% → 7.5% → 10% →
-20.3% → 30.7% → 41.0% → 51.3% → 61.7% → 72.0% → 86.0% → 88.5% → 96.0% → 97.5% → 99.0%`，
+20.3% → 30.7% → 41.0% → 51.3% → 61.7% → 72.0% → 86.0% → 88.5% → 96.0% → 97.5% → 99.0%`，  
 **前进 17 次、倒回 0 次**。真实运行时每一格之间隔着几分钟，肉眼看得见。
 
 **测试**
 
-- **改** `tests/test_batch.py::test_stage_and_progress_follow_the_round`：旧版只验了
-  「检查段、门禁段按轮前进」，而**写稿段该不该动它一个字没验**——测的是错的那半边，
-  所以折算规则漏掉一整段也能全绿。新版按五段逐段验，并加上三条硬口径：段与段首尾相接、
+- **改** `tests/test_batch.py::test_stage_and_progress_follow_the_round`：旧版只验了  
+  「检查段、门禁段按轮前进」，而**写稿段该不该动它一个字没验**——测的是错的那半边，  
+  所以折算规则漏掉一整段也能全绿。新版按五段逐段验，并加上三条硬口径：段与段首尾相接、  
   写稿段要占一半以上、末段不占满 1.0。
-- **新增** `test_progress_bands_are_contiguous_and_the_writing_band_has_room`、
+- **新增** `test_progress_bands_are_contiguous_and_the_writing_band_has_room`、  
   `test_whole_draft_path_ticks_on_the_rewrite_round`。
 - 全量单测 **1240 → 1242 OK**。
 
 **说明**
 
-- **只改进度口径，不动生成行为**：`script_engine` 一行未动，日志行一字未改——
+- **只改进度口径，不动生成行为**：`script_engine` 一行未动，日志行一字未改——  
   界面按既有段名折算这件事本来就是这样设计的，缺的只是表没写全。
-- 复核对账用 `_smoke/probe_bar_new.py`（两条路的真实日志行 → 轨迹）与
-  `_smoke/probe_progress_rules.py`（穷举 `script_engine` 里 89 处日志格式串，
+- 复核对账用 `_smoke/probe_bar_new.py`（两条路的真实日志行 → 轨迹）与  
+  `_smoke/probe_progress_rules.py`（穷举 `script_engine` 里 89 处日志格式串，  
   逐行问一次折算规则：97 行会推进度、**全部落在五段之内**，171 行不动）。
-- 后者自身有一处缺陷已修：占位替换从前只填第一个 `%d`、其余拿「乙」兜，而
-  「段 %d/%d 完成」连着两个 `%d`——于是这一行被问成「乙」，整段写稿的行一条都
+- 后者自身有一处缺陷已修：占位替换从前只填第一个 `%d`、其余拿「乙」兜，而  
+  「段 %d/%d 完成」连着两个 `%d`——于是这一行被问成「乙」，整段写稿的行一条都  
   没被认出来。**替身造得不真，得出的结论也不成立。**
 
----
-
-## v0.44.0
-
-**新增：一期三份字幕——SRT / LRC / 整秒 TXT 由同一份源生成**
-
-一句话：有些场合只认整秒戳。出片第 6 步现在**同一次生成、同一份 `script` 与 `timings`**
-落三份字幕：`.srt`（起止齐全）、`.lrc`（音频平台歌词位，百分秒）、`.txt`（`[mm:ss]` 整秒）。
-整秒按**四舍五入**（`[00:02.72]` → `[00:03]`、`[00:20.41]` → `[00:20]`），**按总秒进位**，
-所以 `[00:59.72]` → `[01:00]`。前两份**逐字节未变**（有改前快照对账）。另附
-`tools/lrc_round_seconds.py` 处理存量 LRC。
-
-**新增**
-- **`subtitle_engine.fmt_second_time()`**：`mm:ss` 的**唯一出处**。先量化到与 `fmt_lrc_time`
-  同一颗百分秒，再整数半加（`+50 // 100`）——**不是** `round(seconds)`：那是银行家舍入，
-  `round(0.5)` 给 0，而 `.50` 必须进秒。
-- **`subtitle_engine.build_txt()`**：整秒 TXT，一行一条（`[mm:ss]` + 说话人前缀 + 正文）。
-  与 `build_lrc` **共用 `_build_lyrics()`**——同一份 script、同一份 timings、同一个说话人判据
-  （`speaker_name_shown`）、同一套「句内换行压成空格」清理，只把时间戳写法当参数传进去。
-  「同一份源」是代码级的事实，不是两处各写一遍等着漂。
-- **`layout.episode_files()`** 新增 `subtitle_txt` 键（`字幕/<期号>.txt`），与另两份同目录同前缀。
-- **出片第 6 步**同时写三份；`subtitle_txt` 进 `result` 与 manifest 的 `assets`；产物区
-  （报告页「输出」）多一行「字幕（整秒 TXT）」下载链接。
-- **`tools/lrc_round_seconds.py`**：存量 LRC 的离线取整工具，**独立实现**（与产品侧互为参照）。
-  默认**只出报告不写盘**（逐行 `old → new`、进位／舍去／带动分钟的计数、**撞车检查**）；
-  `--write` 就地改写（先落 `.bak`）、`-o DIR` 另存一份、`-o DIR --ext txt` 换扩展名另存。
-  参数是文件、目录或通配符，目录递归收 `*.lrc`。
-- **存量产物**：`projects/20260917-015336/字幕/<期号>.txt` 十份（1／2／2a／2b／2c／2d／2da／2db／2dc／3），
-  与同名 `.lrc` **逐字不差**，只有时间戳取整。原件 `.lrc` 一份未动。
-
-**测试**
-- **`tests/test_subtitle_txt.py`（22 项）**：取整边界（`.49` 舍／`.50` 进／`0.4999` 属百分秒刻度
-  的 `00:00.50`／秒带动分钟／分钟超 59／负数归零）；**同源律**——`build_lrc` 交给离线工具转
-  出来的，必须与 `build_txt` **逐字节相同**（名字开关两态、600 条密集轴、300 条正常语速轴）；
-  去戳后两份文本逐字符相同；句内换行压平；路径表三份同目录同前缀；**出片那一步三份一起写**
-  （源码契约钉子，防后来人重构时漏掉第三份）。
-- **`tools/probes/subtitle_three_way.py`**（新增，归位并登记）：真实项目 10 期、**2490 句**
-  的同源实测——同源律／产物对账／SRT 时间轴**三路全过**，取整后**撞车 0 处**。
-- **`tools/probes/lrc_round_verify.py`**：实现交叉复算（整数版 vs 独立写的 `Decimal ROUND_HALF_UP`
-  版）＋ `.lrc ↔ .txt` 产物对账，10 份 **2490 个时间戳全过**；边界 14 项单跑全过。
-- **前两份不变的基线**：`_smoke/subtitle_txt_baseline.py` 存改前 `build_srt` / `build_lrc` 的输出
-  快照（4 配置 × 2 脚本 × 2 格式 = 16 条），改后 sha256 **一分不差**。
-- **全量单测 1240 项 OK**（改前 1218：+22 新文件）。
-
-**说明**
-- **整秒取整发生在百分秒刻度上，不是原始浮点秒上**。`0.4999` 秒会落进 `00:01`——因为字幕
-  时间轴的最小刻度就是百分秒（LRC 那份写的也是 `[00:00.50]`）。要两处同轴，否则「LRC 事后
-  取整」与「出片直接生成」会给出两个答案。
-- **英文词间空格不在射程**：正则没有词边界知识，`RAGAssistant` 切不出 `RAG Assistant`。那一类
-  仍归提示词前置（v0.43.0 的示例块），本工具与本次改动都只管时间戳这一件事。
-- **分钟位口径同源**：小时以上照旧两位分钟，不引入 `hh:` 段——`fmt_lrc_time` 与
-  `fmt_second_time` 是同一个出处。
-- **不拿历史产物当还原基准**：历史 `.lrc` 是**当时的**配置与**当时的**脚本生成的（说话人名
-  改过、脚本也改过若干句），用现在的参数去还原必然不等——那是配置史不是代码缺陷。探针因此
-  只判与配置无关的三条。
-- **改动前快照**：`_smoke/_backup/20260925-lrc-round/`（存量取整工具）与
-  `_smoke/_backup/20260925-subtitle-txt/`（本次接入出片），各含文件与改前 md5。
-
----
 
 ## v0.43.0
 
 **修复：脚本落盘把「汉字与西文之间的空格」一起删了——提示词示范的字距，落盘就被抹平**
 
-一句话：提示词早就示范了「含碳 1.2% 的铁」「stainless steel」这种写法，可脚本落盘那道收束跑的是
-`re.sub(r"\s+", "", text)`——把**词与词的边界**一起删了。于是「要求什么、抹掉什么」：模型照示例写出
-来的空格一到落盘就没了；盘上那几句带空格的活得下来，只因为它们是被手改过的、绕过了生成链路。现在把
+一句话：提示词早就示范了「含碳 1.2% 的铁」「stainless steel」这种写法，可脚本落盘那道收束跑的是  
+`re.sub(r"\s+", "", text)`——把**词与词的边界**一起删了。于是「要求什么、抹掉什么」：模型照示例写出  
+来的空格一到落盘就没了；盘上那几句带空格的活得下来，只因为它们是被手改过的、绕过了生成链路。现在把  
 决定正文形态的七处收口到一个 `tidy_text()`：汉字与西文之间补空格、空白折叠成一个，**别的一个字不动**。
 
 **新增**
-- **字距规范化 `script_engine.tidy_text`**（唯一实现，只插不删、幂等）：**补三类**——汉字 ↔ 拉丁字母
-  （`AI写的` → `AI 写的`）、汉字 ↔ 阿拉伯数字（`2026年` → `2026 年`）、百分号 → 汉字（`占比15%规则` →
-  `占比 15% 规则`）；**不补两类**——数字与紧跟着它的百分号（`12%`／`36.5℃` 是一个整体）、英文单词与
-  单词之间。空白（含换行、制表、全角空格）折叠成一个半角空格、两端去净——去掉的是**排版噪声**，不是
+
+- **字距规范化 `script_engine.tidy_text`**（唯一实现，只插不删、幂等）：**补三类**——汉字 ↔ 拉丁字母  
+  （`AI写的` → `AI 写的`）、汉字 ↔ 阿拉伯数字（`2026年` → `2026 年`）、百分号 → 汉字（`占比15%规则` →  
+  `占比 15% 规则`）；**不补两类**——数字与紧跟着它的百分号（`12%`／`36.5℃` 是一个整体）、英文单词与  
+  单词之间。空白（含换行、制表、全角空格）折叠成一个半角空格、两端去净——去掉的是**排版噪声**，不是  
   词与词的边界。
-- **七处落盘收口到它**：`normalize_script`（正文）、`apply_patch` 的并句与插入（`_drop_group`）、
-  `apply_replace`、`apply_insert`、`apply_trim`、`clean_title`。**保留不动的五处**：`_locate_line` 的引文
-  反查、`_clip_script_rows` 的模型视图（去空白是容错／省 token）、三处字数统计（只取长度）——这五处都
+- **七处落盘收口到它**：`normalize_script`（正文）、`apply_patch` 的并句与插入（`_drop_group`）、  
+  `apply_replace`、`apply_insert`、`apply_trim`、`clean_title`。**保留不动的五处**：`_locate_line` 的引文  
+  反查、`_clip_script_rows` 的模型视图（去空白是容错／省 token）、三处字数统计（只取长度）——这五处都  
   不决定正文长什么样。
-- **粘合那三句单独补一次**（`glue_intro_outro`）：片头、前期回顾、片尾是**从模板逐字拼**的，不经过正文
-  那道收束（顺序本就是「粘合在收束之后」），所以字距在这里补，位置在**补时长之前**——量时长用的就是
-  补过字距的文本。回顾句的唯一生产者 `pipeline.review_rows` 也补一次：重拼工具
+- **粘合那三句单独补一次**（`glue_intro_outro`）：片头、前期回顾、片尾是**从模板逐字拼**的，不经过正文  
+  那道收束（顺序本就是「粘合在收束之后」），所以字距在这里补，位置在**补时长之前**——量时长用的就是  
+  补过字距的文本。回顾句的唯一生产者 `pipeline.review_rows` 也补一次：重拼工具  
   （`tools/reglue_review.py`）走它、不走 glue，只补 glue 会漏掉重拼那条路。
-- **`tests/test_text_spacing.py`（26 项）**：规则表逐条（含两条反例：数字↔百分号、英文↔英文）、字符守恒
-  （去空白后逐字相同）、幂等、七处落盘点、粘合与回顾、以及**提示词与代码同源**——示例块里那几条
-  「正确」必须原样过一遍落盘、「错误」那条必须被落盘改掉。提示词单方面改、或收束又改回「删光空白」，
+- **`tests/test_text_spacing.py`（26 项）**：规则表逐条（含两条反例：数字↔百分号、英文↔英文）、字符守恒  
+  （去空白后逐字相同）、幂等、七处落盘点、粘合与回顾、以及**提示词与代码同源**——示例块里那几条  
+  「正确」必须原样过一遍落盘、「错误」那条必须被落盘改掉。提示词单方面改、或收束又改回「删光空白」，  
   这一组都会响。
 
 **变更**
-- **脚本写作提示词的示例块**（`build_system_prompt` / `_segment_system_prompt`，两份逐字同源）：正例第 1 条
-  换成 `含碳 1.2% 且含铬 10.5% 的铁属于 stainless steel，为什么这么说呢？`——一句话示范五个边界
-  （汉字↔数字、数字↔百分号、百分号↔汉字、汉字↔西文、西文↔西文），规则由示例承担，不再用散文复述；
-  错误条换成同句的**无空格版**，错误数由三处改为**五处**，把「汉字与西文、数字之间没有空格」「英文单词
+
+- **脚本写作提示词的示例块**（`build_system_prompt` / `_segment_system_prompt`，两份逐字同源）：正例第 1 条  
+  换成 `含碳 1.2% 且含铬 10.5% 的铁属于 stainless steel，为什么这么说呢？`——一句话示范五个边界  
+  （汉字↔数字、数字↔百分号、百分号↔汉字、汉字↔西文、西文↔西文），规则由示例承担，不再用散文复述；  
+  错误条换成同句的**无空格版**，错误数由三处改为**五处**，把「汉字与西文、数字之间没有空格」「英文单词  
   之间也没有空格（`stainlesssteel` 该写 `stainless steel`）」写进说明。
-- **标题也补字距**（`clean_title`）：标题不进 TTS，但会经 `{title}` 进片头模板、也会印在封面与背景上，
-  与正文同一套口径省得两套规矩。限长 24 字照旧（先补字距后截断，空格占额度：`第1期：skill-standardization的设计`
+- **标题也补字距**（`clean_title`）：标题不进 TTS，但会经 `{title}` 进片头模板、也会印在封面与背景上，  
+  与正文同一套口径省得两套规矩。限长 24 字照旧（先补字距后截断，空格占额度：`第1期：skill-standardization的设计`  
   → `skill-standardization 的设`，恰好 24 字）。
 
 **修复**
-- **脚本落盘不再删光空白**：`normalize_script` 与六处修补点的 `re.sub(r"\s+", "", text)` 换成 `tidy_text`。
-  从前那行是「格式收束」的**边界画错了**——目的正当（去掉模型塞进来的换行、缩进、连续空格），实现过宽
-  （连词间空格一起删），于是把「去掉排版噪声」做成了「把整句拧成一个字块」。全仓 `re.sub(r"\s+", "", ...)`
+
+- **脚本落盘不再删光空白**：`normalize_script` 与六处修补点的 `re.sub(r"\s+", "", text)` 换成 `tidy_text`。  
+  从前那行是「格式收束」的**边界画错了**——目的正当（去掉模型塞进来的换行、缩进、连续空格），实现过宽  
+  （连词间空格一起删），于是把「去掉排版噪声」做成了「把整句拧成一个字块」。全仓 `re.sub(r"\s+", "", ...)`  
   共十三处，这次只动**决定正文形态的七处**，其余六处按语义保留。
-- **删掉示例块里那句指代式索引**（`——照上面第一条的写法`）：它讲的是「没空格」那处错误，却排在末尾
-  紧贴「句尾没标点」，指代对象与相邻项错位；且与前一条决定（规则交给示例承担、不写散文复述）自相矛盾。
+- **删掉示例块里那句指代式索引**（`——照上面第一条的写法`）：它讲的是「没空格」那处错误，却排在末尾  
+  紧贴「句尾没标点」，指代对象与相邻项错位；且与前一条决定（规则交给示例承担、不写散文复述）自相矛盾。  
   规则改由「错误句 ↔ 正例第一句」的逐字对照承担。
 
 **测试**
-- 新增 `tests/test_text_spacing.py` **26 项**；全量 `python -m unittest discover -s tests -q` → **Ran 1218 OK**
+
+- 新增 `tests/test_text_spacing.py` **26 项**；全量 `python -m unittest discover -s tests -q` → **Ran 1218 OK**  
   （v0.42.0 时 1192 项）。
-- **字幕断行实测**（`tools/probes/subtitle_spacing_probe.py`，只读；全项目 17 份脚本、4243 句，口径按出片
-  实际档位：歌词档、每行容量 33 字、框高 8 行）：字距改动命中 **226 句（5.33%）**；折行总行数 312 → 351
-  （39 句各多一行、**没有一句少行**）；**断词 0 → 0**（`_in_latin_token` 的保护本来就生效，字距不碰它）；
-  **超容量行 0**（每行 ≤ 容量的硬保证保持）；最长折行 6 行 < 框高 8 行，单句都装得进框。
+- **字幕断行实测**（`tools/probes/subtitle_spacing_probe.py`，只读；全项目 17 份脚本、4243 句，口径按出片  
+  实际档位：歌词档、每行容量 33 字、框高 8 行）：字距改动命中 **226 句（5.33%）**；折行总行数 312 → 351  
+  （39 句各多一行、**没有一句少行**）；**断词 0 → 0**（`_in_latin_token` 的保护本来就生效，字距不碰它）；  
+  **超容量行 0**（每行 ≤ 容量的硬保证保持）；最长折行 6 行 < 框高 8 行，单句都装得进框。  
   结论：字幕层没有变坏，代价是 39 句各多占一行（框内窗口按实际行数算，滚动位置随之变）。
 
 **说明**
+
 - **不做存量回填**：盘上 17 份脚本一个字没动（要回填另说，那是一次性批量改写，不是这条链路的事）。
-- **波形与估时会变**：`seed = sha256(音色标识 + 文本)`，文本一动波形就动；`count_latin_tokens` 数的是词元
-  （`RAGAssistant` 一个、`RAG Assistant` 两个），估时会跟着涨一点。已出片的期不受影响，**重新生成**的期
+- **波形与估时会变**：`seed = sha256(音色标识 + 文本)`，文本一动波形就动；`count_latin_tokens` 数的是词元  
+  （`RAGAssistant` 一个、`RAG Assistant` 两个），估时会跟着涨一点。已出片的期不受影响，**重新生成**的期  
   会拿到不同波形。
-- **管不到的仍是英文分词**：`RAGAssistant` 不会被切成 `RAG Assistant`——正则没有词边界知识，一个字母串
-  该切成几个词判不出来（`AI` 与 `Assistant` 是词，`NVIDIA` 是一个词），硬切就是猜。这一层归**提示词
+- **管不到的仍是英文分词**：`RAGAssistant` 不会被切成 `RAG Assistant`——正则没有词边界知识，一个字母串  
+  该切成几个词判不出来（`AI` 与 `Assistant` 是词，`NVIDIA` 是一个词），硬切就是猜。这一层归**提示词  
   前置**，代码只做保底：汉字与西文之间一处不漏。字距是格式，格式归代码；代码管不到的那一段才归提示词。
 
 ---
+
 
 ## v0.42.0
 
 **变更：字幕版式三档并两档——单行改横滚、双行删除、两档共用同一个框；回顾整切三条、不再按尺切**
 
-一句话：字幕版式从「三档各画各的」收成「两档只差一个轴」——同一个框、同一套 Style、同一套字宽口径。
-单行档不再把超出的字裁掉，改成把溢出那一截滚进框；回顾从「拼一大段再按字数切」改成三句一物一句，
+一句话：字幕版式从「三档各画各的」收成「两档只差一个轴」——同一个框、同一套 Style、同一套字宽口径。  
+单行档不再把超出的字裁掉，改成把溢出那一截滚进框；回顾从「拼一大段再按字数切」改成三句一物一句，  
 切句那一步连同 `split_sentences` 一起删掉。
 
 **变更**
-- **版式两档，只差一个轴**（`config_manager.MODE_SPEC`）：删 `dual`（双行）；`single` 改名「单行滚动」并
-  改用轴表达（`"axis": "x"` / `"axis": "y"`）；默认档从 `dual` 改 `lyric`。两档共用
-  `subtitle_engine.frame_geometry` 的**同一个矩形**与**同一套 Style**——从前单双行是另一套
+
+- **版式两档，只差一个轴**（`config_manager.MODE_SPEC`）：删 `dual`（双行）；`single` 改名「单行滚动」并  
+  改用轴表达（`"axis": "x"` / `"axis": "y"`）；默认档从 `dual` 改 `lyric`。两档共用  
+  `subtitle_engine.frame_geometry` 的**同一个矩形**与**同一套 Style**——从前单双行是另一套  
   （BorderStyle=3 ＋ per-line 填充块），同一个下拉里塞着两套框的样子。
-- **单行档从「裁掉」改成「滚过框口」**（`subtitle_engine._strip_events`）：一句一行、不折字；装得下就静止
-  居中，装不下走**三段式**——①句首静止（文字左缘贴框左，先让人读到开头）②匀速左移（位移 = 文字宽 −
-  框宽，只把溢出那截滚进框）③句尾静止（文字右缘贴框右）。速度 = 文字宽 ÷ 句时长（就是语速，不另给速度
-  旋钮），于是 **滚动时长 = 句时长 × 位移 ÷ 文字宽 恒小于句时长**——任何长度都滚得完，不需要容差、也不
-  需要兜底分支；横屏默认值下句首静止约 9.8 秒（＝读完框内那一眼的时间），与句子长短无关。
-  跑马灯式「整句从框外滚到框外」则两种跑法都错：按句时长硬塞会快过朗读三成，按朗读同步就滚不完。
+- **单行档从「裁掉」改成「滚过框口」**（`subtitle_engine._strip_events`）：一句一行、不折字；装得下就静止  
+  居中，装不下走**三段式**——①句首静止（文字左缘贴框左，先让人读到开头）②匀速左移（位移 = 文字宽 −  
+  框宽，只把溢出那截滚进框）③句尾静止（文字右缘贴框右）。速度 = 文字宽 ÷ 句时长（就是语速，不另给速度  
+  旋钮），于是 **滚动时长 = 句时长 × 位移 ÷ 文字宽 恒小于句时长**——任何长度都滚得完，不需要容差、也不  
+  需要兜底分支；横屏默认值下句首静止约 9.8 秒（＝读完框内那一眼的时间），与句子长短无关。  
+  跑马灯式「整句从框外滚到框外」则两种跑法都错：按句时长硬塞会快过朗读三成，按朗读同步就滚不完。  
   **旧单行档更直接：它不滚，超出的部分被裁掉**（104 字那句实渲只剩中间约 33 字）。
-- **字宽是实渲标定出来的，不是「一个汉字一个字号」**（`subtitle_engine.CHAR_W_*`）：汉字 `0.751`、
-  全角标点 `0.820`、半角 `0.438`（× 字号），后端与预览读同一组常量。按 1.0 估会把字宽算多三成，
+- **字宽是实渲标定出来的，不是「一个汉字一个字号」**（`subtitle_engine.CHAR_W_*`）：汉字 `0.751`、  
+  全角标点 `0.820`、半角 `0.438`（× 字号），后端与预览读同一组常量。按 1.0 估会把字宽算多三成，  
   横滚的终点就跑过框。
-- **`subtitle.outline` 改语义为「字幕框描边宽」**（默认 `6` → `2`），两档共用。删掉单双行之后它一个读者
+- **`subtitle.outline` 改语义为「字幕框描边宽」**（默认 `6` → `2`），两档共用。删掉单双行之后它一个读者  
   都不剩，留着就是一个用户看不见的死旋钮。
-- **三个键去掉歌词前缀**：`subtitle.lyric_window` / `lyric_max_rows` / `lyric_scroll_ms` →
-  `subtitle.window` / `subtitle.frame_rows` / `subtitle.scroll_ms`——窗口与框高**两档共用**（单行档由档位表
-  定 1 行），`scroll_ms` 仍是歌词档的换句上滚时长（横滚不用它：速度由语速同步算出）。配置页的功能区
+- **三个键去掉歌词前缀**：`subtitle.lyric_window` / `lyric_max_rows` / `lyric_scroll_ms` →  
+  `subtitle.window` / `subtitle.frame_rows` / `subtitle.scroll_ms`——窗口与框高**两档共用**（单行档由档位表  
+  定 1 行），`scroll_ms` 仍是歌词档的换句上滚时长（横滚不用它：速度由语速同步算出）。配置页的功能区  
   名字跟着改：「歌词窗口」→「框与滚动」。
-- **回顾整切三条、不再细切**（`pipeline.review_rows`）：模板从「一整段 200+ 字」改成三条一物一句——
-  `上期《{上一期的标题}》。` / `聊的是{上一期的期主旨}。` / `讲了{上一期的前三段段主旨}等。`
-  引用值只剃**尾部**的句读标点与空白（`REVIEW_TAIL_STRIP`）：头不剃（实测 99 条引用里头部带标点 0 例），
-  中间一个字不动。从前按 `gate.max_chars` 切句，切点落在长度上，切出过「…收窄至"仅填空"的本质，」
-  下一句以「的架构迭代」开头这种半句话（切点落在西文词后的空格上，虚词被甩到下一句）。现在句子边界由
+- **回顾整切三条、不再细切**（`pipeline.review_rows`）：模板从「一整段 200+ 字」改成三条一物一句——  
+  `上期《{上一期的标题}》。` / `聊的是{上一期的期主旨}。` / `讲了{上一期的前三段段主旨}等。`  
+  引用值只剃**尾部**的句读标点与空白（`REVIEW_TAIL_STRIP`）：头不剃（实测 99 条引用里头部带标点 0 例），  
+  中间一个字不动。从前按 `gate.max_chars` 切句，切点落在长度上，切出过「…收窄至"仅填空"的本质，」  
+  下一句以「的架构迭代」开头这种半句话（切点落在西文词后的空格上，虚词被甩到下一句）。现在句子边界由  
   **结构**决定，最多三句。任一路引用值取不到就三条一句都不粘——留「上期《》。」这种半句比少说难看。
-- **预览与成片同源**（`web_ui.paintSubPreview`）：两档共用同一个框（框与裁切矩形的四点逐一同值），
-  单行档加 `<animateTransform>` 按三段式循环演示（静止与滚动的时长比照后端算式），字宽系数换成标定值。
-  另补一道配色转换 `cssColor`：`subtitle.color_a` 存的是 **ASS 的 `&HAABBGGRR`**，直接喂给 SVG 的 `fill`
-  是非法值——浏览器丢掉它、回落到黑色，于是深色框里的「非当前句」成了看不见的字（`&HFFFFFF` 倒过来
+- **预览与成片同源**（`web_ui.paintSubPreview`）：两档共用同一个框（框与裁切矩形的四点逐一同值），  
+  单行档加 `<animateTransform>` 按三段式循环演示（静止与滚动的时长比照后端算式），字宽系数换成标定值。  
+  另补一道配色转换 `cssColor`：`subtitle.color_a` 存的是 **ASS 的 `&HAABBGGRR`**，直接喂给 SVG 的 `fill`  
+  是非法值——浏览器丢掉它、回落到黑色，于是深色框里的「非当前句」成了看不见的字（`&HFFFFFF` 倒过来  
   还是白，白字配色下看不出问题，一旦有人把 A/B 角改成别的颜色就现形）。
 
 **删除**
-- `subtitle_engine`：`wrap_text`、`find_break`、`split_sentences`、`SENTENCE_PUNCT`、`LYRIC_*` 常量，
+
+- `subtitle_engine`：`wrap_text`、`find_break`、`split_sentences`、`SENTENCE_PUNCT`、`LYRIC_*` 常量，  
   以及 `_lyric_*` 一组函数名（改 `_frame_*`——两档共用，不再有歌词专属的一支）
-- `wrap_stats` / `count_word_breaks` 改带轴参数：`axis="x"` 恒报零折行零违规——横滚档不折行，本来就没有
+- `wrap_stats` / `count_word_breaks` 改带轴参数：`axis="x"` 恒报零折行零违规——横滚档不折行，本来就没有  
   断点。从前靠「行数上限 = 1 就跳过」漏出统计，那是个巧合。
 
 **测试**
-- `tests/test_subtitle_wrap.py` 重写为 **70 项**：框几何（两种画幅数值、高 = 行数 × 行距、标定系数、
-  认不出档位回落默认）、单行档（不折行、不丢字、两档同框同填充同描边、短句居中、长句两端贴框、
-  **滚得完的硬断言**、说话人名算进宽度、裁到框内、分色、高亮）、配色两种写法、预览与后端同源
+
+- `tests/test_subtitle_wrap.py` 重写为 **70 项**：框几何（两种画幅数值、高 = 行数 × 行距、标定系数、  
+  认不出档位回落默认）、单行档（不折行、不丢字、两档同框同填充同描边、短句居中、长句两端贴框、  
+  **滚得完的硬断言**、说话人名算进宽度、裁到框内、分色、高亮）、配色两种写法、预览与后端同源  
   （字宽系数、行距、横滚节奏、框四点、ASS→CSS 倒序）。
-- `tests/test_review.py` 改为三条模板（**16 项**）：一物一句、只剃尾不剃头、长回顾不再按尺切、
+- `tests/test_review.py` 改为三条模板（**16 项**）：一物一句、只剃尾不剃头、长回顾不再按尺切、  
   支期按播出顺序、缺料整段不粘。
-- `tests/test_config_keys.py` 新增配置迁移一组（**46 项**）：`dual`/`dual_named` → `lyric`、
-  `dual_named` 补名字开关（只补缺、不覆盖已有值）、三个改名键搬着值走、已有新键时认新键、
+- `tests/test_config_keys.py` 新增配置迁移一组（**46 项**）：`dual`/`dual_named` → `lyric`、  
+  `dual_named` 补名字开关（只补缺、不覆盖已有值）、三个改名键搬着值走、已有新键时认新键、  
   保存后落盘就是新名。
-- 冻结值重取：单行档 4 组 ASS 的 sha256，与横滚算式的四个数
+- 冻结值重取：单行档 4 组 ASS 的 sha256，与横滚算式的四个数  
   （79 字样本 → `\move(1668,955,252,955,14942,27100)`）。
-- 全量 **1141** 项通过；界面冒烟（真浏览器）**78** 项全过（新增 3 项：字幕预览两档画对、
+- 全量 **1141** 项通过；界面冒烟（真浏览器）**78** 项全过（新增 3 项：字幕预览两档画对、  
   单行档确实在滚）。
-- **真帧复验**（libass + ffmpeg，渲 10fps 全段，79 字样本）：句首帧「上期《骨架叙事切分…」开头完整、滚动中帧内容
-  确实左移、收尾帧「…刚性同步机制。」结尾完整落在框内且右缘贴框右——三帧一个字不丢。同一句不裁不滚
+- **真帧复验**（libass + ffmpeg，渲 10fps 全段，79 字样本）：句首帧「上期《骨架叙事切分…」开头完整、滚动中帧内容  
+  确实左移、收尾帧「…刚性同步机制。」结尾完整落在框内且右缘贴框右——三帧一个字不丢。同一句不裁不滚  
   放进 4000px 画布量墨迹宽 **3102px**，算式给 **3156px**（偏宽 1.7%，方向安全：宁宽勿窄）。
-- 「滚得完」的判定口径统一到**一格 ASS 时间戳之内**：`TAIL_TOLERANCE = 20ms`，写三处（单测与两个复验
-  脚本）。理由——`\move` 的终点是 `round(span × 1000)` 毫秒，而事件起止走 `fmt_ass_time`（`%05.2f`，
-  10ms 一格），两端各最多差 5ms；终点比句末晚几毫秒是**取整残差，不是滚不完**（实测 +3ms）。拿
+- 「滚得完」的判定口径统一到**一格 ASS 时间戳之内**：`TAIL_TOLERANCE = 20ms`，写三处（单测与两个复验  
+  脚本）。理由——`\move` 的终点是 `round(span × 1000)` 毫秒，而事件起止走 `fmt_ass_time`（`%05.2f`，  
+  10ms 一格），两端各最多差 5ms；终点比句末晚几毫秒是**取整残差，不是滚不完**（实测 +3ms）。拿  
   `end <= span` 去卡会误报。
-- 两个复验脚本按仓库惯例入库：`tools/probes/subtitle_roll_check.py`（实渲三帧 ＋ 字宽标定对账）、
+- 两个复验脚本按仓库惯例入库：`tools/probes/subtitle_roll_check.py`（实渲三帧 ＋ 字宽标定对账）、  
   `tools/probes/subtitle_recap_check.py`（拿真实项目的回顾三条 ＋ 真实估时逐句验算）。
 
 **说明**
-- **真实项目重放**：`projects/20260917-015336` 的 2c→2d 回顾（23 / 83 / 134 字，估时 4.8 / 8.9 / 20.3 秒）
-  在单行档下最长那条同样滚得完——句首静止 7.7 秒 ＋ 滚动 12.6 秒 = 20.3 秒 = 句长；歌词档折 1 / 3 / 5 行，
+
+- **真实项目重放**：`projects/20260917-015336` 的 2c→2d 回顾（23 / 83 / 134 字，估时 4.8 / 8.9 / 20.3 秒）  
+  在单行档下最长那条同样滚得完——句首静止 7.7 秒 ＋ 滚动 12.6 秒 = 20.3 秒 = 句长；歌词档折 1 / 3 / 5 行，  
   窗口 8 行装得下。`\move` 与预览示例、测试 `LONG` 用的是同一句 79 字样本，三处同源。
-- **存量配置自动搬迁，而且跑在白名单过滤之前**（`ConfigManager.load`）。顺序反了会连值一起丢：改过名的
+- **存量配置自动搬迁，而且跑在白名单过滤之前**（`ConfigManager.load`）。顺序反了会连值一起丢：改过名的  
   旧键已不在 `PARAM_SPEC` 里，白名单会把它们静默滤掉，人配好的窗口回到默认值，界面上看不出任何异常。
-- 本轮**不动合成侧门禁**：门禁照旧判 `fail`，出问题报 ＋ 落盘、照常出片。横滚档不折行、断词率天然为 0，
+- 本轮**不动合成侧门禁**：门禁照旧判 `fail`，出问题报 ＋ 落盘、照常出片。横滚档不折行、断词率天然为 0，  
   那是「不折行本来就没有断点」的自然结果，不是为了讨好门禁。
 
 ---
 
 **变更：合成链静态层预烘焙 —— 压暗与字幕框一次画进背景图；字幕框改为与第一句字幕同时出现**
 
-一句话：合成链上有两层「只跟背景图与一组常量有关、跟时间无关」的工作，原先**每一帧都重做一遍**
-（整幅压暗是全屏 `drawbox`，字幕框是 libass 的 `\p1` 绘图矩形，等于把同一道算式抄 1800 遍）。
-现在它们在**生成背景图时一次画进去**，运行时链上不再有这两步。副作用是框从第 0 帧就出现，
+一句话：合成链上有两层「只跟背景图与一组常量有关、跟时间无关」的工作，原先**每一帧都重做一遍**  
+（整幅压暗是全屏 `drawbox`，字幕框是 libass 的 `\p1` 绘图矩形，等于把同一道算式抄 1800 遍）。  
+现在它们在**生成背景图时一次画进去**，运行时链上不再有这两步。副作用是框从第 0 帧就出现，  
 这一条同时修回：背景烘两张、按帧接起来。
 
 **新增**
-- **`assets_factory.bake_static_layers(bg_path, out_path, cfg, w, h, suffix, box=True)`**：把「整幅压暗」
-  与「字幕框」一次画进背景图。顺序与原链一致——**先压暗、后画框**（框是半透明的，先画会被压暗一层）。
-  框的几何取自 `subtitle_engine.frame_of`，与 ASS 的框、与界面预览同一个出处，不在这里重算一份。
+
+- **`assets_factory.bake_static_layers(bg_path, out_path, cfg, w, h, suffix, box=True)`**：把「整幅压暗」  
+  与「字幕框」一次画进背景图。顺序与原链一致——**先压暗、后画框**（框是半透明的，先画会被压暗一层）。  
+  框的几何取自 `subtitle_engine.frame_of`，与 ASS 的框、与界面预览同一个出处，不在这里重算一份。  
   尺寸必须等于画幅，不等即报错（不静默缩放）。`box=False` 只压暗、不画框。
-- **`video_engine.box_onset_frames(timings, fps)`**：字幕框该从第几帧起出现。取**第一条文字事件的开始
-  时刻**向上取整到帧号（2b 实测 2.72 秒 × 30 fps → 第 82 帧）；取不到时间轴、或第一句就落在开头，
+- **`video_engine.box_onset_frames(timings, fps)`**：字幕框该从第几帧起出现。取**第一条文字事件的开始  
+  时刻**向上取整到帧号（2b 实测 2.72 秒 × 30 fps → 第 82 帧）；取不到时间轴、或第一句就落在开头，  
   返回 0——没有可延后的区间，退回单张。
-- **`video_engine.compose(..., bg_plain=None, box_frame=0)`**：两张背景图按帧接起来——前 `box_frame`
-  帧用「压暗但无框」那张、其余用「压暗 + 框」那张，于是**框与第一句字幕同时出现**。用 `trim` 的
-  `start_frame` / `end_frame` **帧精确**切，不用 `-t 秒数`（2.72 s × 30 fps = 81.6，到底算 82 还是
-  83 帧说不准）。缓推档两段各自 `zoompan`，第二段带帧偏移 `(on+N0)`——缩放曲线按输出帧序号驱动，
+- **`video_engine.compose(..., bg_plain=None, box_frame=0)`**：两张背景图按帧接起来——前 `box_frame`  
+  帧用「压暗但无框」那张、其余用「压暗 + 框」那张，于是**框与第一句字幕同时出现**。用 `trim` 的  
+  `start_frame` / `end_frame` **帧精确**切，不用 `-t 秒数`（2.72 s × 30 fps = 81.6，到底算 82 还是  
+  83 帧说不准）。缓推档两段各自 `zoompan`，第二段带帧偏移 `(on+N0)`——缩放曲线按输出帧序号驱动，  
   不带偏移接缝处会跳回起点。不传这两个参数就退回「一张图从头用到尾」，与从前逐字节一致。
-- **`tools/reglue_review.py`**：前期回顾重拼。回顾是「脚本定稿那一刻」由程序逐字粘上去的，
-  **出片不回头重拼**——改了模板、重新合成，字一个都不会变。这个工具走现成代码路径
-  （`pipeline.review_rows` 出句、`script_engine._fill_line_seconds` 补时长）把已落盘脚本的回顾段重拼一遍：
+- **`tools/reglue_review.py`**：前期回顾重拼。回顾是「脚本定稿那一刻」由程序逐字粘上去的，  
+  **出片不回头重拼**——改了模板、重新合成，字一个都不会变。这个工具走现成代码路径  
+  （`pipeline.review_rows` 出句、`script_engine._fill_line_seconds` 补时长）把已落盘脚本的回顾段重拼一遍：  
   只动回顾段、改前落备份到 `过程备份/脚本/`、改后逐字节回读对账。
 
 **变更**
-- **链上删掉两个逐帧环节**：`video_engine._dim_filter`（全屏 `drawbox`）与框的 ASS 事件
+
+- **链上删掉两个逐帧环节**：`video_engine._dim_filter`（全屏 `drawbox`）与框的 ASS 事件  
   （`subtitle_engine._frame_box_event`）一起删除。留一个在链上就是同一件事做两遍，而且第二遍是逐帧的。
-- **`format=rgb24` 显式保留、紧贴 `ass=` 之前**：libass 的取色口径由「进到 ass 里的那一帧是什么格式」
-  决定，这不是能从 ASS 里控制的。同一份 ASS、同一个像素实测：输入 `rgb24` 时白字出 233、黑描边出 16，
-  输入 `yuv420p` 时同一处出 **253 / 0**。旧链因为压暗必须在 RGB 域做，链上自带这一步，字幕一直是前者；
-  压暗挪去烘焙后它会跟着消失，字幕会悄悄亮 6%。显式写出来，口径与已发布各期一致；不额外付代价
+- **`format=rgb24` 显式保留、紧贴 `ass=` 之前**：libass 的取色口径由「进到 ass 里的那一帧是什么格式」  
+  决定，这不是能从 ASS 里控制的。同一份 ASS、同一个像素实测：输入 `rgb24` 时白字出 233、黑描边出 16，  
+  输入 `yuv420p` 时同一处出 **253 / 0**。旧链因为压暗必须在 RGB 域做，链上自带这一步，字幕一直是前者；  
+  压暗挪去烘焙后它会跟着消失，字幕会悄悄亮 6%。显式写出来，口径与已发布各期一致；不额外付代价  
   （整帧 `rgb24→yuv420p` 两种形态下都只做一次）。
-- **分段并行默认关闭**（`video_engine.render_workers`）：`WORKERS_MAX = 1`，默认**一次渲到底**。
-  「按设备逻辑核数自适应、永不超过核数」的算式保留（`render_workers(cpu, cap)`、`encoder_threads`）——
+- **分段并行默认关闭**（`video_engine.render_workers`）：`WORKERS_MAX = 1`，默认**一次渲到底**。  
+  「按设备逻辑核数自适应、永不超过核数」的算式保留（`render_workers(cpu, cap)`、`encoder_threads`）——  
   二核机器恒算 1 路，不会硬开六路。换一条链先跑基准量一遍、改一个常量即可重新启用。
-- **双背景与分段并行互斥**（`segment_blocker(cfg, box_frame)`）：分段切的是**已经拼好的**时间轴，
+- **双背景与分段并行互斥**（`segment_blocker(cfg, box_frame)`）：分段切的是**已经拼好的**时间轴，  
   而两张背景一接时间轴就重排，段内网格必然错位。明确拦停并说明，不让它半对半错地跑。
 
 **修复**
-- **单行滚动出现双行**（`subtitle_engine` 的 `WrapStyle: 0 → 2`）：单行档的立意是「一句一行，装不下就
-  从框口滚过去」，成片却折成了两行——根因是字幕文件头的换行策略写的是**自动换行**，渲染器一律按宽度
-  折行，把「装不下」处理成了「折行」，滚的动作根本没有机会发生。改成不自动换行后，装不下才走滚。
+
+- **单行滚动出现双行**（`subtitle_engine` 的 `WrapStyle: 0 → 2`）：单行档的立意是「一句一行，装不下就  
+  从框口滚过去」，成片却折成了两行——根因是字幕文件头的换行策略写的是**自动换行**，渲染器一律按宽度  
+  折行，把「装不下」处理成了「折行」，滚的动作根本没有机会发生。改成不自动换行后，装不下才走滚。  
   对账（拿已发布那一期真用过的 ASS）：253 条文字事件**一字不差**，头部 16 行**只有这一行**不同。
-- **四期前期回顾重拼**（`projects/20260917-015336` 的 2 / 2a / 2b / 3）：这四期的回顾是旧模板（一整段
-  用顿号串起来、每条段主旨自带句号，于是长出 `。、` 与 `。——`）甚至更旧的「按尺切句」留下的——3 期
-  8 句还被从中间切断（第 2 句结在「…执行中『猜』」、第 3 句以「的约束机制」开头）。四期都漏在上一轮
-  点名重写的清单之外。重拼后各 3 句、接缝只剩顿号，回顾段以外逐字节不变
+- **四期前期回顾重拼**（`projects/20260917-015336` 的 2 / 2a / 2b / 3）：这四期的回顾是旧模板（一整段  
+  用顿号串起来、每条段主旨自带句号，于是长出 `。、` 与 `。——`）甚至更旧的「按尺切句」留下的——3 期  
+  8 句还被从中间切断（第 2 句结在「…执行中『猜』」、第 3 句以「的约束机制」开头）。四期都漏在上一轮  
+  点名重写的清单之外。重拼后各 3 句、接缝只剩顿号，回顾段以外逐字节不变  
   （2 →260 句 / 2a →273 / 2b →248 / 3 →244）。
 
 **实测**（真素材，本机）
+
 - **静态层预烘焙**：一期 25 分钟节目，横竖两版合计 **17.8 分钟 → 4.8 分钟**（single 档）。
-- **框出现时刻**：120 秒 / 1080p / medium / crf20，交错各 4 轮、跑了两遍——候选相对现状
-  **1.013x** ／ **0.914x**（中位 **1.003x**）。两次的极值都落在噪声里（这台机器上顺序跑会有 ±10% 的
-  漂移），没有系统性变慢。
-  对账：框出现前候选与「完全不画框」**83.78 dB**（几乎逐字节相同）；框出现后与现状 **54.68 dB**；
-  而现状在框出现前与「不画框」只有 **27.53 dB**——那个空框确实是肉眼可见的差异，不是估的。
+- **框出现时刻**：120 秒 / 1080p / medium / crf20，交错各 4 轮、跑了两遍——候选相对现状  
+  **1.013x** ／ **0.914x**（中位 **1.003x**）。两次的极值都落在噪声里（这台机器上顺序跑会有 ±10% 的  
+  漂移），没有系统性变慢。  
+  对账：框出现前候选与「完全不画框」**83.78 dB**（几乎逐字节相同）；框出现后与现状 **54.68 dB**；  
+  而现状在框出现前与「不画框」只有 **27.53 dB**——那个空框确实是肉眼可见的差异，不是估的。  
   帧数 3600 一分不差，音画差 0.000s。
-- **分段并行净亏**（三次独立实测）：整期 22.7 分钟，1 路 **156.6 s** ／ 6 路 177.9 s ＝ **0.88x**；
-  120 秒片段 1 路 260 帧/秒 ／ 2 路 277 ／ 4 路 246 ／ 6 路 230；横竖并发 38.1 s ／ 33.6 s ＝ **1.13x**。
+- **分段并行净亏**（三次独立实测）：整期 22.7 分钟，1 路 **156.6 s** ／ 6 路 177.9 s ＝ **0.88x**；  
+  120 秒片段 1 路 260 帧/秒 ／ 2 路 277 ／ 4 路 246 ／ 6 路 230；横竖并发 38.1 s ／ 33.6 s ＝ **1.13x**。  
   6 段并发时每帧 CPU 从 11 ms 涨到 **73.5 ms（6.6 倍）**——在烧空转的核。
-- **墙是每帧搬运量，不是 CPU**：单路全链只吃 **2.8～3.1 个逻辑核**（24 核机器）却已跑到约 300 帧/秒；
-  2 个进程并发，合计吞吐与 1 个进程相同（276.8 vs 281.3 帧/秒）。砍搬运量都无收益：去恒等 scale/crop
+- **墙是每帧搬运量，不是 CPU**：单路全链只吃 **2.8～3.1 个逻辑核**（24 核机器）却已跑到约 300 帧/秒；  
+  2 个进程并发，合计吞吐与 1 个进程相同（276.8 vs 281.3 帧/秒）。砍搬运量都无收益：去恒等 scale/crop  
   **+4%**、去 rgb24 往返 **−9%**、输入改「单帧进 + loop 滤镜」**+17%（更慢）**。
 
 **测试**
-- 新建 `tests/test_box_onset.py`（**24 项**）：帧号换算（整数帧不许被浮点噪声推过界、取不到/落在开头/
-  落在片尾之外都是 0）、两张背景帧精确切、缓推档第二段的帧偏移、输入顺序（无框图占 0 号位）与音频
+
+- 新建 `tests/test_box_onset.py`（**24 项**）：帧号换算（整数帧不许被浮点噪声推过界、取不到/落在开头/  
+  落在片尾之外都是 0）、两张背景帧精确切、缓推档第二段的帧偏移、输入顺序（无框图占 0 号位）与音频  
   下标（`1:a → 2:a`，波形/频谱读的就是它）、分段与双背景互斥、`box=False` 只压暗不画框。
 - `tests/test_layout.py`：`TestDimFilter` 换成 `TestStaticLayerBake` ＋ `TestTvRangeColor`。
-- `tests/test_subtitle_wrap.py`：新增 `TestWrapStyle`；框事件相关四条改写（框已改烘焙，ASS 里不再有框）；
+- `tests/test_subtitle_wrap.py`：新增 `TestWrapStyle`；框事件相关四条改写（框已改烘焙，ASS 里不再有框）；  
   冻结哈希重取并在文件头记明复核方式（与**已发布那一期真用过的 ASS** 逐字节比，而不是跑一遍取新值）。
 - 全量 **1192** 项通过。
 
 **说明**
-- **探针对账口径**：「切段代价」不能要求两条有损片逐像素相等（各自独立编码、各自码率控制与前瞻，
+
+- **探针对账口径**：「切段代价」不能要求两条有损片逐像素相等（各自独立编码、各自码率控制与前瞻，  
   彼此不同是必然）；应各自**对无损真值**比 PSNR，看谁离本该画出的画面更远。
-- 探针按仓库惯例入库（`tools/README` 一节）：`bake_static_check.py`、`box_onset_verify.py`、
-  `box_onset_probe.py`、`parallel_render_check.py`、`render_scale_scan.py`、`render_stage_ceiling.py`、
+- 探针按仓库惯例入库（`tools/README` 一节）：`bake_static_check.py`、`box_onset_verify.py`、  
+  `box_onset_probe.py`、`parallel_render_check.py`、`render_scale_scan.py`、`render_stage_ceiling.py`、  
   `hv_parallel_check.py`。
 
 ---
@@ -849,53 +1152,58 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 
 **修复：断词率不过就静默丢弃整期——折行硬切在词中间、程序拼句超尺、状态与报告三处都不出声**
 
-一句话：一期两百多句正文全都合尺，唯一不合尺的那一句是程序自己拼的「前期回顾」；它按设计
-绕过了脚本阶段所有门禁，又被折行算法硬切在词中间，于是整期被静默丢弃——盘上音视频字幕封面
-一样不少，报告写着「未过」没人看，`_projects.json` 里干脆没有这一期，界面上还报「成功」。
+一句话：一期两百多句正文全都合尺，唯一不合尺的那一句是程序自己拼的「前期回顾」；它按设计  
+绕过了脚本阶段所有门禁，又被折行算法硬切在词中间，于是整期被静默丢弃——盘上音视频字幕封面  
+一样不少，报告写着「未过」没人看，`_projects.json` 里干脆没有这一期，界面上还报「成功」。  
 五份盘互相打架，唯一被人看到的是那句「成功」。
 
 **修复**
-- **不切词是硬约束，均衡只是偏好**（`subtitle_engine.py`）：`_nearest_legal_break` 在窗口里
-  找不到合法切点原来 `return hi` 兜底硬切——「大概齐」的位置把切词藏进一个看不出问题的返回值；
-  现改返回 `None`。`wrap_balanced` 的行数由 `ceil(字数 ÷ 每行容量)` 的**定值**降为**下界**：窗口
-  `[lo, max_chars]` 里没有合法点就放开到整行找离目标最近的合法点（宁可这一行短一点、后面多占
+
+- **不切词是硬约束，均衡只是偏好**（`subtitle_engine.py`）：`_nearest_legal_break` 在窗口里  
+  找不到合法切点原来 `return hi` 兜底硬切——「大概齐」的位置把切词藏进一个看不出问题的返回值；  
+  现改返回 `None`。`wrap_balanced` 的行数由 `ceil(字数 ÷ 每行容量)` 的**定值**降为**下界**：窗口  
+  `[lo, max_chars]` 里没有合法点就放开到整行找离目标最近的合法点（宁可这一行短一点、后面多占  
   一行），只有整行就是一个超长 token 时才硬切；每行 ≤ `max_chars`、不丢字两条硬保证不变。
-- **程序拼的文本自己合尺**（`subtitle_engine.split_sentences` 新 ＋ `pipeline.review_rows`）：
-  切点只落在句读标点之后（标点跟着前一句走）→ 退到西文词间空格（不切词）→ 再退到四级折行的
-  硬切。分工写清：`wrap_*` 管「一句话排几行」，它管「一句话该有多长」。`review_rows` 拼完模板后
-  按 `gate.max_chars` 切句（与正文同一把尺），一条模板产出多句；段主旨自带句号，拼进「讲了 A、B、C」
-  时去掉（否则长出「逻辑。、」这种拼坏的标点）。**非做不可**：2d 那句 241 字在 8 行歌词框里的
+- **程序拼的文本自己合尺**（`subtitle_engine.split_sentences` 新 ＋ `pipeline.review_rows`）：  
+  切点只落在句读标点之后（标点跟着前一句走）→ 退到西文词间空格（不切词）→ 再退到四级折行的  
+  硬切。分工写清：`wrap_*` 管「一句话排几行」，它管「一句话该有多长」。`review_rows` 拼完模板后  
+  按 `gate.max_chars` 切句（与正文同一把尺），一条模板产出多句；段主旨自带句号，拼进「讲了 A、B、C」  
+  时去掉（否则长出「逻辑。、」这种拼坏的标点）。**非做不可**：2d 那句 241 字在 8 行歌词框里的  
   合法折行下限就是 9 行，靠折行救不回来。
-- **产物落盘就出片，过没过写在报告里**（`pipeline._run_episode`）：`record_episode` 移出
-  `if report["passed"]`——记账只记「出没出片」，过没过归报告（清单里的 `report` 与「报告/」那一份）。
+- **产物落盘就出片，过没过写在报告里**（`pipeline._run_episode`）：`record_episode` 移出  
+  `if report["passed"]`——记账只记「出没出片」，过没过归报告（清单里的 `report` 与「报告/」那一份）。  
   未过时仍写 `blocked.lock.json` 留痕（`--continue` 靠它认期），但它不再拦人，与脚本阶段同一条定调。
-- **批量与历史不再只报成功**（`web_ui.py`）：批量结果多一口 `not_passed`——跑完了仍算「成功」
-  （口径不变，流程确实全走完），但未过的期单独列出来、日志给明细、提示指向「历史 → 报告」；
+- **批量与历史不再只报成功**（`web_ui.py`）：批量结果多一口 `not_passed`——跑完了仍算「成功」  
+  （口径不变，流程确实全走完），但未过的期单独列出来、日志给明细、提示指向「历史 → 报告」；  
   历史列表给未过的期加 `✕ N 项未过` 标记；单期完成提示带上未过项数。
 
 **新增**
+
 - `subtitle_engine.split_sentences(text, max_chars)`：把一段程序拼出来的长文本按尺切成多句。
 - 批量合成结果新增 `not_passed` 字段；单期完成提示与历史列表的「未过」标记。
 
 **变更**
-- 产物门禁不过的处理：**留痕 ＋ 照常出片 ＋ 照常记账**（原来是写锁硬中断、不产出次品）；
+
+- 产物门禁不过的处理：**留痕 ＋ 照常出片 ＋ 照常记账**（原来是写锁硬中断、不产出次品）；  
   `write_lock` 的说明同步改。与脚本阶段「稿子和问题一起落盘，改稿还是直接出片由人定」对齐。
-- 文档同步：`PROTOCOL.md` / `README.md` / `PLAN.md` 里「门禁不过即中断、不出片」四处说明改写；
+- 文档同步：`PROTOCOL.md` / `README.md` / `PLAN.md` 里「门禁不过即中断、不出片」四处说明改写；  
   `README.md` 测试数 1110 → 1126。
 
 **测试**
-- 全量 **1126 项通过**（+16）：`TestSplitSentences`（7 条）、`TestBalancedWrap` 补「token 横跨窗口
-  也不得切词」「行数是下界」两条、`TestReviewRows` 补「长回顾按尺切句」两条、
-  `TestBatchReportsUnpassedEpisodes`（3 条）、`TestRenderAlwaysRecordsTheEpisode`（记账不在门禁
+
+- 全量 **1126 项通过**（+16）：`TestSplitSentences`（7 条）、`TestBalancedWrap` 补「token 横跨窗口  
+  也不得切词」「行数是下界」两条、`TestReviewRows` 补「长回顾按尺切句」两条、  
+  `TestBatchReportsUnpassedEpisodes`（3 条）、`TestRenderAlwaysRecordsTheEpisode`（记账不在门禁  
   分支里的结构断言）。
-- 全项目六份脚本按新算法重算：折行违规 **3 处 → 0**（旧 2c 1 处、2d 2 处）；2c 那句 195 字回顾由
+- 全项目六份脚本按新算法重算：折行违规 **3 处 → 0**（旧 2c 1 处、2d 2 处）；2c 那句 195 字回顾由  
   1 句拆成 **7 句**、2d 那句 241 字拆成 **9 句**，整期单句最大行数由 7 / 9 降到 **2**（歌词框高 8 行）。
 
 **说明**
-- **存量 2c / 2d 已补账出片**：按盘上清单走合成端同一个 `record_episode` 给这两期补了账（次序必须
-  2c → 2d，`next_from_map` 取的是地图里第一个未出片的期），下一期号推进到 `2da`；画面仍是旧算法
+
+- **存量 2c / 2d 已补账出片**：按盘上清单走合成端同一个 `record_episode` 给这两期补了账（次序必须  
+  2c → 2d，`next_from_map` 取的是地图里第一个未出片的期），下一期号推进到 `2da`；画面仍是旧算法  
   出的那一版，不重合成。
-- **门禁不过时的选期提示**：合成阶段还没有脚本阶段那种进页提醒，本轮走的是「历史带标记 ＋ 批量
+- **门禁不过时的选期提示**：合成阶段还没有脚本阶段那种进页提醒，本轮走的是「历史带标记 ＋ 批量  
   日志明细」最小面。
 
 ---
@@ -904,43 +1212,47 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 
 **修复：承诺链检报出的问题项被归一化丢掉，该项因此永远指不出落点**
 
-一句话：模型报了承诺问题，程序在出口把**每一条**都扔掉，只剩一个判不通过、却指不出
-任何一处的空壳——`patch_targets` 无从下手，「没有可定点修的项」当场 `break`，报告上的
+一句话：模型报了承诺问题，程序在出口把**每一条**都扔掉，只剩一个判不通过、却指不出  
+任何一处的空壳——`patch_targets` 无从下手，「没有可定点修的项」当场 `break`，报告上的  
 承诺链于是永远红着。
 
 **修复**
-- **归一化按两项各自的契约取字段**（`script_engine._norm_issues`）：原先拿「有没有
-  `quote` / `problem`」判一条问题是否存活，而承诺项的输出契约是
-  `line / promise / how / speaker / close_after` **五键——天生没有 `quote` 和
-  `problem`**，于是模型报的每一条承诺问题都在那一行 `continue` 被丢掉（旁边四行
-  「承诺项多出来的键原样带下去」的代码等于没写）。现改为按两种契约取齐说明性字段
-  （`quote ← quote|promise`、`problem ← problem|how|promise|text`），五键原样带下去。
-  实测记录（`projects/20260917-015336/过程/2a|2c`）：`check_promise` 两次 `ok=false`
+
+- **归一化按两项各自的契约取字段**（`script_engine._norm_issues`）：原先拿「有没有  
+  `quote` / `problem`」判一条问题是否存活，而承诺项的输出契约是  
+  `line / promise / how / speaker / close_after` **五键——天生没有 `quote` 和  
+  `problem`**，于是模型报的每一条承诺问题都在那一行 `continue` 被丢掉（旁边四行  
+  「承诺项多出来的键原样带下去」的代码等于没写）。现改为按两种契约取齐说明性字段  
+  （`quote ← quote|promise`、`problem ← problem|how|promise|text`），五键原样带下去。  
+  实测记录（`projects/20260917-015336/过程/2a|2c`）：`check_promise` 两次 `ok=false`  
   且 `issues=0`，`detail` 还写着「通过」——结论、详情、清单三项自相矛盾，同源至此。
-- **详情与结论同源**（`script_engine._issues_detail`）：判不通过而一条也报不出来时，
-  详情不再印「通过」，改印「未通过（模型未指出具体句子）」；判通过时空清单照旧念
+- **详情与结论同源**（`script_engine._issues_detail`）：判不通过而一条也报不出来时，  
+  详情不再印「通过」，改印「未通过（模型未指出具体句子）」；判通过时空清单照旧念  
   「通过」。
 
 **说明**
-- **承诺链走的就是统一门禁路径**：修好落点之后，它经 `patch_targets` → 定点修 →
-  `check_rounds` 封顶 → 超了直接落盘，与形式门禁同一条路。该分支（承诺句不许删 +
-  `close_after` 处用 `inserts` 插一句回应）代码里本就写好，只是**从来没被喂进过一条
+
+- **承诺链走的就是统一门禁路径**：修好落点之后，它经 `patch_targets` → 定点修 →  
+  `check_rounds` 封顶 → 超了直接落盘，与形式门禁同一条路。该分支（承诺句不许删 +  
+  `close_after` 处用 `inserts` 插一句回应）代码里本就写好，只是**从来没被喂进过一条  
   带落点的承诺项**。本轮**没有为它新增任何分支**——不降级、不交人工、不早退。
 - **合成端不拦，维持原状**：`write_gate_report` 是记录不是闸门，本轮一字未动。
-- **语义检未受影响**：它的键本就是 `quote` / `problem`，与归一化口径一致。实测副本
-  `2a`（4 条）→ `2b`（8 条）→ `2c`（通过）的收敛轨迹即为证：判得出、定得点、修得动、
+- **语义检未受影响**：它的键本就是 `quote` / `problem`，与归一化口径一致。实测副本  
+  `2a`（4 条）→ `2b`（8 条）→ `2c`（通过）的收敛轨迹即为证：判得出、定得点、修得动、  
   复判能过。它默认关是**成本纪律**（全链最贵的一项，要逐字核素材并分批），不是缺陷。
 
 **测试**
-- 全量 **1110** 项通过（比上版 +4）。新增 `TestPromiseIssuesSurviveNormalization`
-  一组钉子：①承诺项缺 `quote` / `problem` 也不被丢（五键齐、落点对）②能生成
-  `patch_targets` 落点（承诺句 + `close_after` 锚点）——证明走的就是那条老路
-  ③判 fail 且无落点时详情不印「通过」，判 pass 时空清单照旧念「通过」
-  ④**通用钉子**：`check6_schema` 要求哪些键，归一化后就得留下哪些键——将来任何
+
+- 全量 **1110** 项通过（比上版 +4）。新增 `TestPromiseIssuesSurviveNormalization`  
+  一组钉子：①承诺项缺 `quote` / `problem` 也不被丢（五键齐、落点对）②能生成  
+  `patch_targets` 落点（承诺句 + `close_after` 锚点）——证明走的就是那条老路  
+  ③判 fail 且无落点时详情不印「通过」，判 pass 时空清单照旧念「通过」  
+  ④**通用钉子**：`check6_schema` 要求哪些键，归一化后就得留下哪些键——将来任何  
   一项改了输出契约都能被它当场钉住。
 
 **文档**
-- `ARCHITECTURE.md`（版本头 / 测试数 / 版本落位）、`README.md`（测试数 1110）、
+
+- `ARCHITECTURE.md`（版本头 / 测试数 / 版本落位）、`README.md`（测试数 1110）、  
   `PROTOCOL.md`（承诺链检一行）、`PLAN.md`（六检表承诺链一行）同步。
 
 ---
@@ -949,55 +1261,60 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 
 **字幕：歌词档改成「固定框」并加一块实时预览**
 
-一句话：**一套配置管两种字幕模式**——单行/双行管「文字背景填充 + 文字位置」，
+一句话：**一套配置管两种字幕模式**——单行/双行管「文字背景填充 + 文字位置」，  
 歌词管「一个固定宽高的半透明框，文字在框里」。
 
 **新增**
-- **歌词整块框**：不再是 per-line 填充块，而是一条 `\p1` 绘图事件画出的矩形
-  （左 `margin_lr` / 右 画幅宽 − `margin_lr` / 底 画幅高 − `margin_v`（竖屏
-  `margin_v_vertical`）/ 高 `lyric_max_rows` × 行距），填充不透明度 = `bg_alpha`
-  （与旧 per-line 盒同一口径），描边用写死的小值（`LYRIC_BOX_BORDER`，不读
+
+- **歌词整块框**：不再是 per-line 填充块，而是一条 `\p1` 绘图事件画出的矩形  
+  （左 `margin_lr` / 右 画幅宽 − `margin_lr` / 底 画幅高 − `margin_v`（竖屏  
+  `margin_v_vertical`）/ 高 `lyric_max_rows` × 行距），填充不透明度 = `bg_alpha`  
+  （与旧 per-line 盒同一口径），描边用写死的小值（`LYRIC_BOX_BORDER`，不读  
   `subtitle.outline`）。
-- **文字裁到框内**：每条歌词的定位头加 `\clip(框四角)`，上滚时离开框顶的句子被
+- **文字裁到框内**：每条歌词的定位头加 `\clip(框四角)`，上滚时离开框顶的句子被  
   裁掉，不再飘到框外。
-- **字幕实时预览**（配置 → 字幕卡标题下的第一块）：横屏 1920×1080 与竖屏
-  1080×1920 两格 SVG，`viewBox` 就是真实画幅、内部全用真实像素，位置 / 框宽高 /
-  边距 / 透明度零换算；单行 / 双行 / 歌词三档都按当前配置画。写配置的两个入口
-  （控件落值、滑杆拖动）各挂一次重画，拖动时 60ms 节流。两格共用**同一个固定
-  舞台高**（`height:400px`），画面比盒子扁或高时由 `preserveAspectRatio` 的
-  `meet` 自动摆正——横屏上下居中、竖屏左右居中，两格彼此对齐。（早先用
-  `height:auto` + `max-height`：竖屏被收住才有余量，横屏盒子正好等于画面比例、
+- **字幕实时预览**（配置 → 字幕卡标题下的第一块）：横屏 1920×1080 与竖屏  
+  1080×1920 两格 SVG，`viewBox` 就是真实画幅、内部全用真实像素，位置 / 框宽高 /  
+  边距 / 透明度零换算；单行 / 双行 / 歌词三档都按当前配置画。写配置的两个入口  
+  （控件落值、滑杆拖动）各挂一次重画，拖动时 60ms 节流。两格共用**同一个固定  
+  舞台高**（`height:400px`），画面比盒子扁或高时由 `preserveAspectRatio` 的  
+  `meet` 自动摆正——横屏上下居中、竖屏左右居中，两格彼此对齐。（早先用  
+  `height:auto` + `max-height`：竖屏被收住才有余量，横屏盒子正好等于画面比例、  
   没有余量，于是只有竖屏居中、横屏贴顶。）
-- **图层号显式三层**：框 0（垫底）< 常驻句 1 < 淡出句 2。从前是 0/1 两层，框与
+- **图层号显式三层**：框 0（垫底）< 常驻句 1 < 淡出句 2。从前是 0/1 两层，框与  
   文字靠文件先后分。
 
 **变更**
-- **歌词纵向基准改挂到框上**：删掉绝对锚点 `subtitle.lyric_anchor_y`，当前句改落
-  **框的垂直中心**（`锚点 = 框底 − 框高 / 2`）。同一套配置在两种画幅下靠各自的
+
+- **歌词纵向基准改挂到框上**：删掉绝对锚点 `subtitle.lyric_anchor_y`，当前句改落  
+  **框的垂直中心**（`锚点 = 框底 − 框高 / 2`）。同一套配置在两种画幅下靠各自的  
   `margin_v` / `margin_v_vertical` 各得其所，不再需要 1080 比例换算。
 - **接驳表（同一批配置两种语义）**：
   - `margin_lr`：单双行＝文字距左右；歌词＝**框宽**（兼折行容量）
   - `margin_v` / `margin_v_vertical`：单双行＝文字距底边；歌词＝**框底距底边**
   - `bg_alpha`：单双行＝每行填充块透明度；歌词＝**整块框透明度**
   - `outline`：单双行＝填充块内边距；歌词＝**不适用**（仅单双行生效）
-  - `lyric_max_rows`：歌词＝**框高** = 行数 × 行距
-  四项 help 文字已写清两义，`outline` 的 help 里点明「仅单双行生效」（不置灰）。
-- **歌词档 Style 分岔**：`BackColour` 全透明（`&HFF000000`）、`BorderStyle=1`、
-  `Outline` 用写死小值——免得多叠出一层 per-line 盒。单双行那一路逐字不变
+  - `lyric_max_rows`：歌词＝**框高** = 行数 × 行距  
+    四项 help 文字已写清两义，`outline` 的 help 里点明「仅单双行生效」（不置灰）。
+- **歌词档 Style 分岔**：`BackColour` 全透明（`&HFF000000`）、`BorderStyle=1`、  
+  `Outline` 用写死小值——免得多叠出一层 per-line 盒。单双行那一路逐字不变  
   （8 组 ASS 的 sha256 冻结钉子仍绿）。
 
 **修复**
+
 - `config.json` 里 `subtitle.lyric_anchor_y` 的孤儿键清掉（该项已删）。
 - 配置页字幕卡「歌词窗口」区去掉「当前句锚点高度」控件。
 
 **测试**
-- 全量 **1106** 项通过（比上版 +4）。字幕档：改掉钉旧锚点 / 旧图层号的过期断言，
-  新增框几何（四点 / 框高）、填充与写死描边、`\clip` 裁切、三层图层号、样式分叉
+
+- 全量 **1106** 项通过（比上版 +4）。字幕档：改掉钉旧锚点 / 旧图层号的过期断言，  
+  新增框几何（四点 / 框高）、填充与写死描边、`\clip` 裁切、三层图层号、样式分叉  
   五组钉子。
 
 **文档**
-- `PLAN.md`（歌词档三参数 + 「歌词的框」一节）、`PROTOCOL.md`（subtitle 分区描述）、
-  `README.md`（测试数 1106）、`ARCHITECTURE.md`（版本头 / 测试数 / 真帧复验标注 /
+
+- `PLAN.md`（歌词档三参数 + 「歌词的框」一节）、`PROTOCOL.md`（subtitle 分区描述）、  
+  `README.md`（测试数 1106）、`ARCHITECTURE.md`（版本头 / 测试数 / 真帧复验标注 /  
   版本落位）同步。
 
 ---
@@ -1005,36 +1322,41 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 ## v0.40.1
 
 **变更**
-- **探针脚本归位**：`_smoke/` 下 104 个脚本（`_bgm_gen.py`、`_probe_*.py`、`_make_*_page.py`、
-  `_check_buttons.js` 等）全部迁到 **`tools/probes/`**，文件名去掉前导下划线。此前它们堆在
-  被 `.gitignore` 整目录排除的 `_smoke/` 里，而源码、测试、文档又反过来引用那个目录——
-  对外 clone 必然报错（`tests/test_bgm_loudness.py` 在本机就真红过）。现在**脚本进
-  `tools/probes/`（入库）、产物落 `_smoke/`（不入库）**，两件事彻底分开，`_smoke/` 不再被
+
+- **探针脚本归位**：`_smoke/` 下 104 个脚本（`_bgm_gen.py`、`_probe_*.py`、`_make_*_page.py`、  
+  `_check_buttons.js` 等）全部迁到 **`tools/probes/`**，文件名去掉前导下划线。此前它们堆在  
+  被 `.gitignore` 整目录排除的 `_smoke/` 里，而源码、测试、文档又反过来引用那个目录——  
+  对外 clone 必然报错（`tests/test_bgm_loudness.py` 在本机就真红过）。现在**脚本进  
+  `tools/probes/`（入库）、产物落 `_smoke/`（不入库）**，两件事彻底分开，`_smoke/` 不再被  
   任何正式文件引用，可以整目录删掉而不断链。
-- 脚本内的路径锚点同步改：`ROOT` → 项目根、`HERE` → `_smoke/`（产物锚）、`sys.path` 里用
-  `HERE` 的改指脚本自身目录；15 处 `import _probe_x` / `from _probe_x import y` 改指新模块名；
+- 脚本内的路径锚点同步改：`ROOT` → 项目根、`HERE` → `_smoke/`（产物锚）、`sys.path` 里用  
+  `HERE` 的改指脚本自身目录；15 处 `import _probe_x` / `from _probe_x import y` 改指新模块名；  
   4 处脚本间文件名引用改走 `tools/probes/`。
 
 **修复**
-- 引用改指正式路径：`tests/test_bgm_loudness.py`（2 处）、`tools/bgm_level.py`（2 处文档）、
-  `tools/bgm_loudness.py`、`tts_service/serve.py`、`tts_service/README.md`（2 处）、
+
+- 引用改指正式路径：`tests/test_bgm_loudness.py`（2 处）、`tools/bgm_level.py`（2 处文档）、  
+  `tools/bgm_loudness.py`、`tts_service/serve.py`、`tts_service/README.md`（2 处）、  
   `README.md`、`PLAN.md`。
-- `ARCHITECTURE.md` 的「8.6 临时文件」是过期记录（列出的文件早已不在根目录），改写为现在的
+- `ARCHITECTURE.md` 的「8.6 临时文件」是过期记录（列出的文件早已不在根目录），改写为现在的  
   规矩：脚本进 `tools/probes/`、产物落 `_smoke/`。
-- `tts_service/README.md` 里指向 `_smoke/_clone_probe/` 的证据链改成「见 CHANGELOG」——
+- `tts_service/README.md` 里指向 `_smoke/_clone_probe/` 的证据链改成「见 CHANGELOG」——  
   对照页在 gitignore 目录里，对外不可见；数值本身留在正文，不丢信息。
 
 **说明**
-- 迁移用 AST 按**字节位置**定位 `dirname` 链。前两版分别失败于「字符串替换咬到子串」与
-  「正则贪婪吃掉外层闭合括号、9 个文件语法错误」——平衡括号只能靠语法树定位，
+
+- 迁移用 AST 按**字节位置**定位 `dirname` 链。前两版分别失败于「字符串替换咬到子串」与  
+  「正则贪婪吃掉外层闭合括号、9 个文件语法错误」——平衡括号只能靠语法树定位，  
   且 AST 的 `col_offset` 是 UTF-8 字节偏移，源码含中文时不能用字符下标切片。
 - 产物路径一律未动：所有探针的产出仍落 `_smoke/`，跑法与判据与迁移前一致。
 
 **测试**
-- 全量 **1102** 项通过（与上版同数，未增删用例）；另跑 82 个脚本的路径解析体检，
+
+- 全量 **1102** 项通过（与上版同数，未增删用例）；另跑 82 个脚本的路径解析体检，  
   `ROOT`/`HERE` 求值全部落回正确位置。
 
 **文档**
+
 - `.gitignore` 注释改写：该目录只装运行产物，探针脚本在 `tools/probes/`。
 - `ARCHITECTURE.md` 版本头与落位表更新为 0.40.1。
 
@@ -1094,42 +1416,42 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 
 **字幕多落一份 LRC：音频平台的字幕位只认它**
 
-起因是一线事实：把 SRT 交给喜马拉雅，播放页没有字幕；换成 LRC 就出来了。核过本机
-产物（UTF-8 无 BOM、CRLF、`00:00:02,720 --> 00:00:09,600`、序号连续）——**SRT 本身
-完全合规**，不认的是平台：音频播放页的字幕走**歌词渲染**，没有 SRT 的解析通道。所以
+起因是一线事实：把 SRT 交给喜马拉雅，播放页没有字幕；换成 LRC 就出来了。核过本机  
+产物（UTF-8 无 BOM、CRLF、`00:00:02,720 --> 00:00:09,600`、序号连续）——**SRT 本身  
+完全合规**，不认的是平台：音频播放页的字幕走**歌词渲染**，没有 SRT 的解析通道。所以  
 这一版不是把 SRT 改得更「标准」，而是**另落一份它认得下的**。
 
 **新增**
 
-- **`build_lrc` 与 SRT 同源同一次生成**：同一份逐句时间轴，写盘就在写 SRT 那几行旁
-  边，落 `字幕/<期号>.lrc`。不走「从 SRT 反解」——那要多绕一圈、还得依赖 SRT 先存
+- **`build_lrc` 与 SRT 同源同一次生成**：同一份逐句时间轴，写盘就在写 SRT 那几行旁  
+  边，落 `字幕/<期号>.lrc`。不走「从 SRT 反解」——那要多绕一圈、还得依赖 SRT 先存  
   在，并且照画面断行搬过去会切出「半句配一个时间戳」。
 - **产物区多一个「字幕（歌词 LRC）」下载入口**。
 
 **变更**
 
-- **说话人写进文本，判据与 ASS 共用一处**：`speaker_name_shown(cfg)` 一个函数管画面
-  字幕与歌词字幕，版式选「双行带名」或姓名指示选「字幕色区分」就带 `小美：…` 前
-  缀。不给 LRC 另立开关——它比画面字幕更需要这一条，而不是需要另一条；两处各写一遍
+- **说话人写进文本，判据与 ASS 共用一处**：`speaker_name_shown(cfg)` 一个函数管画面  
+  字幕与歌词字幕，版式选「双行带名」或姓名指示选「字幕色区分」就带 `小美：…` 前  
+  缀。不给 LRC 另立开关——它比画面字幕更需要这一条，而不是需要另一条；两处各写一遍  
   就迟早各说各话。
-- **用原始整句，不套画面断行**：LRC 一行就是一条，照画面宽度断开只会得到半句带时间
+- **用原始整句，不套画面断行**：LRC 一行就是一条，照画面宽度断开只会得到半句带时间  
   戳的怪东西；句内换行也一并压成空格，免得把一条劈成两条、第二条连时间戳都没有。
 
 **说明**
 
-- **LRC 的三条硬规格**（平台认不认就看这几条）：时间标签是 `[mm:ss.xx]`，秒后**两位
-  百分秒**而不是毫秒三位（时间先换成百分秒总数再拆位，`59.999` 会进位成
-  `01:00.00`，不会截成 `00:59.99`）；**只写起始时间**，一条显示到下一条为止；**没有
+- **LRC 的三条硬规格**（平台认不认就看这几条）：时间标签是 `[mm:ss.xx]`，秒后**两位  
+  百分秒**而不是毫秒三位（时间先换成百分秒总数再拆位，`59.999` 会进位成  
+  `01:00.00`，不会截成 `00:59.99`）；**只写起始时间**，一条显示到下一条为止；**没有  
   样式**，所以 A/B 双色无处可放。
 
 **测试**
 
-- 新增 10 项（时间格式与进位、只有起始时间、整句不断行、句内换行、时间轴短于句数、
+- 新增 10 项（时间格式与进位、只有起始时间、整句不断行、句内换行、时间轴短于句数、  
   名字开关同源），全量 **1079** 项通过。
 
 **文档**
 
-- README 与 PROTOCOL 的产物清单补 `.lrc`；一并改正一处旧描述——`.ass` 一直写在
+- README 与 PROTOCOL 的产物清单补 `.lrc`；一并改正一处旧描述——`.ass` 一直写在  
   `过程/` 里拼，不在 `字幕/`。
 
 ---
@@ -1142,25 +1464,25 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 
 **修复**
 
-- **开工按钮不再点完就亮**：批任务看板与单期脚本看板都是「读一次任务台账 → 还在跑就
-  歇一会儿再读」。歇那一下从前是「起个定时器就走」——`await` 它的调用方当场往下执
-  行，于是按钮在任务刚起步的那一刻就恢复了，看着像已经收工；人再点一下，第二个任务
-  就起来了。现在歇的那一下是**等着**的，整条链串成一条真等到收工的线：跑着就摁不
-  动，收工才恢复。中止按钮的显隐同步跟着走。单期脚本那条路同样中招（调用方的
+- **开工按钮不再点完就亮**：批任务看板与单期脚本看板都是「读一次任务台账 → 还在跑就  
+  歇一会儿再读」。歇那一下从前是「起个定时器就走」——`await` 它的调用方当场往下执  
+  行，于是按钮在任务刚起步的那一刻就恢复了，看着像已经收工；人再点一下，第二个任务  
+  就起来了。现在歇的那一下是**等着**的，整条链串成一条真等到收工的线：跑着就摁不  
+  动，收工才恢复。中止按钮的显隐同步跟着走。单期脚本那条路同样中招（调用方的  
   `finally` 在任务刚起步时就执行），一并修。
-- **批任务的进度归「本期」所有**：进度口一律只增不减（进度条不许倒回，这是单期就定下
-  的规矩），而批任务是串行多期——第二期一开局就顶着上一期跑完时的高位，整期看着不
-  动、反倒像卡住。现在每期开头把本期进度清零，界面按 `(第几期-1+本期进度)/总期数`
+- **批任务的进度归「本期」所有**：进度口一律只增不减（进度条不许倒回，这是单期就定下  
+  的规矩），而批任务是串行多期——第二期一开局就顶着上一期跑完时的高位，整期看着不  
+  动、反倒像卡住。现在每期开头把本期进度清零，界面按 `(第几期-1+本期进度)/总期数`  
   折算整批进度；公式是界面从前就在用的那一个，缺的只是后端这一步。
 
 **不变**
 
-- 单期任务的进度仍然是只增不减（那条规矩服务的是「已跑完的格数」，本来就不该倒
+- 单期任务的进度仍然是只增不减（那条规矩服务的是「已跑完的格数」，本来就不该倒  
   回）；视频合成那一步照旧不写日志。
 
 **测试**
 
-- 冒烟新增三条判据（跑着时按钮摁不动、中止按钮露着、收工才恢复），单测新增一条（每期
+- 冒烟新增三条判据（跑着时按钮摁不动、中止按钮露着、收工才恢复），单测新增一条（每期  
   开头进度必须清零）。全量 1069 项单测、75 项界面冒烟通过。
 
 ---
@@ -1169,35 +1491,35 @@ mingw 仓库（连带 234 个依赖不可用）、腾讯云 / 中科大 404、�
 
 **捧哏形式的 A 连说上限由 1 放宽到 2**
 
-一个使用侧的小改动。本机用「主讲＋捧哏」（`anchor`），A 的连说上限原本是 **1 句**——
-A 只要连着说两句，形式门禁就报「连说超限」，把整段交给模型并句。可实际对话里 A「附
-和 + 补一句」（「对。」「在平原上根本不用想。」）是很自然的，为这一句的余量多跑一轮
+一个使用侧的小改动。本机用「主讲＋捧哏」（`anchor`），A 的连说上限原本是 **1 句**——  
+A 只要连着说两句，形式门禁就报「连说超限」，把整段交给模型并句。可实际对话里 A「附  
+和 + 补一句」（「对。」「在平原上根本不用想。」）是很自然的，为这一句的余量多跑一轮  
 并句不划算。
 
 **变更**
 
 - **`paradigms.py` 的 anchor 卡 `run` 由 `{"A": 1, "B": 10}` 改为 `{"A": 2, "B":
-  10}`**：只动这一个数。六种形式的上限归**对话形式卡**，取值只有一个出口
-  `paradigms.run_caps()`（`script_engine._run_caps()` 转一手，测试钉着别处不许直接
-  取）——所以提示词四处（整篇【文体依据】、分段生成要求第 2 条、补字铁律、替换铁
-  律）、形式门禁 `ab_run_limit` 的判据、界面下拉说明里挂的上限，**全部自动跟着变，
+  10}`**：只动这一个数。六种形式的上限归**对话形式卡**，取值只有一个出口  
+  `paradigms.run_caps()`（`script_engine._run_caps()` 转一手，测试钉着别处不许直接  
+  取）——所以提示词四处（整篇【文体依据】、分段生成要求第 2 条、补字铁律、替换铁  
+  律）、形式门禁 `ab_run_limit` 的判据、界面下拉说明里挂的上限，**全部自动跟着变，  
   没有第二处要改**。
-- **示范（`example`）、节奏句（`rhythm`）、其余五种形式一律不动**：示范里 A 仍是每次
-  一句（1 ≤ 2，依然合规）；形状示范教的那件事——「A 短插、B 成段」——一个字没变。放
+- **示范（`example`）、节奏句（`rhythm`）、其余五种形式一律不动**：示范里 A 仍是每次  
+  一句（1 ≤ 2，依然合规）；形状示范教的那件事——「A 短插、B 成段」——一个字没变。放  
   宽的只是**许可**（门禁阈值），不是**形状**（常态节奏）。
 - **不影响已有的稿子**：上限是生成与门禁判超限时读的值，历史项目与已定稿的脚本不动。
 
 **文档**
 
-- 三份文档里「本机 A 捧哏上限 1 句」的表述同步一遍（`ARCHITECTURE.md` 的六形式上限
-  表、整篇/分段/插入三处提示词转录，以及 `ARCHITECTURE.md`／`PROTOCOL.md`／
-  `README.md` 讲 v0.37.0 并句成因的那几处括号）——现值标出来，历史成因加「当时」限
+- 三份文档里「本机 A 捧哏上限 1 句」的表述同步一遍（`ARCHITECTURE.md` 的六形式上限  
+  表、整篇/分段/插入三处提示词转录，以及 `ARCHITECTURE.md`／`PROTOCOL.md`／  
+  `README.md` 讲 v0.37.0 并句成因的那几处括号）——现值标出来，历史成因加「当时」限  
   定。
 
 **说明**
 
-- **这不是在验证那条「A 上限 1 是否在逼模型一句一换」的假设**（`ARCHITECTURE.md`
-  §6.2）——起因只是使用侧的实用需求；原先设想的「原样 vs 1→2」两臂因此没了对照组，
+- **这不是在验证那条「A 上限 1 是否在逼模型一句一换」的假设**（`ARCHITECTURE.md`  
+  §6.2）——起因只是使用侧的实用需求；原先设想的「原样 vs 1→2」两臂因此没了对照组，  
   那条假设仍未验。
 
 ---
@@ -1208,55 +1530,55 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 真机第 2 期暴露两个症状，各有一条硬根因。
 
-**症状一：补字补出 33 句逐字复读，删完报告还说「素材撑不满目标时长」。** 查证下来料是够的
-（该期压比 2.09，合格区间 1.5~6.25），坏在两处：补字轮**看不到本段以外的任何正文**，提示词
-却要它「到素材里挑正文还没讲到的点」——它看不见前几段讲了什么，必然撞上去；而 `apply_insert`
+**症状一：补字补出 33 句逐字复读，删完报告还说「素材撑不满目标时长」。** 查证下来料是够的  
+（该期压比 2.09，合格区间 1.5~6.25），坏在两处：补字轮**看不到本段以外的任何正文**，提示词  
+却要它「到素材里挑正文还没讲到的点」——它看不见前几段讲了什么，必然撞上去；而 `apply_insert`  
 的落地校验**全无查重**，唯一硬指标是字数。于是：
 
 **修复**
 
-- **补字轮两路视野对齐**：`build_insert_prompt` 新增前文块（【已写脚本（前文）】，逐句带编号）
+- **补字轮两路视野对齐**：`build_insert_prompt` 新增前文块（【已写脚本（前文）】，逐句带编号）  
   ——首写轮本来就拿着全篇已写正文，补字轮补齐，不再只有本段那三块。
-- **`insert_system` 把口径改成禁令**：「复读不算补字」改成「**禁止重复已有的脚本内容**」，
-  并删掉那句后门「挑不出新东西时，把已经提到的点讲得更细」——它等于明许重讲已讲过的点，
+- **`insert_system` 把口径改成禁令**：「复读不算补字」改成「**禁止重复已有的脚本内容**」，  
+  并删掉那句后门「挑不出新东西时，把已经提到的点讲得更细」——它等于明许重讲已讲过的点，  
   与禁令直接打架。
-- **轮次重排成「补字 → 查重 → 替换 → 计算」**：第一轮仍是「写作 + 计算」，之后每轮把
-  「计算」挪到**轮末**（本轮收口，供下一轮开头补字用）；补字是复读的源头，补完立刻查、就地
+- **轮次重排成「补字 → 查重 → 替换 → 计算」**：第一轮仍是「写作 + 计算」，之后每轮把  
+  「计算」挪到**轮末**（本轮收口，供下一轮开头补字用）；补字是复读的源头，补完立刻查、就地  
   换，替换完再核账。轮次预算仍吃 `script.segment_fix_rounds`，不新增配置点。
-- **新增 `find_repeats`：判重范围是整篇，动刀范围是本段**：输入整篇句列表与本段句号区间，
-  输出**本段内、后出现**的那些副本（每组只留第一次出现，其余每一处进名单）——「段 2 复读段 1」
-  这种，只有整篇范围看得见。判重口径复用现成的 `_dedupe_key` 与 `DEDUPE_MIN_CHARS`，与整期
+- **新增 `find_repeats`：判重范围是整篇，动刀范围是本段**：输入整篇句列表与本段句号区间，  
+  输出**本段内、后出现**的那些副本（每组只留第一次出现，其余每一处进名单）——「段 2 复读段 1」  
+  这种，只有整篇范围看得见。判重口径复用现成的 `_dedupe_key` 与 `DEDUPE_MIN_CHARS`，与整期  
   兜底那把尺同源。
-- **新增 `apply_replace`：定点换句，字数守恒**：行数一个字不变（没有 `absorb`、没有 `inserts`）。
-  落地四条，缺一即拒：只动点名的句子；新句归一化后**不得与整篇任何其它一句重复**（就地再查
-  一次重，这是这条路的专项判据）；新句字数**落在被替换那句的原字数与单句上限之间**（「同长度
-  换内容」——换短了核账又报缺口，下一轮又补、又可能复读，绕回老路）；带 `emotion` 时须在语篇
+- **新增 `apply_replace`：定点换句，字数守恒**：行数一个字不变（没有 `absorb`、没有 `inserts`）。  
+  落地四条，缺一即拒：只动点名的句子；新句归一化后**不得与整篇任何其它一句重复**（就地再查  
+  一次重，这是这条路的专项判据）；新句字数**落在被替换那句的原字数与单句上限之间**（「同长度  
+  换内容」——换短了核账又报缺口，下一轮又补、又可能复读，绕回老路）；带 `emotion` 时须在语篇  
   词表内。
-- **替换提示词带全篇已写脚本**：问题虽然发生在本段、原文素材也只给本段，但**要看得到所有已
-  写的**：【本段原文】（素材）与【已写脚本】（全篇正文，逐句带编号）分开摆，
-  再给【要换掉的那句】（句号 + 原句 + 字数区间）与【这一处的任务】（讲一件新事）。防重复那套
+- **替换提示词带全篇已写脚本**：问题虽然发生在本段、原文素材也只给本段，但**要看得到所有已  
+  写的**：【本段原文】（素材）与【已写脚本】（全篇正文，逐句带编号）分开摆，  
+  再给【要换掉的那句】（句号 + 原句 + 字数区间）与【这一处的任务】（讲一件新事）。防重复那套  
   正反例抽成共享块 `_norepeat_block()`，插入与替换一份纪律两处用。
 
-**症状二：日志里并句永远不到 70%，一次没成功过。** 这是**数学无解**：判据要「并后 ≥ 原句
-合计 × 70%」，提示词又硬性要求「每句 ≤ 40 字」——原句合计 > 57 字时，两条同时满足是不可能
-的；而 70% 这条**一个字都没进提示词**，模型不知道有这条规矩，只会按「合并＝精简」写。本机 A
+**症状二：日志里并句永远不到 70%，一次没成功过。** 这是**数学无解**：判据要「并后 ≥ 原句  
+合计 × 70%」，提示词又硬性要求「每句 ≤ 40 字」——原句合计 > 57 字时，两条同时满足是不可能  
+的；而 70% 这条**一个字都没进提示词**，模型不知道有这条规矩，只会按「合并＝精简」写。本机 A  
 捧哏上限 1 句，「并成 1 句」正是最易无解的情形（第 2 期 15 处全没修好）。
 
 **修复**
 
-- **判据换成可行域 `absorb_span`（判据与处方同源，只有一个算处）**：常规区间
-  `[单句上限 × 70%, 单句上限]`（本机 **28~40**）；原句合计连 28 都不到时退成
-  `[原句合计 × 70%, 原句合计]`；再抬到不低于单句下限。**区间恒非空，且上限必然 ≤ 单句上限**
+- **判据换成可行域 `absorb_span`（判据与处方同源，只有一个算处）**：常规区间  
+  `[单句上限 × 70%, 单句上限]`（本机 **28~40**）；原句合计连 28 都不到时退成  
+  `[原句合计 × 70%, 原句合计]`；再抬到不低于单句下限。**区间恒非空，且上限必然 ≤ 单句上限**  
   ——并出来的句子不会再被句长门禁打回。
-- **区间写进处方**：`patch_targets` 的并句分支直接给「每句 %d~%d 字」的具体数字，与判据同一处
+- **区间写进处方**：`patch_targets` 的并句分支直接给「每句 %d~%d 字」的具体数字，与判据同一处  
   算出来，不许两处各算一遍。
-- **整期去重降级为最后兜底**：替换轮跑完仍有重复才删，日志写明是兜底；报告那句**推断**删掉
-  （「这说明素材撑不满目标时长——请补充素材或调低每期时长」），改成照实说：删了几句、本期压比
+- **整期去重降级为最后兜底**：替换轮跑完仍有重复才删，日志写明是兜底；报告那句**推断**删掉  
+  （「这说明素材撑不满目标时长——请补充素材或调低每期时长」），改成照实说：删了几句、本期压比  
   多少、缺口多少字。该期料是目标的 2.09 倍，把责任推给素材方向是错的。
 
-**另修一处额度隐患。** 补字轮的 `other_chars`（占位字数）只算了【本段原文】一次，而
-`build_insert_prompt` 实际把原文注入了两遍（`seg_mat` 全量 + `fit` 凝缩），另加新增的【已写
-脚本（前文）】块——本机额度大（47872）没爆，**小额度后端必爆**。现在三块都计进占位，
+**另修一处额度隐患。** 补字轮的 `other_chars`（占位字数）只算了【本段原文】一次，而  
+`build_insert_prompt` 实际把原文注入了两遍（`seg_mat` 全量 + `fit` 凝缩），另加新增的【已写  
+脚本（前文）】块——本机额度大（47872）没爆，**小额度后端必爆**。现在三块都计进占位，  
 `fit_material` 遇预算不够时自动退到凝缩，不超预算、不抛异常。
 
 ---
@@ -1265,122 +1587,122 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **三段串行改成「出货 → 检查 → 门禁」；补丁逐条落地；写作阶段只管字数、粘合句全豁免；段级量配置化**
 
-顺序是这一次的主轴。从前门禁跑在最前、检查跑在后，中间检查段的补丁会**插入新句**
-（加行，可能冒出连说超限），改完没人复核形式——报告上的形式结论是旧稿的结论，
+顺序是这一次的主轴。从前门禁跑在最前、检查跑在后，中间检查段的补丁会**插入新句**  
+（加行，可能冒出连说超限），改完没人复核形式——报告上的形式结论是旧稿的结论，  
 「报告绿、稿子坏」的静默放行就是这么来的。现在：
 
 **变更**
 
-- **出货段**（写正文）从门禁段第 1 轮里拎出来，独立成段。它只干一件事：拿出一份
-  **可用稿子**——内容对不对、形式合不合规都不判。产物不可用（输出拆不开、一句可用
-  内容都没有）在本段重试，次数吃 `script.segment_parse_rounds`（复用现成那个配置数，
+- **出货段**（写正文）从门禁段第 1 轮里拎出来，独立成段。它只干一件事：拿出一份  
+  **可用稿子**——内容对不对、形式合不合规都不判。产物不可用（输出拆不开、一句可用  
+  内容都没有）在本段重试，次数吃 `script.segment_parse_rounds`（复用现成那个配置数，  
   不另起一个），用尽就报错，不往下走。
 - **检查段**（内容检：承诺链检必判、语义检按开关）占 0~50%。
-- **门禁段**（形式门禁，代码判九项）占 50~100%。它每轮**重新判形式**，再把这之前内容检
+- **门禁段**（形式门禁，代码判九项）占 50~100%。它每轮**重新判形式**，再把这之前内容检  
   的结论并回报告——形式结论因此永远对着最终稿，而不是对着几轮前那一版。
 
-**补丁从「全有或全无」改成逐条落地。** 一次点名四十多句，只要有一条过不了校验，整份
+**补丁从「全有或全无」改成逐条落地。** 一次点名四十多句，只要有一条过不了校验，整份  
 补丁作废、稿子一个字不动，另外四十条作废——实测一轮耗掉十六分钟。现在分两类：
 
-- **单条不合格**（越界、没点名、空文本、并句三条硬校验、两条互相冲突）→ 拒该条、记下
+- **单条不合格**（越界、没点名、空文本、并句三条硬校验、两条互相冲突）→ 拒该条、记下  
   原因，其余照常落地。并句与冲突是**成组**的（落一半等于把一段话截断）。
 - **结构性**（条目不是对象、句号不是整数）→ 仍整份退：那种输出从根上不能用。
 
-`apply_patch` 现在返回 `(稿子, rejected)`；`rejected` 连同原因回灌下一轮的提示词
+`apply_patch` 现在返回 `(稿子, rejected)`；`rejected` 连同原因回灌下一轮的提示词  
 （`【上一轮为什么没落地】`），「重发同一批」从此是有依据的重试，不是重摇骰子。
 
-**末尾标点加第二判据：结构符号不许紧挨着终止标点。** 判定分两步，**两步都只看末位**：
-末字符须是终止标点；紧挨在它前一位的字符不许是 `{}[]<>\\` 这类「给眼睛看的」结构符号
-（半角全角都算）。挡的是「补个标点就洗白」：`…{` 被指出后模型照处方补成 `…{。`，末位
-一合规，那个符号就再没人查了。判据用**黑名单**而不是白名单——叠标点（`真的吗？！`）与
-百分数收尾（`占比 15%。`）都合法，白名单会误伤它们。两种坏法**分开报**，因为处方不一样：
+**末尾标点加第二判据：结构符号不许紧挨着终止标点。** 判定分两步，**两步都只看末位**：  
+末字符须是终止标点；紧挨在它前一位的字符不许是 `{}[]<>\\` 这类「给眼睛看的」结构符号  
+（半角全角都算）。挡的是「补个标点就洗白」：`…{` 被指出后模型照处方补成 `…{。`，末位  
+一合规，那个符号就再没人查了。判据用**黑名单**而不是白名单——叠标点（`真的吗？！`）与  
+百分数收尾（`占比 15%。`）都合法，白名单会误伤它们。两种坏法**分开报**，因为处方不一样：  
 缺标点的「补一个」，带结构符号的「把符号去掉」。
 
 **配置化**（原来写死在源码里，人就调不动）：
 
-| 配置键 | 默认 | 管什么 |
-| --- | --- | --- |
-| `script.segment_tol_frac` | 15 | 段字数容差（百分数）；容差下限＝最小可写段 × 本比例 |
-| `script.segment_fix_rounds` | 5 | 段内修正轮次（少了插入、多了压删，共用这一份） |
-| `script.segment_parse_rounds` | 2 | 输出坏了重发轮次（整篇出货与段级解析共用） |
-| `script.plan_rounds` | 2 | 规划打回轮次 |
-| `script.gate_rounds` / `script.check_rounds` | 3 / 3 | 门禁段、检查段各自的轮次上限 |
+| 配置键                                          | 默认    | 管什么                         |
+| -------------------------------------------- | ----- | --------------------------- |
+| `script.segment_tol_frac`                    | 15    | 段字数容差（百分数）；容差下限＝最小可写段 × 本比例 |
+| `script.segment_fix_rounds`                  | 5     | 段内修正轮次（少了插入、多了压删，共用这一份）     |
+| `script.segment_parse_rounds`                | 2     | 输出坏了重发轮次（整篇出货与段级解析共用）       |
+| `script.plan_rounds`                         | 2     | 规划打回轮次                      |
+| `script.gate_rounds` / `script.check_rounds` | 3 / 3 | 门禁段、检查段各自的轮次上限              |
 
-**配额地板：`软句数下限 × 每句最少字`**（默认 15 × 8 = 120 字）——**和碎段合并不是同一把尺**。
-地板只管一件事：提示词那句「约 N 句」不许与配额矛盾。配额是**按料摊的**（料多的地方多写、
-料少的地方少写），这本就是对的结果，不需要谁去救；只有配额掉到「15 句 × 每句最少 8 字」以下时，
-提示词才会一边要它写 15 句、一边只给它不足 120 字的额度，两句话打架。碎段合并那把尺乘的是
-**期望句长**（15 × 24 = 360），判的是「这一段的料够不够单开一段」，是**产能**问题——两把尺管
+**配额地板：`软句数下限 × 每句最少字`**（默认 15 × 8 = 120 字）——**和碎段合并不是同一把尺**。  
+地板只管一件事：提示词那句「约 N 句」不许与配额矛盾。配额是**按料摊的**（料多的地方多写、  
+料少的地方少写），这本就是对的结果，不需要谁去救；只有配额掉到「15 句 × 每句最少 8 字」以下时，  
+提示词才会一边要它写 15 句、一边只给它不足 120 字的额度，两句话打架。碎段合并那把尺乘的是  
+**期望句长**（15 × 24 = 360），判的是「这一段的料够不够单开一段」，是**产能**问题——两把尺管  
 两件事，值不同才对。地板真咬到某一段时，抬出的那点从最大的一段扣回，**合计仍咬住目标**。
 
-**写作阶段只管字数一笔账；形式九项全交给门禁。** 真机第 2 期暴露三处断链，起因都是
+**写作阶段只管字数一笔账；形式九项全交给门禁。** 真机第 2 期暴露三处断链，起因都是  
 写作阶段越权：
 
-- **补字／压字不再自己判句长**：句长是**全篇一把尺**的量，门禁 `line_length` 两个
-  方向都有处方；补字阶段替它把关的代价是把「一条坏句」放大成「整段停摆」——真机一条
-  7 字句让 40+ 条新增整批作废，那一段的配额缺口 1872 字一次都没再试。删掉那两条校验
-  后，四路落地校验统一成「都不校验」（正文与修补本来就没有），结构类校验（越界／非
+- **补字／压字不再自己判句长**：句长是**全篇一把尺**的量，门禁 `line_length` 两个  
+  方向都有处方；补字阶段替它把关的代价是把「一条坏句」放大成「整段停摆」——真机一条  
+  7 字句让 40+ 条新增整批作废，那一段的配额缺口 1872 字一次都没再试。删掉那两条校验  
+  后，四路落地校验统一成「都不校验」（正文与修补本来就没有），结构类校验（越界／非  
   对象／非整数／空文本／speaker 非 A-B／emotion 非词表）一条不少。
-- **段内失败不再直接交卷**：补字、压字两处「落地失败就收工」改成**这一轮不改稿、
+- **段内失败不再直接交卷**：补字、压字两处「落地失败就收工」改成**这一轮不改稿、  
   轮次照减**，跑满 `script.segment_fix_rounds` 才停——轮次预算是给「改到进容差」的。
-- **程序粘的片头／回顾／片尾不进任何逐句判据**：它们是程序逐字拼的固定结构，模型没
-  参与、也改不动；判出来还没法定点修（改完就不是固定结构了）。`gate_generate` 现在按
-  标签认出它们（`PROGRAM_ONLY_TAGS`），七项逐句判据一律跳过，连说账上还充当**分隔符**；
-  整篇量（句数、总时长）照算，报告里注明跳过了几句。生成过程中门禁本来也看不到它们
+- **程序粘的片头／回顾／片尾不进任何逐句判据**：它们是程序逐字拼的固定结构，模型没  
+  参与、也改不动；判出来还没法定点修（改完就不是固定结构了）。`gate_generate` 现在按  
+  标签认出它们（`PROGRAM_ONLY_TAGS`），七项逐句判据一律跳过，连说账上还充当**分隔符**；  
+  整篇量（句数、总时长）照算，报告里注明跳过了几句。生成过程中门禁本来也看不到它们  
   （粘合发生在门禁之后），这条主要作用于**重判**。
 
 **标签序列定型，前期回顾改到第 2 句。** 目标序列四种（片头档位 × 回顾开关）：
 
-| 片头档位 | 回顾 | 序列 |
-| --- | --- | --- |
-| 标准（两句） | 开 | 开场／回顾／承接／正文…／收束 |
-| 标准（两句） | 关 | 开场／承接／正文…／收束 |
-| 简档（一句） | 开 | 开场／回顾／正文…／收束 |
-| 简档（一句） | 关 | 开场／正文…／收束 |
+| 片头档位   | 回顾 | 序列              |
+| ------ | -- | --------------- |
+| 标准（两句） | 开  | 开场／回顾／承接／正文…／收束 |
+| 标准（两句） | 关  | 开场／承接／正文…／收束    |
+| 简档（一句） | 开  | 开场／回顾／正文…／收束    |
+| 简档（一句） | 关  | 开场／正文…／收束       |
 
-片头第二句从「开场」改成词表内的中性档**承接**——两句都挂「开场」会得出「开场、开场」，
-而序列里**只有一个开场**。前期回顾从词表内的「承接」改成程序专有的**回顾**（它跟片头尾
-同类，挂中性档会把「这是回顾」这个位置信息丢掉）。`PROGRAM_ONLY_TAGS` 因此变成三词，
-脚本页标签下拉跟着放行这三词：盘上稿子里有、下拉里没有的话，那一格没有任何选项能被
+片头第二句从「开场」改成词表内的中性档**承接**——两句都挂「开场」会得出「开场、开场」，  
+而序列里**只有一个开场**。前期回顾从词表内的「承接」改成程序专有的**回顾**（它跟片头尾  
+同类，挂中性档会把「这是回顾」这个位置信息丢掉）。`PROGRAM_ONLY_TAGS` 因此变成三词，  
+脚本页标签下拉跟着放行这三词：盘上稿子里有、下拉里没有的话，那一格没有任何选项能被  
 选中，浏览器退回显示第一项——**数据是对的，界面是错的**。
 
-**容差下限改成地板的派生量。** 从前它是独立常数（`script.segment_tol_min_chars`，默认
-60），那个 60 没有算式出处，还让「各段容差之和 = 全篇容差」这笔账对不上。现在 =
-`_quota_floor × 容差比例`（本机 120 × 15% = **18**），全篇各段容差之和恰是 15% × 全篇
-配额（配额本身低于地板的段除外）。该配置点随之**下线**（配置页少一格）。另两处「最小
-可写段」的兜底——分批时每批的配额下界、结构定义里「调用方没给配额」时的句数刹车——
-也改用 `_quota_floor`：后者原写 `60 × 10 = 600`，那个 ×10 在代码与配置里都找不到出处，
+**容差下限改成地板的派生量。** 从前它是独立常数（`script.segment_tol_min_chars`，默认  
+60），那个 60 没有算式出处，还让「各段容差之和 = 全篇容差」这笔账对不上。现在 =  
+`_quota_floor × 容差比例`（本机 120 × 15% = **18**），全篇各段容差之和恰是 15% × 全篇  
+配额（配额本身低于地板的段除外）。该配置点随之**下线**（配置页少一格）。另两处「最小  
+可写段」的兜底——分批时每批的配额下界、结构定义里「调用方没给配额」时的句数刹车——  
+也改用 `_quota_floor`：后者原写 `60 × 10 = 600`，那个 ×10 在代码与配置里都找不到出处，  
 算出来的句数上限（87 句）跟真配额派生不出关系。
 
-**定点修补的文本字段加最小长度。** 四份结构定义的 `text` 本来全是裸的（长度只写在
-自然语言提示词里）；现在给**修补**那一路的 text 加上最小长度（＝`gate.min_chars`，本机
-8 字）——它在门禁与检查阶段跑、改完直接落盘，一个残句没有下一道工序替它兜。正文／补字／
-压字三路不加：写作阶段的字数账是**总账**（本段配额），单句长短归门禁判。**只加最小长度、
-不加最大长度**——实测后端对 `maxLength` 是**硬截断**（要求 40 字，返回恰好 40 字符、
+**定点修补的文本字段加最小长度。** 四份结构定义的 `text` 本来全是裸的（长度只写在  
+自然语言提示词里）；现在给**修补**那一路的 text 加上最小长度（＝`gate.min_chars`，本机  
+8 字）——它在门禁与检查阶段跑、改完直接落盘，一个残句没有下一道工序替它兜。正文／补字／  
+压字三路不加：写作阶段的字数账是**总账**（本段配额），单句长短归门禁判。**只加最小长度、  
+不加最大长度**——实测后端对 `maxLength` 是**硬截断**（要求 40 字，返回恰好 40 字符、  
 末字是逗号，话说了半句），对 `minLength` 正常（56 字符完整句、末字句号）。
 
 **修复**
 
-- 【验收窗口】三处（段提示词、补写轮、压紧轮）都漏把配置递给 `_segment_window` ——配置改了，
-  核账按新容差收稿、提示词还报旧窗口，模型按假窗口收工照样挨打，那正是这套窗口存在的理由。
+- 【验收窗口】三处（段提示词、补写轮、压紧轮）都漏把配置递给 `_segment_window` ——配置改了，  
+  核账按新容差收稿、提示词还报旧窗口，模型按假窗口收工照样挨打，那正是这套窗口存在的理由。  
   三处补齐，并加了一条「把容差从 15% 调到 25%，窗口跟着变」的测试。
 - `_segment_fix_rounds` 的源码兜底值是 2，配置默认是 5 ——一个数两个说法，兜底跟着配置走。
-- 提示词两处措辞：`【验收窗口】` 从「超出会被打回继续补写或压紧」改成把区间说成**任务**
-  （「把字数控制在这个区间之内」）；压紧轮的「减到差不多就停」换成明确区间
+- 提示词两处措辞：`【验收窗口】` 从「超出会被打回继续补写或压紧」改成把区间说成**任务**  
+  （「把字数控制在这个区间之内」）；压紧轮的「减到差不多就停」换成明确区间  
   （「减进验收区间就算完成，不许减到区间以下」）——「差不多」模型读不出是多少。
-- 落盘那份 json 里的「第几轮」从前**两段各自从 1 数起**：检查段第 1 轮与门禁段第 1 轮都写 1，
-  而界面上的「第 N 轮」正是读它——会从检查段的第 3 轮掉回门禁段的第 1 轮，看着像全程只跑了
-  一轮。现在门禁段的轮号接在检查段**实际跑过**的轮数后面，全程只向前；定稿沿用它那一轮
+- 落盘那份 json 里的「第几轮」从前**两段各自从 1 数起**：检查段第 1 轮与门禁段第 1 轮都写 1，  
+  而界面上的「第 N 轮」正是读它——会从检查段的第 3 轮掉回门禁段的第 1 轮，看着像全程只跑了  
+  一轮。现在门禁段的轮号接在检查段**实际跑过**的轮数后面，全程只向前；定稿沿用它那一轮  
   的号（定稿不是新一轮）。
-- **配额地板取错了尺**（上面那条公式的初版取的是 360）：地板原写成「软句数下限 × 期望句长」
-  （15 × 24 = 360），那是碎段合并的**产能**判据——当地板用等于给一部分段**偷偷改压比**：
-  配额按料摊，料少的地方本来就该少写，抬到 360 就成了「拿更少的料写更多的字」，而邻居还按
-  原压比。本机目标 6585 字，地板 360 时写作段数超过 18 个就顶破目标（顶破＝凭空要求模型多
-  写字）；改成「× 每句最少字」= 120 后，触发线升到 55 个段，正常一期碰不到。碎段合并里那句
+- **配额地板取错了尺**（上面那条公式的初版取的是 360）：地板原写成「软句数下限 × 期望句长」  
+  （15 × 24 = 360），那是碎段合并的**产能**判据——当地板用等于给一部分段**偷偷改压比**：  
+  配额按料摊，料少的地方本来就该少写，抬到 360 就成了「拿更少的料写更多的字」，而邻居还按  
+  原压比。本机目标 6585 字，地板 360 时写作段数超过 18 个就顶破目标（顶破＝凭空要求模型多  
+  写字）；改成「× 每句最少字」= 120 后，触发线升到 55 个段，正常一期碰不到。碎段合并里那句  
   「这个阈值正好是引导不说谎的下限」也是错的（把期望句长认成了每句最少字），一并改正。
 
-**日志措辞**：量词统一——「门禁未过：N **个检查项**」（从前写「N 处」，被读成「N 句」）；
-两段的第 1 轮各补一行「检查第 1 轮：判定完成」/「门禁第 1 轮：判定完成」，从前首轮既不出货
+**日志措辞**：量词统一——「门禁未过：N **个检查项**」（从前写「N 处」，被读成「N 句」）；  
+两段的第 1 轮各补一行「检查第 1 轮：判定完成」/「门禁第 1 轮：判定完成」，从前首轮既不出货  
 也不修补，日志上看像跳了一轮。
 
 ---
@@ -1389,46 +1711,46 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **门禁与内容检拆成两段各自成环；语义检降为开关（默认关）、承诺链检必检；门禁段与检查段内部零重写**
 
-从前只有**一个**重试环，**一个**上限数（`script.max_llm_rounds`）同时管着形式门禁与内容检
+从前只有**一个**重试环，**一个**上限数（`script.max_llm_rounds`）同时管着形式门禁与内容检  
 两种检查：形式没过的那一轮，内容检连跑都不跑；轮次预算被两边抢着用。现在拆成两段串行——
 
 **变更**
 
-- **段一（形式门禁）**：代码判九项。出货或定点修补 → 判 → 过了转段二；修满
+- **段一（形式门禁）**：代码判九项。出货或定点修补 → 判 → 过了转段二；修满  
   `script.gate_rounds` 仍不过，**也转段二**（不早退、不在这里空转）。
-- **段二（内容检）**：模型判。首轮不出货，直接核段一留下的那一版；过了定稿落盘，
+- **段二（内容检）**：模型判。首轮不出货，直接核段一留下的那一版；过了定稿落盘，  
   修满 `script.check_rounds` 仍不过就落盘退出，带着问题交人。
 
 两段各用各的预算，互不侵占对方。
 
-**两段内部一条重写分支都没有。** 对一份可用稿子，门禁段与检查段只有「判」与「定点修」
-两种动作；重写只属于正文生成步骤——第一次写，或产物不可用（解析不出稿子）时重试。
-从前那四处「重写」各有各的下场：缺字段那条本是死路（补字段那一步跑在门禁之前，
-门禁看到的三字段早齐了），直接删掉、无需替代；补丁落不了地改为**下一轮重发同批补丁**
-（输入一模一样，一次定点调用远比重摇两百句划算）；检查指不出句号改为**拿 `quote`
+**两段内部一条重写分支都没有。** 对一份可用稿子，门禁段与检查段只有「判」与「定点修」  
+两种动作；重写只属于正文生成步骤——第一次写，或产物不可用（解析不出稿子）时重试。  
+从前那四处「重写」各有各的下场：缺字段那条本是死路（补字段那一步跑在门禁之前，  
+门禁看到的三字段早齐了），直接删掉、无需替代；补丁落不了地改为**下一轮重发同批补丁**  
+（输入一模一样，一次定点调用远比重摇两百句划算）；检查指不出句号改为**拿 `quote`  
 反查**；解析不出稿子**收回生成步骤**，重试次数并入 `gate_rounds`。
 
-**语义检降为配置开关、默认关。** 逐字核素材是全链最贵的一项检查（素材装不下还要分批，
-最坏八次调用）。默认关掉后只判承诺链检——它不看素材、只看脚本自己，**一次调用判完**；
+**语义检降为配置开关、默认关。** 逐字核素材是全链最贵的一项检查（素材装不下还要分批，  
+最坏八次调用）。默认关掉后只判承诺链检——它不看素材、只看脚本自己，**一次调用判完**；  
 开着才分批。关掉时它既不出现在请求里，也不算「待重判」（否则开关形同虚设）。
 
-**承诺链检升级为四件套 + 按建议位置插入闭合句。** 从前它只报「第几句 / 原话 / 什么问题」，
-修法还方向错位：要补的是后文的回应，报出来的却是开头提承诺那一句，而下文只许改被点名的
-句子、不许增行——模型最省事的做法是把承诺句删掉或改没，下一轮检查看「没承诺」就判通过，
-问题在报告上消失、稿子一字未动。现在一次答全：`promise`（承诺是什么）、`how`（怎样才算
-闭合）、`speaker`（这句闭合的话由谁来说，A 或 B）、`close_after`（建议插在第几句之后）。
-修法是**插入**——补丁新增 `inserts` 形态（在锚句之后插一句、带说话人），与 `absorb`
+**承诺链检升级为四件套 + 按建议位置插入闭合句。** 从前它只报「第几句 / 原话 / 什么问题」，  
+修法还方向错位：要补的是后文的回应，报出来的却是开头提承诺那一句，而下文只许改被点名的  
+句子、不许增行——模型最省事的做法是把承诺句删掉或改没，下一轮检查看「没承诺」就判通过，  
+问题在报告上消失、稿子一字未动。现在一次答全：`promise`（承诺是什么）、`how`（怎样才算  
+闭合）、`speaker`（这句闭合的话由谁来说，A 或 B）、`close_after`（建议插在第几句之后）。  
+修法是**插入**——补丁新增 `inserts` 形态（在锚句之后插一句、带说话人），与 `absorb`  
 并句并存。提示词写死三条：语义闭合、角色闭合、不许删承诺。
 
-**落点不许 0。** 契约把 `line` 收紧为 ≥1、并封顶总句数（约束解码实测吃硬约束）；
-提示词删掉「找不出具体哪一句时填 0」，改要求「填其中最该改的那一句」。模型仍给不出有效
-句号时，**拿问题自带的 `quote` 去稿子反查**（去空白后字符串比对，不花模型调用）；
+**落点不许 0。** 契约把 `line` 收紧为 ≥1、并封顶总句数（约束解码实测吃硬约束）；  
+提示词删掉「找不出具体哪一句时填 0」，改要求「填其中最该改的那一句」。模型仍给不出有效  
+句号时，**拿问题自带的 `quote` 去稿子反查**（去空白后字符串比对，不花模型调用）；  
 反查不到就记一笔「未修好」，不早退、不重写，其余项照修。
 
-**配置与界面。** `script.max_llm_rounds` 已移除，改为 `script.gate_rounds` 与
-`script.check_rounds`（各 1~5 轮，默认 3）；新增 `script.check_semantic`（默认关）。
-轮次日志带上段名（「门禁第 N 轮」「检查第 N 轮」「生成第 N 次」），界面进度按段折算
-（段一 0~50%、段二 50~100%），不再出现段间倒回。三个新点位登记进配置页 `script` 区，
+**配置与界面。** `script.max_llm_rounds` 已移除，改为 `script.gate_rounds` 与  
+`script.check_rounds`（各 1~~5 轮，默认 3）；新增 `script.check_semantic`（默认关）。  
+轮次日志带上段名（「门禁第 N 轮」「检查第 N 轮」「生成第 N 次」），界面进度按段折算  
+（段一 0~~50%、段二 50~100%），不再出现段间倒回。三个新点位登记进配置页 `script` 区，  
 不进快捷区。承诺检的 `speaker` 就是 **A 或 B**（脚本里的说话人代号）。
 
 **测试**
@@ -1441,28 +1763,28 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **粘合挪到格式收束之后：片头标签是「开场」、片尾是「收束」**
 
-片头尾的标签一直是「承接」，盯的是「标签落在稿子上就得守稿子的词表」这条顾虑。
-真实的毛病在**顺序**上：粘合函数末尾还会跑一遍全稿格式收束，那把尺子
-（语篇词表）会把不在表里的标签一律洗成中性档——程序刚粘上去的片头当场被洗掉，
+片头尾的标签一直是「承接」，盯的是「标签落在稿子上就得守稿子的词表」这条顾虑。  
+真实的毛病在**顺序**上：粘合函数末尾还会跑一遍全稿格式收束，那把尺子  
+（语篇词表）会把不在表里的标签一律洗成中性档——程序刚粘上去的片头当场被洗掉，  
 模板里就算写「开场」，落到稿上也只剩「承接」。
 
 **变更**
 
-- 粘合之后**不再跑任何格式工序**，只剩一件事：给新粘上的句子补 `estimated_seconds`
+- 粘合之后**不再跑任何格式工序**，只剩一件事：给新粘上的句子补 `estimated_seconds`  
   （从前是借那道收束一并量的）。正文那一遍收束仍留在粘合之前，位置没动。
-- 片头首句标签回到「开场」、片尾末句回到「收束」，标准与精简两档模板都改。这两个词
-  归程序：新增 `PROGRAM_ONLY_TAGS` 作为它们唯一的名分出处——不发给模型、不进语篇
+- 片头首句标签回到「开场」、片尾末句回到「收束」，标准与精简两档模板都改。这两个词  
+  归程序：新增 `PROGRAM_ONLY_TAGS` 作为它们唯一的名分出处——不发给模型、不进语篇  
   词表、不进脚本页的标签下拉，模板只从它取词。
-- 由此片头尾在**脚本页重判**时会被当成「词表外标签」——重判读的是盘上成品整份
-  （片头尾已在其中），所以只有那一次把这两个词放行。**生成侧一个字不放宽**：门禁
+- 由此片头尾在**脚本页重判**时会被当成「词表外标签」——重判读的是盘上成品整份  
+  （片头尾已在其中），所以只有那一次把这两个词放行。**生成侧一个字不放宽**：门禁  
   判据与可填词表仍只有那八个词，正文里真出现表外的字照样报红（降级路才可能出）。
 - 前期回顾那句保持中性档「承接」——它确实是承接（接上期的话头），不需要例外。
 
 **测试**
 
-- 新增两条测试钉子：一条钉「粘合在收束之后」（附反证：同一份稿子再过一遍收束，
-  片头尾标签确实会变成「承接」，所以「片头还是开场」只可能来自新顺序）；一条钉
-  「补时长不动正文——正文句的秒数与收束后逐句相等」。另两条旧口径断言按新顺序改写：
+- 新增两条测试钉子：一条钉「粘合在收束之后」（附反证：同一份稿子再过一遍收束，  
+  片头尾标签确实会变成「承接」，所以「片头还是开场」只可能来自新顺序）；一条钉  
+  「补时长不动正文——正文句的秒数与收束后逐句相等」。另两条旧口径断言按新顺序改写：  
   它们原先拿「收束之后的文本」当比对参照，而收束过程会把文本里的空白压掉。
 
 ---
@@ -1471,17 +1793,17 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **标签行右侧的「当前值」不再定格：换下拉、改数字后即刻跟随**
 
-每个控件的标题行右端有一枚金色的当前值（如「风格倾向 — 论证型」）。它原先只在
-页面渲染那一刻写一次，此后由「服务端回值 → 刷界面」那唯一的回刷入口重填——而
-回刷入口只给滑杆和开关重写，**下拉与数字框落到「只改控件自身的值」那一支，金字
-不动**。于是：在下拉里换掉风格倾向，下拉框自己变了、盘上也写成功了，那枚金字却
+每个控件的标题行右端有一枚金色的当前值（如「风格倾向 — 论证型」）。它原先只在  
+页面渲染那一刻写一次，此后由「服务端回值 → 刷界面」那唯一的回刷入口重填——而  
+回刷入口只给滑杆和开关重写，**下拉与数字框落到「只改控件自身的值」那一支，金字  
+不动**。于是：在下拉里换掉风格倾向，下拉框自己变了、盘上也写成功了，那枚金字却  
 还停在上一次的旧值上。
 
 **修复**
 
-- 回刷入口现在不分控件形态，一律重填那枚金字；开关仍写「开/关」，滑杆的数字与
+- 回刷入口现在不分控件形态，一律重填那枚金字；开关仍写「开/关」，滑杆的数字与  
   单位写法与从前逐字一致。
-- 覆盖 24 个下拉点位：风格倾向、对话形式、帧率、字幕预设、背景、动画模式、说话人
+- 覆盖 24 个下拉点位：风格倾向、对话形式、帧率、字幕预设、背景、动画模式、说话人  
   指示、音色、模型名等，改完即刻跟随。
 - 同一点位出现在多处（如目标时长既在脚本页快捷区、又在配置页）时，两处的金字一起走。
 
@@ -1491,27 +1813,27 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **每种对话形式带一段「形状示范」（示例进提示词）**
 
-把节奏写准、把上限写全，仍然不够用：模型照样一句一换。描述回答「应当怎样」，
-示范回答「长什么样」——它得先看见一段。六种形式各带一条 `example`（三到七句
-实例，文字与本期素材无关），由 `paradigms.example_block()` 渲染进**三处**：
+把节奏写准、把上限写全，仍然不够用：模型照样一句一换。描述回答「应当怎样」，  
+示范回答「长什么样」——它得先看见一段。六种形式各带一条 `example`（三到七句  
+实例，文字与本期素材无关），由 `paradigms.example_block()` 渲染进**三处**：  
 整篇（`run_block`）、分段（生成要求第 2 条）、插入（铁律里的 speaker 条）。
 
 **新增**
 
-- **只给形状，不给内容**：示范标题里明写「文字内容与本期素材无关——不许照抄
+- **只给形状，不给内容**：示范标题里明写「文字内容与本期素材无关——不许照抄  
   这里的字」。不写这一句，模型会把示范当成「可以这么说」的候选句。
-- **示范不许自己超限**：每条示例与它那种形式的上限一致（anchor 的示范是
+- **示范不许自己超限**：每条示例与它那种形式的上限一致（anchor 的示范是  
   `B B B → A → B B B`），否则等于当着模型的面破规矩。
-- **它不是固定序列**：只有 `qa` 锁死 `A B A B` 这条规矩不变；示范是一个可能的
+- **它不是固定序列**：只有 `qa` 锁死 `A B A B` 这条规矩不变；示范是一个可能的  
   形状，不是必须照排的顺序。
 
 **测试**
 
-- 同步：`tests/test_paradigms.py` 新增 `TestFormExample` 六条（字段完整、示例
-  不超本形式上上限、示例每句本身过句长/标点/词表、形状可辨认、三处都到、
-  未知形式给空串）；`test_script_stage_carries_only_the_run_caps` 的钉子从
-  「`emotion` 这个键不许出现」改为「情绪基调不许回来 + 释义表不许贴第二份」
-  （`emotion` 现在是形状示范里的输出字段之一，不再是第二份标签表）；
+- 同步：`tests/test_paradigms.py` 新增 `TestFormExample` 六条（字段完整、示例  
+  不超本形式上上限、示例每句本身过句长/标点/词表、形状可辨认、三处都到、  
+  未知形式给空串）；`test_script_stage_carries_only_the_run_caps` 的钉子从  
+  「`emotion` 这个键不许出现」改为「情绪基调不许回来 + 释义表不许贴第二份」  
+  （`emotion` 现在是形状示范里的输出字段之一，不再是第二份标签表）；  
   `ARCHITECTURE.md` 1.3 节；本档。
 
 ---
@@ -1520,21 +1842,21 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **并句提示词里删掉两个「别的阶段」的概念（纯删，不补替代文字）**
 
-并句和句长是**两个阶段**：并句轮只做合并（判据只有「并后保真 ≥ 原文 70%」），
-并出来的超长句由**下一轮**句长门禁报出、走普通定点改压缩。两件事互不相干。
-但提示词里有两条把两个阶段混在一起的话，会直接把模型推去边并边压——保真度掉到
-70% 线以下，整份补丁被 `apply_patch` 判废，那一轮一个字没改，于是降级整篇重出
+并句和句长是**两个阶段**：并句轮只做合并（判据只有「并后保真 ≥ 原文 70%」），  
+并出来的超长句由**下一轮**句长门禁报出、走普通定点改压缩。两件事互不相干。  
+但提示词里有两条把两个阶段混在一起的话，会直接把模型推去边并边压——保真度掉到  
+70% 线以下，整份补丁被 `apply_patch` 判废，那一轮一个字没改，于是降级整篇重出  
 （把已经好的几百句重摇一遍，正是定点路要根除的东西）。
 
 **删除**
 
-- **定点修补系统提示词**（`_PATCH_SYSTEM_TMPL`）：删掉末尾「并句只删掉合并处的
-  重复衔接…意思一个都不许少**；并出来超过单句字数上限的，就地精简措辞**。」
+- **定点修补系统提示词**（`_PATCH_SYSTEM_TMPL`）：删掉末尾「并句只删掉合并处的  
+  重复衔接…意思一个都不许&#x5C11;**；并出来超过单句字数上限的，就地精简措辞**。」
 - **`ab_run_limit` 的回灌 tip**（`patch_targets`）：同一句，同样删掉。
-- **`_feedback_length` 的过短条**：删掉括号「（并句往往直接顶破单句上限）」——
-  拿句长上限当「不许并句」的理由，本身就是两阶段混淆的产物；禁用并句的理由是
+- **`_feedback_length` 的过短条**：删掉括号「（并句往往直接顶破单句上限）」——  
+  拿句长上限当「不许并句」的理由，本身就是两阶段混淆的产物；禁用并句的理由是  
   不动结构/行数（函数 docstring 里写着，不进提示词）。
-- 三处都是**纯删、不补替代说明**：连「下一轮句长门禁会处理」也不写进并句的
+- 三处都是**纯删、不补替代说明**：连「下一轮句长门禁会处理」也不写进并句的  
   提示词，那仍是另一个阶段的概念。一个提示词只管它自己那一步的事。
 
 **文档**
@@ -1549,19 +1871,19 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **修复**
 
-- **配置页布尔开关永远翻不了**：`sw.onclick` 发的是**点击前**的状态（关→发"关"），
-  亮/暗又只由服务端回值驱动——发旧值→写回旧值→显示旧值，点了等于没点。
-  影响配置页**全部**布尔开关（前期回顾、门禁严格模式、降噪等）。修法一行：
+- **配置页布尔开关永远翻不了**：`sw.onclick` 发的是**点击前**的状态（关→发"关"），  
+  亮/暗又只由服务端回值驱动——发旧值→写回旧值→显示旧值，点了等于没点。  
+  影响配置页**全部**布尔开关（前期回顾、门禁严格模式、降噪等）。修法一行：  
   发目标态 `!sw.classList.contains('on')`。合成页「输出视频」走 toggleSw 另一条路，不受影响。
-- **脚本页/合成页切进去不重拉数据**：切页 0 请求，页面之外的变化（另开窗口、
-  CLI、批任务写完）永远看不见。`showTab` 进 script/render 时补 `refreshEpisodes`：
-  重拉期表但**保留当前勾选**（`loadEpisodes` 会清勾选重置默认，拿来当刷新会
-  切一次页丢一次勾）；本页从没载入过才走默认勾选那条路；正画布上已调出的稿子不碰。
+- **脚本页/合成页切进去不重拉数据**：切页 0 请求，页面之外的变化（另开窗口、  
+  CLI、批任务写完）永远看不见。`showTab` 进 script/render 时补 `refreshEpisodes`：  
+  重拉期表但**保留当前勾选**（`loadEpisodes` 会清勾选重置默认，拿来当刷新会  
+  切一次页丢一次勾）；本页从没载入过才走默认勾选那条路；正画布上已调出的稿子不碰。  
   playwright 实测：切走切回 2 次 `/api/scripts` 请求，勾选原样保留。
 
 **测试**
 
-- 真浏览器探针（开关两连击状态翻转 + 服务端写回；选期勾选跨页保留），全量 1003 条
+- 真浏览器探针（开关两连击状态翻转 + 服务端写回；选期勾选跨页保留），全量 1003 条  
   测试 OK。
 
 ---
@@ -1572,23 +1894,23 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **变更**
 
-- **为什么除名**：片头尾由程序在整期定稿那一刻粘上（`glue_intro_outro`），
-  「开场 / 收束」只在那两三句上出现，正文里没有哪一句该背这两个标签。
+- **为什么除名**：片头尾由程序在整期定稿那一刻粘上（`glue_intro_outro`），  
+  「开场 / 收束」只在那两三句上出现，正文里没有哪一句该背这两个标签。  
   留在词表里等于给模型一个用不上的选项，还占界面下拉一行。
-- **改了什么**：`DISCOURSE_ORDER` / `DISCOURSE_VOCAB` / `EMOTION_TAGS` 去「开场」「收束」
-  （8 词）；`DISCOURSE_HELP` 删两条释义；片头尾模板的标签从「开场 / 收束」改为
-  词表内的中性档「承接」——粘出来的整份文件重判（UI 读全份文件）不会吃到
+- **改了什么**：`DISCOURSE_ORDER` / `DISCOURSE_VOCAB` / `EMOTION_TAGS` 去「开场」「收束」  
+  （8 词）；`DISCOURSE_HELP` 删两条释义；片头尾模板的标签从「开场 / 收束」改为  
+  词表内的中性档「承接」——粘出来的整份文件重判（UI 读全份文件）不会吃到  
   「词表外标签」。三处生成提示词里「照抄这里的十个词」改为不写死个数的表述。
 
 **说明**
 
-- **旧稿注意**：v0.34.1 之前粘的片头尾带着「开场 / 收束」，用 UI 重判这些期会在
-  首末两句报「词表外标签」——属预期信号（那是旧词表时代的产物），重新生成或
+- **旧稿注意**：v0.34.1 之前粘的片头尾带着「开场 / 收束」，用 UI 重判这些期会在  
+  首末两句报「词表外标签」——属预期信号（那是旧词表时代的产物），重新生成或  
   手改这两句即可；不影响出片。
 
 **测试**
 
-- `tests/test_script_contract.py`（片头尾标签断言改为承接 + 新增除名钉子）、两处版本
+- `tests/test_script_contract.py`（片头尾标签断言改为承接 + 新增除名钉子）、两处版本  
   落位、本档。
 
 ---
@@ -1599,28 +1921,28 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **变更**
 
-- **取下的理由**：它只看说话人字母序列、一个字不看语义，连说超自己上限就把那句
-  **硬翻给对方**——A 写的一句问话落到 B 嘴里，成了「B 自己问自己」；翻一个 speaker
-  还会连带稿子署名、字幕样式、字幕名、视频立绘四样全错。它自己的注释都写着
-  「上限必须宽到不需要它动刀」，而捧哏给 A 的上限是六种形式里最窄的 1——
+- **取下的理由**：它只看说话人字母序列、一个字不看语义，连说超自己上限就把那句  
+  **硬翻给对方**——A 写的一句问话落到 B 嘴里，成了「B 自己问自己」；翻一个 speaker  
+  还会连带稿子署名、字幕样式、字幕名、视频立绘四样全错。它自己的注释都写着  
+  「上限必须宽到不需要它动刀」，而捧哏给 A 的上限是六种形式里最窄的 1——  
   **指望别触发的机制，配了一个必然触发的值**。
-- **新解法＝并句（absorb）**：门禁 `ab_run_limit` 改为把**整段**（不是超出的那几句）
-  连双方上限一起点出来；定点补丁新增可选键 `absorb`（值 = 并掉的句数），把这一段
-  并进第一句、并到上限以内——说话人一个字不动，行数因此变少，**这是补丁里唯一
-  合法的减行表达**。拆句、凭空加句在 schema 里仍然写不出来；换人也不在 schema 里。
-  `apply_patch` 逐条核：被并的每一句都得被点名、都得与第一句同一个人、并出来的字
+- **新解法＝并句（absorb）**：门禁 `ab_run_limit` 改为把**整段**（不是超出的那几句）  
+  连双方上限一起点出来；定点补丁新增可选键 `absorb`（值 = 并掉的句数），把这一段  
+  并进第一句、并到上限以内——说话人一个字不动，行数因此变少，**这是补丁里唯一  
+  合法的减行表达**。拆句、凭空加句在 schema 里仍然写不出来；换人也不在 schema 里。  
+  `apply_patch` 逐条核：被并的每一句都得被点名、都得与第一句同一个人、并出来的字  
   不得少于原文七成（只许删合并处的重复衔接，不许吃内容）。
-- **节奏句定稿（用户定的）**：主讲＋捧哏改为「**B 成段推进（三到六句），A 隔一段
-  插一句短句**」——「段」第一次出现就地定死，第二个「段」继承定义，不再能读成
+- **节奏句定稿（用户定的）**：主讲＋捧哏改为「**B 成段推进（三到六句），A 隔一段  
+  插一句短句**」——「段」第一次出现就地定死，第二个「段」继承定义，不再能读成  
   「每隔一句」。捧哏 A 上限保持 1（用户定）。
-- **门禁与语义检共用 `script.max_llm_rounds`（默认 3 次）**：格式项全过语义检才跑；
-  超限问题带句号，走定点补丁（不再是从前那条「交人工」的死路——从前它被
+- **门禁与语义检共用 `script.max_llm_rounds`（默认 3 次）**：格式项全过语义检才跑；  
+  超限问题带句号，走定点补丁（不再是从前那条「交人工」的死路——从前它被  
   `enforce_max_run` 在门禁前掰平，门禁永远绿，连报的机会都没有）。
 
 **测试**
 
-- 删 `TestEnforceMaxRun` 四条；新增门禁「点整段＋上限、不改稿」两条、并句四条
-  （正例＋不许吃内容＋不许跨人＋不许并没点名的）、schema 契约改口径（`absorb` 可选、
+- 删 `TestEnforceMaxRun` 四条；新增门禁「点整段＋上限、不改稿」两条、并句四条  
+  （正例＋不许吃内容＋不许跨人＋不许并没点名的）、schema 契约改口径（`absorb` 可选、  
   speaker 不在）。全量 1002 条绿。
 
 ---
@@ -1629,134 +1951,130 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 对话形式跟着**期**走，不再只有一份全局值。
 
-- **期级旁挂档 `脚本/<no>.form.json`**（`layout.form_file`）：一期生成时用的对话形式记在
-  这一期自己身上。与正文分开存——正文是扁平句子数组，出片、时长、字幕、视频、前端预览
+- **期级旁挂档 `脚本/<no>.form.json`**（`layout.form_file`）：一期生成时用的对话形式记在  
+  这一期自己身上。与正文分开存——正文是扁平句子数组，出片、时长、字幕、视频、前端预览  
   全按数组读它，加字段会一次破坏所有这些读取方（同 `plan_file` 的理由）。
-- **写侧 `pipeline.write_form_file` / 读侧 `pipeline.episode_form`**（成对）：生成每一轮落盘时
-  把**解析后的形式**（配置里选的 > 卡上默认）写进去；空值不落盘——写一份空的，读的那头
+- **写侧 `pipeline.write_form_file` / 读侧 `pipeline.episode_form`**（成对）：生成每一轮落盘时  
+  把**解析后的形式**（配置里选的 > 卡上默认）写进去；空值不落盘——写一份空的，读的那头  
   就分不清「记的就是空」和「没记过」，而两者该走的分支正好相反。
-- **判稿优先读本期自己那份**（`web_ui.api_script_gate`）：连说上限挂在对话形式上头，从前
-  写第 3 期选「捧哏」、写第 4 期改成「追问深挖」，回头重判第 3 期读的是「追问深挖」——
-  同一份稿子被两把尺子量，一会儿过一会儿不过。现在这一期有记录就用记录，配置只表示
+- **判稿优先读本期自己那份**（`web_ui.api_script_gate`）：连说上限挂在对话形式上头，从前  
+  写第 3 期选「捧哏」、写第 4 期改成「追问深挖」，回头重判第 3 期读的是「追问深挖」——  
+  同一份稿子被两把尺子量，一会儿过一会儿不过。现在这一期有记录就用记录，配置只表示  
   「下一次生成用哪种」。没有记录的期（本功能上线前写的）什么都不动，回落当前配置。
 - **前端把期号报给判稿接口**：`/api/script/gate` 从前只带 `project_id`，服务端不知道读哪一期。
-- 钉子：`tests/test_script_contract.TestEpisodeFormIsRecorded` 7 条（旁挂档命名与正文互不干扰、
-  写读往返、空值不写、缺失/损坏一律无记录、记录压过当时配置、生成写与判稿读两处接线、
+- 钉子：`tests/test_script_contract.TestEpisodeFormIsRecorded` 7 条（旁挂档命名与正文互不干扰、  
+  写读往返、空值不写、缺失/损坏一律无记录、记录压过当时配置、生成写与判稿读两处接线、  
   写下去的是解析后的结果）。
 
 **关键澄清（同一轮查证）**
 
-- 用户在脚本页选的对话形式**一直是生效的**——提示词原文里明写「本期对话形式：主讲＋捧哏」，
-  该行与角色、上限都从 `_form_key()` 一处出发。此前观察到的「选了捧哏仍是一问一答形状」
+- 用户在脚本页选的对话形式**一直是生效的**——提示词原文里明写「本期对话形式：主讲＋捧哏」，  
+  该行与角色、上限都从 `_form_key()` 一处出发。此前观察到的「选了捧哏仍是一问一答形状」  
   是**模型没照做**，不是选择没生效（详见 v0.32.0 起的实测记录）。
-- 范式卡上的 `form` 只在配置**留空**时兜底（v0.31.0 定的「不选跟卡」），不是「立项时定形式」。
+- 范式卡上的 `form` 只在配置**留空**时兜底（v0.31.0 定的「不选跟卡」），不是「立项时定形式」。  
   立项时没有、也不该有选择对话形式这一步。
 
 ---
 
 ## v0.32.1
 
-**一句话：给每种对话形式的节奏补上一个「常见量级」。上一版把节奏从「两位主持人」搬进
-了写作规矩那一节（方向是对的），但写的是「连着说几句」这种没数的描述——真跑一遍才
+**一句话：给每种对话形式的节奏补上一个「常见量级」。上一版把节奏从「两位主持人」搬进  
+了写作规矩那一节（方向是对的），但写的是「连着说几句」这种没数的描述——真跑一遍才  
 发现，模型把它当背景读，选捧哏照样一句一换。**
 
 **修复**
 
 **节奏必须有具体量级，纯描述会被当背景略过**
 
-- 上一版的 `rhythm` 是纯描述：「B 连着说几句、成段推进，A 隔一段插一句短的」。
-  静态测试全绿（提示词里确实有这一句），**但真跑出来的稿子不是这样**。实测（同一
+- 上一版的 `rhythm` 是纯描述：「B 连着说几句、成段推进，A 隔一段插一句短的」。  
+  静态测试全绿（提示词里确实有这一句），**但真跑出来的稿子不是这样**。实测（同一  
   素材、同一张卡、同一张范式卡，只换对话形式提示词）：
-
-  | 节奏怎么写的 | 放在哪 | 实测 |
-  |---|---|---|
-  | 「B 连着说**几句**」（无数字） | 【文体依据】 | 40 句 / A 19 B 21 / 开头 `B A B A B A` / B 最长连说 **2** |
-  | 「B 连着说**三到六句**」 | 【文体依据】 | 22 句 / A 7 B 15 / 开头 `B B B A·B B B A·B B B A` / B 最长连说 **3**、连说≥3 有 **3 段** |
-  | 同上，挪进编号验收段 | 验收段 | 22 句 / 连说≥3 只 **1 段**，`B B A B B B B A…` 更散 |
-
-- 两条读出来的结论：**①量级才是那个开关**——「几句」被略过，「三到六句」照做；
-  **②位置不是变量**，甚至反向（挪进验收段反而更散）。所以节奏行仍留在【文体依据】，
+  | 节奏怎么写的             | 放在哪    | 实测                                                                           |
+  | ------------------ | ------ | ---------------------------------------------------------------------------- |
+  | 「B 连着说**几句**」（无数字） | 【文体依据】 | 40 句 / A 19 B 21 / 开头 `B A B A B A` / B 最长连说 **2**                           |
+  | 「B 连着说**三到六句**」    | 【文体依据】 | 22 句 / A 7 B 15 / 开头 `B B B A·B B B A·B B B A` / B 最长连说 **3**、连说≥3 有 **3 段** |
+  | 同上，挪进编号验收段         | 验收段    | 22 句 / 连说≥3 只 **1 段**，`B B A B B B B A…` 更散                                  |
+- 两条读出来的结论：**①量级才是那个开关**——「几句」被略过，「三到六句」照做；  
+  **②位置不是变量**，甚至反向（挪进验收段反而更散）。所以节奏行仍留在【文体依据】，  
   「以描述为主」这条不变，只是每个描述里带一个具体范围。
 - 四处补上量级（`paradigms.py` 的 `DIALOGUE_FORMS`）：
-
-  | 形式 | 补进去的量级 |
-  |---|---|
-  | 交替讲述 | 常见的样子是各连着讲**三到五句**再交棒——不要一句一换 |
-  | 追问深挖 | 常见的样子是 B 连着说**三四句**展开，A 插**一两句**往回追 |
-  | 闲聊漫谈 | 常见的样子是**一两句**就换个话头、偶尔有人连着说**三四句** |
-  | 主讲＋捧哏 | B 连着说**三到六句**、成段推进，……也不许一句一换 |
-
+  | 形式    | 补进去的量级                              |
+  | ----- | ----------------------------------- |
+  | 交替讲述  | 常见的样子是各连着讲**三到五句**再交棒——不要一句一换       |
+  | 追问深挖  | 常见的样子是 B 连着说**三四句**展开，A 插**一两句**往回追 |
+  | 闲聊漫谈  | 常见的样子是**一两句**就换个话头、偶尔有人连着说**三四句**   |
+  | 主讲＋捧哏 | B 连着说**三到六句**、成段推进，……也不许一句一换        |
 - 「一问一答」与「观点对辩」不动：前者本来就写死 `A B A B`，后者本来就有「约三四句」。
-- 钉子：`test_every_form_gives_a_concrete_magnitude` 断言六种形式的节奏里都出现一个数
+- 钉子：`test_every_form_gives_a_concrete_magnitude` 断言六种形式的节奏里都出现一个数  
   （汉字或阿拉伯数字）——去掉数就等于退回「描述当背景」。
-- 这一版留下的通则（已写进项目记忆）：**提示词里含某句 ≠ 模型照做**。凡改的是「模型的
+- 这一版留下的通则（已写进项目记忆）：**提示词里含某句 ≠ 模型照做**。凡改的是「模型的  
   行为」，断言提示词文本的静态测试证明不了任何事，必须真跑一次量输出。
 
 ---
 
 ## v0.32.0
 
-**四件事：风格倾向甩掉「提问频率」与「情绪密度」两维（语篇词表从此只有一份），对话
-形式补上「A 是谁、B 是谁」与「两人怎么接」，六种形式里只有一问一答把说话顺序写死，
-看稿页面重判时补上项目级设置。上一版把连句上限搬进形式，这一版把**节奏**也搬了进来
+**四件事：风格倾向甩掉「提问频率」与「情绪密度」两维（语篇词表从此只有一份），对话  
+形式补上「A 是谁、B 是谁」与「两人怎么接」，六种形式里只有一问一答把说话顺序写死，  
+看稿页面重判时补上项目级设置。上一版把连句上限搬进形式，这一版把**节奏**也搬了进来  
 ——上限只划红线，划不出形状。**
 
 **变更**
 
 **一、风格倾向只剩调子三维：体裁、比喻密度、互动词强度**
 
-- 删掉 `question_rate`（提问频率）。它手里有**两把钥匙**：一是提示词里那一行带数的
-  硬要求（「每两句到三句有一处问句」）——整份提示词里唯一带数的节奏规定；二是低档
-  时把「追问」从语篇枚举里摘掉。而「多久问一次」只有两个人对话才成立，一个人念稿子
-  哪来的提问频率？它挂在风格里，就跟对话形式抢方向盘：形式给的是上限（**上限不是
-  目标**），风格给的是一条带数的硬要求——带数的那个赢。实测症状就是选了「主讲＋
-  捧哏」，稿子照样一句一问：59 句、A 的 29 句全是「追问」、问号结尾 28 句、一个人
+- 删掉 `question_rate`（提问频率）。它手里有**两把钥匙**：一是提示词里那一行带数的  
+  硬要求（「每两句到三句有一处问句」）——整份提示词里唯一带数的节奏规定；二是低档  
+  时把「追问」从语篇枚举里摘掉。而「多久问一次」只有两个人对话才成立，一个人念稿子  
+  哪来的提问频率？它挂在风格里，就跟对话形式抢方向盘：形式给的是上限（**上限不是  
+  目标**），风格给的是一条带数的硬要求——带数的那个赢。实测症状就是选了「主讲＋  
+  捧哏」，稿子照样一句一问：59 句、A 的 29 句全是「追问」、问号结尾 28 句、一个人  
   连着说两句的情况一次都没有。
-- 删掉 `emotion_density`（情绪密度）。它一个字都不进提示词，唯一作用是低档时把
-  「铺垫」「过渡」从枚举里删掉——人在界面上配不出、也验不了它。人报上来的那条报错
-  正是它的来路：**提示词里列着十个词（含铺垫/过渡），门禁手里只有八个**，于是写稿
+- 删掉 `emotion_density`（情绪密度）。它一个字都不进提示词，唯一作用是低档时把  
+  「铺垫」「过渡」从枚举里删掉——人在界面上配不出、也验不了它。人报上来的那条报错  
+  正是它的来路：**提示词里列着十个词（含铺垫/过渡），门禁手里只有八个**，于是写稿  
   时合法的标签，判的时候成了「词表外标签：第 25 句「过渡」、第 41 句「铺垫」…」。
-- 两维拆掉之后 `STYLE_DIMS` / `PRESET_SPEC` / `STYLE_GUIDE` 三表同步瘦身，风格倾向
+- 两维拆掉之后 `STYLE_DIMS` / `PRESET_SPEC` / `STYLE_GUIDE` 三表同步瘦身，风格倾向  
   的界面说明从「低、中、低、克制」变成「比喻密度低、互动词强度克制」。
 
 **二、语篇词表收成一份常量，`discourse_vocab_for()` 整个删掉**
 
-- 词表就是 `config_manager.DISCOURSE_ORDER`（十字：承接/追问/解释/强调/比喻/铺垫/
-  过渡/总结/开场/收束）。新增 `script_engine.vocab_words()` 作为唯一的取词口：写脚本
-  提示词里的逐词释义、整篇/分段/插入三个输出 schema 的枚举、门禁的 `emotion_vocab`
+- 词表就是 `config_manager.DISCOURSE_ORDER`（十字：承接/追问/解释/强调/比喻/铺垫/  
+  过渡/总结/开场/收束）。新增 `script_engine.vocab_words()` 作为唯一的取词口：写脚本  
+  提示词里的逐词释义、整篇/分段/插入三个输出 schema 的枚举、门禁的 `emotion_vocab`  
   判据、界面那个逐句标签下拉，读的都是它。
-- 「一个词表分两处算，迟早给出两套口径」——这句话这版有实证：两次收窄（提问频率去
-  「追问」、情绪密度去「铺垫/过渡」）造成的都是同一件事。收窄这一步取消了，两套口径
+- 「一个词表分两处算，迟早给出两套口径」——这句话这版有实证：两次收窄（提问频率去  
+  「追问」、情绪密度去「铺垫/过渡」）造成的都是同一件事。收窄这一步取消了，两套口径  
   从结构上不可能再出现。
-- 钉子：`test_the_two_dropped_style_dims_stay_dropped` 按源码扫全包，这两个键一回到
-  任何模块就红；`test_the_gate_judges_by_the_same_table` 拿「铺垫/过渡」两种项目设置
+- 钉子：`test_the_two_dropped_style_dims_stay_dropped` 按源码扫全包，这两个键一回到  
+  任何模块就红；`test_the_gate_judges_by_the_same_table` 拿「铺垫/过渡」两种项目设置  
   各判一遍，都必须过。
 
 **三、对话形式：明确 A / B 角，节奏写进写作规矩，只有一问一答锁顺序**
 
-- 每种形式从「名字 + 一句介绍 + 两条上限」补成三样，各管一件事、进提示词的位置也
-  不同：`roles`（A 是谁、B 是谁）进【两位主持人】那一节；`rhythm`（两人怎么接）与
+- 每种形式从「名字 + 一句介绍 + 两条上限」补成三样，各管一件事、进提示词的位置也  
+  不同：`roles`（A 是谁、B 是谁）进【两位主持人】那一节；`rhythm`（两人怎么接）与  
   `run`（两条上限）进【文体依据】那一节。
-- **节奏从前挂在「这两位是谁」那一节里**，模型把它当人物介绍读，读不出「该怎么写」；
-  上版又只给了上限，而上限里推不出「该连着说几句」——模型拿自己的默认节奏（中文双人
-  播客的默认正好是一问一答）来填，完全合规、门禁也判得过。现在上限与节奏都在写作
+- **节奏从前挂在「这两位是谁」那一节里**，模型把它当人物介绍读，读不出「该怎么写」；  
+  上版又只给了上限，而上限里推不出「该连着说几句」——模型拿自己的默认节奏（中文双人  
+  播客的默认正好是一问一答）来填，完全合规、门禁也判得过。现在上限与节奏都在写作  
   规矩那一节。
-- **六种形式里只有「一问一答」把说话顺序写死**（A B A B …）——「你问一句我答一句」
-  就是它本身。其余五种一律描述式，并明说不固定顺序：交替讲述里谁先开口、各讲几段
-  都不定；捧哏的句子不必是问句、也不是只有提问才能开口；闲聊谁接话都行；对辩各自
-  把一段立场说清再交给对方。把某一种固定序列焊进提示词，等于把所有素材的节奏压成
+- **六种形式里只有「一问一答」把说话顺序写死**（A B A B …）——「你问一句我答一句」  
+  就是它本身。其余五种一律描述式，并明说不固定顺序：交替讲述里谁先开口、各讲几段  
+  都不定；捧哏的句子不必是问句、也不是只有提问才能开口；闲聊谁接话都行；对辩各自  
+  把一段立场说清再交给对方。把某一种固定序列焊进提示词，等于把所有素材的节奏压成  
   同一副样子。
-- 同样明确：**A 不永远是提问者**。「A 提问、B 回答」是一问一答这一种形式的角色约定，
+- 同样明确：**A 不永远是提问者**。「A 提问、B 回答」是一问一答这一种形式的角色约定，  
   不是全体的通则——从前所有形式的说明都把 A 写成提问方，于是形式名换了、稿子没换。
-- 三处提示词（整篇【文体依据】、分段路生成要求第 2 条、插入模板的 speaker 一条）引
+- 三处提示词（整篇【文体依据】、分段路生成要求第 2 条、插入模板的 speaker 一条）引  
   同一份 `rhythm_text()`；分段路与插入路从前连节奏都没有。
-- 界面下拉里每种形式的说明后面补上它的角色（「A 是捧哏；B 是主讲」），与上限并排
+- 界面下拉里每种形式的说明后面补上它的角色（「A 是捧哏；B 是主讲」），与上限并排  
   ——选「主讲＋捧哏」的人得先在界面上看清这里谁主讲。
 
 **四、看稿页面重判时补上项目级设置**
 
-- `api_script_gate` 从前只补了卡、**没补配置**（等于修了一半）：生成那一刻走的是
-  「全局 + 项目」，页面重判只读全局，两条路拿的是两把尺子。同一份稿子在同一套门禁下
+- `api_script_gate` 从前只补了卡、**没补配置**（等于修了一半）：生成那一刻走的是  
+  「全局 + 项目」，页面重判只读全局，两条路拿的是两把尺子。同一份稿子在同一套门禁下  
   一会儿过一会儿不过，报错就出在页面上。现在重判也走 `project_store.apply_to_config`。
 
 **说明**
@@ -1767,138 +2085,138 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 ## v0.31.0
 
-**五件事：连句上限从素材类型卡搬进「对话形式」（卡彻底不管这个数），卡上的站位说明
-被形式真正顶掉，插入与写作共用同一份写作纪律，比喻回到语篇词表，句长在三处模板里
-从写死的 8–40 变成按配置填。配置项没加没减，`script.dialogue_form` 的语义变了——
+**五件事：连句上限从素材类型卡搬进「对话形式」（卡彻底不管这个数），卡上的站位说明  
+被形式真正顶掉，插入与写作共用同一份写作纪律，比喻回到语篇词表，句长在三处模板里  
+从写死的 8–40 变成按配置填。配置项没加没减，`script.dialogue_form` 的语义变了——  
 它现在同时管站位与连句上限。**
 
 **变更**
 
 **一、连句上限跟着对话形式走，卡上不再有这个数**
 
-- 从前 `max_run` 长在素材类型卡上，八张卡各一个数。那时对话形式只有一两种，卡一并
-  规定就够；现在形式拆成六种，同一批素材选「一问一答」还是「主讲＋捧哏」，句子该
+- 从前 `max_run` 长在素材类型卡上，八张卡各一个数。那时对话形式只有一两种，卡一并  
+  规定就够；现在形式拆成六种，同一批素材选「一问一答」还是「主讲＋捧哏」，句子该  
   怎么排是两回事，一个数盖不住。
-- 现在每种形式自己带两条上限：`qa` A 2 / B 4、`alternate` 5 / 5、`drill` 2 / 5、
-  `debate` 4 / 4、`chat` 3 / 3、`anchor` 1 / 10。**A、B 各一条，且都有上限**——
+- 现在每种形式自己带两条上限：`qa` A 2 / B 4、`alternate` 5 / 5、`drill` 2 / 5、  
+  `debate` 4 / 4、`chat` 3 / 3、`anchor` 1 / 10。**A、B 各一条，且都有上限**——  
   捧哏那种也不放开：主讲连着说 10 句足够把一段讲透，再不封顶就成单口了。
-- 卡上换成一个 `form` 键（这批素材的默认形式），`max_run` 键在 `register` 里被丢掉；
+- 卡上换成一个 `form` 键（这批素材的默认形式），`max_run` 键在 `register` 里被丢掉；  
   旧卡上带着这个键也不会再有任何效果，留着只会让人以为改它能改到上限。
-- 取值只剩一条路：`paradigms.resolve_form()` 定形式（配置里选的 > 卡上的默认 >
-  兜底 `qa`），`paradigms.run_caps()` 给两条数，`script_engine._run_caps()` 是代码侧
-  唯一的取法口。写脚本的提示词、`ab_run_limit` 门禁、`enforce_max_run` 后处理三处
-  一律调它——分头各取一次就会出现「提示词按一种形式写、门禁按另一种判」，稿子陷在
+- 取值只剩一条路：`paradigms.resolve_form()` 定形式（配置里选的 > 卡上的默认 >  
+  兜底 `qa`），`paradigms.run_caps()` 给两条数，`script_engine._run_caps()` 是代码侧  
+  唯一的取法口。写脚本的提示词、`ab_run_limit` 门禁、`enforce_max_run` 后处理三处  
+  一律调它——分头各取一次就会出现「提示词按一种形式写、门禁按另一种判」，稿子陷在  
   「改了还是不过」。
-- 界面上看得见这两个数：下拉里每种形式的说明后面挂上它给的上限（「连着说的上限：
-  A 2 句、B 4 句」），点位说明也改写成「同时决定同一人连着说的上限」。门禁按这两个
+- 界面上看得见这两个数：下拉里每种形式的说明后面挂上它给的上限（「连着说的上限：  
+  A 2 句、B 4 句」），点位说明也改写成「同时决定同一人连着说的上限」。门禁按这两个  
   数判、后处理按它压句，界面上却说不出处，「为什么这段被压成交替」就成了悬案。
 
 **二、卡上的站位说明被对话形式真正顶掉**
 
-- 从前的接法是错的：形式与卡各说一遍站位，选中的形式只是**加**在卡的话后面，卡上
-  「A 是主持人、B 是被访者」那句永远顶不掉——看着像覆盖做了，实际是两套站位同时
+- 从前的接法是错的：形式与卡各说一遍站位，选中的形式只是**加**在卡的话后面，卡上  
+  「A 是主持人、B 是被访者」那句永远顶不掉——看着像覆盖做了，实际是两套站位同时  
   生效。写脚本那一段又不再复述 `cast`，于是「覆盖」在提示词里只剩一句声明。
-- 现在只有一处说站位（【两位主持人】）：没选形式时走卡上的 `cast`，选了形式就整句
+- 现在只有一处说站位（【两位主持人】）：没选形式时走卡上的 `cast`，选了形式就整句  
   换成形式的定位，并明说「与卡上的站位冲突时以形式为准」。
 
 **三、插入与写作共用同一份写作纪律（求同存异，不吞掉插入自己的东西）**
 
-- 新增 `_vocab_block(preset)` 与 `_style_block(preset)`：语篇词表连同逐词释义、风格
-  倾向四行，整篇、分段、插入三处引**同一份**。各处自己列一份的代价是硬的——写作按
-  收窄后的枚举写、插入按另一份写，插入句一落进正文就被 `emotion_vocab` 门禁打回，
+- 新增 `_vocab_block(preset)` 与 `_style_block(preset)`：语篇词表连同逐词释义、风格  
+  倾向四行，整篇、分段、插入三处引**同一份**。各处自己列一份的代价是硬的——写作按  
+  收窄后的枚举写、插入按另一份写，插入句一落进正文就被 `emotion_vocab` 门禁打回，  
   那一轮补的字全废。
-- 插入的连句上限、句长区间、站位、可朗读规则同样引自写作那几处；句长按 `gate.min_chars`
+- 插入的连句上限、句长区间、站位、可朗读规则同样引自写作那几处；句长按 `gate.min_chars`  
   / `gate.max_chars` 填，不再写死 8–40。
-- **插入自己的东西一个字没动**：只许新增不许删改、`after` 的语义、与已写正文不重复
-  的那一整套判据（连例子带判词）、措辞禁忌——那些是「补写」这件事特有的，写脚本
+- **插入自己的东西一个字没动**：只许新增不许删改、`after` 的语义、与已写正文不重复  
+  的那一整套判据（连例子带判词）、措辞禁忌——那些是「补写」这件事特有的，写脚本  
   那一轮根本没有它们。统一的是能统一的那部分，不是拿写作去替代插入。
 
 **四、比喻回到语篇词表**
 
-- `discourse_vocab_for` 从前在 `metaphor_density=low` 时把「比喻」从枚举里摘掉，于是
-  默认档（论证型、比喻密度就是 low）写出来的稿子一个比方都不会打。那是把「少用」
+- `discourse_vocab_for` 从前在 `metaphor_density=low` 时把「比喻」从枚举里摘掉，于是  
+  默认档（论证型、比喻密度就是 low）写出来的稿子一个比方都不会打。那是把「少用」  
   当成了「禁用」。
-- 现在比喻密度**不再收窄词表**，只驱动风格行：low 档的话从「不使用比喻」改成「比喻
-  最多一两处，别句句打比方」。收窄只剩两条——提问频率 low 去「追问」、情绪密度 low
+- 现在比喻密度**不再收窄词表**，只驱动风格行：low 档的话从「不使用比喻」改成「比喻  
+  最多一两处，别句句打比方」。收窄只剩两条——提问频率 low 去「追问」、情绪密度 low  
   去「铺垫 / 过渡」。
 
 **五、句长在三处模板里不再写死**
 
-- `patch_system(cfg)`（定点修补）与 `trim_system(cfg)`（段内压紧）从配置读
-  `gate.min_chars` / `gate.max_chars`，模板里的「8–40 字」换成一个按钮。写死的代价
-  是硬的：人把上限调到 30，提示词还按 40 说，模型写到 35 字，`line_length` 门禁按
+- `patch_system(cfg)`（定点修补）与 `trim_system(cfg)`（段内压紧）从配置读  
+  `gate.min_chars` / `gate.max_chars`，模板里的「8–40 字」换成一个按钮。写死的代价  
+  是硬的：人把上限调到 30，提示词还按 40 说，模型写到 35 字，`line_length` 门禁按  
   30 判——一次调用作废，下一轮还是同一段。插入那一处早就修过，这两处是同一类。
-- 门禁判据行（`ab_run_limit`）、`PLAN.md` 里对应那一行、`paradigms.py` 模块头的归属表
+- 门禁判据行（`ab_run_limit`）、`PLAN.md` 里对应那一行、`paradigms.py` 模块头的归属表  
   一并改成对话形式口径。
-- 另：`script_engine.py` 里一处注释把本机用户名当路径样例写在里面（「斜杠 <用户名>
+- 另：`script_engine.py` 里一处注释把本机用户名当路径样例写在里面（「斜杠 <用户名>  
   斜杠」），改成中性写法——源码里不该出现谁的用户名。
 
 **验收**
 
-- 单元：全量 987 条通过。`tests/test_paradigms.py` 新增 `TestResolveForm`（三层取值：
-  配置 > 卡上默认 > 兜底；`run_caps` 两侧都有数）、`TestRunCapsHaveOneSource` 6 条钉子
-  （旧取值口 `max_run_of` 已消失；直接取上限的动作只许落在 `_run_caps` 一处；旧卡上
-  的 `max_run` 键会被丢掉；插入与写作共用词表 / 风格两块；三张模板里的句长都是按钮、
+- 单元：全量 987 条通过。`tests/test_paradigms.py` 新增 `TestResolveForm`（三层取值：  
+  配置 > 卡上默认 > 兜底；`run_caps` 两侧都有数）、`TestRunCapsHaveOneSource` 6 条钉子  
+  （旧取值口 `max_run_of` 已消失；直接取上限的动作只许落在 `_run_caps` 一处；旧卡上  
+  的 `max_run` 键会被丢掉；插入与写作共用词表 / 风格两块；三张模板里的句长都是按钮、  
   修补与压紧确实把配置递了进去；门禁判据行说的是对话形式）。
-- `tests/test_gates.py` 与 `tests/test_script_contract.py` 里按压上限与「提示词的上限
+- `tests/test_gates.py` 与 `tests/test_script_contract.py` 里按压上限与「提示词的上限  
   就是门禁的上限」的用例改成按形式算，并强制 `dialogue_form=""`，不再受本机配置影响。
-- 三条路径实取一遍提示词：选了形式时卡上的站位整句消失、A/B 上限跟着形式变（`anchor`
+- 三条路径实取一遍提示词：选了形式时卡上的站位整句消失、A/B 上限跟着形式变（`anchor`  
   → 1 / 10）、`gate.max_chars=30` 时插入与修补都说「8–30 字」。
 
 ---
 
 ## v0.30.2
 
-**两件事：卡内再切一层「功能区」（先看功能、区内再看形态），路径类点位从「一个空框子」
+**两件事：卡内再切一层「功能区」（先看功能、区内再看形态），路径类点位从「一个空框子」  
 变成「说清要什么 + 点着选」。配置项没加没减，值域与保存方式一个没动。**
 
 **变更**
 
 **一、卡内功能区**
 
-- 上一版把一张卡里的控件按形态分行（滑杆一行、开关一行、下拉一行）：行齐了，功能
-  却被拆散。LLM 那张卡里「LLM 后端」与「模型名」挨在一起，「API 地址 / API Key」
-  掉到下一行，中间没有任何东西说明它们是一件事；而卡的最上面是五个滑杆，一进来
+- 上一版把一张卡里的控件按形态分行（滑杆一行、开关一行、下拉一行）：行齐了，功能  
+  却被拆散。LLM 那张卡里「LLM 后端」与「模型名」挨在一起，「API 地址 / API Key」  
+  掉到下一行，中间没有任何东西说明它们是一件事；而卡的最上面是五个滑杆，一进来  
   看到的全是参数，看不出这是「语言模型」的配置。
-- 现在分两层：**卡 → 功能区（小标题）→ 区内按形态分行**。表在 `web_ui.py` 的
-  `ZONES` 里，顺序即卡里的顺序。LLM 那张卡：`连接`（后端 / 模型名 / 地址 / Key）→
+- 现在分两层：**卡 → 功能区（小标题）→ 区内按形态分行**。表在 `web_ui.py` 的  
+  `ZONES` 里，顺序即卡里的顺序。LLM 那张卡：`连接`（后端 / 模型名 / 地址 / Key）→  
   `生成参数与超时`（五个滑杆）。
-- **一张卡只有一个功能区时不画小标题**，与从前逐字一样。整张卡只讲一件事的
+- **一张卡只有一个功能区时不画小标题**，与从前逐字一样。整张卡只讲一件事的  
   （项目、AIGC 标识、背景、动画、封面、字体）不进这张表。
-- 大卡的切法：写作目标＝时长与规模／切分与文体／取材与门禁；门禁阈值＝总时长容差／
-  单句长短；角色与音色＝引擎与音色／称呼与语速／本地语音服务；音频输出＝编码与
-  响度／停顿与降噪／片头尾与声明；背景音乐＝来源与音量／人声闪避；画面输出＝
-  画幅与帧率／编码与画面处理；说话人指示＝指示方式与颜色／立绘；字幕＝版式与
+- 大卡的切法：写作目标＝时长与规模／切分与文体／取材与门禁；门禁阈值＝总时长容差／  
+  单句长短；角色与音色＝引擎与音色／称呼与语速／本地语音服务；音频输出＝编码与  
+  响度／停顿与降噪／片头尾与声明；背景音乐＝来源与音量／人声闪避；画面输出＝  
+  画幅与帧率／编码与画面处理；说话人指示＝指示方式与颜色／立绘；字幕＝版式与  
   字号／边距与底框／角色字幕色。区内排布与上一版一致，行序按功能重排。
 
 **二、路径类点位（6 个：片头音频、片尾音频、自定义声明音频、自备音乐、两张立绘）**
 
-- 它们填的是**本机绝对路径**，管线一律拿 `os.path.exists` 判它。从前界面上就是一个
-  空框子，占位符只写「留空即不使用」——说了可不可以不填，没说该往里放什么。现在
-  占位符是「本机绝对路径，留空即不使用」，框旁边多一个「选择…」：弹本机文件对话框
-  （音频点位过滤音频、立绘过滤图片），选完把绝对路径写回该点位，与手填完全等价——
+- 它们填的是**本机绝对路径**，管线一律拿 `os.path.exists` 判它。从前界面上就是一个  
+  空框子，占位符只写「留空即不使用」——说了可不可以不填，没说该往里放什么。现在  
+  占位符是「本机绝对路径，留空即不使用」，框旁边多一个「选择…」：弹本机文件对话框  
+  （音频点位过滤音频、立绘过滤图片），选完把绝对路径写回该点位，与手填完全等价——  
   **不复制文件、不改读取位置**。
-- 新增 `POST /api/pickfile`。对话框在本机弹（服务与浏览器同机）；请求跑在
-  ThreadingHTTPServer 的工作线程上，而 Tk 只保证能在主线程里建 root，所以对话框交给
-  子进程去开（`sys.executable -c`，stdout 走 utf-8，中文路径不乱码）。取消＝什么都没
+- 新增 `POST /api/pickfile`。对话框在本机弹（服务与浏览器同机）；请求跑在  
+  ThreadingHTTPServer 的工作线程上，而 Tk 只保证能在主线程里建 root，所以对话框交给  
+  子进程去开（`sys.executable -c`，stdout 走 utf-8，中文路径不乱码）。取消＝什么都没  
   发生；环境缺图形接口时回一句「可以直接手填路径」，不抛栈。
-- **填了不存在的文件，界面上现在会说**：`validate_config` 对每个路径点位核一次存在性，
-  不存在就出警告（例：`自备音乐文件：找不到这个文件 —— D:\…（成品里会当作没填）`）。
-  这四个地方从前是**静默当没填**——片头音频、片尾音频、立绘、自备音乐，成品里什么都
+- **填了不存在的文件，界面上现在会说**：`validate_config` 对每个路径点位核一次存在性，  
+  不存在就出警告（例：`自备音乐文件：找不到这个文件 —— D:\…（成品里会当作没填）`）。  
+  这四个地方从前是**静默当没填**——片头音频、片尾音频、立绘、自备音乐，成品里什么都  
   不出现也不报错，人以为填上了；六个里只有 AI 声明音频会直接报错。
 - 其中四个点位原先一个字说明都没有（片头音频、片尾音频、自备音乐、两张立绘），补齐。
 
 **验收**
 
-- 单元：`TestConfigGrid` 增 4 条（功能区表与点位表对账：打错字、漏登记、重名、单区
-  白切；区在界面上的落法；路径点位必须声明选哪类文件；空框子必须有占位符与选择按钮），
-  `TestPickFile` 增 5 条（选择脚本可编译、过滤表齐全、路由已注册、非路径点位一律拒绝、
+- 单元：`TestConfigGrid` 增 4 条（功能区表与点位表对账：打错字、漏登记、重名、单区  
+  白切；区在界面上的落法；路径点位必须声明选哪类文件；空框子必须有占位符与选择按钮），  
+  `TestPickFile` 增 5 条（选择脚本可编译、过滤表齐全、路由已注册、非路径点位一律拒绝、  
   取消不算错误），`validate_config` 增路径存在性一组。
-- 真浏览器：`tools/ui_smoke.py` 增第 13/14 条判据（卡内功能区一块网格配一行小标题；
-  路径框带占位符与「选择…」），并把「按钮 → 接口 → 写回点位」用拦接口的办法跑通
+- 真浏览器：`tools/ui_smoke.py` 增第 13/14 条判据（卡内功能区一块网格配一行小标题；  
+  路径框带占位符与「选择…」），并把「按钮 → 接口 → 写回点位」用拦接口的办法跑通  
   （真弹对话框会卡住跑冒烟的人）。全 72 项通过、无 console 报错。
-- 对话框管路另有取证脚本 `_smoke/_pick_probe.py`：给子进程塞一个假 tkinter，核 argv、
-  过滤表、标题有没有传到 `askopenfilename`、中文加空格路径能否原样回传、取消与
+- 对话框管路另有取证脚本 `_smoke/_pick_probe.py`：给子进程塞一个假 tkinter，核 argv、  
+  过滤表、标题有没有传到 `askopenfilename`、中文加空格路径能否原样回传、取消与  
   「无图形接口」两条支路的返回——屏幕上不弹任何窗口。8 项全过。
 
 ---
@@ -1909,128 +2227,128 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 **修正**
 
-- **同一种控件的宽度不再有宽有窄**。从前判定是「说明长于 40 字就跨两列」，于是
-  同一张卡里滑杆有的占两格、有的占一格，下拉同理，行的起点与终点全乱。现在一律
+- **同一种控件的宽度不再有宽有窄**。从前判定是「说明长于 40 字就跨两列」，于是  
+  同一张卡里滑杆有的占两格、有的占一格，下拉同理，行的起点与终点全乱。现在一律  
   一格；跨列的只剩多行输入（textarea）——250px 宽写不下一段文字。
-- **行尾的空档不再被回头填上**。`grid-auto-flow:row dense` 会把排在后头的控件
+- **行尾的空档不再被回头填上**。`grid-auto-flow:row dense` 会把排在后头的控件  
   提上来填那个空档，同类控件因此被拆到两行里。去掉 dense，行填不满就让它空着。
-- **一类控件占一行，形态一变就另起一行**。新增 `ctlKind()`（形态判定，与
-  `control()` 里那几支 if 一一对应）与 `fillByKind()`（分桶铺设），每桶第一格加
-  `.kstart` 钉在列 1。桶序即排布序：滑杆 → 开关 → 下拉 → 输入框。以「写作目标」
-  卡为例：第一行四个滑杆（目标时长／分段软句数下限／回灌重试上限／地图期数上限），
-  第二行两个开关（取材标记／门禁严格模式），第三行四个下拉（压缩档／风格倾向／
+- **一类控件占一行，形态一变就另起一行**。新增 `ctlKind()`（形态判定，与  
+  `control()` 里那几支 if 一一对应）与 `fillByKind()`（分桶铺设），每桶第一格加  
+  `.kstart` 钉在列 1。桶序即排布序：滑杆 → 开关 → 下拉 → 输入框。以「写作目标」  
+  卡为例：第一行四个滑杆（目标时长／分段软句数下限／回灌重试上限／地图期数上限），  
+  第二行两个开关（取材标记／门禁严格模式），第三行四个下拉（压缩档／风格倾向／  
   对话形式／素材类型），第四行最左一格是清单类标题词表，后面三格空着。
-- **配置页与脚本页、合成页的快捷区走同一条铺法**，三处口径一致；同形态内保持
+- **配置页与脚本页、合成页的快捷区走同一条铺法**，三处口径一致；同形态内保持  
   原来的声明顺序，配置项的先来后到不动。
 
 **验收**
 
-- `tests/test_config_keys.py` 增三条源码钉子：不再按说明字数跨列、配置页网格不得
+- `tests/test_config_keys.py` 增三条源码钉子：不再按说明字数跨列、配置页网格不得  
   带 dense、形态分桶与「变了就换行」必须在两个渲染口都接上。
-- `tools/ui_smoke.py` 增第 12 条判据：在真实浏览器里按几何位置逐张卡分行，核
-  「同格不同形」「跨列」「行尾空档被回头填上」。容器宽 1538px、四列各 369.5px 时
-  实测每格宽 369.5（＝一格），左缘依次 0／389.5／779／1168.5（＝列 1／2／3／4），
+- `tools/ui_smoke.py` 增第 12 条判据：在真实浏览器里按几何位置逐张卡分行，核  
+  「同格不同形」「跨列」「行尾空档被回头填上」。容器宽 1538px、四列各 369.5px 时  
+  实测每格宽 369.5（＝一格），左缘依次 0／389.5／779／1168.5（＝列 1／2／3／4），  
   说明文字无横向溢出。
 
 ---
 
 ## v0.30.0
 
-**四件事：段主旨落盘（旁挂文件，正文那份 json 一个字不动）、前期回顾（片头之后
-正文之前，程序逐字拼）、对话形式从素材类型卡里单拎成配置、配置页网格重排（只改
-界面，配置项一个没动）。一并下线全局「额外要求」——重点已由项目级「重点方向」
+**四件事：段主旨落盘（旁挂文件，正文那份 json 一个字不动）、前期回顾（片头之后  
+正文之前，程序逐字拼）、对话形式从素材类型卡里单拎成配置、配置页网格重排（只改  
+界面，配置项一个没动）。一并下线全局「额外要求」——重点已由项目级「重点方向」  
 承担。**
 
 **变更**
 
 **一、段主旨落盘（旁挂）**
 
-- 新增 `layout.plan_file(root, no)`：`脚本/<no>.plan.json`，与正文脚本同目录
-  同号，只多一个后缀。段主旨（段号／段主旨／覆盖节号／配额）从前只活在内存
+- 新增 `layout.plan_file(root, no)`：`脚本/<no>.plan.json`，与正文脚本同目录  
+  同号，只多一个后缀。段主旨（段号／段主旨／覆盖节号／配额）从前只活在内存  
   （`groups[k]["topic"]`），函数一返回即弃，前期回顾无据可引。
-- `_generate_segmented` 返回值从 `(title, plan, script)` 变四元组，末尾带上段
-  清单；`generate` 把它透传进 payload，落盘时交 `pipeline.write_plan_file` 写成
-  旁挂档（**只在有段清单时写**——整篇路没有段主旨，写一份空壳只会让回顾读出一个
-  空数组）。写在这里而不是散在 web_ui 里，是因为读的那一头 `pipeline.review_rows`
+- `_generate_segmented` 返回值从 `(title, plan, script)` 变四元组，末尾带上段  
+  清单；`generate` 把它透传进 payload，落盘时交 `pipeline.write_plan_file` 写成  
+  旁挂档（**只在有段清单时写**——整篇路没有段主旨，写一份空壳只会让回顾读出一个  
+  空数组）。写在这里而不是散在 web_ui 里，是因为读的那一头 `pipeline.review_rows`  
   也在这一处，两头同模块才谈得上成对。
-- **正文 `脚本/<no>.json` 结构一个字不动**：出片、时长估算、字幕、视频、前端
+- **正文 `脚本/<no>.json` 结构一个字不动**：出片、时长估算、字幕、视频、前端  
   预览全按扁平数组读它，改成 `{lines, segments}` 会一次破坏所有这些读取方。
-- 缺这一份是合法状态（没跑过分段路的期、本功能上线前写的期），读到就当
+- 缺这一份是合法状态（没跑过分段路的期、本功能上线前写的期），读到就当  
   「上一期没留下段主旨」，按缺料降级，不报错。
 
 **二、前期回顾**
 
-- 位置写死在 `glue_intro_outro`：`片头 → 回顾 → 正文 → 片尾`。回顾与片头尾
-  同类——模型不参与，程序逐字拼，不过门禁、不核字数；`normalize_script` 统一
+- 位置写死在 `glue_intro_outro`：`片头 → 回顾 → 正文 → 片尾`。回顾与片头尾  
+  同类——模型不参与，程序逐字拼，不过门禁、不核字数；`normalize_script` 统一  
   量一遍时长（新加的句子不量就是 0 秒，字幕时间轴会错位）。
-- 模板在 `INTRO_OUTRO["review"]`（不随档位变，所以不在 standard / brief 里）：
-  `上期《{prev_title}》聊的是{prev_gist}——讲了{prev_topics}等。`
+- 模板在 `INTRO_OUTRO["review"]`（不随档位变，所以不在 standard / brief 里）：  
+  `上期《{prev_title}》聊的是{prev_gist}——讲了{prev_topics}等。`  
   末条固定带「等」，哪怕只有一条。
-- `pipeline.review_rows` 组句，两路取料：**期主旨**取地图行
-  （`project_store.map_episodes` 的 `gist`，不读盘）；**段主旨**取上一期的旁挂
-  档，最多 3 条。注意地图在 `item["map"]["episodes"]`——`item["episodes"]` 是
+- `pipeline.review_rows` 组句，两路取料：**期主旨**取地图行  
+  （`project_store.map_episodes` 的 `gist`，不读盘）；**段主旨**取上一期的旁挂  
+  档，最多 3 条。注意地图在 `item["map"]["episodes"]`——`item["episodes"]` 是  
   已出片登记，只有期号与标题，照它取会永远取不到 gist，表现成「回顾从不出现」。
-- **任一路缺就整句不粘**：第 1 期、本期不在地图上、上一期不在本项目、上一期
+- **任一路缺就整句不粘**：第 1 期、本期不在地图上、上一期不在本项目、上一期  
   没留下段主旨——一律按「这句没有」处理，绝不留半句话。
 - 开关 `intro_outro.review`，**默认关**。
 
 **三、对话形式（六种，从素材类型卡单拎出来）**
 
-- `paradigms.DIALOGUE_FORMS`：一问一答／交替讲述／追问深挖／观点对辩／闲聊
-  漫谈／主讲＋捧哏。`form_block` 拼成提示词里的一段；空值/未知键返回空串，
+- `paradigms.DIALOGUE_FORMS`：一问一答／交替讲述／追问深挖／观点对辩／闲聊  
+  漫谈／主讲＋捧哏。`form_block` 拼成提示词里的一段；空值/未知键返回空串，  
   与从前逐字一致。
-- 配置项 `script.dialogue_form`（默认空＝跟随素材类型）。**落位与风格倾向一致**：
-  配置页可调，**同时在脚本页「写作要点」那一排**有控件——它是写脚本那一刻才要
-  定的选择，跟风格倾向同类；只摆在配置页的话，生成一次要切两次页，改的人很
+- 配置项 `script.dialogue_form`（默认空＝跟随素材类型）。**落位与风格倾向一致**：  
+  配置页可调，**同时在脚本页「写作要点」那一排**有控件——它是写脚本那一刻才要  
+  定的选择，跟风格倾向同类；只摆在配置页的话，生成一次要切两次页，改的人很  
   容易以为「改了没生效」。
-- **站位（cast）与形式分工不同**：站位管「谁懂谁不懂」，形式管「话怎么交错」；
-  选了形式就**顶掉**卡上那段站位说明（是覆盖，不是并列两个来源），播讲人称呼
+- **站位（cast）与形式分工不同**：站位管「谁懂谁不懂」，形式管「话怎么交错」；  
+  选了形式就**顶掉**卡上那段站位说明（是覆盖，不是并列两个来源），播讲人称呼  
   两种情况都保留。
-- 三处进提示词：整篇路系统提示词、分段路每段用户提示词、插入轮系统提示词
+- 三处进提示词：整篇路系统提示词、分段路每段用户提示词、插入轮系统提示词  
   （插入得与整段用同一种「话怎么接」，不然一段里两种节奏打架）。
-- 脚本页那一行的说明只有一句（「话怎么接」＋留空什么意思）：六种形式的做法
-  在下拉选项里跟着选项走，不在这儿再枚举一遍；「与从前逐字一致」「不进任何
+- 脚本页那一行的说明只有一句（「话怎么接」＋留空什么意思）：六种形式的做法  
+  在下拉选项里跟着选项走，不在这儿再枚举一遍；「与从前逐字一致」「不进任何  
   门禁」这类内部口径也不摆到界面上。
 
 **四、下线全局「额外要求」**
 
-- 删 `script.extra_requirement`（配置页点位、`web_ui` 六处传参、`generate` /
-  `_generate_segmented` / `_segment_user_prompt` / `build_user_prompt` 的 `extra`
-  形参与【补充说明】块、`pipeline.run_episode` 的兼容形参）。重点改由项目级
-  「重点方向」在排图那一步承担，写作侧不再有第二个「补充说明」入口——两处可写
+- 删 `script.extra_requirement`（配置页点位、`web_ui` 六处传参、`generate` /  
+  `_generate_segmented` / `_segment_user_prompt` / `build_user_prompt` 的 `extra`  
+  形参与【补充说明】块、`pipeline.run_episode` 的兼容形参）。重点改由项目级  
+  「重点方向」在排图那一步承担，写作侧不再有第二个「补充说明」入口——两处可写  
   的后果是人改了新的一处以为生效，旧那处还在往提示词里塞话。
 
 **五、配置页网格重排（只改界面，不动任何配置项）**
 
-- 从前每格按控件自己的自然高度排：滑块 18px、下拉与输入框 37px，滑块底下还
-  多一行刻度，开关连标题行都没有。结果同一行里各控件的水平线全不一样，一格
+- 从前每格按控件自己的自然高度排：滑块 18px、下拉与输入框 37px，滑块底下还  
+  多一行刻度，开关连标题行都没有。结果同一行里各控件的水平线全不一样，一格  
   里五行说明把整行顶高、旁边的窄格空出一大片。
-- 现在每格钉成固定四段：**标题行 22px / 控件槽 34px / 刻度槽 15px / 说明**。
-  前两段是硬高度，滑块、下拉、输入框、开关一律落在同一条线上；没有刻度的项
-  也占一格空的刻度槽，连格与格的底部都对得上。开关进了同一副骨架——拨杆在
+- 现在每格钉成固定四段：**标题行 22px / 控件槽 34px / 刻度槽 15px / 说明**。  
+  前两段是硬高度，滑块、下拉、输入框、开关一律落在同一条线上；没有刻度的项  
+  也占一格空的刻度槽，连格与格的底部都对得上。开关进了同一副骨架——拨杆在  
   控件槽、标题上行、开/关写在标题右端。
-- 配置页网格列数改**固定四档**（按可用宽度整档切换，不随窗口连续伸缩——连续
-  伸缩会让同一张卡在不同窗口下排到完全不同的位置），配 `dense` 让跨列的项回头
-  填补空档。说明长的项（≥40 字）与路径项跨两列：一句百来字的说明挤在一列里
+- 配置页网格列数改**固定四档**（按可用宽度整档切换，不随窗口连续伸缩——连续  
+  伸缩会让同一张卡在不同窗口下排到完全不同的位置），配 `dense` 让跨列的项回头  
+  填补空档。说明长的项（≥40 字）与路径项跨两列：一句百来字的说明挤在一列里  
   要折四五行，正是参差的主要来源。
-- **骨架只挂在配置页那张网格（`.grid.g4`）上**。脚本页与合成页的快捷区在左栏
-  里只有 ~370px 宽，仍用自适应铺列——固定列数套下去，7 个控件会挤成一列竖字。
+- **骨架只挂在配置页那张网格（`.grid.g4`）上**。脚本页与合成页的快捷区在左栏  
+  里只有 ~370px 宽，仍用自适应铺列——固定列数套下去，7 个控件会挤成一列竖字。  
   这一版按此改过一次，所以加了源码级钉子。
-- 试听按钮与下拉同一槽，音频播放器默认不出现、点了才在下方铺开，不再一开始
+- 试听按钮与下拉同一槽，音频播放器默认不出现、点了才在下方铺开，不再一开始  
   就占着一行挤掉下拉的宽度。
 - 立项表单那些不铺网格的字段不受这套骨架约束，照旧按内容自然排。
 
 **测试**
 
-- 新增 `tests/test_review.py`：开关关／第 1 期／不在地图上／段主旨缺失四路降级、
-  引用上限 3 条且带「等」、支期按播出顺序算上一期、期主旨取自地图行而非出片
-  登记；另盯**写侧**（`pipeline.write_plan_file`）——段清单在场才落盘、整篇路
+- 新增 `tests/test_review.py`：开关关／第 1 期／不在地图上／段主旨缺失四路降级、  
+  引用上限 3 条且带「等」、支期按播出顺序算上一期、期主旨取自地图行而非出片  
+  登记；另盯**写侧**（`pipeline.write_plan_file`）——段清单在场才落盘、整篇路  
   不落空壳、写一份第 1 期的旁挂后第 2 期的回顾要能念出来（读写往返）。
-- 新增钉子：形式覆盖卡上站位（含未知键返回空串）、段清单四元组、「额外要求」
-  点位已下线且源码无残留、**脚本页快捷区逐键与总表对账**（「对话形式」必须与
+- 新增钉子：形式覆盖卡上站位（含未知键返回空串）、段清单四元组、「额外要求」  
+  点位已下线且源码无残留、**脚本页快捷区逐键与总表对账**（「对话形式」必须与  
   「风格倾向」并排可改——那张白名单写错键名不报错，只是界面上静默少一格）。
-- 新增 `TestConfigGrid`：基础网格必须是自适应铺列（窄栏不许被写死列数）、骨架
-  的每条选择器都必须带 `.g4`、开关必须带控件槽与刻度槽。第一条与第二条都做过
+- 新增 `TestConfigGrid`：基础网格必须是自适应铺列（窄栏不许被写死列数）、骨架  
+  的每条选择器都必须带 `.g4`、开关必须带控件槽与刻度槽。第一条与第二条都做过  
   反向验证——把骨架改回裸 `.grid>` 真能被拦下。
 - 全量 963 条通过。
 
@@ -2038,53 +2356,53 @@ A 只要连着说两句，形式门禁就报「连说超限」，把整段交给
 
 ## v0.29.0
 
-**项目级「重点方向」：人写一段侧重，与范式卡的重点判据一起进排图，调的是分组
+**项目级「重点方向」：人写一段侧重，与范式卡的重点判据一起进排图，调的是分组  
 粒度——侧重的内容合得细、多占期数，次要的合得粗。留空则一切照旧。**
 
-背景：重点判据（范式卡的 `focus`）只进排图，管的是"什么值得单开一期、什么
-并进去、什么不播"——它决定的是**期的边界**，不是期内的详略。所以想让整档节目
-偏向某个方向，缺的不是写脚本时的指令，而是**排图时多一路人的判断**：卡上的
+背景：重点判据（范式卡的 `focus`）只进排图，管的是"什么值得单开一期、什么  
+并进去、什么不播"——它决定的是**期的边界**，不是期内的详略。所以想让整档节目  
+偏向某个方向，缺的不是写脚本时的指令，而是**排图时多一路人的判断**：卡上的  
 判据是文体的通用口径，跟这本具体书无关。
 
 **变更**
 
-- **项目新增 `focus_note`（界面：重点方向）**：立项时可填、此后可改；空串是
-  「人没写过」，排图提示词与从前**逐字一致**——老项目重排一次图，口径不会因为
+- **项目新增 `focus_note`（界面：重点方向）**：立项时可填、此后可改；空串是  
+  「人没写过」，排图提示词与从前**逐字一致**——老项目重排一次图，口径不会因为  
   多了一条通道就悄悄变。
-- **`paradigms.prompt_block` 新增 `extra_focus`**：非空时在「**重点判据**」之后
-  并列一行「**本档侧重**（人给这档节目定的方向，与上面的重点判据**同时生效**）」，
-  随后跟一句把方向挂到粒度上的说明（少合几节、多给期数；次要的多合几节、少占
+- **`paradigms.prompt_block` 新增 `extra_focus`**：非空时在「**重点判据**」之后  
+  并列一行「**本档侧重**（人给这档节目定的方向，与上面的重点判据**同时生效**）」，  
+  随后跟一句把方向挂到粒度上的说明（少合几节、多给期数；次要的多合几节、少占  
   期数；**都在上下限之内，下限优先**）。卡上的判据不因此作废——是叠加不是替换。
-- **只进 plan 档**：`stage="script"`（写脚本）不含这一路。侧重管「怎么切、怎么
+- **只进 plan 档**：`stage="script"`（写脚本）不含这一路。侧重管「怎么切、怎么  
   并」，写脚本那一步看到的是期主旨与凝缩要点，不重复。
-- **两处排图都接**：首次排图（`plan_map`）与插入重排（`plan_insert`）同时取
-  项目上的 `focus_note`，并各记一行日志。只在首次认、插入不认，等于补一次料
+- **两处排图都接**：首次排图（`plan_map`）与插入重排（`plan_insert`）同时取  
+  项目上的 `focus_note`，并各记一行日志。只在首次认、插入不认，等于补一次料  
   就换一套分组口径，而两张图要拼在一起用。
-- 新增钉子 10 条：侧重写在时进提示词并带粒度规则、空值/空白/None 时输出与从前
-  逐字一致、不进 script 档、`plan_map` 与 `plan_insert` 两路端到端送达、
+- 新增钉子 10 条：侧重写在时进提示词并带粒度规则、空值/空白/None 时输出与从前  
+  逐字一致、不进 script 档、`plan_map` 与 `plan_insert` 两路端到端送达、  
   `focus_note` 的落库/可改/默认空/去空白。
 
 ---
 
 ## v0.28.2
 
-**插入轮的上下文补全，与写脚本同源：原文、段主旨、范式卡、标签列接通——
+**插入轮的上下文补全，与写脚本同源：原文、段主旨、范式卡、标签列接通——  
 只接上下文，不加任何门禁或硬规则。**
 
-背景（2d 期 215-221、250-260 插入乱象的机制根因）：插入链路是范式盲的——
-`build_insert_prompt` 不接范式卡，模型不知道 A/B 在本篇各干什么活；正文行只有
+背景（2d 期 215-221、250-260 插入乱象的机制根因）：插入链路是范式盲的——  
+`build_insert_prompt` 不接范式卡，模型不知道 A/B 在本篇各干什么活；正文行只有  
 speaker 与 text，追问接缝对它隐形；原文进不来，它拿着凝缩摘要编细节。
 
 **变更**
 
-- **`build_insert_prompt` 新增 `raw_material` / `topic` 两路输入**：调用处把
-  本段对应的原文（`seg_mat`，与写脚本同一份 `mat_of` 产物）与段主旨（`topic`）
+- **`build_insert_prompt` 新增 `raw_material` / `topic` 两路输入**：调用处把  
+  本段对应的原文（`seg_mat`，与写脚本同一份 `mat_of` 产物）与段主旨（`topic`）  
   接进来，各自成块（【本段原文】【本段主旨】）；不给就不出现该块，不放假锚。
-- **`insert_system(card, cfg)` 带范式卡**：card 在场时追加 `paradigms.script_block`
+- **`insert_system(card, cfg)` 带范式卡**：card 在场时追加 `paradigms.script_block`  
   的【文体依据】块（两人站位、同一人连续句数上限）；不带卡的老调用保持原样。
-- **`_numbered_rows` 加语篇标签列**：`250. [A·追问] ……`——插入与压紧两条路
+- **`_numbered_rows` 加语篇标签列**：`250. [A·追问] ……`——插入与压紧两条路  
   共用同一函数，一并生效；测试 stub 的行解析正则随格式更新。
-- 新增钉子：插入提示词带原文/主旨/标签列且缺输入时不放假块；插入系统提示词
+- 新增钉子：插入提示词带原文/主旨/标签列且缺输入时不放假块；插入系统提示词  
   带范式卡（cast 与连说上限）。
 
 ---
@@ -2093,10 +2411,10 @@ speaker 与 text，追问接缝对它隐形；原文进不来，它拿着凝缩�
 
 **片头尾的语篇标签在模板里写死：开场 / 承接 / 收束，不再靠 normalize 兜底。**
 
-- `INTRO_OUTRO` 模板每句带 `emotion` 键（片头 A=开场、片头 B=承接、片尾=收束，
-  精简档同）；`glue_intro_outro._render` 透传到句子上。normalize 对词表内的值
+- `INTRO_OUTRO` 模板每句带 `emotion` 键（片头 A=开场、片头 B=承接、片尾=收束，  
+  精简档同）；`glue_intro_outro._render` 透传到句子上。normalize 对词表内的值  
   原样放行，一行未动。
-- 背景：模板原先只写 speaker 与 text，粘出的片头尾没有标签，normalize 兜底
+- 背景：模板原先只写 speaker 与 text，粘出的片头尾没有标签，normalize 兜底  
   全落中性档——旧词表代落「平静」、现行落「承接」，片头变成「承接：欢迎收听…」。
 - 测试：新增钉子断言标准档与精简档粘出的首尾句标签（开场/承接/收束）。
 
@@ -2104,109 +2422,109 @@ speaker 与 text，追问接缝对它隐形；原文进不来，它拿着凝缩�
 
 ## v0.28.0
 
-**句尾标点进硬约束：提示词契约带正反示例教「按语义选符号」，门禁管「有没有」，
+**句尾标点进硬约束：提示词契约带正反示例教「按语义选符号」，门禁管「有没有」，  
 缺了定点打回让模型按语义补——py 不猜语义，模型不许裸尾。**
 
-背景：2b 期 65% 的句子没有终止标点（段生成路调用内自模仿雪崩，经段间上下文
-蔓延）；2c 期补写插入的新句系统性裸尾（插入示例文本本身没标点）；追问标签的
+背景：2b 期 65% 的句子没有终止标点（段生成路调用内自模仿雪崩，经段间上下文  
+蔓延）；2c 期补写插入的新句系统性裸尾（插入示例文本本身没标点）；追问标签的  
 句子仅 29% 带问号。标点从头到尾不在任何硬约束里，是否带、带什么全凭采样手感。
 
 **新增**
 
-- **句尾标点门禁（`line_end_punct`）**：逐句判「末字符不是终止标点」——先剥掉
-  收尾引号/括号（「……这样的话。」标点在引号里），再看末字符是否属于
-  。！？…（含半角）。一步盖住「完全没标点」与「拿逗号顿号收尾」两种坏形；
-  命中自带句号，与措辞禁忌同路走定点修补，回灌文案带方向（疑问收？、感叹收！、
-  陈述收。）。**有没有归 py，对不对归语义**：问句收句号是语义的事，py 不判。
-  验证：判据（裸尾/逗号尾/引号包句/省略号/空串）、门禁命中与放行、语义类型
+- **句尾标点门禁（`line_end_punct`）**：逐句判「末字符不是终止标点」——先剥掉  
+  收尾引号/括号（「……这样的话。」标点在引号里），再看末字符是否属于  
+  。！？…（含半角）。一步盖住「完全没标点」与「拿逗号顿号收尾」两种坏形；  
+  命中自带句号，与措辞禁忌同路走定点修补，回灌文案带方向（疑问收？、感叹收！、  
+  陈述收。）。**有没有归 py，对不对归语义**：问句收句号是语义的事，py 不判。  
+  验证：判据（裸尾/逗号尾/引号包句/省略号/空串）、门禁命中与放行、语义类型  
   不判、回灌带句号与方向、定点指向、两份提示词带条款，各有用例。
 
 **变更**
 
-- **生成契约的正反示例换血（整篇与分段两处逐字同步）**：正确示例从一条扩成
-  三条——追问收？、承接收。、强调收！，三个标签各配一种句尾符号；错误示例
-  一条演示三处错（词表外标签、标签词混进 text、句尾没标点）。text 条款补
+- **生成契约的正反示例换血（整篇与分段两处逐字同步）**：正确示例从一条扩成  
+  三条——追问收？、承接收。、强调收！，三个标签各配一种句尾符号；错误示例  
+  一条演示三处错（词表外标签、标签词混进 text、句尾没标点）。text 条款补  
   「每句必须以标点符号收尾，收什么由语义定，不许全篇拿句号应付」。
-- **插入 / 压紧 / 修补三份提示词的格式示例带上句尾标点**：原来的占位文本
-  （「新增的整句文本」等）本身裸着，模型照形状抄——2c 期补写裸句正是从
-  插入路带出来的。三处各补一条句尾标点条款；修补那份（门禁打回的执行者）
+- **插入 / 压紧 / 修补三份提示词的格式示例带上句尾标点**：原来的占位文本  
+  （「新增的整句文本」等）本身裸着，模型照形状抄——2c 期补写裸句正是从  
+  插入路带出来的。三处各补一条句尾标点条款；修补那份（门禁打回的执行者）  
   明确「补什么符号由这句话的语义定，不许一律补句号应付」。
-- 测试夹具同步：段/整篇 payload、补字与修补 stub、压紧 stub 的合成句子全部
-  带上句尾标点（压紧 stub 截断时保留结尾标点，从正文扣字）；相关期望值随
+- 测试夹具同步：段/整篇 payload、补字与修补 stub、压紧 stub 的合成句子全部  
+  带上句尾标点（压紧 stub 截断时保留结尾标点，从正文扣字）；相关期望值随  
   有效字口径（标点 ×0.5）更新。
 - **整篇与分段输出格式示例的占位文本补上句尾标点**：`"text": "台词正文，
-  只写要念出来的话"` 本身裸尾（两处）——首版五处提示词改漏的地方，模型照
+  只写要念出来的话"` 本身裸尾（两处）——首版五处提示词改漏的地方，模型照  
   示例形状抄同样出裸句。
-- **源码级钉子（TestEveryExampleTextCarriesTerminalPunct）**：正则扫
-  script_engine 里全部 `"text": "…"` 示例字面量，裸尾即红；唯一放行是
+- **源码级钉子（TestEveryExampleTextCarriesTerminalPunct）**：正则扫  
+  script_engine 里全部 `"text": "…"` 示例字面量，裸尾即红；唯一放行是  
   「错误：」示例（它本来就演示句尾没标点）。改漏一个示例，测试当场咬住。
 
 ---
 
 ## v0.27.0
 
-**emotion 字段回归，但换血：只装语篇标签（承接/追问/解释/强调/比喻/铺垫/过渡/
+**emotion 字段回归，但换血：只装语篇标签（承接/追问/解释/强调/比喻/铺垫/过渡/  
 总结/开场/收束），词表按风格倾向收窄进 schema 枚举；合成链硬隔离，一个字都不读。**
 
-背景：2b 期实测删净 emotion 后问句率 0%（2a 期为 47.5%）——逐句必填的枚举是
-生成侧的句型硬信号（「追问」标签 99% 对应真问句），v0.26.0 删除时只论证了合成侧
-零消费，漏了它在生成侧的价值。恢复但换血，v0.9.0 判死的是真情绪词与 instruct
+背景：2b 期实测删净 emotion 后问句率 0%（2a 期为 47.5%）——逐句必填的枚举是  
+生成侧的句型硬信号（「追问」标签 99% 对应真问句），v0.26.0 删除时只论证了合成侧  
+零消费，漏了它在生成侧的价值。恢复但换血，v0.9.0 判死的是真情绪词与 instruct  
 通路，语篇标签与那条死路无关。
 
-- 生成侧：一句台词恢复三字段 `speaker / emotion / text`。五 schema（整篇/分段/
-  插入/压紧/补丁）emotion 进枚举：插入新句必填，修补与压紧可选；词表不再整篇
-  一套——按风格倾向收窄（`discourse_vocab_for`）：question_rate=low 无「追问」、
-  metaphor_density=low 无「比喻」、emotion_density=low 裁「铺垫/过渡」，中性档
-  「承接」（新增词，顺着往下讲的句子用它，对齐 2a 期「平静」承担近半句子的实证）
+- 生成侧：一句台词恢复三字段 `speaker / emotion / text`。五 schema（整篇/分段/  
+  插入/压紧/补丁）emotion 进枚举：插入新句必填，修补与压紧可选；词表不再整篇  
+  一套——按风格倾向收窄（`discourse_vocab_for`）：question_rate=low 无「追问」、  
+  metaphor_density=low 无「比喻」、emotion_density=low 裁「铺垫/过渡」，中性档  
+  「承接」（新增词，顺着往下讲的句子用它，对齐 2a 期「平静」承担近半句子的实证）  
   任何档都在。枚举里没有的词约束解码选不出来——收窄是硬约束，不靠提示词自律。
-- 提示词：整篇/分段/补写/压紧/修补五处补语篇契约与正反例（正确
-  `{"speaker":"A","emotion":"追问","text":"…问句…"}`；错误：词表外的「疑惑」、
+- 提示词：整篇/分段/补写/压紧/修补五处补语篇契约与正反例（正确  
+  `{"speaker":"A","emotion":"追问","text":"…问句…"}`；错误：词表外的「疑惑」、  
   旁白腔混进 text），逐词给「词=干什么活」释义。
-- 门禁：`emotion_vocab` 回归（兜降级路的漏网），`fields_complete` 判据补 emotion；
-  `normalize_script` 对全表外的值落「承接」——风格收窄归门禁，词表合法性归
+- 门禁：`emotion_vocab` 回归（兜降级路的漏网），`fields_complete` 判据补 emotion；  
+  `normalize_script` 对全表外的值落「承接」——风格收窄归门禁，词表合法性归  
   normalize，两层不打架。
-- 合成侧硬隔离：`tts_engine` 的 `synth_line` / `_service_synth` 删除 emotion 参数
-  与请求体键——脚本里带不带标签，合成行为一模一样，instruct 路径（v0.9.0 判死）
+- 合成侧硬隔离：`tts_engine` 的 `synth_line` / `_service_synth` 删除 emotion 参数  
+  与请求体键——脚本里带不带标签，合成行为一模一样，instruct 路径（v0.9.0 判死）  
   不因标签回归而复活；`degree`（整期档位）照常透传。
-- 界面：脚本表恢复「标签」下拉列（选项单源注入自 `DISCOURSE_ORDER`）；范式卡不
+- 界面：脚本表恢复「标签」下拉列（选项单源注入自 `DISCOURSE_ORDER`）；范式卡不  
   恢复情绪键——词表走风格收窄，卡只管站位与连句上限。
-- 测试：`TestSchemaHasNoEmotionField` 翻转为 `TestDiscourseTagRestored`（枚举在、
-  收窄生效、模板不被污染、修补提示词带口径）；合成侧两条旧透传钉子翻转为隔离
+- 测试：`TestSchemaHasNoEmotionField` 翻转为 `TestDiscourseTagRestored`（枚举在、  
+  收窄生效、模板不被污染、修补提示词带口径）；合成侧两条旧透传钉子翻转为隔离  
   钉子（签名无 emotion、请求体无 emotion 键）；补词表外拒绝落地的钉子。
 
 ---
 
 ## v0.26.5
 
-**取材标记：素材里「给眼睛看的」内容（网址、代码、公式、表格、路径、清单……），
-在提示词里打标记提醒模型转述或跳过，不逐字念进台词。**
-背景：素材里镜像清单、命令列表、网址、代码块这类内容会被模型逐条铺进台词——
-念出来是灾难，还浪费配额。出口的台词门禁一直在兜底，但漏网即重摇：入口提醒
+**取材标记：素材里「给眼睛看的」内容（网址、代码、公式、表格、路径、清单……），  
+在提示词里打标记提醒模型转述或跳过，不逐字念进台词。**  
+背景：素材里镜像清单、命令列表、网址、代码块这类内容会被模型逐条铺进台词——  
+念出来是灾难，还浪费配额。出口的台词门禁一直在兜底，但漏网即重摇：入口提醒  
 在前、出口门禁在后，两层咬合。
 
 **新增**
 
-- 形状扫描器 `_shape_flags(text, cfg, anchor)`：八家族形状判定——网址/邮箱、
-  公式（LaTeX 标记 + Unicode 数学符号密度）、代码（围栏 + 关键词/符号密度，
-  txt/docx 抽出后没有围栏也能兜住）、表格、路径/目录树、参考文献、排版标签
-  残留、日志/时间戳行；再加**清单类**（节标题命中词表，词表
-  `script.flag_title_words` 进 config，不区分大小写）。全部按命中次数阈值判，
+- 形状扫描器 `_shape_flags(text, cfg, anchor)`：八家族形状判定——网址/邮箱、  
+  公式（LaTeX 标记 + Unicode 数学符号密度）、代码（围栏 + 关键词/符号密度，  
+  txt/docx 抽出后没有围栏也能兜住）、表格、路径/目录树、参考文献、排版标签  
+  残留、日志/时间戳行；再加**清单类**（节标题命中词表，词表  
+  `script.flag_title_words` 进 config，不区分大小写）。全部按命中次数阈值判，  
   正文干净不误报。
-- 标记行 `_sec_note_text`：只列命中的家族，每家族一条用法指导（转述含义或
+- 标记行 `_sec_note_text`：只列命中的家族，每家族一条用法指导（转述含义或  
   跳过），绝不逐字念。
-- 展示拼接 `_apply_sec_notes`：在素材文本的命中节标签行后插入标记行；找不到
+- 展示拼接 `_apply_sec_notes`：在素材文本的命中节标签行后插入标记行；找不到  
   节标签（无逐节原文的老路）就一根不插——宁可缺标记，不造假位置。
-- 配置键：`script.shape_flags`（总开关，默认开）、`script.flag_title_words`
+- 配置键：`script.shape_flags`（总开关，默认开）、`script.flag_title_words`  
   （清单类标题词表）。
 - 日志留痕：`取材标记：第15节（清单/网址）、第19节（清单）…`。
 
 **变更**
 
-- `generate` / `_generate_segmented` 新增 `sec_flags` 参数（默认 None，既有
-  调用方行为不变）；`_segment_user_prompt` 新增 `noted_fit`、
+- `generate` / `_generate_segmented` 新增 `sec_flags` 参数（默认 None，既有  
+  调用方行为不变）；`_segment_user_prompt` 新增 `noted_fit`、  
   `build_insert_prompt` 新增 `noted_material`（展示用 noted 版）。
-- **素材账零污染（一根尺原则）**：压比（【本段用量】）、装箱称重、节权重摊配
-  额全部吃**原始素材**——标记行是 py 写的指令不是素材内容，混进压比就虚高；
+- **素材账零污染（一根尺原则）**：压比（【本段用量】）、装箱称重、节权重摊配  
+  额全部吃**原始素材**——标记行是 py 写的指令不是素材内容，混进压比就虚高；  
   标记行归提示词固定开销（总量百余字）。不删任何素材，压比从头到尾一个数。
 - 出口台词门禁（READABLE_RULE + unreadable_hits）零改动，继续兜底。
 
@@ -2214,97 +2532,98 @@ speaker 与 text，追问接缝对它隐形；原文进不来，它拿着凝缩�
 
 ## v0.26.4
 
-**碎段合并：低于阈值的逻辑段并进配额较小的邻居，装箱桶兜底。**
-背景：小节扎堆会出一批 60~145 有效字的段——一次完整 LLM 调用写三句话，烧时间、
+**碎段合并：低于阈值的逻辑段并进配额较小的邻居，装箱桶兜底。**  
+背景：小节扎堆会出一批 60~145 有效字的段——一次完整 LLM 调用写三句话，烧时间、  
 多接缝；且配额过小时「约 N 句」的软引导自相矛盾（15 句 × 每句最少 8 字 = 120 字
+
 > 配额 60 字）。实测一期 8 段里 4 段 ≤145 有效字。
 
 **新增**
 
-- **`_merge_tiny_groups(secs, groups, target_chars, cfg, log)`**：配额低于阈值的
-  逻辑段并进**配额较小的相邻段**（节号与取材范围取并集、配额相加）；合并后仍
+- **`_merge_tiny_groups(secs, groups, target_chars, cfg, log)`**：配额低于阈值的  
+  逻辑段并进**配额较小的相邻段**（节号与取材范围取并集、配额相加）；合并后仍  
   低于阈值就链式继续，直到全部达标或只剩一段。纯算术，模型不参与。
-- **配置键 `script.segment_min_sents`（默认 15）**：提示词软句数下限改为可配置
+- **配置键 `script.segment_min_sents`（默认 15）**：提示词软句数下限改为可配置  
   （原 `SEGMENT_MIN_SENTS` 常量降为缺配置时的兜底默认）。
 - **阈值全部现算，不写死**：`阈值 = script.segment_min_sents × 期望句长
-  ((gate.min_chars + gate.max_chars) / 2)`。改句长配置或软句数配置，阈值跟着变；
+  ((gate.min_chars + gate.max_chars) / 2)`。改句长配置或软句数配置，阈值跟着变；  
   段配额 ≥ 阈值时「约 N 句」的引导才与配额自洽——阈值正好是引导不说谎的下限。
 
 **变更**
 
-- **合并位置在装箱之前**（`_generate_segmented` 里逻辑拆分之后）：它只改
-  「哪几节归同一段」，节顺序不变；装箱按容量再切是兜底——合并段超容时桶照旧
-  按整节切开，`written` 按实际封桶累计的账不受影响。装箱路（`pack_segments`）
+- **合并位置在装箱之前**（`_generate_segmented` 里逻辑拆分之后）：它只改  
+  「哪几节归同一段」，节顺序不变；装箱按容量再切是兜底——合并段超容时桶照旧  
+  按整节切开，`written` 按实际封桶累计的账不受影响。装箱路（`pack_segments`）  
   与无重量降级路（`_groups_asis`）拿到的都是合并后的分组，两条路自动同形。
-- **日志**：合并发生时打一行
-  `碎段合并：8 个逻辑段 → 4 个（阈值 360 有效字 = 软句数下限 15 × 期望句长 24…）`；
+- **日志**：合并发生时打一行  
+  `碎段合并：8 个逻辑段 → 4 个（阈值 360 有效字 = 软句数下限 15 × 期望句长 24…）`；  
   没碎段不出行。规划轮在合并后跑，段主旨条数自动对上。
 
 **测试**
 
-- 新增 `TestMergeTinySegments` 7 条：并入较轻邻居 + 链式合并、全碎并成一段、
-  无碎段不动、阈值随配置变（不写死）、软句数读配置键、配置默认 15、
+- 新增 `TestMergeTinySegments` 7 条：并入较轻邻居 + 链式合并、全碎并成一段、  
+  无碎段不动、阈值随配置变（不写死）、软句数读配置键、配置默认 15、  
   整链路合并后规划轮条数对上。
-- 钉装箱/插压行为的既有夹具显式 `script.segment_min_sents: 0`（段数是断言的
+- 钉装箱/插压行为的既有夹具显式 `script.segment_min_sents: 0`（段数是断言的  
   一部分，合并行为由专属用例覆盖）。
 
 ---
 
 ## v0.26.3
 
-**删掉「字数不达标可以接受」的合法出口，给模型真实尺度感与验收窗口。**
-背景：探针实测（本地模型 + 真实管道提示词）finish=stop、交付率 46.3%，与线上 44% 吻合——
-缺口不是截断，是模型照规则 5 那句「素材真用完了，宁可字数少一点——字数不达标可以接受」
-在凝缩要点讲完的地方合法收工。素材按字数给够了，但模型没有「素材相对目标是什么量级」
+**删掉「字数不达标可以接受」的合法出口，给模型真实尺度感与验收窗口。**  
+背景：探针实测（本地模型 + 真实管道提示词）finish=stop、交付率 46.3%，与线上 44% 吻合——  
+缺口不是截断，是模型照规则 5 那句「素材真用完了，宁可字数少一点——字数不达标可以接受」  
+在凝缩要点讲完的地方合法收工。素材按字数给够了，但模型没有「素材相对目标是什么量级」  
 的尺度感，也没有「写到哪里程序才收稿」的验收线。
 
 **变更**
 
-- **删「宁少勿滥」出口**（段系统提示词规则 5 尾部）：原句整句删除，红线只留
+- **删「宁少勿滥」出口**（段系统提示词规则 5 尾部）：原句整句删除，红线只留  
   「段内复读不允许」；补一句指路「字数够不够由程序核账，不归你判断，你只管不复读」。
-- **段用户提示词新增【本段用量】**：`素材有效字 ÷ 配额有效字`，py 对实际喂入的 fit
+- **段用户提示词新增【本段用量】**：`素材有效字 ÷ 配额有效字`，py 对实际喂入的 fit  
   现算，两边同尺。方向写死在句子里，不让模型猜：
-  - 素材 ≥ 配额：「你的任务是从素材选料铺满配额，细节取用密度要够；写薄了就是
-    浪费素材，不存在『素材用完』。」（方向句到此为止，不上「必须写满」式口号——
+  - 素材 ≥ 配额：「你的任务是从素材选料铺满配额，细节取用密度要够；写薄了就是  
+    浪费素材，不存在『素材用完』。」（方向句到此为止，不上「必须写满」式口号——  
     压不压得满由核账与补写轮闭环兜底，提示词喊口号只会诱发为凑数复读）
-  - 素材 < 配额：「靠追问与展开（补条件、补代价、补反例、补具体场景）把素材讲透
+  - 素材 < 配额：「靠追问与展开（补条件、补代价、补反例、补具体场景）把素材讲透  
     讲满，不编造素材之外的事实。」
   - 素材没喂或量不出来就不给这一行——假锚比没锚更坏。
 - **段用户提示词新增【验收窗口】**：`程序按 low~high 字收稿，超出会被打回继续补写
   或压紧`，区间 = 配额 ± max(15%, 60 字)。
-- **补写/压紧提示词带验收区间**：插入轮改「本段目前 N 字，验收区间 low~high，
-  还差 M 字」；压紧轮改「验收区间 low~high，把字数减进验收区间」——模型第一次
+- **补写/压紧提示词带验收区间**：插入轮改「本段目前 N 字，验收区间 low~~high，  
+  还差 M 字」；压紧轮改「验收区间 low~~high，把字数减进验收区间」——模型第一次  
   知道改到哪算过关。
-- **新增 `_segment_window(quota)`**：验收区间的唯一出口，核账判停与提示词报数
+- **新增 `_segment_window(quota)`**：验收区间的唯一出口，核账判停与提示词报数  
   同源，两处永远一致。
 
 **测试**
 
-- 新增 `TestSegmentUsageAndWindow` 6 条：用量行方向句、素材少时方向翻转、
+- 新增 `TestSegmentUsageAndWindow` 6 条：用量行方向句、素材少时方向翻转、  
   无素材不给行、窗口与核账同尺、补写/压紧带区间、helper 单源。
-- 翻转旧钉子：「字数不达标可以接受」由 assertIn 改 assertNotIn（它是被实证的
+- 翻转旧钉子：「字数不达标可以接受」由 assertIn 改 assertNotIn（它是被实证的  
   44% 缺口出口，不得回潮）。
 
 ---
 
 ## v0.26.2
 
-**每次 LLM 调用追加一行收工观测：finish_reason + 输入/输出/思考 token（后端实测回传）。**
-背景：分段写作实测每轮只交付配额的 44%（配 3444 有效字写回 1509，补 1935 写回 859），
-缺口大且稳，怀疑有东西在限制窗口。而 `meta` 里的 `finish_reason` 与 usage 从不进
+**每次 LLM 调用追加一行收工观测：finish_reason + 输入/输出/思考 token（后端实测回传）。**  
+背景：分段写作实测每轮只交付配额的 44%（配 3444 有效字写回 1509，补 1935 写回 859），  
+缺口大且稳，怀疑有东西在限制窗口。而 `meta` 里的 `finish_reason` 与 usage 从不进  
 日志——「被截断」还是「模型自停」在现有日志里根本分辨不出来。本轮只补观测，不改任何行为。
 
 **新增**
 
-- `_call_telemetry(meta)`：把一次调用的收工原因折成一行——
-  `finish=stop，输入 N token，输出 N token，思考 N token`。token 数取后端 usage
+- `_call_telemetry(meta)`：把一次调用的收工原因折成一行——  
+  `finish=stop，输入 N token，输出 N token，思考 N token`。token 数取后端 usage  
   实测（非本地估算）；后端未下发 usage 时明说「token 数是空的」，不放假零。
-- 五处调用点接线：分段初稿 / 补句 / 压句（`段 N：…`），整篇重出 / 定点修补
+- 五处调用点接线：分段初稿 / 补句 / 压句（`段 N：…`），整篇重出 / 定点修补  
   （`第 N 轮：…`）。web_ui 轮次进度仍由「模型返回正文」行推进，不受影响。
 
 **判读**
 
-- `finish=length` 且输出 token 每次停在同一附近 → 输出被截断（预算或上下文窗口
+- `finish=length` 且输出 token 每次停在同一附近 → 输出被截断（预算或上下文窗口  
   钳制），去查后端 n_ctx 与 llm.max_tokens 的关系；
 - `finish=stop` 但输出 token 远低于目标 → 模型自己停，是行为问题不是窗口问题；
 - `输入 N token` 远小于提示词实际字数折算 → 输入被上下文裁过。
@@ -2313,107 +2632,107 @@ speaker 与 text，追问接缝对它隐形；原文进不来，它拿着凝缩�
 
 ## v0.26.1
 
-**日志单位残渣清扫：五处「模型返回 N 字符（含壳）」退场，返回行一律报正文有效字。**
-v0.25.1 统一了核账，但「模型返回」这一行量的是 HTTP 原始串长度（整串 JSON 含壳），
+**日志单位残渣清扫：五处「模型返回 N 字符（含壳）」退场，返回行一律报正文有效字。**  
+v0.25.1 统一了核账，但「模型返回」这一行量的是 HTTP 原始串长度（整串 JSON 含壳），  
 紧挨着「少 N 有效字」出现，看着就是字与字符在互减——单位混排的最后一处残渣。
 
 **变更**
 
-- **分段路三处**：初稿 / 补句 / 压句调用后不再打印原始串长度。初稿返回行改为
-  解析成功后报「模型返回正文 N 有效字」（lines 逐句求和，与配额同一把尺）；
-  补句 / 压句的结果本就由「插进 N 句 / M 有效字」「压 N 句 / 删 M 句」承接，
+- **分段路三处**：初稿 / 补句 / 压句调用后不再打印原始串长度。初稿返回行改为  
+  解析成功后报「模型返回正文 N 有效字」（lines 逐句求和，与配额同一把尺）；  
+  补句 / 压句的结果本就由「插进 N 句 / M 有效字」「压 N 句 / 删 M 句」承接，  
   原始串行整行删除。「约束解码已降级」改为仅在降级确实发生时单独成行。
-- **整篇 / 补丁路两处**：「第 N 轮：模型返回 N 字符」同样改为报正文有效字
-  （整篇为解析出的 lines 求和、补丁为补后全稿求和），落点挪到解析成功之后。
+- **整篇 / 补丁路两处**：「第 N 轮：模型返回 N 字符」同样改为报正文有效字  
+  （整篇为解析出的 lines 求和、补丁为补后全稿求和），落点挪到解析成功之后。  
   这一行是 web_ui 轮次进度的推进信号，「第 N 轮 … 模型返回」的形态保留。
-- **裸「字」标签补齐**：段调用行的「配额 N 字」、插入行的「少 N 字」、中止行的
+- **裸「字」标签补齐**：段调用行的「配额 N 字」、插入行的「少 N 字」、中止行的  
   「已写 N 字」统一为「有效字」，与核账口径同名。
 
 **不变**
 
-- 核账算法零改动：四处求和本就是 `duration_model.effective_chars`（汉字 1.0 +
+- 核账算法零改动：四处求和本就是 `duration_model.effective_chars`（汉字 1.0 +  
   标点 0.5 + 西文词 1.5），与配额同尺。本轮只动日志，不动机制。
-- 输入侧的「原始字符」标注（素材取用、装箱折 token）保留——那把尺服务 tokenizer，
+- 输入侧的「原始字符」标注（素材取用、装箱折 token）保留——那把尺服务 tokenizer，  
   与语音时长无关，且日志里已写明用途。
 
 ---
 
 ## v0.26.0
 
-**脚本侧 emotion 字段整体删除：一句台词只剩 `speaker` 和 `text`。** 最小侵入切法：
-项目侧（pipeline → tts_engine → HTTP）传输原样保留，合成侧靠既有的自适应兜底
-（`.get("emotion", "")` 为空就不进请求体 → `build_instruct` 返回 None → 克隆调用
-不带 instruct），行为与 none 档逐字节一致；脚本这一层从 schema、提示词、解析到
-门禁把标签连根拿掉。依据是全链路核账：生产引擎为 Base + ICL 克隆，给 Base 传
-instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考音频的韵律先验是唯一
-有效的语气来源——emotion 字段对声音零消费，剩下的只有被模型回填进 text 的风险
+**脚本侧 emotion 字段整体删除：一句台词只剩 `speaker` 和 `text`。** 最小侵入切法：  
+项目侧（pipeline → tts_engine → HTTP）传输原样保留，合成侧靠既有的自适应兜底  
+（`.get("emotion", "")` 为空就不进请求体 → `build_instruct` 返回 None → 克隆调用  
+不带 instruct），行为与 none 档逐字节一致；脚本这一层从 schema、提示词、解析到  
+门禁把标签连根拿掉。依据是全链路核账：生产引擎为 Base + ICL 克隆，给 Base 传  
+instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考音频的韵律先验是唯一  
+有效的语气来源——emotion 字段对声音零消费，剩下的只有被模型回填进 text 的风险  
 （本期实测一轮 49% 句数是 text=emotion 词的回声行）。
 
 **删除**
 
-- **schema 五处**：全篇 / 定点修补 / 分段 / 补句 / 压句的输出契约里，`emotion`
+- **schema 五处**：全篇 / 定点修补 / 分段 / 补句 / 压句的输出契约里，`emotion`  
   属性、required、按档位收窄的枚举全部移除——约束解码下模型想填都填不出来。
-- **提示词五处的 emotion 契约**：字段说明、正反例、「标签只待在 emotion 字段里」
-  的口径整段撤掉。字段契约收窄成两个字段并重写正反例：
-  正确 `{"speaker": "A", "text": "为什么这么说呢？"}`；
-  错误 `{"speaker": "A", "text": "小美疑惑地说：为什么这么说呢？"}`——
+- **提示词五处的 emotion 契约**：字段说明、正反例、「标签只待在 emotion 字段里」  
+  的口径整段撤掉。字段契约收窄成两个字段并重写正反例：  
+  正确 `{"speaker": "A", "text": "为什么这么说呢？"}`；  
+  错误 `{"speaker": "A", "text": "小美疑惑地说：为什么这么说呢？"}`——  
   语气/情绪描写（旁白腔）与说话人标记一样，不进 text。
-- **门禁两条**：`emotion_vocab`（词表越界）、`emotion_level`（档位越界）随字段
-  一起撤——稿子里没有标签可判，判它只会恒为假。`fields_complete` 只查
+- **门禁两条**：`emotion_vocab`（词表越界）、`emotion_level`（档位越界）随字段  
+  一起撤——稿子里没有标签可判，判它只会恒为假。`fields_complete` 只查  
   speaker / text。定点修补的落点分类里对应两条分支同步删除。
-- **解析与修补的情绪处理**：`normalize_script` 不再归并标签；`_strip_label_prefix`
-  （靠本句 emotion 标签定位前缀）连带删除；补句 / 压句 / 定点修补里对 emotion
+- **解析与修补的情绪处理**：`normalize_script` 不再归并标签；`_strip_label_prefix`  
+  （靠本句 emotion 标签定位前缀）连带删除；补句 / 压句 / 定点修补里对 emotion  
   的校验与回写全部移除。
-- **`emotion_vocab` / `_emotion_rule` / `EMOTION_RULE` / `NONE_LEVEL_EMOTIONS` /
+- **`emotion_vocab` / `_emotion_rule` / `EMOTION_RULE` / `NONE_LEVEL_EMOTIONS` /  
   `DEFAULT_EMOTION`**：档位话术与词表函数没有消费方了，整组删除。
-- **范式卡的「情绪基调」**：八张卡的 `emotion` 键与 `script_block` 渲染的
-  「情绪基调」「情绪到哪为止」两行删除——后者明着教模型填一个已不存在的字段。
-  `register` 的默认卡补回 `cast` / `max_run`（与 emotion 同行书写，随行删除时
+- **范式卡的「情绪基调」**：八张卡的 `emotion` 键与 `script_block` 渲染的  
+  「情绪基调」「情绪到哪为止」两行删除——后者明着教模型填一个已不存在的字段。  
+  `register` 的默认卡补回 `cast` / `max_run`（与 emotion 同行书写，随行删除时  
   一并误伤）。
-- **风格维度「情绪密度」**：从整篇与分段的风格行里撤掉——这一维全程围着标签转，
-  没有标签就没有判据对象。范式卡配置里的 `emotion_density` 选项原样保留（人不
+- **风格维度「情绪密度」**：从整篇与分段的风格行里撤掉——这一维全程围着标签转，  
+  没有标签就没有判据对象。范式卡配置里的 `emotion_density` 选项原样保留（人不  
   被迁移，只是不再进提示词）。
-- **Web UI**：脚本表格的「情绪」下拉列、`/api/config` 的 `emotions` 载荷、前端
+- **Web UI**：脚本表格的「情绪」下拉列、`/api/config` 的 `emotions` 载荷、前端  
   `EMOTIONS` 变量删除。
 
 **保留（最小侵入边界）**
 
-- `tts_engine` / `serve.py` / `pipeline.py` 零改动：`emotion` 与 `degree` 参数、
-  HTTP 载荷、`build_instruct` / `INSTRUCT_EMOTIONS` 原样在位——上游该传传，
+- `tts_engine` / `serve.py` / `pipeline.py` 零改动：`emotion` 与 `degree` 参数、  
+  HTTP 载荷、`build_instruct` / `INSTRUCT_EMOTIONS` 原样在位——上游该传传，  
   合成侧自适应。light 档若哪天真被选中，那条通路的去留另案。
-- `config_manager` 的三个词表（`EMOTION_VOCAB` / `DISCOURSE_VOCAB` / `EMOTION_TAGS`）
+- `config_manager` 的三个词表（`EMOTION_VOCAB` / `DISCOURSE_VOCAB` / `EMOTION_TAGS`）  
   保留为既有导出与测试桩，注释已标明脚本侧不再消费。
 
 **说明**
 
-- 全量测试 888 项通过（删除 18 条 emotion 契约用例，新增 4 条「schema 无 emotion
+- 全量测试 888 项通过（删除 18 条 emotion 契约用例，新增 4 条「schema 无 emotion  
   字段」钉子）。
-- 一句台词的完整形态从此是 `{"speaker": "A", "text": "……"}`；旧稿里多出的
+- 一句台词的完整形态从此是 `{"speaker": "A", "text": "……"}`；旧稿里多出的  
   emotion 键无人读取，重合成行为不变。
 
 ---
 
 ## v0.25.1
 
-**核账换到与配额同一把尺（有效字），日志数字一律带单位。** 起因是第 2 期一段
-分段写作的实测账目：配额报 3024 字、模型返回 6246 字符、缺口报 2734 字——三个
+**核账换到与配额同一把尺（有效字），日志数字一律带单位。** 起因是第 2 期一段  
+分段写作的实测账目：配额报 3024 字、模型返回 6246 字符、缺口报 2734 字——三个  
 数三种单位（有效字 / 整串 JSON 字符 / 字符），同一份日志里裸奔，没法对账。
 
 **修复**
 
-- **核账口径 = 有效字，与配额同尺**。配额出自 `duration_model.chars_for_target`
-  （单位：有效字，汉字 1 / 标点 0.5 / 西文词 1.5），核账从前却拿 `sum(len(text))`
-  数**字符**去减它——这正是 v0.16.0 在输入侧修掉的病（「左边是朗读字数，右边是
-  `len()` 的字符数……那个比较没有意义」，更新日志原话），在输出侧原样活着：
-  当年只修了装箱那半边，段核账这半边漏网。现在段核账四处（首轮 gap、补句增量、
-  收尾 chars、段完成账）全部走 `duration_model.effective_chars`，「判定口径统一
+- **核账口径 = 有效字，与配额同尺**。配额出自 `duration_model.chars_for_target`  
+  （单位：有效字，汉字 1 / 标点 0.5 / 西文词 1.5），核账从前却拿 `sum(len(text))`  
+  数**字符**去减它——这正是 v0.16.0 在输入侧修掉的病（「左边是朗读字数，右边是  
+  `len()` 的字符数……那个比较没有意义」，更新日志原话），在输出侧原样活着：  
+  当年只修了装箱那半边，段核账这半边漏网。现在段核账四处（首轮 gap、补句增量、  
+  收尾 chars、段完成账）全部走 `duration_model.effective_chars`，「判定口径统一  
   到字数」（v0.13.0）的"字"从此只有一种定义。
-- **`body` 折 token 处故意保留 `len()`**：tokenizer 吃的是原始字符，这一处的
+- **`body` 折 token 处故意保留 `len()`**：tokenizer 吃的是原始字符，这一处的  
   单位本来就该不同，不是漏改。
 
 **变更**
 
-- **日志数字一律带单位**：配额 / 缺口 / 完成账标「有效字」，素材两行标「字符
+- **日志数字一律带单位**：配额 / 缺口 / 完成账标「有效字」，素材两行标「字符  
   （装箱折 token 用）」，「模型返回 N 字符」标明「整串 JSON 含壳，非正文字数」。
 
 **说明**
@@ -2424,75 +2743,73 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 
 ## v0.25.0
 
-**配额权重的单位改正：原始字符数 → 原文有效字。** v0.23.0 换对了函数、换错了单位；
+**配额权重的单位改正：原始字符数 → 原文有效字。** v0.23.0 换对了函数、换错了单位；  
 这一版把「产能」与「重量」彻底分开，并把两轮提示词里的体量数字撤掉。
 
 **修复**
 
-- 配额权重从 `loc.chars`（`ingest.slice_by_anchor` 的 `len(body)`，**原始字符数**，
-  还含标题行）换成节的 `chars`（`probe` 用 `effective_chars` 算的**原文有效字**）。
-  **单位必须与成稿目标同源**：成稿目标出自 `duration_model.chars_for_target`
-  （`时长 × 速度 × STANDARD_K`，`STANDARD_K` 的单位是有效字/秒），地图压比
-  （`planner._ratio_issues`）也拿期的有效字比成稿目标。上一版拿原始字符数当权重，
-  仍是两把尺混用——原始字符数与有效字的比值**逐节不同**（第 2 期：03 节 1.47、
+- 配额权重从 `loc.chars`（`ingest.slice_by_anchor` 的 `len(body)`，**原始字符数**，  
+  还含标题行）换成节的 `chars`（`probe` 用 `effective_chars` 算的**原文有效字**）。  
+  **单位必须与成稿目标同源**：成稿目标出自 `duration_model.chars_for_target`  
+  （`时长 × 速度 × STANDARD_K`，`STANDARD_K` 的单位是有效字/秒），地图压比  
+  （`planner._ratio_issues`）也拿期的有效字比成稿目标。上一版拿原始字符数当权重，  
+  仍是两把尺混用——原始字符数与有效字的比值**逐节不同**（第 2 期：03 节 1.47、  
   04 节 2.04、05 节 1.88），连"哪个节料多"的排序都被带偏。
 
   **第 2 期实测（全篇目标 6024 有效字）**：
-
-  | 权重尺 | 段 1 | 段 2 | 段 1 压比 | 段 2 压比 |
-  |---|---|---|---|---|
-  | 摘要字数（≤ v0.22.1） | 1823 | 4201 | 3.47 | **1.50 贴死下限** |
-  | 原始字符数（v0.23.0） | 2599 | 3425 | 2.44 | 1.83 |
-  | **原文有效字（v0.25.0）** | **3024** | **3000** | **2.09** | **2.09** |
-
-  整期压比 = 12611 / 6024 = 2.09。**只有按有效字摊，两段压比才同时等于整期口径**——
+  | 权重尺                | 段 1      | 段 2      | 段 1 压比   | 段 2 压比        |
+  | ------------------ | -------- | -------- | -------- | ------------- |
+  | 摘要字数（≤ v0.22.1）    | 1823     | 4201     | 3.47     | **1.50 贴死下限** |
+  | 原始字符数（v0.23.0）     | 2599     | 3425     | 2.44     | 1.83          |
+  | **原文有效字（v0.25.0）** | **3024** | **3000** | **2.09** | **2.09**      |
+  整期压比 = 12611 / 6024 = 2.09。**只有按有效字摊，两段压比才同时等于整期口径**——  
   前两版的问题都不是"某一段被压狠了"，而是"两段的压比不相等"。
-- `pipeline.evidence_pack` 改放行 `chars`（原文有效字），不再放 `loc`：配额要的是产能，
+- `pipeline.evidence_pack` 改放行 `chars`（原文有效字），不再放 `loc`：配额要的是产能，  
   装箱折 token 用的是取料长度，两个数不同源、不共用一个字段。
 - `_material_chars` 改读 `chars`；`chars` 缺失**报错**，不退回别的尺。
-- `_gist_chars` **删除**：它的两处消费者（逻辑拆分清单、规划轮段清单）都撤了体量数字，
+- `_gist_chars` **删除**：它的两处消费者（逻辑拆分清单、规划轮段清单）都撤了体量数字，  
   一个量没有用途就不该留在代码里。
 
 **变更**
 
-- **逻辑拆分提示词**（`_logic_split_user`）撤掉每节的「凝缩 N 字，原文 N 字」。分组只看
-  语义；铁律自己写着「归类看内容，不看体量」、schema 注释也写着"模型不产任何数字"，
+- **逻辑拆分提示词**（`_logic_split_user`）撤掉每节的「凝缩 N 字，原文 N 字」。分组只看  
+  语义；铁律自己写着「归类看内容，不看体量」、schema 注释也写着"模型不产任何数字"，  
   user 侧却先递了两个进去，自相矛盾。摆着字数会把模型往"按字数摊匀"上带。
-- **规划轮提示词**（`_segment_plan_user`）撤掉「配额约 N 字」与每节的「凝缩 N 字」。
-  段边界是程序定的、配额是程序摊的，这一轮只写「期标题 + 段主旨」，字数只会把
+- **规划轮提示词**（`_segment_plan_user`）撤掉「配额约 N 字」与每节的「凝缩 N 字」。  
+  段边界是程序定的、配额是程序摊的，这一轮只写「期标题 + 段主旨」，字数只会把  
   "这一段讲什么"带成"这一段该多长"。
-- **「题目」→「段主旨」**：`_segment_plan_system` / `_segment_plan_user` / `_validate_plan`
-  的打回文案 / 段系统提示词的「本段主题」/ 日志文案，全部改口径。它产出的是**段主旨**，
+- **「题目」→「段主旨」**：`_segment_plan_system` / `_segment_plan_user` / `_validate_plan`  
+  的打回文案 / 段系统提示词的「本段主题」/ 日志文案，全部改口径。它产出的是**段主旨**，  
   与期主旨同层级，不是给段起个名字。
-- 连带清理：`split_by_logic` / `_logic_split_user` / `_segment_plan_user` 取消不再需要的
-  `sec_chars` 与 `target_chars` 参数；`_segment_plan_system` 里「某节的第 N 块」的说明是
+- 连带清理：`split_by_logic` / `_logic_split_user` / `_segment_plan_user` 取消不再需要的  
+  `sec_chars` 与 `target_chars` 参数；`_segment_plan_system` 里「某节的第 N 块」的说明是  
   v0.22.0 删块机制时的残留，一并删掉。
-- **没动的**：本期计划块的「**本期素材共约 N 字**」保留——那是给**写作**模型的预算依据
-  （素材撑不满目标字数时，它唯一能执行的出路是照实写短），且本来就是有效字口径，与配额
+- **没动的**：本期计划块的「**本期素材共约 N 字**」保留——那是给**写作**模型的预算依据  
+  （素材撑不满目标字数时，它唯一能执行的出路是照实写短），且本来就是有效字口径，与配额  
   同一把尺。
 
-**测试**：905 项全绿（+3：`TestPlanPromptHasNoNumbers` 三项；改写 +2 -1：
-`test_quota_weight_is_material_words_not_gist` 三把尺对照、`test_missing_material_words_is_reported`、
+**测试**：905 项全绿（+3：`TestPlanPromptHasNoNumbers` 三项；改写 +2 -1：  
+`test_quota_weight_is_material_words_not_gist` 三把尺对照、`test_missing_material_words_is_reported`、  
 `test_prompt_feeds_gist_but_no_size_numbers`）。
 
 ---
 
-**段系统提示词补上「段内同一件事只说一遍」。** v0.23.0 把「逼它凑」的力卸掉了，
+**段系统提示词补上「段内同一件事只说一遍」。** v0.23.0 把「逼它凑」的力卸掉了，  
 这一版补的是漏掉的那道门。
 
 **修复**
 
-- 段生成的**系统**提示词（`_segment_system_prompt`）【生成要求】新增第 5 条：本段自己
-  内部同一件事只说一遍。此前禁重复的条款有四处（本期计划块、段 user 提示词的凝缩要点栏、
-  「已写正文」栏、插入修补模板），**四处管的都是「与前文重复」**；一处正文在**一个段内**
+- 段生成的**系统**提示词（`_segment_system_prompt`）【生成要求】新增第 5 条：本段自己  
+  内部同一件事只说一遍。此前禁重复的条款有四处（本期计划块、段 user 提示词的凝缩要点栏、  
+  「已写正文」栏、插入修补模板），**四处管的都是「与前文重复」**；一处正文在**一个段内**  
   把同一件事讲两遍，四处一道也管不到——第 2 期段 2 的复读正是这个形态。
-- 新条款配**三反三正实例**（换词重说同一件事 / 同一条结论说两遍 / 换个包装重讲同一个
-  例子 = 重复；补条件、补代价、补反例、落到具体场景 = 不重复），判据与补字提示词同源：
-  「把本段前后两句并排放进听众耳朵里听一遍」。**只写名词等于没写判据**——判「重不重复」
+- 新条款配**三反三正实例**（换词重说同一件事 / 同一条结论说两遍 / 换个包装重讲同一个  
+  例子 = 重复；补条件、补代价、补反例、落到具体场景 = 不重复），判据与补字提示词同源：  
+  「把本段前后两句并排放进听众耳朵里听一遍」。**只写名词等于没写判据**——判「重不重复」  
   的人和被管的人是同一个，所以配实例。
-- 条款末尾给足退路：**字数不达标可以接受，段内复读不允许**，挖不出新东西就往下挖一层，
+- 条款末尾给足退路：**字数不达标可以接受，段内复读不允许**，挖不出新东西就往下挖一层，  
   素材真用完宁可写短。与本期计划块里「字数不达标是可以接受的」同一口径。
-- 代价（明账）：段系统提示词 1605 → 2455 字符（+850）。它是每段的**硬开销**，从本段可用
+- 代价（明账）：段系统提示词 1605 → 2455 字符（+850）。它是每段的**硬开销**，从本段可用  
   额度里扣，段能装的料相应少一截。这条正是被卸掉「逼它凑」的力之后仍要写的钱。
 
 **测试**：902 项全绿（+1：`test_segment_prompt_forbids_restating_inside_the_segment`）。
@@ -2505,16 +2822,16 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 
 **修复**
 
-- 配额权重从 `gist + points` 的字数（那是**摘要自己**写得多长）换成凝缩那一步记下的
-  `loc.chars`（**这一段吃了多少原文**）。该写多长由料的多少定——摘要啰嗦的节会被多派
-  字数，而它未必有那么多料，那一段为了凑配额只能把刚写过的话换个说法再讲一遍（第 2 期
-  实测：段 2 旧配额 4201 字、压比 1.50 贴死下限，去重删掉 64 句；新配额 3425 字，两段
+- 配额权重从 `gist + points` 的字数（那是**摘要自己**写得多长）换成凝缩那一步记下的  
+  `loc.chars`（**这一段吃了多少原文**）。该写多长由料的多少定——摘要啰嗦的节会被多派  
+  字数，而它未必有那么多料，那一段为了凑配额只能把刚写过的话换个说法再讲一遍（第 2 期  
+  实测：段 2 旧配额 4201 字、压比 1.50 贴死下限，去重删掉 64 句；新配额 3425 字，两段  
   压比统一到全篇口径，段 1 从 1823 涨到 2599）。
-- `pipeline.evidence_pack` 放行 `loc`：从前只传 `source / anchor / gist / line / points`，
+- `pipeline.evidence_pack` 放行 `loc`：从前只传 `source / anchor / gist / line / points`，  
   把「这一段压的是原文哪一块、那块多大」整个丢了，脚本侧根本看不到原文量。
-- `_seg_weight` 拆成 `_gist_chars`（凝缩详略，给提示词展示）与 `_material_chars`（原文量，
+- `_seg_weight` 拆成 `_gist_chars`（凝缩详略，给提示词展示）与 `_material_chars`（原文量，  
   给配额当权重）：一个函数原本被三处共用，其中两处的语义与配额不同——**一个词一个义**。
-- `loc.chars` 缺失**报错**，不退回摘要尺：退回去等于把摊歪的配额重新摊一遍，而且从日志上
+- `loc.chars` 缺失**报错**，不退回摘要尺：退回去等于把摊歪的配额重新摊一遍，而且从日志上  
   看不出来用的是哪把尺。
 
 **文档**
@@ -2524,7 +2841,7 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 
 **测试**
 
-- 901 项全绿（+2：`test_quota_weight_is_material_not_gist` 权重不跟摘要走、
+- 901 项全绿（+2：`test_quota_weight_is_material_not_gist` 权重不跟摘要走、  
   `test_missing_material_chars_is_reported` 缺 loc 报错）。
 
 ---
@@ -2533,26 +2850,26 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 
 **日志里那个「段」字拆开：逻辑段与写作段各有名字，两步带编号。** 纯文案修复，无行为变化。
 
-真实运行日志上出现过「分段生成后开始逻辑拆分？逻辑拆分完又进行分段？」的疑问——顺序一直是对的
+真实运行日志上出现过「分段生成后开始逻辑拆分？逻辑拆分完又进行分段？」的疑问——顺序一直是对的  
 （`split_by_logic` → `pack_segments` → 规划轮），是日志把两件不同的事都写成了「段」：
 
 **修复**
 
-- `分段生成：` 这个前缀同时挂在逻辑拆分与装箱前面，读起来像分段做了两遍；且装箱才用得上的
-  两个数（全篇目标字数、输入额度）被挂在逻辑拆分那一行——逻辑拆分不用它们。现在改成
+- `分段生成：` 这个前缀同时挂在逻辑拆分与装箱前面，读起来像分段做了两遍；且装箱才用得上的  
+  两个数（全篇目标字数、输入额度）被挂在逻辑拆分那一行——逻辑拆分不用它们。现在改成  
   `分段 · 第1步 逻辑拆分：依据本期主旨与 N 节凝缩…` 与 `分段 · 第2步 装箱：逐个逻辑段量体量
   （输入额度 … − 固定开销 − 已写正文，全篇目标约 N 字）…`。
 - **同一个「N 段」指了两个东西**：`逻辑拆分完成：2 段` 是模型按**内容**分的组，`装箱完成：
-  2 段` 是真正分别喂给模型的段。两次都是 2 时看着像同一步跑了两遍，数量不同时更乱。现在分别叫
-  **逻辑段**与**写作段**：`逻辑拆分完成：3 节 → 2 个逻辑段（逻辑段1 = 第1节…）`、
+  2 段` 是真正分别喂给模型的段。两次都是 2 时看着像同一步跑了两遍，数量不同时更乱。现在分别叫  
+  **逻辑段**与**写作段**：`逻辑拆分完成：3 节 → 2 个逻辑段（逻辑段1 = 第1节…）`、  
   `装箱完成：2 个逻辑段 → 3 个写作段，配额合计 N 字（…）`，规划轮那行改用「写作段」。
-- 量不出输入额度的后端不再打印「输入额度 0 token」（读起来像额度被吃光了），改为「这个后端
+- 量不出输入额度的后端不再打印「输入额度 0 token」（读起来像额度被吃光了），改为「这个后端  
   量不出输入额度，逻辑分组原样落段（不合并、不再切）」。
 
 **文档**
 
-- README「四、产物」与 PROTOCOL 3.3.4：补上**逻辑段 / 写作段**的定义与关系——逻辑段是模型按
-  内容分的组，写作段是真正分别喂给模型的段，一个逻辑段至少落成一个写作段，**写作段数 ≥
+- README「四、产物」与 PROTOCOL 3.3.4：补上**逻辑段 / 写作段**的定义与关系——逻辑段是模型按  
+  内容分的组，写作段是真正分别喂给模型的段，一个逻辑段至少落成一个写作段，**写作段数 ≥  
   逻辑段数**；并点明日志那行「N 个逻辑段 → M 个写作段」说的就是这两个不同的数。
 
 **测试**：899 项全绿（本次只改日志文案与文档，无断言变更）。
@@ -2694,7 +3011,7 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 **新增**
 
 - **项目受众 `audience`（节目级一句话）**。在**画地图**那一步向模型要（`MAP_SCHEMA` 与 `episodes` 同级、同样必填），落进项目，**界面上可改**（立项弹窗与项目卡片的「节目名 / 副标题 / 受众」）。它是节目级而非期级：印在每一期片头里，各期必须逐字一致。四条纪律：模型只给第一版（重排不覆盖）、人填过不覆盖、单集与逐期即兴项目没有地图所以留空（片头里那一小段自动消失）、通路走 `project.audience` 通道键（`PROJECT_CONFIG_MAP` + `CONFIG_PASS_THROUGH`）——不由人配在设置页，值一律来自项目。
-- 排地图提示词加【另外给一项：受众】：写成能直接填进「面向___的听众」的定语，≤12 字，不带「面向」「的听众」「观众」这些尾巴。
+- 排地图提示词加【另外给一项：受众】：写成能直接填进「面向\__\_的听众」的定语，≤12 字，不带「面向」「的听众」「观众」这些尾巴。
 
 **注意**
 
@@ -2716,13 +3033,9 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 **变更**
 
 - **`required_context()` 删除**（`llm_client`）。它唯一的作用是算「这套分配要求后端窗口至少多大 = 输出预算 + 输入需求」，而这个数没有人能兑现：窗口在模型加载前不存在于任何接口里（LM Studio 懒加载只回模型文件上限，照它算反而把请求顶爆）。既问不出来、也管不着，就不报。
-
 - **`quota_note` 只报「准备喂多少」**：额度（= 最大输出 × 输入倍率）、素材字数、折合 token，末尾一句「放不下时按节切成多段分别喂完（不丢料）」。删掉「请保证后端上下文窗口 ≥ X+K」——放不下不叫「窗口不够」，叫「切开喂」，切段本来就把这件事消化掉了。
-
 - **六处报错文案与注释去掉对后端的指示**（`script_engine`）：`fit_material`、`pack_segments` 两处、`_refit_pieces`、`SEGMENT_MAX_PARTS` 注释、`generate` 的 docstring、任务开头的额度日志说明。从「请调大 llm.input_ratio **并把后端上下文窗口一起开大**」变成「请调大 llm.input_ratio（或回地图拆期）」——路径照旧给，命令不再下。
-
 - **`llm.input_ratio` 的帮助文案改写**：删掉「默认 1.0 是要求后端窗口 ≥ 2 × 最大输出」，改为「后端窗口有多大不归程序管，也不需要告诉它；倍率由你按自己的后端定」。
-
 - **文档同步**：`PROTOCOL.md` 3.3.2 的分层表与额度说明、`README.md` 的分层表与说明段，一律改成「不猜、不探、不兜底、**不管**」；`PLAN.md` 补 §17.9 收口记录。
 
 **修复**
@@ -2742,29 +3055,21 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 **修复**
 
 - **素材被判「超出容量」而原文一字未进**。`fit_material` 算的是 `material_capacity(cfg) - other_chars`：左边是**朗读字数**（汉字 1、标点 0.5、西文按词 1.5、符号 0），右边是 `len()` 的**字符数**（所有字符都算），再把 `len(material)` 拿去跟这个差比大小——三个数三种语义，那个比较没有意义。技术文档那类料 2.6 个字符才顶 1 个朗读字，一跨尺就把装得下的判成装不下，整期退到凝缩骨架。现在两端都折 **token** 再比（`llm_client` 的同一套折算），单位一致。
-
 - **内容检分批同样在混用两把尺**。`check6_llm` 里每批的字数额度还是 `material_capacity(cfg) - other`——与上面同一个式子，只是出口不同。现在改用 `budget_chars_for_check`（输入额度折回字符，扣掉每批必带的提示词、整篇脚本、判据包与固定说明），报错文案也说清是「最大输出 × 输入倍率」这个旋钮不够，不再报成「素材容量」。
 
 **新增**
 
 - **`llm.input_ratio`（输入倍率）配置项与输入额度入口**。上一版把「输入额度 = 最大输出 × 输入倍率」整条链删掉、让画地图的容量公式去顶班，于是两个不同单位的数被凑到一起。现在恢复：默认 1.0（= 输入额度与输出预算同额，要求后端窗口 ≥ 2 × 最大输出——**最保守的起步**，不会让既有后端在没人动过旋钮的情况下被顶爆）、范围 0.5~16.0、归「语言模型」卡、`views=("script",)`（配置页与写作阶段页都进得去）。客户端侧配套四个入口——`input_budget_tokens`（这一次能装多少 token）、`budget_chars`（折回还能喂多少字符）、`material_tokens`（字数→token，含余量）、`quota_note`（把额度与窗口要求换算成具体数字落进日志）。倍率调小 → 原文多切几块、不丢料；调大 → 必须把后端上下文窗口一起开大。
-
 - **py 装箱（`pack_segments`）**：按输入额度把各节装成段，**纯算术，模型不参与任何切分**。桶容量 = 输入额度 − 提示词 − 固定占位 − **已写正文**（前面各段的成稿配额，逐段递减：写过的正文要一直带着防断链）。按讲述顺序（地图定死，不可重排）顺序贪心——装得下就装、装不下开新段、单节自身超桶容量按**原文位置**切块（`SEGMENT_MAX_PARTS = 8`，对齐内容检批数上限）、能合的节合并（`SEGMENT_MERGE_MAX = 3`：合并段配额是各节之和，段一长就重新遇上「一次写太长会漂移」）。配额先摊到**节**（`q_i = 目标 × 凝缩权重 / Σ权重`，余数补给最大的一节），段配额 = 桶内各节配额之和；被切开的节两块之间按原文长度比摊。额度不够（桶容量 ≤ 0，或切到 8 块仍装不下）**报错要求调大倍率或拆期**，不许无限切。
-
 - **段内兜底再切（`_refit_pieces`）**：段内若仍装不下（折算比有波动、或已写正文比配额长了一截），把那几个块再切细分几次喂完——**不丢原文、也不换成凝缩**。块序号接着原来的排（「第 2/2 块」再切 3 → 「第 4/6、5/6、6/6」），区间首尾相接、总长不变。
-
 - **每段只喂本段那几节的原文**（`pipeline.section_materials` / `section_material_of`）：从前每段都把**整期素材**过一遍闸门，等于一段写偏了、后面每段都跟着偏。现在按块取料（切点尽量落在行边界），拿不到逐节原文时才退回整期素材。判据包组节时补回 `line`——同名标题会取错节。
-
 - **测试**：`TestPacking`（11 项：按重量装箱、桶容量随已写正文递减、合并封顶、块数超顶报错、额度放不下提示词报错、无额度能力后端退化成一节一段、段内再切的块序号与区间、再切不并节）、`TestFitMaterialBudget`（5 项）、`TestSectionFedSegments`（3 项，含「并成一段要拿到两节原文」）、`TestInputBudget`（重写，9 项）、`TestBatchCheck` 改为走真实额度入口（不再打桩 `material_capacity`）。
 
 **变更**
 
 - **规划轮只做两件事：起标题、给每段写一句话题目**。段边界归装箱，规划轮碰不到——两边都去定边界，边界就不存在。输出的 schema 用 `minItems == maxItems == 段数` **钉死**，模型既不能增也不能删；题目只写「这一段讲什么」，**不许写"从哪里起、到哪里止"**（取材范围由程序给死：第几节、切块时是第几块），程序只认 `topics` 条数 == 段数。反复不过就按各段首节的凝缩主旨代填，**段边界与配额一个字不动**。
-
 - **旧校验「同一节进了两个段就打回」删除**。切块之后同一节**必然**进相邻两段，那条规则是旧分工（模型分组）的残留，留着只会把正确结果打回。
-
 - **`material_capacity` 退为兜底**。只剩一处用途：没有额度能力的后端（测试假模型、将来接的非 OpenAI 客户端）走 `budget_chars_for_check` 的 fallback；生产路径一次都不再问它。**画地图那把尺与写作侧那把尺从此不共用**：倍率调大调小，地图一个字节不动；改时长改档位，倍率也不用动。
-
 - **文档同步**：`PROTOCOL.md` 3.3.2 从「输入预算与分批核对」改写为「三把尺各管各的」（附分层表）、3.3.4 分段生成改写为装箱定段 + 规划轮只起名；`README.md` 三处口径（喂多少字 / 放不下怎么办 / 分段生成）重写；`PLAN.md` 第十七章状态改为已实施并补 §17.8 落地记录。
 
 **说明**
@@ -2782,7 +3087,6 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 **修复**
 
 - **素材生成器仍会产出不齐的素材**。`_smoke/_bgm_gen.py` 的 `save_wav()` 原先只做**防溢出**（`peak > 0.90` 才缩），不做响度归一：重的被压、轻的原样留着，这正是 13.6 LU 差距的出处。上一版只是事后校正了现有文件，生成侧没动，所以重新生成一遍素材就会重新不齐、且不报错。现在落盘即调归一，素材出来天然是平的一档。防溢出那一步保留但写清了它不是归一 —— 两者职责不同，混起来才会漏。
-
 - **归一失败会留下半成品，而 `main()` 会跳过已存在的文件**。上一版没有这个路径，但本次接入生成侧就出现了：一旦某档归一失败，未归一的文件会留在磁盘上，下次运行因为「文件已存在」被永久跳过。现在失败即删文件并抛错。
 
 **变更**
@@ -2798,7 +3102,6 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
   - 归一必须真把 23 LU 的差距收敛到 0.5 LU 内；再跑一次应是空操作（幂等）。
   - 不可达目标必须拒写且**文件一个字节不变**（用 md5 比对）；非单声道 / 非 16bit 素材拒绝且不改动。
   - 实现只能有一份：源级扫描防止生成侧漏调归一、防止校正侧又写一份测量实现、防止失败时不删半成品。
-
 - 全量 853 项通过（上一版 845 + 本版 8）。
 
 ---
@@ -2810,7 +3113,6 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 **修复**
 
 - **背景音乐在成片里几乎不可闻**。人声与音乐的电平差实测 28~34 dB，正常播放音量下人耳抓不到。三重衰减叠加：默认音量 `bgm.volume=0.18`（-14.9 dB）；闪避阈值 `0.03`（-30.4 dB）远低于人声峰值，人声一起即近满压（约 -25 dB）；恢复时间 400 ms 比句间停顿 0.35 s 还长，音乐**在句间回不到基线**，从混进去那一刻起就没抬过头。音乐确实混进去了（`过程/<期号>/voice.wav` 与 `voice_bgm.wav` 并存，相减即得音乐轨），是被压没了，不是没混。
-
 - **15 档内置素材响度不齐，最大差 13.6 LU（约 4 倍）**。根源在素材生成脚本的 `save_wav()` 只做削峰保护、不做响度归一——响的被压到 0.90，轻的原样保留。同一个音量值换个档位，实际响度天差地别，这是「有时好像有、有时完全没有」的第二个来源。
 
 **变更**
@@ -2824,7 +3126,6 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 **新增**
 
 - **`tools/bgm_level.py`**：把内置 BGM 素材统一到同一响度。测量走 ffmpeg `loudnorm`（EBU R128），施加增益走纯 PCM 整数运算，不做动态压缩、不改采样率/位深/声道。带真峰值硬约束（`mech` 的真峰值只剩 0.6 dB 空间，故目标响度定 -23 LUFS），写入后复测，偏差超 0.5 LU 或出现削波即拒写。15 档全部达标（Δ ≤ 0.05 LU、零削波），旧素材备份在 `_smoke/_bgm_level_backup_*`。
-
 - 全量 845 项通过。
 
 ---
@@ -2884,7 +3185,7 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 
 **变更**
 
-- **句数退到程序层**：提示词从前写「本段配额约 2315 字（大致 57~40 句，每句 8~40 字）」——句数既是程序算出来的、又被写成模型的目标，模型挑更具体的那个听，写完 59 句就收手。现在提示词只给一个软句数（`配额 ÷ 期望句长`，期望句长取句长区间中点 24，配额 2315 → 96 句），并明说「句数只是量级参考，**一切以字数为准**」。字数成了唯一目标，与「账本口径只有字、句数永不进核账」的既有契约对齐。
+- **句数退到程序层**：提示词从前写「本段配额约 2315 字（大致 57~~40 句，每句 8~~40 字）」——句数既是程序算出来的、又被写成模型的目标，模型挑更具体的那个听，写完 59 句就收手。现在提示词只给一个软句数（`配额 ÷ 期望句长`，期望句长取句长区间中点 24，配额 2315 → 96 句），并明说「句数只是量级参考，**一切以字数为准**」。字数成了唯一目标，与「账本口径只有字、句数永不进核账」的既有契约对齐。
 - **失控刹车按配额现算**：`maxItems` 从前写死为 `形态上限 40 × 2 = 80`，与「本段该写多少字」脱钩——配额一大，句数先撞刹车、后撞配额，模型还没写完该写的话就被语法截断。现在按本段配额现算（`配额 × (1+容差) ÷ 最短句`，配额 2315 → 333 句），取的是「合法输出的句数上界」，永不误伤；它的职责只有防约束解码下无限写，控长归字数核账。
 - **规划轮不再报句数**：「每段预计写成 15~40 句对话」改为体量均衡引导（不要一段一节、另一段十节），并声明各段该写多少字由程序按凝缩字数占比分配。规划这一步只做切与排，不碰数字。
 
@@ -2912,7 +3213,7 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 
 **变更**
 
-- **更新日志结构归一**：节序统一为 新增/变更/修复/说明（此前 新增→修复→变更 与 新增→变更→修复 两套并存，v0.11~v0.12 各版又各自为政）；39 条裸条目补齐加粗短标题（`- 配置总表：…` → `- **配置总表**：…`，说明节的说明性条目同样处理）；v0.10.0~v0.12.1 六版补引言与全版计数、v0.9.0 补计数句；v0.6.0 引言 11 段 1832 字压缩为 3 段。条目内容零信息损失。
+- **更新日志结构归一**：节序统一为 新增/变更/修复/说明（此前 新增→修复→变更 与 新增→变更→修复 两套并存，v0.11~~v0.12 各版又各自为政）；39 条裸条目补齐加粗短标题（`- 配置总表：…` → `- **配置总表**：…`，说明节的说明性条目同样处理）；v0.10.0~~v0.12.1 六版补引言与全版计数、v0.9.0 补计数句；v0.6.0 引言 11 段 1832 字压缩为 3 段。条目内容零信息损失。
 
 ---
 
@@ -2958,11 +3259,9 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 **修复**
 
 - **AI 声明覆盖正文第一句**：声明合成与台词合成共用同一个工作目录，`synthesize` 按 `%04d_%s.wav` 命名空间落盘——声明在音频后处理阶段后合成，以 `0000_A.wav` 的身份覆盖掉正文第 0 句（欢迎收听）。现象即"AI 生成说了两遍、欢迎收听消失"。修复：声明写进独立目录 `work/decl/`，与台词命名空间物理隔离。根因是路径冲突，不是 TTS 或拼接逻辑的问题。
-
 - **emotion 标签整批混入正文**：分段生成 prompt 只写了"text 纯文本"，没有说清每个字段各自装什么——模型把「解释」「追问」「强调」「比喻」当句式拐杖拼进 text 开头，TTS 原样念出来。根因是前置规范缺位，不是模型突然变坏。修复分两层：
   - **前置（主修）**：整篇 / 分段 / 定点补丁三处 prompt 的字段定义升级为字段契约块——每个字段写明"只装什么、绝不装什么"，text 说明物理后果（每个字都会被念出来），并给出正反例（`text:"追问AI…"` 是错误示范）；示例 JSON 的抽象占位（`text:"台词"`、`emotion:"标签"`）换成真实演示，抽象占位本身就在诱导模型往 emotion 填描述词。
   - **后置（零成本兜底，不重跑 LLM）**：`normalize_script` / `apply_patch` 增加 `_strip_label_prefix`——只剥本句自己 emotion 标签的开头前缀（连带冒号/顿号变体）；别的标签开头可能是正常正文（emotion=平静 的「比喻是人类最好的思维拐杖」），碰了就是篡改。兜底是确定性字符串处理，不是校验失败重试，无 LLM 成本。
-
 - **契约块措辞回避「情绪」二字**：paper 档（语篇功能标签档）的纪律是全篇不出现心情词措辞，契约块初稿的"情绪标签词"违反该档措辞互斥（既有测试当场拦下）。
 
 ## v0.11.1
@@ -3033,106 +3332,107 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 
 ## v0.9.0
 
-音色自举的参考文案从**两句平铺陈述**换成**陈述 + 疑问 + 惊叹三句型混合**。依据是
-2026-09 的三轮克隆实验：Base 克隆会整条继承 ref 的韵律先验——混合 ref 让输出的
-疑问句句尾抬高约 +2.7 半音（超 1 半音可辨阈）、全局韵律更生动；而给 Base 传
-instruct 的句型路由两轮干净对照一个反向（−1.12）一个无效（−0.49），正式判死。
+音色自举的参考文案从**两句平铺陈述**换成**陈述 + 疑问 + 惊叹三句型混合**。依据是  
+2026-09 的三轮克隆实验：Base 克隆会整条继承 ref 的韵律先验——混合 ref 让输出的  
+疑问句句尾抬高约 +2.7 半音（超 1 半音可辨阈）、全局韵律更生动；而给 Base 传  
+instruct 的句型路由两轮干净对照一个反向（−1.12）一个无效（−0.49），正式判死。  
 第三类「句型语调」标注功能随之取消，不做任何实现——混合 ref 就是它的替代。新增两项、变更两项、说明两项。
 
 **新增**
 
-- **念全校验与自动重念**：CustomVoice 一次念三句偶尔念两句就停（实验实测
-  4.19s = 前两句的量），ref 音频缺句而 ref.txt 写三句时，Base 会把没被念出的
-  那句当成待合成文本补说，每条输出复读一遍。现在生成后按能量法数语音段数
-  （≥3）与语速（3.5～7.0 含标点字/有声秒），不合格换种子重念，最多 4 次，
+- **念全校验与自动重念**：CustomVoice 一次念三句偶尔念两句就停（实验实测  
+  4.19s = 前两句的量），ref 音频缺句而 ref.txt 写三句时，Base 会把没被念出的  
+  那句当成待合成文本补说，每条输出复读一遍。现在生成后按能量法数语音段数  
+  （≥3）与语速（3.5～7.0 含标点字/有声秒），不合格换种子重念，最多 4 次，  
   用尽即报错——残废 ref 宁可拦在门外，不混进项目当音色源头。
-- **档案对账字段**：profile.json 与查账输出新增 `voiced_seconds`、
+- **档案对账字段**：profile.json 与查账输出新增 `voiced_seconds`、  
   `speech_rate`、`attempts`，念全过程可追溯。
 
 **变更**
 
-- **REF_TEXTS 换混合三句型**：A/B 两角各一条（与项目内容无关的原则不变），
-  `synth_one` 的调用方式、种子派生、`--voice-a/b` 项目配置透传全部不变——
+- **REF_TEXTS 换混合三句型**：A/B 两角各一条（与项目内容无关的原则不变），  
+  `synth_one` 的调用方式、种子派生、`--voice-a/b` 项目配置透传全部不变——  
   生产的克隆链路（Base + ICL）零改动。
-- **确定性边界重申**：重念尝试序列的种子固定（base + 0/7/14/21），哪次定稿由
+- **确定性边界重申**：重念尝试序列的种子固定（base + 0/7/14/21），哪次定稿由  
   确定性波形决定，同输入仍收敛到同一条定稿，逐字节可复现的性质没破。
 
 **说明**
 
-- **韵律继承的全局效应**：陈述句的句尾起伏也会变大（实验：句末峰 +6.59 半音，
+- **韵律继承的全局效应**：陈述句的句尾起伏也会变大（实验：句末峰 +6.59 半音，  
   但末段回落，不呈疑问句的持续上扬），听感验收过可接受。
-- **实验脚本留档**：`_smoke/` 下的三轮实验脚本（`_probe_richref2.py` 等）与两份试听报告保留，
+- **实验脚本留档**：`_smoke/` 下的三轮实验脚本（`_probe_richref2.py` 等）与两份试听报告保留，  
   作为「instruct 判死 / 混合 ref 有效」结论的原始证据。
 
 ---
 
 ## v0.8.0
 
-脚本生成的两条路线不再由开关选，而由**项目模式**定死：成稿规划走分段生成，逐期即兴
-与单集走整篇生成。开关能选的东西就是能选错的东西——本次事故里那一期走的正是没开分段
-的老路。这一版把它变成结构性判据，同时补上三处让稿子「注水」的口子：分量下限、
+脚本生成的两条路线不再由开关选，而由**项目模式**定死：成稿规划走分段生成，逐期即兴  
+与单集走整篇生成。开关能选的东西就是能选错的东西——本次事故里那一期走的正是没开分段  
+的老路。这一版把它变成结构性判据，同时补上三处让稿子「注水」的口子：分量下限、  
 重复检测、以及从不告诉模型「手里有多少素材」。
 
-分量下限从「原文不足成稿目标一半」提到 **1.2 倍**。旧口径建立在「轻度扩写可行」的
-假设上，实测不成立：模型的产出与素材近乎 1:1 消耗（实测 4034 ÷ 4132 ≈ 0.98），素材
-刚好等于目标时它写不满，出路只剩把写过的段落再背一遍。这条线一处定义、四处生效——
+分量下限从「原文不足成稿目标一半」提到 **1.2 倍**。旧口径建立在「轻度扩写可行」的  
+假设上，实测不成立：模型的产出与素材近乎 1:1 消耗（实测 4034 ÷ 4132 ≈ 0.98），素材  
+刚好等于目标时它写不满，出路只剩把写过的段落再背一遍。这条线一处定义、四处生效——  
 逐期体检、排图前的产能预检、总量兜底、排图提示词。
 
 全版新增五项、变更六项、修复三项。
 
 **新增**
 
-- **路线按项目模式定死**。`generate` 新增 `segmented` 判据，由调用方按 `plan_mode`
-  传入：成稿规划（mapped）走分段，逐期即兴与单集走整篇。这条判据与成稿规划的料源
+- **路线按项目模式定死**。`generate` 新增 `segmented` 判据，由调用方按 `plan_mode`  
+  传入：成稿规划（mapped）走分段，逐期即兴与单集走整篇。这条判据与成稿规划的料源  
   判据（`pipeline.resolve_material`）是同一条，不是第二套语言。
-- **重复凑数的程序硬去重**。同一句长句（归一化后相同、≥12 字）在整篇里出现多次时
-  只留第一次。实测整篇生成一期 302 句里 129 句（43%）是把自己写过的整段又背了一遍，
-  这属于复播而非改写，删掉没有任何信息损失。它放在门禁之前，让时长、句数这些门禁
+- **重复凑数的程序硬去重**。同一句长句（归一化后相同、≥12 字）在整篇里出现多次时  
+  只留第一次。实测整篇生成一期 302 句里 129 句（43%）是把自己写过的整段又背了一遍，  
+  这属于复播而非改写，删掉没有任何信息损失。它放在门禁之前，让时长、句数这些门禁  
   对着真实的稿子判，而不是对着注水后的数字判；删了多少句记成「重复凑数」进报告。
-- **本期素材体量进提示词**。从前只说「要写多少」、不说「手里有多少」——素材撑不满
-  目标字数时，模型唯一的出路就是凑。本期素材字数连同「写不满就照实写短、不许复读
+- **本期素材体量进提示词**。从前只说「要写多少」、不说「手里有多少」——素材撑不满  
+  目标字数时，模型唯一的出路就是凑。本期素材字数连同「写不满就照实写短、不许复读  
   凑数」一并写进本期计划块，两条路共用。
-- **规划校验补「每节恰好一次」**。此前只查「每一节都被覆盖」，同一节被分进两段时
-  会被写两遍——那不是覆盖到了，是同一条重复。跨段重复直接打回重排；段内重复属笔误，
+- **规划校验补「每节恰好一次」**。此前只查「每一节都被覆盖」，同一节被分进两段时  
+  会被写两遍——那不是覆盖到了，是同一条重复。跨段重复直接打回重排；段内重复属笔误，  
   归并即可，不打回。
-- **排图提示词印出分量下限**。此前只印上限，模型的第一轮分组必然落到下限线；补上之后
+- **排图提示词印出分量下限**。此前只印上限，模型的第一轮分组必然落到下限线；补上之后  
   重排从「唯一的纠错手段」回到「兜底」。
 
 **变更**
 
-- **分段生成不再是可选开关**。删除配置项 `script.segmented`（配置页「脚本」页的那
-  一行一并撤掉）。成稿规划项目自动走分段；本期凝缩读不出来（还没排图、版本对不上）
+- **分段生成不再是可选开关**。删除配置项 `script.segmented`（配置页「脚本」页的那  
+  一行一并撤掉）。成稿规划项目自动走分段；本期凝缩读不出来（还没排图、版本对不上）  
   时仍退回整篇，不让人卡在「一步跑不动」上。
-- **压比下限 0.5 → 1.2**，三档统一。`probe.MIN_RATIO` 一处改动，逐期体检、产能预检、
+- **压比下限 0.5 → 1.2**，三档统一。`probe.MIN_RATIO` 一处改动，逐期体检、产能预检、  
   总量兜底、排图提示词四处同时生效；产能预检的报错门槛随之上移。
-- **删除「轻度扩写区」软警告**。它覆盖 0.5~1.0，在新下限下整个区间都已越过红线，
+- **删除「轻度扩写区」软警告**。它覆盖 0.5~1.0，在新下限下整个区间都已越过红线，  
   函数与两处调用点一并删除。
-- **重排耗尽后的收口分两极**。仍超上限 → 报错停下交人（压不动的期写不出来，落库
-  等于让后面每一期都照错的图出片）；仍低于下限 → 落警告放行（料不够写出来是短、
+- **重排耗尽后的收口分两极**。仍超上限 → 报错停下交人（压不动的期写不出来，落库  
+  等于让后面每一期都照错的图出片）；仍低于下限 → 落警告放行（料不够写出来是短、  
   不是错）。原先是两者都落警告。
-- **超一期容量的单元仍是警告，不阻断排图**。出问题的是其中某一期，不是整张图；让它
-  先排出图、由逐期体检点名那一期、由重排试着一拆，拆不动才由上限报错兜住。若在单元
+- **超一期容量的单元仍是警告，不阻断排图**。出问题的是其中某一期，不是整张图；让它  
+  先排出图、由逐期体检点名那一期、由重排试着一拆，拆不动才由上限报错兜住。若在单元  
   层面直接抛错，人会连问题在哪一期都看不到。
-- **文档同步**。README 与 PROTOCOL 里的「分段生成（可选）」「下限 = 一半」「压得松
+- **文档同步**。README 与 PROTOCOL 里的「分段生成（可选）」「下限 = 一半」「压得松  
   是自由度」一律改写为现行口径，并撤掉已不存在的「体量离群体检」描述。
 
 **修复**
 
-- **地图保存丢字段**。地图弹窗保存时只回传标题、主旨、要点、落点，`chars` 与 `done`
-  没带回去——在界面上点一次保存，体检体量全归零、所有期被重置成没出过片。渲染与
+- **地图保存丢字段**。地图弹窗保存时只回传标题、主旨、要点、落点，`chars` 与 `done`  
+  没带回去——在界面上点一次保存，体检体量全归零、所有期被重置成没出过片。渲染与  
   保存两端都补齐。
 - **规划放行跨段重复节**。（见「新增」第四条。）
 - **排图提示词缺下限**。（见「新增」第五条。）
 
 **说明**
 
-- **逐期即兴与单集不设分量下限**。贴进来的素材就是全部依据，写不满目标时长时按素材
-  撑得起的内容照实写短——时长会诚实地不达标，门禁只报不拦。不走「目标随素材降」
+- **逐期即兴与单集不设分量下限**。贴进来的素材就是全部依据，写不满目标时长时按素材  
+  撑得起的内容照实写短——时长会诚实地不达标，门禁只报不拦。不走「目标随素材降」  
   那条路：那等于把使用者设的时长偷偷改掉，让结果看起来达标。
-- **段级重出未做**。整篇路径保留着，成稿规划走分段之后，结构坏掉时仍由整篇重出兜住，
+- **段级重出未做**。整篇路径保留着，成稿规划走分段之后，结构坏掉时仍由整篇重出兜住，  
   不必再为分段单独维护一套「只重出受影响段」的机制。
 
 ---
+
 
 ## v0.7.0
 
@@ -3371,6 +3671,8 @@ instruct 的句型路由两轮干净对照一个反向（−1.12）一个无效�
   现在有了。
 
 ---
+
+
 
 ## v0.6.0
 
@@ -4046,6 +4348,8 @@ instruct 的句型路由两轮干净对照一个反向（−1.12）一个无效�
 
 ---
 
+
+
 ## v0.2.0
 
 本版把「配置总表 — 界面 — 管线」这条链上的断点逐条接回，让立项能承载「给一部成稿、
@@ -4249,6 +4553,8 @@ instruct 的句型路由两轮干净对照一个反向（−1.12）一个无效�
 - **产物校验按需判定**：产物校验只要求「这一期被要求产出什么」，`manifest.json` 记录 `do_video` 供报告判定。
 
 ---
+
+
 
 ## v0.1.0
 

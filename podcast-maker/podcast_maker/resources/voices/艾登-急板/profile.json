@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "艾登-急板",
+ "family": "艾登",
+ "flavor": "急板",
+ "text_role": "A",
+ "text": "我一直觉得这本书写得很有意思。有人问我：“这书真的是AI写的吗？”我翻到最后一页……这答案太让人吃惊了！",
+ "builtin_voice": "Aiden",
+ "official_take": 3,
+ "seed": 1654744179,
+ "sha16": "5f162d0968f651ba",
+ "f0_med": 134.1,
+ "seconds": 12.96,
+ "voiced_seconds": 8.53,
+ "speech_rate": 6.1,
+ "rate_out_of_window": true,
+ "loudness_gain_db": -3.63,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "阳光的美式男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "5f162d0968f651ba"
+}

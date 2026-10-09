@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "万恶之源男-深巷",
+ "family": "万恶之源男",
+ "flavor": "深巷",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Ryan",
+ "official_take": 5,
+ "seed": 1468285803,
+ "sha16": "7ba5afea49ec29a5",
+ "f0_med": 133.3,
+ "seconds": 15.36,
+ "voiced_seconds": 10.62,
+ "speech_rate": 4.52,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 0.61,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "节奏感强的男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "7ba5afea49ec29a5"
+}

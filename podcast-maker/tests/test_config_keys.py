@@ -378,6 +378,41 @@ class TestEngineScope(unittest.TestCase):
                          "以下音色点位没声明引擎归属，会在两个引擎下同时露出：%s" % loose)
 
 
+class TestShowIf(unittest.TestCase):
+    """show_if 显隐声明的结构性校验：依赖键必须存在且为枚举，声明的取值
+    必须真是该键的档位——写错的症状是该收起的行收不起，还不报错。"""
+
+    def test_show_if_deps_are_real_enum_values(self):
+        bad = []
+        for key, spec in PARAM_SPEC.items():
+            sf = spec.get("show_if")
+            if not sf:
+                continue
+            for dep, vals in sf.items():
+                if dep not in PARAM_SPEC:
+                    bad.append("%s 依赖不存在的键 %s" % (key, dep))
+                    continue
+                if PARAM_SPEC[dep]["type"] != "enum":
+                    bad.append("%s 依赖的 %s 不是枚举" % (key, dep))
+                    continue
+                opts = {o["value"] for o in param_options(dep)}
+                for v in vals:
+                    if v not in opts:
+                        bad.append("%s 依赖 %s 的取值 %r 不在档位表"
+                                   % (key, dep, v))
+        self.assertFalse(bad, "show_if 声明有硬伤：%s" % bad)
+
+    def test_bgm_source_dependent_points_all_declare_show_if(self):
+        # 背景音乐卡三行各自只在匹配来源下露出；少声明一行就会回到
+        # 「切了来源、别的下拉还杵在原地」的样子。
+        for key, mode in (("bgm.preset", ["builtin"]),
+                          ("bgm.library_name", ["library"]),
+                          ("bgm.custom_path", ["custom"])):
+            self.assertEqual(PARAM_SPEC[key].get("show_if"),
+                             {"bgm.mode": mode},
+                             "%s 的 show_if 与来源档位不匹配" % key)
+
+
 class TestConfigMigration(unittest.TestCase):
     """第十三类缺陷：点位改了名或下了线，存量配置里的值静默消失。
 

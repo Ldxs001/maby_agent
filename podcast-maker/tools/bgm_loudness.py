@@ -151,7 +151,7 @@ def plan_gain(lufs, tp, target_lufs, tp_ceil):
 
 
 def normalize_file(path, target_lufs=DEFAULT_TARGET_LUFS,
-                   tp_ceil=DEFAULT_TP_CEIL, ffmpeg=None):
+                   tp_ceil=DEFAULT_TP_CEIL, ffmpeg=None, allow_limited=False):
     """把单个 WAV 就地拉到目标响度。
 
     返回 dict：`ok` / `gain_db` / `lufs` / `tp` / `after_lufs` / `after_tp` /
@@ -159,6 +159,12 @@ def normalize_file(path, target_lufs=DEFAULT_TARGET_LUFS,
 
     **文件只在 `ok=True` 时被改动**：任何一步出问题都不写盘；万一写完复测
     不过，会把内存里留着的原样本写回去再返回失败。调用方不需要自己兜底。
+
+    `allow_limited=True`（AI 生成链显式放行）：素材峰均比大到峰值先撞线、
+    目标响度不可达时，不判失败，改按真峰值上限落稿，实际落点看
+    `after_lufs`，`limited=True` 供账本追溯。只放行、绝不削峰 —— 增益
+    照旧由 plan_gain 按上限算出，动态结构一个采样不动。默认 False：
+    CLI 与 15 档批量校正维持「不可达即拒写」的严格语义。
     """
     ffmpeg = ffmpeg or ffmpeg_bin()
     name = os.path.basename(path)
@@ -171,9 +177,10 @@ def normalize_file(path, target_lufs=DEFAULT_TARGET_LUFS,
 
     # 可达性前置判定：峰值先撞线时，响度能到哪儿是算得出来的。到不了目标
     # 就别写 —— 「先改一版再报失败」等于留下一个响度不合标的素材，而调用方
-    # 可能只看返回码就把备份删了。
+    # 可能只看返回码就把备份删了。唯一出口：调用方显式 allow_limited
+    # （AI 生成链），此时按峰值上限落稿、limited=True 回报，账本可追溯。
     reachable = lufs + gain
-    if reachable < target_lufs - VERIFY_TOL_LU:
+    if reachable < target_lufs - VERIFY_TOL_LU and not allow_limited:
         return {"ok": False, "name": name, "lufs": lufs, "tp": tp,
                 "gain_db": gain, "limited": True, "reason":
                 "目标 %.2f LUFS 在真峰值上限 %.2f dBTP 内不可达：该素材峰值为 "
@@ -195,15 +202,19 @@ def normalize_file(path, target_lufs=DEFAULT_TARGET_LUFS,
     write_pcm(path, new, rate)
 
     # 闭环复测：不测就等于没做。不过就把原样本写回去，保证「失败 = 文件未变」。
+    # 基准是**计划落点**（lufs + gain）而非目标：未撞线时两者相等，判据不变；
+    # 有限幅放行时计划落点本来就低于目标，拿目标当基准会把放行稿误杀还原。
     after_lufs, after_tp = measure(path, ffmpeg)
+    expected = lufs + gain
+    miss = None if after_lufs is None else after_lufs - expected
     delta = None if after_lufs is None else after_lufs - target_lufs
-    if after_lufs is None or abs(delta) > VERIFY_TOL_LU:
+    if after_lufs is None or abs(miss) > VERIFY_TOL_LU:
         write_pcm(path, samples, rate)
         return {"ok": False, "name": name, "lufs": lufs, "tp": tp,
                 "gain_db": gain, "after_lufs": after_lufs, "after_tp": after_tp,
                 "reason": ("写入后复测失败" if after_lufs is None else
-                           "复测 LUFS 偏离目标 %+.2f LU（容差 %.1f），已还原原文件"
-                           % (delta, VERIFY_TOL_LU))}
+                           "复测 LUFS 偏离计划落点 %+.2f LU（容差 %.1f），已还原原文件"
+                           % (miss, VERIFY_TOL_LU))}
 
     return {"ok": True, "name": name, "lufs": lufs, "tp": tp,
             "gain_db": gain, "after_lufs": after_lufs, "after_tp": after_tp,

@@ -1,0 +1,752 @@
+{
+ "schema": 1,
+ "sample_rate": 32000,
+ "loudness": {
+  "event_peak_dbfs": -3.0,
+  "amb_rms_dbfs": -26.0,
+  "peak_ceiling_dbfs": -1.5,
+  "note": "事件=峰值归一（瞬态单发）；氛围=RMS 归一+软限幅（垫底稳态）"
+ },
+ "entries": [
+  {
+   "name": "金属-碰撞",
+   "type": "event",
+   "scene": "兵刃相接、金属撞击，拔刀/铁器砸落",
+   "duration": 2.23,
+   "file": "金属-碰撞.mp3",
+   "sha256": "b4d03f73f049d5d439fa523327eba3268dfe201b01f61fe96a82052ec582a6c0",
+   "bytes": 56204,
+   "library_rms_dbfs": -23.4,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "842170",
+    "title": "3 Basic Metal Clangs Free",
+    "user": "AardsReal",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/842/842170_13307919-lq.mp3",
+    "preview_sha256": "657fee59130871403e97f4a070cf26abb756c91fb85d1650b4b96b30ff0c313e"
+   }
+  },
+  {
+   "name": "拳-重击",
+   "type": "event",
+   "scene": "重拳砸击、闷响倒地",
+   "duration": 5.38,
+   "file": "拳-重击.mp3",
+   "sha256": "3deccb1397d0c3e30ca2dc4c4022fd503bfa8f771fbb1298ae7be39382b20490",
+   "bytes": 131372,
+   "library_rms_dbfs": -30.4,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "348246",
+    "title": "PUNCH-BOXING-05-REVERB.wav",
+    "user": "newagesoup",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/348/348246_4067257-lq.mp3",
+    "preview_sha256": "f14ab8282657bb99b8d3a322b6efe14d57d6315589206dfa8c851bcc205f844c"
+   }
+  },
+  {
+   "name": "枪-单发",
+   "type": "event",
+   "scene": "近处单发枪响，干脆利落",
+   "duration": 1.92,
+   "file": "枪-单发.mp3",
+   "sha256": "04777eac5590e9ea5964687197db3ab497025adf3f70fa9a254fd41fc02194b0",
+   "bytes": 48428,
+   "library_rms_dbfs": -29.1,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "415912",
+    "title": "Heathers Gunshot Effect2.wav",
+    "user": "okieactor",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/415/415912_7107077-lq.mp3",
+    "preview_sha256": "fa5c45aeb9cf4d1373cd7c384135af06ca47797746261ff6bb07d30dd7acefd9"
+   }
+  },
+  {
+   "name": "爆炸-远",
+   "type": "event",
+   "scene": "远处爆炸闷响，战场/事故远景",
+   "duration": 3.14,
+   "file": "爆炸-远.mp3",
+   "sha256": "ff2a2c4a51488a243847c51130b9fe42ca4736ce30c559d7acd36ef40e247d88",
+   "bytes": 77804,
+   "library_rms_dbfs": -11.2,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "255527",
+    "title": "verydistantexplosion.wav",
+    "user": "Opticreep",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/255/255527_4731953-lq.mp3",
+    "preview_sha256": "466eb0fcfbf18d4b6b6aae83fa92d0f5e12372866423600bbb8e707a5ac27c48"
+   }
+  },
+  {
+   "name": "玻璃-破碎",
+   "type": "event",
+   "scene": "玻璃碎裂，摔杯/砸窗/失控",
+   "duration": 4.23,
+   "file": "玻璃-破碎.mp3",
+   "sha256": "0fdec15fd21b2a890165edd9bc86bc3d70ae30ba201391a12d434bb31d51234e",
+   "bytes": 103724,
+   "library_rms_dbfs": -35.3,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "204185",
+    "title": "breaking_glass1.wav",
+    "user": "reg7783",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/204/204185_2394357-lq.mp3",
+    "preview_sha256": "6fc30119e11c7a10f2e4aab82d51c8e2c53d5324d828f7220667f775af6822ba"
+   }
+  },
+  {
+   "name": "门-关",
+   "type": "event",
+   "scene": "门砰然关上，离场/决裂/摔门",
+   "duration": 4.01,
+   "file": "门-关.mp3",
+   "sha256": "65c2d2f46bb996fce7d8dabfbca7778cf1a3ce7f17b983dd50cc5a1b529d1a62",
+   "bytes": 98540,
+   "library_rms_dbfs": -27.9,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "244421",
+    "title": "shower-door-slam01.flac",
+    "user": "Aiyumi",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/244/244421_2326086-lq.mp3",
+    "preview_sha256": "ae711107282291c0050f615311a0880eba9850a2b5a3ceb73b9e89fb72bb78fe"
+   }
+  },
+  {
+   "name": "敲门-三下",
+   "type": "event",
+   "scene": "敲门声，来客/悬念",
+   "duration": 2.08,
+   "file": "敲门-三下.mp3",
+   "sha256": "d3d3d7c50766ac41f8faf9988e754029794b06a8376b9551536c0bf58445e6fe",
+   "bytes": 51884,
+   "library_rms_dbfs": -21.8,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "268500",
+    "title": "door_knock.wav",
+    "user": "wjtaylor",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/268/268500_4989900-lq.mp3",
+    "preview_sha256": "91beee57f88ee32efd9550f9c37e04067d96a01b0f5d7d19b33d4038f0510a7d"
+   }
+  },
+  {
+   "name": "剑-挥砍",
+   "type": "event",
+   "scene": "挥砍破空声，武打动作",
+   "duration": 2.05,
+   "file": "剑-挥砍.mp3",
+   "sha256": "18247918e204cb285b1e16e80fd354f9254609e3b883658a68950489aed0d77d",
+   "bytes": 51020,
+   "library_rms_dbfs": -23.4,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "733891",
+    "title": "Whoosh Triple",
+    "user": "velcronator",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/733/733891_6703998-lq.mp3",
+    "preview_sha256": "b9a5b8e4dfbd44fb81a70622340c06d6fc0cf05ccbe19a45368b0e225cca93b2"
+   }
+  },
+  {
+   "name": "心跳-单组",
+   "type": "event",
+   "scene": "低频心跳两三下，紧张转折（吝啬使用）",
+   "duration": 5.15,
+   "file": "心跳-单组.mp3",
+   "sha256": "5ced82e896804cd188b70f448a89c4ab918cff06e0673efdc9dd6ca1e5056f81",
+   "bytes": 125324,
+   "library_rms_dbfs": -23.3,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "164644",
+    "title": "Heartbeat_2.wav",
+    "user": "deleted_user_2104797",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/164/164644_2104797-lq.mp3",
+    "preview_sha256": "358b7e0280ab63d2515a36377aed62b629d3cb0b41b1d95e703bc3c3d973ca65"
+   }
+  },
+  {
+   "name": "雷-单声",
+   "type": "event",
+   "scene": "单声炸雷，天气转折/惊变",
+   "duration": 7.19,
+   "file": "雷-单声.mp3",
+   "sha256": "722f86f30899839b6b0a8498f571b6e6e791097856fc4fc3ecd851d4a8bba5f5",
+   "bytes": 174572,
+   "library_rms_dbfs": -19.4,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "436794",
+    "title": "Thunder Clap2",
+    "user": "roboroo",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/436/436794_3206727-lq.mp3",
+    "preview_sha256": "17f6fcc8fa2b6a3e78b4fbb09d6ab51747a95cd32696d0042481d8239ccd70b8"
+   }
+  },
+  {
+   "name": "电话-铃",
+   "type": "event",
+   "scene": "老式电话铃，突来电话",
+   "duration": 6.35,
+   "file": "电话-铃.mp3",
+   "sha256": "5a1941f3ded1771b84979cad29b7c8455a602e0b6f69ff21b5a156f42cc84f74",
+   "bytes": 154700,
+   "library_rms_dbfs": -31.2,
+   "library_peak_dbfs": -3.2,
+   "source": {
+    "site": "freesound.org",
+    "id": "509742",
+    "title": "Omas Telefon 02.wav",
+    "user": "MrOptimism",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/509/509742_3084479-lq.mp3",
+    "preview_sha256": "00017deb892cbe5ae85e5bced61d6b1939c7e31827c1a430fda2990c49f4baf1"
+   }
+  },
+  {
+   "name": "钟-报时",
+   "type": "event",
+   "scene": "教堂钟/报时钟，时间流逝/整点转场",
+   "duration": 4.44,
+   "file": "钟-报时.mp3",
+   "sha256": "16ea784d4020be0668f1ea13fbecdf39045e76006526940a06a1dbb041374f33",
+   "bytes": 108908,
+   "library_rms_dbfs": -18.3,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "633208",
+    "title": "Old Church Bell (no noise)",
+    "user": "igroglaz",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/633/633208_3381595-lq.mp3",
+    "preview_sha256": "956cdf01789306ad3f0f8b60cb194b75417a54407a34dfd89bc7a5d65a47e901"
+   }
+  },
+  {
+   "name": "翻纸-沙沙",
+   "type": "event",
+   "scene": "翻纸沙沙，档案/账本/翻页",
+   "duration": 4.83,
+   "file": "翻纸-沙沙.mp3",
+   "sha256": "468551502517e720124d8ce5c0657cf1a1216debf7ee8ee8184a6bdc4425a09f",
+   "bytes": 118412,
+   "library_rms_dbfs": -34.1,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "181774",
+    "title": "rustling paper.wav",
+    "user": "keweldog",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/181/181774_3153523-lq.mp3",
+    "preview_sha256": "7eea518f79981f1d829942130991dea83644097bb54f0d577be3655256b344eb"
+   }
+  },
+  {
+   "name": "打字-按键",
+   "type": "event",
+   "scene": "键盘敲击，写作/发报/办公",
+   "duration": 5.55,
+   "file": "打字-按键.mp3",
+   "sha256": "c48f46a68a29e8035dc07dba440522fe994b682e10bfa73e980d44aebcdbc7f0",
+   "bytes": 135692,
+   "library_rms_dbfs": -35.0,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "754201",
+    "title": "Fast keyboard typing",
+    "user": "Spacekittycat",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/754/754201_14346530-lq.mp3",
+    "preview_sha256": "566f40628699f500afef314b1900be6641371585181b877ce4a348ef7d9db646"
+   }
+  },
+  {
+   "name": "喊口号",
+   "type": "event",
+   "scene": "人群齐喊口号，群体场景",
+   "duration": 5.5,
+   "file": "喊口号.mp3",
+   "sha256": "935ef410b3771601a20d32c8c0bb06a7c36ef83ea08423454ca2153a46a855b5",
+   "bytes": 133964,
+   "library_rms_dbfs": -22.3,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "819342",
+    "title": "Thank you Crowd Chant",
+    "user": "wordwiz1",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/819/819342_12069828-lq.mp3",
+    "preview_sha256": "673be83693eebdd5ca24c05e2f7b7bac000c21f23613d0c26315b3adea9987b7"
+   }
+  },
+  {
+   "name": "尖叫-女",
+   "type": "event",
+   "scene": "女声短促尖叫，惊悚点睛（每期至多一两次）",
+   "duration": 3.86,
+   "file": "尖叫-女.mp3",
+   "sha256": "2c6e81f9cc2203d065d2dc3e611a623fe37e4b0453106a141f579bc203318f87",
+   "bytes": 95084,
+   "library_rms_dbfs": -15.6,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "721498",
+    "title": "Scream Of A Woman",
+    "user": "synth2",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/721/721498_2381713-lq.mp3",
+    "preview_sha256": "4c9012694a95aa1d7c74eb9b1de969dd1f7fe13b98e338ee90fce60ae6ff8309"
+   }
+  },
+  {
+   "name": "打呼噜",
+   "type": "event",
+   "scene": "打呼噜，睡眠桥段（偏喜剧）",
+   "duration": 5.0,
+   "file": "打呼噜.mp3",
+   "sha256": "672d01bac4b22e32d84fe0ecabc8465daa3b4ff4bd438f0c02bf046c25a14ec4",
+   "bytes": 121868,
+   "library_rms_dbfs": -21.5,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "108519",
+    "title": "Fast Snore .wav",
+    "user": "bsmacbride",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/108/108519_1338699-lq.mp3",
+    "preview_sha256": "0847de9954b3aa94e607459cb5023c035a518d54885a1efe806c77e002f35ec7"
+   }
+  },
+  {
+   "name": "雨-中",
+   "type": "amb",
+   "scene": "中等雨声持续，雨夜整段垫底",
+   "duration": 11.32,
+   "file": "雨-中.mp3",
+   "sha256": "4b906cd46b15ad65dba954b790bdc633765f7119f6bccc66d539b1eff3c68e75",
+   "bytes": 273932,
+   "library_rms_dbfs": -26.4,
+   "library_peak_dbfs": -10.8,
+   "source": {
+    "site": "freesound.org",
+    "id": "238016",
+    "title": "rain 4",
+    "user": "eaglechopper",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/238/238016_3948615-lq.mp3",
+    "preview_sha256": "37bb41118c20e4b38b6d49448aefff8092b9b0e54d6d90739b2b25e1d908d027"
+   }
+  },
+  {
+   "name": "风-呜咽",
+   "type": "amb",
+   "scene": "风呜咽/呼啸，荒野/萧瑟/寒冬",
+   "duration": 6.31,
+   "file": "风-呜咽.mp3",
+   "sha256": "5bd9538bc4df8a53b19335a30b698b53da38d959fbd5e48d3c614ec5286ae7e4",
+   "bytes": 153836,
+   "library_rms_dbfs": -26.3,
+   "library_peak_dbfs": -11.1,
+   "source": {
+    "site": "freesound.org",
+    "id": "767148",
+    "title": "Wind howling",
+    "user": "paf60",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/767/767148_15595729-lq.mp3",
+    "preview_sha256": "86001566b32c4b2319fb975f8627ef5e062e9d519aee088bfafb9bcb01c1ea96"
+   }
+  },
+  {
+   "name": "火-篝火",
+   "type": "amb",
+   "scene": "篝火噼啪，烤火/夜谈",
+   "duration": 11.6,
+   "file": "火-篝火.mp3",
+   "sha256": "29c3cb031feec37860f188bb9e287275c7eab025a91d1a611f484c322c8e7776",
+   "bytes": 280844,
+   "library_rms_dbfs": -26.8,
+   "library_peak_dbfs": -1.1,
+   "source": {
+    "site": "freesound.org",
+    "id": "676385",
+    "title": "Fire Crackling",
+    "user": "StevenMyat_",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/676/676385_14682249-lq.mp3",
+    "preview_sha256": "0a61d80394780583c4eb7fe56671d853f9c5e19b58589933d70c9ea001581b3d"
+   }
+  },
+  {
+   "name": "虫鸣-夜",
+   "type": "amb",
+   "scene": "夏夜虫鸣，乡村/夜晚",
+   "duration": 12.26,
+   "file": "虫鸣-夜.mp3",
+   "sha256": "f37ebdc680cadb61db7b0485c6c9d64ef8790439eb2e1bb0a554e7bd5c3fa1c3",
+   "bytes": 296396,
+   "library_rms_dbfs": -26.4,
+   "library_peak_dbfs": -6.6,
+   "source": {
+    "site": "freesound.org",
+    "id": "477863",
+    "title": "cherping summer night crickets.wav",
+    "user": "Dashman71",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/477/477863_10100504-lq.mp3",
+    "preview_sha256": "0d5e1a210001094d9002c8f4ba86263ec84617cdd317b60eec963f8b3969eca0"
+   }
+  },
+  {
+   "name": "鸟-晨林",
+   "type": "amb",
+   "scene": "清晨林间鸟鸣，田园/苏醒",
+   "duration": 9.84,
+   "file": "鸟-晨林.mp3",
+   "sha256": "1a1eeb8f76d02142a264d0d72ee4639f51882ba10a07b58e92066adbe7e86faa",
+   "bytes": 238508,
+   "library_rms_dbfs": -26.3,
+   "library_peak_dbfs": -2.8,
+   "source": {
+    "site": "freesound.org",
+    "id": "391277",
+    "title": "Spring Birds Forest 04 Amp.wav",
+    "user": "ANARKYA",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/391/391277_4448255-lq.mp3",
+    "preview_sha256": "d9472f622d964a92a8795ae6341eb05879a2b88a8b72e3012eb8453efcb72984"
+   }
+  },
+  {
+   "name": "海浪-缓",
+   "type": "amb",
+   "scene": "舒缓海浪，海边/抒情段",
+   "duration": 10.01,
+   "file": "海浪-缓.mp3",
+   "sha256": "4419684a244f551af418e6f613d2a923bdc24b720bb74d9f85cd08c1e5df5c95",
+   "bytes": 241964,
+   "library_rms_dbfs": -26.3,
+   "library_peak_dbfs": -11.6,
+   "source": {
+    "site": "freesound.org",
+    "id": "587069",
+    "title": "Ocean Sound.aiff",
+    "user": "FilippoMoschella",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/587/587069_13232243-lq.mp3",
+    "preview_sha256": "452f0ea0edf7a013c57808f0ae21cad3e618d0f2137b646049a737426b27ac5d"
+   }
+  },
+  {
+   "name": "战场-厮杀",
+   "type": "amb",
+   "scene": "远景混战（人群+兵器+火器），战争段落垫底",
+   "duration": 12.63,
+   "file": "战场-厮杀.mp3",
+   "sha256": "dba415a1a609ab4d63202c94ac7c15a6c9a3a5856b9694fe02a1aebce51d79bc",
+   "bytes": 305036,
+   "library_rms_dbfs": -26.3,
+   "library_peak_dbfs": -9.2,
+   "source": {
+    "site": "freesound.org",
+    "id": "694374",
+    "title": "Fireworks/ Warzone 6",
+    "user": "NearTheAtmoshphere",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/694/694374_2578040-lq.mp3",
+    "preview_sha256": "9f5f1889412acffcc017ff871fc0806046f1461d255cf8bf7d5774625a01e4d9"
+   }
+  },
+  {
+   "name": "人群-嘈杂",
+   "type": "amb",
+   "scene": "人群嘈杂低语，集市/酒馆/饭馆",
+   "duration": 15.71,
+   "file": "人群-嘈杂.mp3",
+   "sha256": "eff9a823aa55ec10d8d7bb881988578a4d37bdde1549b37fa07d3319a7dc9312",
+   "bytes": 379340,
+   "library_rms_dbfs": -26.3,
+   "library_peak_dbfs": -9.6,
+   "source": {
+    "site": "freesound.org",
+    "id": "457043",
+    "title": "Busy Room Ambience / Small crowd / People talking in background",
+    "user": "Breviceps",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/457/457043_9159316-lq.mp3",
+    "preview_sha256": "d1811805467a88474b6f622ca2c6ae19a4deebd013b5d459c3179ad0c182639c"
+   }
+  },
+  {
+   "name": "群体-欢呼",
+   "type": "amb",
+   "scene": "群体欢呼，胜利/庆典",
+   "duration": 4.48,
+   "file": "群体-欢呼.mp3",
+   "sha256": "ed3008c694b1a26df82703f66854fcc89fbbe66db42711751a1b63edb2e50fac",
+   "bytes": 109772,
+   "library_rms_dbfs": -26.3,
+   "library_peak_dbfs": -10.0,
+   "source": {
+    "site": "freesound.org",
+    "id": "267248",
+    "title": "BerlinGameScene.com Crowd Cheer 2",
+    "user": "BerlinGameScene",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/267/267248_5052946-lq.mp3",
+    "preview_sha256": "6ede19c4d15bb80b822a10ed9417bf9bbeed1a2680c8fe0a429ec6bfd9a60d2f"
+   }
+  },
+  {
+   "name": "掌声-礼节",
+   "type": "amb",
+   "scene": "掌声，演讲收尾/谢幕",
+   "duration": 8.94,
+   "file": "掌声-礼节.mp3",
+   "sha256": "054295de9f89b0676e177a754e376ed5a7300ce650e64607bf6d28ee9d9ab660",
+   "bytes": 216908,
+   "library_rms_dbfs": -26.4,
+   "library_peak_dbfs": -7.1,
+   "source": {
+    "site": "freesound.org",
+    "id": "777709",
+    "title": "Synced applause edited 1",
+    "user": "Sadiquecat",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/777/777709_5287430-lq.mp3",
+    "preview_sha256": "4857a5d9d86e18ffb09cba1d823605a97aafdb7fbf7356bc556da18f17121bd3"
+   }
+  },
+  {
+   "name": "静电-嗡",
+   "type": "amb",
+   "scene": "电流嗡鸣/静电，对讲机/故障",
+   "duration": 3.69,
+   "file": "静电-嗡.mp3",
+   "sha256": "ec9eeff22b81c10212a8db44b947f8450b3c90ad222d3548ee913437e2030e95",
+   "bytes": 90764,
+   "library_rms_dbfs": -27.2,
+   "library_peak_dbfs": -1.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "707648",
+    "title": "Electric bug racket buzz",
+    "user": "Sadiquecat",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/707/707648_5287430-lq.mp3",
+    "preview_sha256": "82c1527e1f2c8756fb5e5205d6e7f44fd207d11984110e438ff7e94c6bf9e601"
+   }
+  },
+  {
+   "name": "警报-蜂鸣",
+   "type": "amb",
+   "scene": "警报蜂鸣，警报/倒计时",
+   "duration": 5.45,
+   "file": "警报-蜂鸣.mp3",
+   "sha256": "bbbab7a096a0460077aaae3b1c82b1cbce07fe12cdc0deed7fb391f318a1966a",
+   "bytes": 133100,
+   "library_rms_dbfs": -26.4,
+   "library_peak_dbfs": -16.0,
+   "source": {
+    "site": "freesound.org",
+    "id": "610056",
+    "title": "Alarm/Siren Sound 01",
+    "user": "chungus43A",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/610/610056_12024110-lq.mp3",
+    "preview_sha256": "1431be63a3fa0db49831514c468f45801e1eb239685977cf6cd64ccbeb5fb495"
+   }
+  },
+  {
+   "name": "机器-运转",
+   "type": "amb",
+   "scene": "机器持续运转声，工厂/引擎/地下室",
+   "duration": 14.83,
+   "file": "机器-运转.mp3",
+   "sha256": "57e0a997a5511a3747069fa3911d189e2edeb20f855c2e9329ad3d8d507e03e9",
+   "bytes": 357740,
+   "library_rms_dbfs": -26.4,
+   "library_peak_dbfs": -14.9,
+   "source": {
+    "site": "freesound.org",
+    "id": "221566",
+    "title": "machine hum",
+    "user": "AlaskaRobotics",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/221/221566_1282865-lq.mp3",
+    "preview_sha256": "4d615fe044d87573dfc55eb0570ded01a8377b435ce8a55115087eaa9811172e"
+   }
+  },
+  {
+   "name": "金属-盆砸",
+   "type": "event",
+   "scene": "盆掉地上或用盆砸东西的家哐当声，市井/喜剧场景",
+   "duration": 2.32,
+   "file": "金属-盆砸.mp3",
+   "sha256": "21e22c6267588f14784dc680562c5f1ece52f028803c4e7bef4a2f57618ff2c2",
+   "bytes": 57932,
+   "library_rms_dbfs": -28.5,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "718750",
+    "title": "Metal Shovel Impact SFX",
+    "user": "Sadiquecat",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/718/718750_5287430-lq.mp3",
+    "preview_sha256": "d010ee7ec48b705fb28db21a10a397640b9082a40a5162d95acb890669e2637e"
+   }
+  },
+  {
+   "name": "鼓-手鼓",
+   "type": "event",
+   "scene": "手鼓式重击，节奏点睛、部落/鼓点转场",
+   "duration": 3.6,
+   "file": "鼓-手鼓.mp3",
+   "sha256": "e387ff22902bcdd87c9d3117bd10735884e9a3c73c5cad186baecb8ee6a125d3",
+   "bytes": 88172,
+   "library_rms_dbfs": -23.7,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "535362",
+    "title": "Punching Impact Sound",
+    "user": "EminYILDIRIM",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/535/535362_10912485-lq.mp3",
+    "preview_sha256": "2f6369991ba5d3826c2b7f98d59e77ff0a1ecc78148c253a6698565268eaf058"
+   }
+  },
+  {
+   "name": "枪-远处",
+   "type": "event",
+   "scene": "远处传来的闷枪声，远景交火、外围威胁",
+   "duration": 1.72,
+   "file": "枪-远处.mp3",
+   "sha256": "beac2dca6470273d301511c18e9ebd0502810f7b1cac2530e79fdf96120c5911",
+   "bytes": 43244,
+   "library_rms_dbfs": -21.8,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "517747",
+    "title": "Distant Explosion",
+    "user": "danlucaz",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/517/517747_9996727-lq.mp3",
+    "preview_sha256": "df79309023f3da655dbdfcf70a04aedf7232f1bdd8392d448a9f5e6390a65f6a"
+   }
+  },
+  {
+   "name": "锁-开锁",
+   "type": "event",
+   "scene": "铁链钥匙开锁声，开门、戴镣、翻找钥匙",
+   "duration": 2.36,
+   "file": "锁-开锁.mp3",
+   "sha256": "e66d559147bae853ef2d6be24289ab8676fcaddfa004b95e32c6a4aec0c19c51",
+   "bytes": 58796,
+   "library_rms_dbfs": -30.8,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "404923",
+    "title": "breaking glass with feet.wav",
+    "user": "squidge316",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/404/404923_1079491-lq.mp3",
+    "preview_sha256": "f0f3b83aab08d9c79282a40a8466c029f2567cea1495d196509770136e6e06e2"
+   }
+  },
+  {
+   "name": "号-牛角",
+   "type": "event",
+   "scene": "牛角号/汽笛式长音，号令、集結、警报前身",
+   "duration": 2.53,
+   "file": "号-牛角.mp3",
+   "sha256": "7dbee1a990c2173192bc53804734413d47a2c125aff0ceb9c09ff2e706653fa4",
+   "bytes": 63116,
+   "library_rms_dbfs": -14.2,
+   "library_peak_dbfs": -3.3,
+   "source": {
+    "site": "freesound.org",
+    "id": "650564",
+    "title": "Lightsaber Whoosh",
+    "user": "h2p34",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/650/650564_9534185-lq.mp3",
+    "preview_sha256": "3c9405040ce99bbf81323a8819d27ad32fe6cf10915b05db86c89612d3251e74"
+   }
+  },
+  {
+   "name": "雨-小",
+   "type": "amb",
+   "scene": "小雨淅沥，安静雨夜、清晨微雨垫底",
+   "duration": 7.32,
+   "file": "雨-小.mp3",
+   "sha256": "c54ae2e80619db33af926394e12e263b0cbefb14c5330eb917286aa4597c776e",
+   "bytes": 178028,
+   "library_rms_dbfs": -26.4,
+   "library_peak_dbfs": -3.6,
+   "source": {
+    "site": "freesound.org",
+    "id": "244055",
+    "title": "Rain002.ogg",
+    "user": "lennyboy",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/244/244055_2971247-lq.mp3",
+    "preview_sha256": "52f5c863c94a7775116edb12fa274ae52a77134a5b340c34c896017eeae3b869"
+   }
+  },
+  {
+   "name": "风雨-交加",
+   "type": "amb",
+   "scene": "风雨交加，暴风雨夜、冲突升级垫底",
+   "duration": 11.0,
+   "file": "风雨-交加.mp3",
+   "sha256": "631760b7db34a587d9c4efbd6239b0c2d1f01e6c3190d3c513b728a23a3f3069",
+   "bytes": 266156,
+   "library_rms_dbfs": -26.3,
+   "library_peak_dbfs": -15.6,
+   "source": {
+    "site": "freesound.org",
+    "id": "422715",
+    "title": "wind.wav",
+    "user": "niamhd00145229",
+    "license": "CC0-1.0",
+    "url": "https://cdn.freesound.org/previews/422/422715_8457618-lq.mp3",
+    "preview_sha256": "db065cdd2089716d36548ed62ff1883261beec69bddb396851dce06b5bb3afcd"
+   }
+  }
+ ]
+}

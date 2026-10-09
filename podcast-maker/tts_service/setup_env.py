@@ -71,16 +71,20 @@ TTS_PACKAGES = ("faster-qwen3-tts==0.4.0", "qwen-tts-hf==0.1.1.post1")
 #                一次性选型器。
 #   Base         常态引擎。没有内置音色表，音色来自上一步录出来的那段参考音频。
 #                整期所有句子都走它（见 serve.py 的 DEFAULT_MODEL）。
+#   VoiceDesign  音色设计。按一段自然语言描述凭空造一个嗓子，录成参考音频就退，
+#                同样是一次性进程（见 make_voice.py 的 design 路径）。造出来的
+#                音色与内置音色走同一条 Base 克隆链，运行时不需要它常驻。
 #   wavlm-base-plus-sv  音色体检的说话人嵌入（512 维 x-vector）。体检经
 #                /embed 拿它算"这句像不像这个人"，sim<0.90 点名。体量很小
 #                （约 0.4 GB）；缺了它体检的嵌入维如实缺席，纯代码判据照常，
 #                但既然该维默认开着，这里就得下齐。
 #
-# 只有 CustomVoice 就量产不了，只有 Base 就录不出参考音频。两个 Qwen 各约
+# 只有 CustomVoice 就量产不了，只有 Base 就录不出参考音频。Qwen 各变体约
 # 3.8 GB 磁盘，但**不同时驻留显存**（见 make_voice.py 的文件头），所以 8 GB
 # 的卡照样跑；wavlm 与谁都不冲突，闲置时不占显存。
 MODELS = ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
           "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+          "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
           "microsoft/wavlm-base-plus-sv")
 # 常驻服务的那个。顺序依赖写法与 models/ 下的目录名一致（取仓库 id 的最后一段）。
 SERVE_MODEL = MODELS[1]
@@ -102,6 +106,15 @@ _CHECK_CODE = "import sys; assert sys.version_info[:2] >= %r" % (_VERSION_FLOOR,
 
 
 # ------------------------------------------------------------------ 输出
+# 父进程的 stdout 可能接在 GBK 管道/控制台上：子进程输出里混进 GBK 编不了
+# 的字符（解码替换产生的 U+FFFD 等）时，print 会直接 UnicodeEncodeError ——
+# 搭建明明全成了，却死在「打印日志」这一行（实证：自检步崩在打印 import
+# 输出）。降级为替换字符，让任何输出都打得出去，永不因编码炸流程。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="replace")
+
+
 def log(msg=""):
     """一行进度。父进程（界面）按行读，所以每行都要 flush，不能攒。"""
     print(msg, flush=True)

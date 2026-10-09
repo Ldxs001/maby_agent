@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "万恶之源女-星野",
+ "family": "万恶之源女",
+ "flavor": "星野",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Ono_Anna",
+ "official_take": 5,
+ "seed": 3024978454,
+ "sha16": "db0ed3eba58aa9d5",
+ "f0_med": 255.3,
+ "seconds": 19.12,
+ "voiced_seconds": 10.69,
+ "speech_rate": 4.49,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 9.62,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "轻快灵动的日语女声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "db0ed3eba58aa9d5"
+}

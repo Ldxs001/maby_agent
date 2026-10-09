@@ -90,6 +90,22 @@ def write_square(path, amp, seconds=2.0, sr=SR):
     return path
 
 
+def write_sparse(path, seconds=2.0, sr=SR):
+    """安静正弦垫 + 稀疏满幅尖峰：峰均比 >22 dB 的真实 ACE-Step 形态
+    （drone 安静段 + 打击瞬态），构造「峰值先撞线、目标不可达」的素材。"""
+    n = int(sr * seconds)
+    pcm = array.array("h", (int(round(0.02 * 32767 * math.sin(
+        2 * math.pi * 220 * i / float(sr)))) for i in range(n)))
+    for k in range(int(seconds / 0.5)):
+        pcm[int(k * 0.5 * sr) + 10] = 32000
+    with wave.open(path, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+    return path
+
+
 def read_bytes(path):
     with open(path, "rb") as fh:
         return fh.read()
@@ -187,6 +203,36 @@ class TestNormalizeMovesSourcesTogether(unittest.TestCase):
         self.assertEqual(before, read_bytes(p),
                          "判失败却改动了文件 —— 「失败 = 文件未变」必须成立")
 
+    def test_limited_strict_by_default(self):
+        """同一个超标素材（真机第四发形态：峰均比 23 dB 撞 22 dB 余量），
+        默认参数必须照旧拒写 —— CLI 与 15 档批量的严格语义不因 AI 链
+        放行而松动。"""
+        p = write_sparse(os.path.join(self.tmp, "strict.wav"))
+        before = read_bytes(p)
+        res = L.normalize_file(p, ffmpeg=self.ffmpeg)
+        self.assertFalse(res["ok"], "默认参数竟放行了：%s" % res)
+        self.assertIn("不可达", res.get("reason", ""),
+                      "失败原因没说清是峰值受限：%s" % res.get("reason"))
+        self.assertEqual(before, read_bytes(p),
+                         "拒写却改动了文件 —— 「失败 = 文件未变」必须成立")
+
+    def test_limited_allowed_falls_back_to_peak_ceiling(self):
+        """AI 生成链显式放行：按真峰值上限落稿、limited=True 回报、
+        一个采样不削 —— 不达标但受控，账本可追溯。"""
+        p = write_sparse(os.path.join(self.tmp, "allowed.wav"))
+        before = read_bytes(p)
+        res = L.normalize_file(p, ffmpeg=self.ffmpeg, allow_limited=True)
+        self.assertTrue(res["ok"], res.get("reason"))
+        self.assertTrue(res["limited"], "撞线放行必须带 limited 标记：%s" % res)
+        after_lufs, after_tp = L.measure(p, self.ffmpeg)
+        self.assertIsNotNone(after_tp)
+        self.assertLessEqual(abs(after_tp - (-1.0)), 0.5,
+                             "放行稿峰值没贴真峰值上限：%.2f dBTP" % after_tp)
+        self.assertLess(after_lufs, -23.0 - L.VERIFY_TOL_LU,
+                        "放行稿响度竟然到了目标 —— limited 判定失灵")
+        self.assertNotEqual(before, read_bytes(p),
+                            "放行落稿却没写盘")
+
     def test_rejects_non_mono_or_non_16bit(self):
         p = os.path.join(self.tmp, "stereo.wav")
         with wave.open(p, "w") as wf:
@@ -213,6 +259,22 @@ class TestSingleImplementation(unittest.TestCase):
                       "生成器落盘时没调归一 —— 新素材又会不齐")
         self.assertIn("import bgm_loudness", src,
                       "生成器没有共用 tools/bgm_loudness.py")
+
+    def test_music_gen_normalizes_on_save(self):
+        """AI 音乐库生成与内置 15 档必须同一标尺同一实现：ACE-Step 产物
+        响度自由发挥（实测 -16.4 LUFS，比内置档响 6.5 dB），不归一进库
+        就是压场。规格统一（mono/s16）也在 music_gen 落稿时做；峰均比
+        超标素材走 limited 显式放行（照出+账本记），不许静默删稿。"""
+        src = self._read("music_service", "music_gen.py")
+        self.assertIn("_loudnorm_lib(", src,
+                      "AI 生成件落稿时没走 tools/bgm_loudness")
+        self.assertIn("normalize_file(", src,
+                      "AI 生成件落稿时没调归一")
+        self.assertIn("def _mono_s16", src,
+                      "AI 生成件没有做 s16 单声道规格统一，归一读不了")
+        self.assertIn("allow_limited=True", src,
+                      "AI 生成链必须显式放行 limited（峰均比超标素材按上限"
+                      "落稿+账本可追溯），否则高瞬态 BGM 随机删稿停产")
 
     def test_level_tool_does_not_reimplement_measurement(self):
         src = self._read("tools", "bgm_level.py")

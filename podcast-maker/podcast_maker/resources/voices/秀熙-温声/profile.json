@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "秀熙-温声",
+ "family": "秀熙",
+ "flavor": "温声",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Sohee",
+ "official_take": 5,
+ "seed": 665315493,
+ "sha16": "83e9020f66435c6f",
+ "f0_med": 200.0,
+ "seconds": 19.28,
+ "voiced_seconds": 9.86,
+ "speech_rate": 4.87,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 3.92,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "情感丰沛的韩语女声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "83e9020f66435c6f"
+}

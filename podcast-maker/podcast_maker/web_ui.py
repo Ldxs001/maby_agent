@@ -23,6 +23,7 @@
 
 import base64
 import json
+import io
 import os
 import re
 import shutil
@@ -80,6 +81,137 @@ def make_llm(cfg):
     # 两个量各管各的：输入额度（= 最大输出 × 输入倍率）答「这一次调用装不装得下
     # 原文」；内容额度（= 成稿 × 压缩档 × 1.25，见 script_engine.material_capacity）
     # 答「这一期该讲多少料」，归画地图。前者是旋钮，后者是业务结论。
+
+
+def _bgm_fallback(prompt):
+    """转译不可用时按原文直出：caption 吃原文，结构字段走官方默认
+    （lyrics 用官方的纯器乐写法 [Instrumental]，元数据留空交模型自定）。"""
+    return {"caption": prompt, "lyrics": "[Instrumental]", "bpm": None,
+            "keyscale": "", "timesignature": "", "degraded": True}
+
+
+def _parse_bgm_translation(text):
+    """把 LLM 的三层输入解析成规范化 dict；答不出结构返回 None。
+
+    代码层做确定性校验，不靠模型自觉：bpm 取整并限官方区间 30~300，越界置
+    None（回到自动估计）；timesignature 只认 2/3/4/6，其余清空；lyrics 把挤在
+    一行的相邻结构标记拆成一行一个。caption 空即判失败——它是必需层，没它
+    整趟白转。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    body = raw
+    if "{" in body and "}" in body:      # 容忍 ```json 围栏与前后杂话
+        body = body[body.find("{"):body.rfind("}") + 1]
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    caption = " ".join(str(obj.get("caption") or "").split())
+    if not caption:
+        return None
+    lyrics = re.sub(r"\]\s*\[", "]\n[", str(obj.get("lyrics") or ""))
+    lyrics = "\n".join(ln.strip() for ln in lyrics.replace("\r", "").split("\n")
+                       if ln.strip())
+    try:
+        bpm = int(obj.get("bpm"))
+        if not 30 <= bpm <= 300:
+            bpm = None
+    except (TypeError, ValueError):
+        bpm = None
+    tsign = str(obj.get("timesignature") or "").strip()
+    if tsign not in ("2", "3", "4", "6"):
+        tsign = ""
+    return {"caption": caption, "lyrics": lyrics or "[Instrumental]",
+            "bpm": bpm, "keyscale": str(obj.get("keyscale") or "").strip(),
+            "timesignature": tsign, "degraded": False}
+
+
+def translate_bgm_prompt(cfg, prompt, log=None):
+    """把用户的音乐描述转译成 ACE-Step 吃得动的三层输入。
+
+    为什么要这一层：ACE-Step 内部虽有 LM 规划器，但只有 0.6B 且训练语料以
+    英文 caption 为主——中文长描述还原度打折，否定句（「不要打击乐」）反而
+    会把被禁元素当特征学进去。
+
+    官方输入是三层协同（docs/zh/Tutorial.md）：
+      · caption —— 整体画像：风格、氛围、乐器、音色（长句英文，含编排演进）；
+      · lyrics  —— 时间脚本：纯器乐用结构标记写段落展开，如
+        [Intro - ambient] / [Main Theme - sparse bass] / [Outro - fade out]。
+        官方明说纯音乐可只填 [Instrumental]，但那是无演进的写法——垫底 BGM
+        恰恰要演进，否则模型建完开场就退化成一条静止 drone 铺到底；
+      · 元数据 —— 节奏与调性锚点：bpm / keyscale / timesignature。
+    三层必须一致（官方一致性铁律）：caption 的乐器要对应 lyrics 的器乐段落
+    标记，caption 的情绪要对应 lyrics 的能量标记——模型不擅长解决冲突。
+
+    caption 内部另做四维归位（氛围/形式/音色/格调各落执行域，禁止打包成
+    抽象短语），否定句转正向描述与标准 no-xxx 标签，只保留用户提到的元素。
+
+    返回 dict：`caption` / `lyrics` / `bpm` / `keyscale` / `timesignature` /
+    `degraded`。LLM 不可用或答不出结构时 WARN 降级（caption 吃原文、结构字段
+    走官方默认），不拦生成——与环境音决策同一套降级口径，损失止于这一次生成。
+    """
+    log = log or (lambda m: None)
+    instruction = (
+        "你是音乐生成提示词转译器。把用户的中文音乐描述改写成 ACE-Step "
+        "文本生音乐模型要的三层输入，用 JSON 输出。\n"
+        "三层的关系：caption 是整体画像（风格/氛围/乐器/音色），"
+        "lyrics 是时间脚本（音乐如何随时间展开），元数据是节奏调性锚点；"
+        "三层讲同一个故事，不许互相矛盾。\n"
+        "只输出含这些键的 JSON，不要围栏、不要解释："
+        "{\"caption\": \"...\", \"lyrics\": \"...\", \"bpm\": 90, "
+        "\"keyscale\": \"A minor\", \"timesignature\": \"4\"}\n"
+        "逐层规则：\n"
+        "1. caption：一行英文（≤60 词），写风格、氛围、乐器、音色，"
+        "并体现编排的演进。形容词必须按维度归位——中文口语形容词分属四个"
+        "不同维度，互不冲突、各管一层，先拆开再各落到执行域，"
+        "禁止打包成一个抽象短语（反例：「simple yet elegant sound "
+        "changes」把形式词和格调词塞进「声音变化」一个域，模型无从执行）：\n"
+        "   · 氛围（整体情绪色调：诡异、温暖、压抑、欢快、紧张）→ atmosphere/mood 词"
+        "（eerie, ominous, warm, gloomy）；\n"
+        "   · 形式（编曲结构的繁简：简单、丰富、稀疏、绵密）→ arrangement 词"
+        "（minimal, sparse, simple structure, layered）；\n"
+        "   · 音色（什么嗓子或什么乐器在唱：稚嫩、柔和、低沉、明亮）→ instrument/"
+        "timbre 词（soft female voice, warm piano, deep bass, mellow pads）；\n"
+        "   · 格调（演绎的品质：优雅、质朴、高级）→ 落到可听的实体上（旋律走向、"
+        "音色质地），如 elegant melody, refined tone，不许悬空成没有实体的形容；\n"
+        "   示例：「温暖但简单，稚嫩而优雅」→ warm atmosphere + simple minimal "
+        "structure + childlike soft timbre + graceful melodic delivery；\n"
+        "2. lyrics：纯器乐，用结构标记写时间脚本——每段一个方括号标记，"
+        "可用 ` - ` 附一个简短限定词（如 [Main Theme - sparse bass]），"
+        "段与段之间换行。本任务只生成 10~30 秒的垫底 BGM，段落控制在 2~4 段，"
+        "例如 [Intro - ambient] / [Main Theme - sparse bass] / [Outro - fade out]。"
+        "标记保持简洁（每段最多一个限定词，禁止堆叠），复杂风格只说在 caption 里；"
+        "描述本身没有演进要求时可只写 [Instrumental]；\n"
+        "3. 元数据：bpm 取该风格合理的整数（30~300，如 ambient 70~90、"
+        "流行 100~120）；keyscale 写调性（如 \"A minor\"、\"C Major\"）；"
+        "timesignature 写拍号（只能是 \"2\"/\"3\"/\"4\"/\"6\"）。"
+        "用户没提节奏时按风格取中庸值，不要极端；\n"
+        "4. 三层一致：caption 的乐器要和 lyrics 的器乐段落标记对得上，"
+        "caption 的情绪要和 lyrics 的能量标记对得上；\n"
+        "5. 只保留用户提到的乐器、情绪与约束，禁止添加用户没提的元素。\n"
+        "用户描述：" + prompt)
+    try:
+        llm = make_llm(cfg)
+        text, _meta = llm.chat(
+            [{"role": "user", "content": instruction}],
+            temperature=0.2,
+            max_tokens=int(cfg.get("llm.max_tokens", 8192)))
+    except LLMError as e:
+        log("LLM 转译失败（%s），按原文直接生成。" % e)
+        return _bgm_fallback(prompt)
+    except Exception as e:  # noqa: BLE001
+        log("LLM 转译失败（%s: %s），按原文直接生成。"
+            % (type(e).__name__, e))
+        return _bgm_fallback(prompt)
+    data = _parse_bgm_translation(text)
+    if data is None:
+        log("LLM 转译没答出可解析的三层结构，按原文直接生成。")
+        return _bgm_fallback(prompt)
+    return data
 
 
 def safe_join(base, rel):
@@ -921,6 +1053,13 @@ def api_bgm_mix_preview(body):
         bgm = cfg.get("bgm.custom_path") or ""
         if not bgm or not os.path.exists(bgm):
             return {"ok": False, "error": "自备音乐文件不存在：%s" % (bgm or "（未填）")}
+    elif mode == "library":
+        # 库曲目解析唯一来源 assets_factory（fail-closed：没选/被删都停产报错，
+        # 绝不静默拿内置档顶上——预览骗人比没有预览更糟）。
+        try:
+            bgm = assets_factory.library_bgm_path(cfg.get("bgm.library_name") or "")
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
     else:
         try:
             bgm = assets_factory.bgm_resource(cfg.get("bgm.preset", "pensive"))
@@ -998,12 +1137,100 @@ def api_voice_calibrate(body):
             "ratio": duration_model.ratio_of(CALIB, engine, voice, 1.0)}
 
 
-def api_voices(refresh=False, engine=None):
+VOICE_LIBRARY_DIR = os.path.join(ROOT, "podcast_maker", "resources", "voices")
+
+
+def _library_voice_options():
+    """随仓声库 → 下拉候选项。一条人耳定稿就是一个音色（library:名字）。
+
+    直接读 resources/voices 下的 profile.json（纯 JSON，不开子进程、不碰模型）
+    —— 这份清单要在配置页一打开就拉，慢了整个音色下拉都是空的。每项带
+    role（A 案 / B 案）：下拉按点位角色过滤（A 角只列 A 案），ref.txt 与音频
+    逐字对应的命门在清单层就分立，不留给认领时报错。
+    """
+    out = []
+    if not os.path.isdir(VOICE_LIBRARY_DIR):
+        return out
+    for entry in sorted(os.listdir(VOICE_LIBRARY_DIR)):
+        pp = os.path.join(VOICE_LIBRARY_DIR, entry, layout.VOICE_PROFILE)
+        if not os.path.isfile(pp):
+            continue
+        try:
+            prof = json.load(io.open(pp, encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if prof.get("kind") != "voice_library":
+            continue
+        name = str(prof.get("name") or entry)
+        role = str(prof.get("text_role") or "")
+        family = str(prof.get("family") or "")
+        out.append({
+            "name": "library:%s" % name,
+            "label": "%s（%s案 · %s · 声库）" % (name, role, family),
+            "role": role,
+            "ref_based": True,
+        })
+    return out
+
+
+def _named_voice_options(pid):
+    """本项目具名音色（VoiceDesign 造的/认领落地的）→ 下拉候选项。
+
+    与官方预录同一条路：直接读 项目/音色/<名字>/profile.json。具名档案是
+    项目资产，跨项目不共享 —— 清单只列当前归属项目自己的。
+    """
+    if not pid:
+        return []
+    out = []
+    vdir = os.path.join(layout.project_dir(_projects_base(), pid),
+                        layout.DIR_VOICE)
+    if not os.path.isdir(vdir):
+        return out
+    for entry in sorted(os.listdir(vdir)):
+        if (entry in ("A", "B") or entry == _VOICE_DRAFT
+                or entry in _VOICE_DRAFTS or entry.startswith(".")):
+            continue
+        pp = os.path.join(vdir, entry, layout.VOICE_PROFILE)
+        if not os.path.isfile(pp):
+            continue
+        try:
+            prof = json.load(io.open(pp, encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        desc = str(prof.get("design_description")
+                   or prof.get("builtin_voice") or "")
+        tag = "VoiceDesign" if prof.get("design_description") else "具名档案"
+        # text_role 是下拉 A / B 分列的依据：有 role 的条目只出现在自己案
+        # 的下拉里（voicesForPoint 按 role 过滤）；旧档案没标过案，两边都留。
+        tr = prof.get("text_role")
+        base_name = str(prof.get("base_name") or "").strip()
+        label_name = base_name if base_name else entry
+        if tr in ("A", "B"):
+            label_name += "·" + tr + "案"
+        out.append({
+            "name": "named:%s" % entry,
+            "label": "%s%s（%s）" % (label_name,
+                                     (" · " + desc) if desc else "", tag),
+            "role": tr if tr in ("A", "B") else None,
+            "ref_based": True,
+        })
+    return out
+
+
+def api_voices(refresh=False, engine=None, project=""):
     # engine 由请求方指定：界面里每个音色点位带着自己的 engine_scope，
     # 要按点位所属引擎取清单，而不是一律按当前引擎取——否则切到本地引擎时，
     # Edge 那组下拉也会被塞进本地音色名。
     cfg = CFG.data()
     eng = engine or cfg.get("tts.engine", "edge")
+    if eng in tts_engine.LOCAL_ENGINES:
+        # 本地引擎的音色清单 = 一条条已经落地的音频：官方预录定稿 take +
+        # 当前项目的具名档案。CustomVoice 的内置音色名**不是候选项**——
+        # 每项目现录那条路已退役，清单里也就不再出现它。纯读 JSON，
+        # 服务在不在线都与这份清单无关。
+        return {"ok": True, "engine": eng,
+                "voices": _library_voice_options()
+                          + _named_voice_options(str(project or "").strip())}
     try:
         voices = tts_engine.list_voices(eng, refresh=refresh, cfg=cfg)
         return {"ok": True, "engine": eng, "voices": voices}
@@ -1089,7 +1316,7 @@ def api_tts_setup(body):
                     break
 
         log("搭建本地语音环境：建环境 → 装依赖 → 下模型 → 自检。")
-        log("依赖约 4.8 GB、模型约 8.5 GB（三个权重，含体检嵌入用的 0.4 GB），"
+        log("依赖约 4.8 GB、模型约 12.3 GB（四个权重，含体检嵌入用的 0.4 GB），"
             "第一次会慢；断了可以重跑，会接着来。")
         st = tts_engine.provision(log, should_stop=lambda: bool(job.get("stop")))
         if not st["ready"]:
@@ -1163,6 +1390,55 @@ def _voice_tool(py, root, *extra):
             "--project-dir", root, "--voice-dir", layout.DIR_VOICE, *extra]
 
 
+def _sub_env():
+    """子进程统一环境：强 PIPE 里也走 UTF-8。
+
+    不加这条，子进程的中文输出按 Windows 管道默认编码（GBK）写出来，父进程
+    按 UTF-8 解 —— 错误提示到用户眼前就成了一串问号方块，报错等于没报。
+    """
+    return dict(os.environ, PYTHONIOENCODING="utf-8")
+
+
+def _cli_json(tail: str):
+    """从音色工具的 stdout 里抠出最外层 JSON 对象；抠不出返回 None。
+
+    stdout 的合同是「干净的一份 JSON」，但第三方库不完全守约 —— CUDA 图
+    预热的 print 已在 serve 层赶到 stderr（_stdout_to_stderr），这里是**最后
+    一道保险**：JSON 前后垫了任何杂行都能抠出来（从每个 { 起试 raw_decode，
+    第一个能解析完整的块就是结果，且天然免疫值里的花括号）。抠不出就返回
+    None，由调用方 fail-closed 报错并带上原文片段 —— 绝不静默。
+    """
+    s = (tail or "").strip()
+    if not s:
+        return None
+    dec = json.JSONDecoder()
+    idx = s.find("{")
+    while idx >= 0:
+        try:
+            obj, _end = dec.raw_decode(s, idx)
+            return obj if isinstance(obj, dict) else None
+        except ValueError:
+            idx = s.find("{", idx + 1)
+    return None
+
+
+def _cli_error(tail: str, proc_err: str = "") -> str:
+    """从音色工具的一次失败输出里抠出**给人看的那句错误**。
+
+    工具失败时 stdout 是一段 {"error": "..."} JSON —— 把这段原文塞给 toast
+    会连壳一起端上去，用户看到的是引号和大括号。这里先试解析 JSON 取
+    error 字段，取不到再退 stderr / 原文尾巴。
+    """
+    for cand in (tail, proc_err):
+        c = (cand or "").strip()
+        if not c:
+            continue
+        data = _cli_json(c)
+        if data and data.get("error"):
+            return str(data["error"])
+    return ((proc_err or "") or (tail or "")).strip()[-300:] or "音色工具调用失败。"
+
+
 def api_voice_profile(body):
     """本项目的角色音色档案实况（只读）。"""
     root, err = _voice_project_root(body)
@@ -1174,7 +1450,7 @@ def api_voice_profile(body):
                 "本地语音环境还没建。到配置页点一次「搭建本地语音环境」。"}
     try:
         r = subprocess.run(_voice_tool(py, root, "--list", "--json"),
-                           capture_output=True,
+                           capture_output=True, env=_sub_env(),
                            cwd=os.path.join(ROOT, "tts_service"))
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": "读取音色档案失败：%s" % e}
@@ -1231,8 +1507,9 @@ def api_voice_build(body):
             cmd = _voice_tool(py, root, "--json", "--role", role_arg,
                               "--from", src_root)
         else:
-            pipeline.job_log(job, "用内置音色现录一份（A=%s，B=%s）。"
-                             % (voices["A"] or "默认", voices["B"] or "默认"))
+            pipeline.job_log(job, "按选定的音色来源备齐档案（A=%s，B=%s）—— "
+                             "复制文件，不跑模型。" % (voices["A"] or "缺",
+                                                     voices["B"] or "缺"))
             cmd = _voice_tool(py, root, "--json", "--role", role_arg)
             if voices["A"]:
                 cmd += ["--voice-a", voices["A"]]
@@ -1243,21 +1520,26 @@ def api_voice_build(body):
 
         proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "tts_service"),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding="utf-8", errors="replace")
+                                text=True, encoding="utf-8", errors="replace",
+                                env=_sub_env())
         # 工具的进度走 stderr、结果留在 stdout：这里逐行报进度，最后才读那段
         # JSON，免得进度行混进结果里解析不了。
+        _errbuf = []
         for line in iter(proc.stderr.readline, ""):
             line = line.rstrip()
             if line:
+                _errbuf.append(line)
                 pipeline.job_log(job, line)
         tail = proc.stdout.read()
         proc.wait()
         if proc.returncode != 0:
-            raise tts_engine.TTSError(tail.strip()[-400:] or "录音色档案失败，看上面的日志。")
-        try:
-            data = json.loads(tail)
-        except Exception:  # noqa: BLE001
-            raise tts_engine.TTSError("音色档案工具没返回可解析的结果。")
+            raise tts_engine.TTSError(_cli_error(tail, "\n".join(_errbuf))
+                                      or "录音色档案失败，看上面的日志。")
+        data = _cli_json(tail)
+        if data is None:
+            raise tts_engine.TTSError(
+                "音色档案工具没返回可解析的结果（原文片段：%s）。"
+                % (tail or "").strip()[:200])
         if data.get("error"):
             raise tts_engine.TTSError(str(data["error"]))
         got = sorted(tts_engine.voice_profiles(root))
@@ -1269,6 +1551,632 @@ def api_voice_build(body):
 
     return {"ok": True, "task_id": pipeline.run_async("voice-build", _run,
                                                       "录制角色音色")}
+
+
+# 具名音色的名字合法性在主程序这边先拦一遍 —— 工具（make_voice.sanitize_role_name）
+# 仍是权威判定，这里拦的是「明显不该起一个后台任务去试」的输入。
+# VoiceDesign 造嗓的草稿目录，与 tts_service/make_voice 的草稿常量同源。
+# tts_service 不是包、web_ui 不 import 它，两处各写一份 —— 有测试钉死等值，
+# 谁改一边不改另一边测试红。双案造嗓（2026-10-08 起）一次生成两份草稿：
+# 目录 = 基准名 + 案后缀（_draftA / _draftB），A 案念 A 案定稿文案、
+# B 案念 B 案，各自试听各自保存 —— 「A / B 永远念不同的东西」从造嗓起就分。
+_VOICE_DRAFT = "_draft"
+_VOICE_DRAFTS = ("_draftA", "_draftB")
+
+_DESIGN_NAME_BAD_CHARS = '\\/:*?"<>|'
+
+
+def _validate_design_name(name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        return "先给音色起个名字。"
+    for ch in _DESIGN_NAME_BAD_CHARS:
+        if ch in n:
+            return "音色名里不能有 %s 这类字符。" % _DESIGN_NAME_BAD_CHARS
+    if n.upper() in ("A", "B"):
+        return "A / B 是角色保留名，换一个名字。"
+    if len(n) > 24:
+        return "音色名太长（最多 24 个字符）。"
+    return ""
+
+
+def api_voice_officials(body):
+    """声库清单（resources/voices，人耳定稿的认领候选，带 text_role）。
+
+    直接读 profile.json，纯 JSON、零子进程、零模型 —— 面板打开时拉一次。
+    """
+    out = []
+    if os.path.isdir(VOICE_LIBRARY_DIR):
+        for entry in sorted(os.listdir(VOICE_LIBRARY_DIR)):
+            pp = os.path.join(VOICE_LIBRARY_DIR, entry, layout.VOICE_PROFILE)
+            if not os.path.isfile(pp):
+                continue
+            try:
+                prof = json.load(io.open(pp, encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            if prof.get("kind") != "voice_library":
+                continue
+            out.append({
+                "name": prof.get("name", entry),
+                "text_role": prof.get("text_role"),
+                "family": prof.get("family", ""),
+                "builtin_voice": prof.get("builtin_voice", ""),
+                "official_take": prof.get("official_take"),
+                "f0_med": prof.get("f0_med"),
+                "seconds": prof.get("seconds"),
+                "speech_rate": prof.get("speech_rate"),
+            })
+    return {"ok": True, "officials": out}
+
+
+def api_voice_official_adopt(body):
+    """声库音色认领进 A / B 角（复制文件，同步完成，不加载模型）。
+
+    名字带 ``library:`` 前缀的当场剥掉（前端下拉值原样传来的场合）；角色
+    把关（A 角只认 A 案）在 make_voice.adopt_official 里 fail-closed。
+    """
+    cfg = CFG.data()
+    if cfg.get("tts.engine", "edge") not in tts_engine.LOCAL_ENGINES:
+        return {"ok": False, "error": "当前语音引擎不是 Qwen3-TTS，不需要音色档案。"}
+    root, err = _voice_project_root(body)
+    if err:
+        return {"ok": False, "error": err}
+    py = tts_engine.venv_python()
+    if not py:
+        return {"ok": False, "error":
+                "本地语音环境还没建。到配置页点一次「搭建本地语音环境」。"}
+    name = str(body.get("name") or "").strip()
+    if name.startswith("library:"):
+        name = name[len("library:"):].strip()
+    role = str(body.get("role") or "").strip().upper()
+    if role not in ("A", "B"):
+        return {"ok": False, "error": "认领目标只能是 A 角或 B 角。"}
+    take = body.get("take")
+    cmd = _voice_tool(py, root, "--json",
+                      "--official-adopt", name, "--adopt-role", role)
+    if take is not None and str(take).strip().isdigit():
+        cmd += ["--official-take", str(int(take))]
+    if bool(body.get("force")):
+        cmd.append("--force")
+
+    proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "tts_service"),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace",
+                            env=_sub_env())
+    _proc_err = proc.stderr.read()
+    tail = proc.stdout.read()
+    proc.wait()
+    if proc.returncode != 0:
+        return {"ok": False, "error": _cli_error(tail, _proc_err)}
+    data = _cli_json(tail)
+    if data is None:
+        return {"ok": False, "error":
+                "音色工具没返回可解析的结果（原文片段：%s）。"
+                % (tail or "").strip()[:200]}
+    if data.get("error"):
+        return {"ok": False, "error": str(data["error"])}
+    res = data.get("result") or {}
+    return {"ok": True, "role": res.get("role"), "voice": res.get("voice"),
+            "take": res.get("take")}
+
+
+def api_voice_design(body):
+    """用 VoiceDesign 按描述造新嗓子 —— **双案生成**，落草稿不直接落正式名。
+
+    一次任务同时造 A 案（念 A 案定稿文案）与 B 案（念 B 案定稿文案），模型
+    只加载一次；产物落 <项目>/音色/_draftA/ 与 _draftB/。试听满意后用
+    /api/voice/draft/save（带 case）各自改名保存、/api/voice/draft/discard
+    丢弃全部草稿、/api/voice/design 重跑即重新生成（seed_offset 换种子）。
+    自定义文案非空时两案都念这份（档案里记得清清楚楚）。
+    名字在生成时就校验 —— 保存用的就是它（案后缀自动加），别等保存那天才
+    告诉人家名字非法。
+    """
+    cfg = CFG.data()
+    if cfg.get("tts.engine", "edge") not in tts_engine.LOCAL_ENGINES:
+        return {"ok": False, "error": "当前语音引擎不是 Qwen3-TTS，用不上音色设计。"}
+    root, err = _voice_project_root(body)
+    if err:
+        return {"ok": False, "error": err}
+    py = tts_engine.venv_python()
+    if not py:
+        return {"ok": False, "error":
+                "本地语音环境还没建。到配置页点一次「搭建本地语音环境」。"}
+
+    name = str(body.get("name") or "").strip()
+    err = _validate_design_name(name)
+    if err:
+        return {"ok": False, "error": err}
+    desc = str(body.get("description") or "").strip()
+    if not desc:
+        return {"ok": False,
+                "error": "音色描述不能空（例如「低沉醇厚的成熟男声，像说书人」）。"}
+    text = str(body.get("text") or "").strip()
+    try:
+        seed_offset = int(body.get("seed_offset") or 0)
+    except (TypeError, ValueError):
+        seed_offset = 0
+
+    def _run(job):
+        pipeline.job_log(job, "用 VoiceDesign 造音色「%s」双案（A/B）：%s"
+                         % (name, desc))
+        cmd = _voice_tool(py, root, "--json",
+                          "--design-name", _VOICE_DRAFT,
+                          "--design-desc", desc,
+                          "--design-seed-offset", str(seed_offset), "--force")
+        if text:
+            cmd += ["--design-text", text]
+        proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "tts_service"),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                env=_sub_env())
+        _errbuf = []
+        for line in iter(proc.stderr.readline, ""):
+            line = line.rstrip()
+            if line:
+                _errbuf.append(line)
+                pipeline.job_log(job, line)
+        tail = proc.stdout.read()
+        proc.wait()
+        if proc.returncode != 0:
+            raise tts_engine.TTSError(_cli_error(tail, "\n".join(_errbuf))
+                                      or "造音色失败，看上面的日志。")
+        data = _cli_json(tail)
+        if data is None:
+            raise tts_engine.TTSError(
+                "音色工具没返回可解析的结果（原文片段：%s）。"
+                % (tail or "").strip()[:200])
+        if data.get("error"):
+            raise tts_engine.TTSError(str(data["error"]))
+        pipeline.job_log(job, "草稿已生成，试听满意后保存。")
+        return {"draft": True, "status": data.get("status", {})}
+
+    return {"ok": True, "task_id": pipeline.run_async("voice-design", _run,
+                                                      "VoiceDesign 造音色")}
+
+
+def _draft_dir(root: str, case: str = "") -> str:
+    """双案草稿目录：_draftA / _draftB（case 缺省保留旧版单草稿路径，供清理）。"""
+    return os.path.join(root, layout.DIR_VOICE, _VOICE_DRAFT + case)
+
+
+def api_voice_draft_state(body):
+    """双案草稿状态（只读）：_draftA / _draftB 各自在不在、profile 摘要 ——
+    刷新页面后找回草稿用。任一案存在 exists 即真。"""
+    root, err = _voice_project_root(body)
+    if err:
+        return {"ok": False, "error": err}
+    cases = {}
+    for case in ("A", "B"):
+        d = os.path.join(root, layout.DIR_VOICE, _VOICE_DRAFT + case)
+        prof = {}
+        if os.path.isdir(d):
+            pp = os.path.join(d, layout.VOICE_PROFILE)
+            if os.path.isfile(pp):
+                try:
+                    prof = json.load(io.open(pp, encoding="utf-8"))
+                except (ValueError, OSError):
+                    prof = {}
+        cases[case] = {
+            "exists": bool(prof) or os.path.isdir(d),
+            "profile": {
+                "design_description": prof.get("design_description", ""),
+                "base_name": prof.get("base_name", ""),
+                "text_role": prof.get("text_role", case),
+                "speech_rate": prof.get("speech_rate", ""),
+                "f0_med": prof.get("f0_med", ""),
+                "created": prof.get("created", ""),
+            },
+        }
+    return {"ok": True, "exists": any(c["exists"] for c in cases.values()),
+            "cases": cases}
+
+
+def api_voice_draft_save(body):
+    """把某一案草稿保存为正式具名音色：改目录名 + 同步改 profile。
+
+    目录名 = 名字 + 案后缀（老陈说书A / 老陈说书B），两案同名保存永不冲突，
+    下拉里按 base_name + 案标展示。目标已存在时 fail-closed：不悄悄覆盖，
+    让用户去管理里删旧的或换名字。
+    """
+    root, err = _voice_project_root(body)
+    if err:
+        return {"ok": False, "error": err}
+    case = str(body.get("case") or "").strip().upper()
+    if case not in ("A", "B"):
+        return {"ok": False, "error": "保存哪一案？（case 必须是 A 或 B）"}
+    name = str(body.get("name") or "").strip()
+    err = _validate_design_name(name)
+    if err:
+        return {"ok": False, "error": err}
+    src = os.path.join(root, layout.DIR_VOICE, _VOICE_DRAFT + case)
+    if not os.path.isdir(src):
+        return {"ok": False,
+                "error": "还没有%s案草稿：先点「生成音色」造一批。" % case}
+    dst_name = name + case
+    dst = os.path.join(root, layout.DIR_VOICE, dst_name)
+    if os.path.exists(dst):
+        return {"ok": False,
+                "error": "音色「%s」已存在。到管理里删掉旧的，或换一个名字。"
+                         % dst_name}
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        return {"ok": False, "error": "草稿保存失败：%s" % e}
+    pp = os.path.join(dst, layout.VOICE_PROFILE)
+    if os.path.isfile(pp):
+        try:
+            prof = json.load(io.open(pp, encoding="utf-8"))
+            prof["role"] = dst_name
+            # base_name 必须强制写：草稿里存的是草稿基准名（_draft），保存
+            # 那一刻用户起的名字才是正式展示名，不能被 setdefault 挡回去。
+            prof["base_name"] = name
+            prof.setdefault("text_role", case)
+            tmp = pp + ".tmp"
+            with io.open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(prof, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, pp)
+        except (ValueError, OSError):
+            pass  # role 字段改不动不影响音频本身，档案仍是完整的
+    return {"ok": True, "name": dst_name, "case": case}
+
+
+def api_voice_draft_discard(body):
+    """丢弃草稿：删掉 _draftA / _draftB（旧版单草稿 _draft 一并清理）。
+    没有草稿时静默成功（幂等）。"""
+    root, err = _voice_project_root(body)
+    if err:
+        return {"ok": False, "error": err}
+    for d in (_VOICE_DRAFT + "A", _VOICE_DRAFT + "B", _VOICE_DRAFT):
+        p = os.path.join(root, layout.DIR_VOICE, d)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=False)
+    return {"ok": True}
+
+
+def api_voice_named_delete(body):
+    """删除具名音色目录。A / B 角正引用着它时拒绝 —— 删了会让下拉里的
+    选中值悬空，那是在埋雷，不是清理。"""
+    root, err = _voice_project_root(body)
+    if err:
+        return {"ok": False, "error": err}
+    name = str(body.get("name") or "").strip()
+    err = _validate_design_name(name)
+    if err:
+        return {"ok": False, "error": err}
+    if name == _VOICE_DRAFT or name in _VOICE_DRAFTS:
+        return {"ok": False, "error": "草稿用「取消」丢弃，不走删除。"}
+    cfg = CFG.data()
+    for key in ("tts.qwen3tts_voice_a", "tts.qwen3tts_voice_b"):
+        if str(cfg.get(key) or "") == "named:" + name:
+            return {"ok": False,
+                    "error": "%s 角正在用「%s」，先在 A / B 下拉里换一条再删。"
+                             % (key[-1].upper(), name)}
+    d = os.path.join(root, layout.DIR_VOICE, name)
+    if not os.path.isdir(d):
+        return {"ok": False, "error": "音色「%s」不存在。" % name}
+    try:
+        shutil.rmtree(d, ignore_errors=False)
+    except OSError as e:
+        return {"ok": False, "error": "删除失败：%s" % e}
+    return {"ok": True, "name": name}
+
+
+def api_voice_library_promote(body):
+    """把本项目满意的具名音色**提升进随仓声库**（resources/voices）。
+
+    声库是人耳验收过的音色资产的唯一家（与 bgm 同级，随仓推送、永不丢）：
+    official take 从车间落库走 curate_voices.py，自造嗓子走这里 —— 同一条
+    分层，不因为来源不同就多一套规则。提升 = 逐字节复制三件套 + profile
+    改标（kind=voice_library + 溯源补记），原项目档案不动。
+
+    fail-closed 三道：档案必须分案（text_role 缺席 = 旧版造嗓，先重造双案）、
+    声库同名已存在（换名或先删）、源目录不完整。
+    """
+    root, err = _voice_project_root(body)
+    if err:
+        return {"ok": False, "error": err}
+    name = str(body.get("name") or "").strip()
+    err = _validate_design_name(name)
+    if err:
+        return {"ok": False, "error": err}
+    src = os.path.join(root, layout.DIR_VOICE, name)
+    if not (os.path.isfile(os.path.join(src, layout.VOICE_WAV))
+            and os.path.isfile(os.path.join(src, layout.VOICE_TXT))):
+        return {"ok": False,
+                "error": "音色「%s」档案不完整（缺 ref.wav / ref.txt）。" % name}
+    prof = {}
+    pp = os.path.join(src, layout.VOICE_PROFILE)
+    if os.path.isfile(pp):
+        try:
+            prof = json.load(io.open(pp, encoding="utf-8"))
+        except (ValueError, OSError):
+            prof = {}
+    tr = prof.get("text_role")
+    if tr not in ("A", "B"):
+        return {"ok": False,
+                "error": "「%s」没有分案标记（text_role），进不了声库 —— "
+                         "旧版造的嗓子请重新双案生成后保存。" % name}
+    dst = os.path.join(VOICE_LIBRARY_DIR, name)
+    if os.path.exists(dst):
+        return {"ok": False,
+                "error": "声库里已有「%s」。换个名字保存，或先删声库里的旧条。"
+                         % name}
+    os.makedirs(VOICE_LIBRARY_DIR, exist_ok=True)
+    try:
+        shutil.copytree(src, dst)
+    except OSError as e:
+        return {"ok": False, "error": "提升失败：%s" % e}
+    lib_pp = os.path.join(dst, layout.VOICE_PROFILE)
+    try:
+        prof["kind"] = "voice_library"
+        prof["name"] = name
+        prof["promoted_from_project"] = \
+            os.path.basename(os.path.normpath(root))
+        prof["promoted_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        tmp = lib_pp + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(prof, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, lib_pp)
+    except (ValueError, OSError):
+        shutil.rmtree(dst, ignore_errors=True)
+        return {"ok": False, "error": "提升失败：profile 写不进声库。"}
+    return {"ok": True, "name": name, "text_role": tr}
+
+
+# --------------------------------------------------------------- 背景音乐（BGM）
+# 音乐不姓项目：一段 30 秒的 BGM 在哪期节目里都能用，把它埋进某个项目目录
+# 等于让第二期再生成一遍。所以落点是仓库根的**全局音乐库**，与项目的音色
+# 目录刻意不同。生成与管理的唯一实现在 music_service/music_gen.py —— 这里
+# 只拼命令行、抠结果，不重写任何判定（与音色档案同一个分工纪律）。
+# 生成跑音乐 venv（重家伙在那边）；草稿保存/取消/删除/清单是纯文件操作，
+# music_gen 的这些路径只靠标准库，主程序的 Python 直接跑。
+_MUSIC_DRAFT = "_draft"   # 与 music_gen.DRAFT_NAME 同源，测试钉死
+_MUSIC_LIB = "音乐库"      # 与 music_gen.LIB_DIRNAME 同源，测试钉死
+
+
+def _music_venv_python() -> str:
+    """音乐独立环境的解释器（与 TTS 的 .venv 互不相干，torch 版本不同）。"""
+    for parts in (("Scripts", "python.exe"), ("bin", "python")):
+        p = os.path.join(ROOT, "music_service", ".venv", *parts)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _music_tool(py, *extra):
+    return [py, os.path.join(ROOT, "music_service", "music_gen.py"), *extra]
+
+
+def _music_call(py, extra, timeout=180):
+    """同步跑一次 music_gen，返回 (解析后的 JSON, 错误人话)。
+    工具失败时 stdout 上是一份 {"error": …} —— 先抠它，抠不出再退 stderr
+    尾巴，绝不把 JSON 壳整段端给用户。"""
+    try:
+        r = subprocess.run(_music_tool(py, *extra), capture_output=True,
+                           cwd=os.path.join(ROOT, "music_service"),
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, env=_sub_env())
+    except subprocess.TimeoutExpired:
+        return None, "音乐库操作超时。"
+    except Exception as e:  # noqa: BLE001
+        return None, "音乐库工具调用失败：%s" % e
+    data = _cli_json(r.stdout or "")
+    if data and data.get("error"):
+        return None, str(data["error"])
+    if data is not None:
+        return data, ""
+    tail = (r.stderr or r.stdout or "").strip()
+    return None, tail[-300:] if tail else "音乐库工具调用失败。"
+
+
+def api_music_state():
+    """音乐库实况（只读）：环境三态 + 草稿 + 入库清单。"""
+    data, err = _music_call(sys.executable, ["--status"])
+    if data is None:
+        return {"ok": False, "error": err}
+    return {"ok": True, "state": data}
+
+
+def api_music_setup(body):
+    """配置页「背景音乐」卡的「搭建」按钮：拿代码 → 建环境 → 装依赖 →
+    下模型 → 自检。
+
+    走异步任务：这是一趟十几分钟和 11 GB 的下载，压在请求里浏览器会先超时。
+    进度沿用现有的 /api/task/<id> 轮询与 /api/job/stop 中止，不另造一套。
+    搭建是用户点了按钮才发生的事 —— 这里不预装、不后台偷跑。
+    """
+    marks = (("[1/6]", "拿官方仓代码"), ("[2/6]", "找机器上的 Python"),
+             ("[3/6]", "建独立环境"), ("[4/6]", "装依赖"),
+             ("[5/6]", "下模型"), ("[6/6]", "自检"))
+
+    def _run(job):
+        done = {"n": 0}
+
+        def logline(msg):
+            pipeline.job_log(job, msg)
+            for mark, name in marks:
+                if msg.startswith(mark):
+                    done["n"] += 1
+                    job["stage"] = name
+                    job["progress"] = min(0.99, done["n"] / float(len(marks)))
+                    break
+
+        logline("搭建本地音乐环境：拿代码 → 建环境 → 装依赖 → 下模型 → 自检。")
+        logline("依赖约 5 GB、权重约 11 GB，第一次会慢；断了可以重跑，会接着来。")
+        cmd = [sys.executable,
+               os.path.join(ROOT, "music_service", "setup_music_env.py")]
+        proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "music_service"),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace",
+                                env=_sub_env(), bufsize=1)
+        for line in iter(proc.stdout.readline, ""):
+            line = line.rstrip()
+            if not line:
+                continue
+            logline(line)
+            if job.get("stop"):
+                proc.kill()
+                pipeline.job_log(job, "已中止。重跑搭建会接着来（已下载的都算数）。")
+                raise RuntimeError("已中止。")
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError("搭建脚本没跑完（返回码 %s），看上面的日志。"
+                               % proc.returncode)
+        data, err = _music_call(sys.executable, ["--status"])
+        if data is None or not data.get("ready"):
+            raise RuntimeError("搭建跑完了，环境仍不完整，看上面的日志。"
+                               + ("（%s）" % err if err else ""))
+        logline("音乐环境已就绪。生成时会自动加载模型，跑完即退、不常驻显存。")
+        return {"ready": True}
+
+    return {"ok": True, "task_id": pipeline.run_async("music-setup", _run,
+                                                      "搭建本地音乐环境")}
+
+
+def api_music_generate(body):
+    """按描述生成一条 BGM —— 产物固定进 音乐库/_draft.wav（草稿流）。
+
+    走异步任务：加载模型半分钟起步、生成一两分钟，压在请求里浏览器会先超时。
+    试听满意后 /api/music/draft/save 改名入库、/api/music/draft/discard 丢弃，
+    重跑本端点（换 seed_offset）出的是另一条。
+    """
+    py = _music_venv_python()
+    if not py:
+        return {"ok": False, "error":
+                "音乐生成环境还没搭。到配置页点一次「搭建音乐环境」。"}
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return {"ok": False,
+                "error": "音乐描述不能空（例如「轻快的钢琴曲，温暖明亮」）。"}
+    try:
+        seconds = int(body.get("seconds") or 30)
+    except (TypeError, ValueError):
+        seconds = 30
+    if not (10 <= seconds <= 30):
+        return {"ok": False, "error": "时长超出范围：本模块只做 10~30 秒的 BGM。"}
+    try:
+        seed_offset = int(body.get("seed_offset") or 0)
+    except (TypeError, ValueError):
+        seed_offset = 0
+
+    def _run(job):
+        pipeline.job_log(job, "生成 BGM（%d 秒）：%s" % (seconds, prompt))
+        tr = translate_bgm_prompt(
+            CFG.data(), prompt,
+            log=lambda m: pipeline.job_log(job, m))
+        if not tr["degraded"]:
+            pipeline.job_log(job, "三层输入已转译：caption=%s｜lyrics=%s｜"
+                             "bpm=%s keyscale=%s timesignature=%s"
+                             % (tr["caption"], tr["lyrics"].replace("\n", " / "),
+                                "auto" if tr["bpm"] is None else tr["bpm"],
+                                tr["keyscale"] or "auto",
+                                tr["timesignature"] or "auto"))
+        cmd = _music_tool(py, "--generate", "--prompt", tr["caption"],
+                          "--prompt-raw", prompt,
+                          "--lyrics", tr["lyrics"],
+                          "--bpm", "" if tr["bpm"] is None else str(tr["bpm"]),
+                          "--keyscale", tr["keyscale"],
+                          "--timesignature", tr["timesignature"],
+                          "--seconds", str(seconds),
+                          "--seed-offset", str(seed_offset))
+        proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "music_service"),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                env=_sub_env())
+        for line in iter(proc.stderr.readline, ""):
+            line = line.rstrip()
+            if line:
+                pipeline.job_log(job, line)
+        tail = proc.stdout.read()
+        proc.wait()
+        data = _cli_json(tail)
+        if data is None:
+            raise RuntimeError("音乐工具没返回可解析的结果（原文片段：%s）。"
+                               % (tail or "").strip()[:200])
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return {"draft": data.get("draft", {})}
+
+    return {"ok": True, "task_id": pipeline.run_async("music-generate", _run,
+                                                      "生成背景音乐")}
+
+
+def api_music_draft_save(body):
+    """把草稿改名入库（全局音乐库）。重名 fail-closed，判定在工具侧。"""
+    name = str(body.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "先给这段音乐起个名字。"}
+    data, err = _music_call(sys.executable, ["--save", name])
+    if data is None:
+        return {"ok": False, "error": err}
+    return {"ok": True, "name": data.get("name", name)}
+
+
+def api_music_draft_discard(body):
+    """丢弃草稿（幂等）。"""
+    data, err = _music_call(sys.executable, ["--discard"])
+    if data is None:
+        return {"ok": False, "error": err}
+    return {"ok": True}
+
+
+def api_music_delete(body):
+    """删除一条已入库音乐。判定（名字合法、存不存在）在工具侧。"""
+    name = str(body.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "缺少要删除的音乐名。"}
+    data, err = _music_call(sys.executable, ["--delete", name])
+    if data is None:
+        return {"ok": False, "error": err}
+    return {"ok": True, "name": name}
+
+
+def api_voice_adopt(body):
+    """把具名音色档案认领进 A / B 角槽位（复制文件，同步完成，不加载模型）。
+
+    与官方认领同一条路、同一种形态：复制是瞬间的事，压进异步任务只会让
+    「选一条音频上场」这件事平白多出一层任务面板。
+    """
+    cfg = CFG.data()
+    if cfg.get("tts.engine", "edge") not in tts_engine.LOCAL_ENGINES:
+        return {"ok": False, "error": "当前语音引擎不是 Qwen3-TTS，不需要音色档案。"}
+    root, err = _voice_project_root(body)
+    if err:
+        return {"ok": False, "error": err}
+    py = tts_engine.venv_python()
+    if not py:
+        return {"ok": False, "error":
+                "本地语音环境还没建。到配置页点一次「搭建本地语音环境」。"}
+    name = str(body.get("name") or "").strip()
+    err = _validate_design_name(name)
+    if err:
+        return {"ok": False, "error": err}
+    role = str(body.get("role") or "").strip().upper()
+    if role not in ("A", "B"):
+        return {"ok": False, "error": "认领目标只能是 A 角或 B 角。"}
+    cmd = _voice_tool(py, root, "--json",
+                      "--adopt-from", name, "--adopt-role", role)
+    if bool(body.get("force")):
+        cmd.append("--force")
+
+    proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "tts_service"),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace",
+                            env=_sub_env())
+    _proc_err = proc.stderr.read()
+    tail = proc.stdout.read()
+    proc.wait()
+    if proc.returncode != 0:
+        return {"ok": False, "error": _cli_error(tail, _proc_err)}
+    data = _cli_json(tail)
+    if data is None:
+        return {"ok": False, "error":
+                "音色工具没返回可解析的结果（原文片段：%s）。"
+                % (tail or "").strip()[:200]}
+    if data.get("error"):
+        return {"ok": False, "error": str(data["error"])}
+    return {"ok": True, "role": role, "name": name}
 
 
 def api_backend_get():
@@ -1937,7 +2845,8 @@ def api_continue(body):
 ROUTES_GET = {
     "/api/config": lambda q, b: api_config_get(),
     "/api/voices": lambda q, b: api_voices(refresh=q.get("refresh") == "1",
-                                          engine=q.get("engine")),
+                                          engine=q.get("engine"),
+                                          project=q.get("project", "")),
     "/api/fonts": lambda q, b: api_fonts(),
     "/api/engines": lambda q, b: api_engines(),
     "/api/tts/state": lambda q, b: api_tts_state(),
@@ -1972,7 +2881,22 @@ ROUTES_POST = {
     "/api/tts/setup": lambda b: api_tts_setup(b),
     "/api/deps/install": lambda b: api_deps_install(b),
     "/api/voice/profile": lambda b: api_voice_profile(b),
+    "/api/voice/officials": lambda b: api_voice_officials(b),
+    "/api/voice/official-adopt": lambda b: api_voice_official_adopt(b),
+    "/api/voice/draft": lambda b: api_voice_draft_state(b),
+    "/api/voice/draft/save": lambda b: api_voice_draft_save(b),
+    "/api/voice/draft/discard": lambda b: api_voice_draft_discard(b),
+    "/api/voice/named/delete": lambda b: api_voice_named_delete(b),
+    "/api/voice/library/promote": lambda b: api_voice_library_promote(b),
     "/api/voice/build": lambda b: api_voice_build(b),
+    "/api/voice/design": lambda b: api_voice_design(b),
+    "/api/voice/adopt": lambda b: api_voice_adopt(b),
+    "/api/music/state": lambda b: api_music_state(),
+    "/api/music/setup": lambda b: api_music_setup(b),
+    "/api/music/generate": lambda b: api_music_generate(b),
+    "/api/music/draft/save": lambda b: api_music_draft_save(b),
+    "/api/music/draft/discard": lambda b: api_music_draft_discard(b),
+    "/api/music/delete": lambda b: api_music_delete(b),
     "/api/render": lambda b: api_render(b),
     "/api/batch": lambda b: api_batch(b),
     "/api/job/stop": lambda b: api_job_stop(b),
@@ -2024,6 +2948,87 @@ class Handler(BaseHTTPRequestHandler):
                 target = assets_factory.bgm_resource(preset)
             except (ValueError, RuntimeError) as e:
                 return self._json({"ok": False, "error": str(e)}, 404)
+            with open(target, "rb") as f:
+                return self._send(200, f.read(), "audio/wav")
+        if path.startswith("/api/music/library/"):
+            # AI 音乐库曲目试听：音乐库/<名>.wav 原样播放。名字是中文
+            # （path 已 unquote），段数与目录穿越在此卡死；存在性与草稿
+            # 排除的判定唯一来源是 music_gen（经 library_bgm_path）。
+            name = path[len("/api/music/library/"):]
+            if (not name or "/" in name or "\\" in name
+                    or name.startswith(".") or name != name.strip()):
+                return self._json({"ok": False, "error": "参数不合法"}, 400)
+            try:
+                target = assets_factory.library_bgm_path(name)
+            except RuntimeError as e:
+                return self._json({"ok": False, "error": str(e)}, 404)
+            with open(target, "rb") as f:
+                return self._send(200, f.read(), "audio/wav")
+        if path.startswith("/api/voice/official-audio/"):
+            # 官方预设试听。名字与 take 用白名单正则卡死，路径越界进不来。
+            rest = path[len("/api/voice/official-audio/"):]
+            parts = [p for p in rest.split("/") if p]
+            if (len(parts) != 2
+                    or not re.fullmatch(r"[A-Za-z0-9_]+", parts[0])
+                    or not re.fullmatch(r"take[0-9]+", parts[1])):
+                return self._json({"ok": False, "error": "参数不合法"}, 400)
+            target = os.path.join(ROOT, "tts_service", "official_voices",
+                                  parts[0], parts[1] + ".wav")
+            if not os.path.isfile(target):
+                return self._json({"ok": False, "error": "音频不存在"}, 404)
+            with open(target, "rb") as f:
+                return self._send(200, f.read(), "audio/wav")
+        if path.startswith("/api/voice/library-audio/"):
+            # 声库原声试听：resources/voices/<名>/ref.wav 原样播放。名字是
+            # 中文（path 已 unquote），段数、非法段与目录穿越一并卡死 ——
+            # 与 named-audio 同一套防线。
+            rest = path[len("/api/voice/library-audio/"):]
+            parts = [p for p in rest.split("/") if p]
+            if (len(parts) != 1
+                    or any(p in (".", "..") or "\\" in p or p.startswith(".")
+                           or not p.strip() for p in parts)):
+                return self._json({"ok": False, "error": "参数不合法"}, 400)
+            target = os.path.join(VOICE_LIBRARY_DIR, parts[0], "ref.wav")
+            if not os.path.isfile(target):
+                return self._json({"ok": False, "error": "音频不存在"}, 404)
+            with open(target, "rb") as f:
+                return self._send(200, f.read(), "audio/wav")
+        if path.startswith("/api/voice/named-audio/"):
+            # 具名音色原声试听：本项目 音色/<名字>/ref.wav 原样播放，不做任何
+            # 变换。名字可以是中文（path 已 unquote），段数、非法段与目录穿越
+            # 一并卡死 —— 与 official-audio 同一套防线。
+            rest = path[len("/api/voice/named-audio/"):]
+            parts = [p for p in rest.split("/") if p]
+            if (len(parts) != 2
+                    or any(p in (".", "..") or "\\" in p or not p.strip()
+                           for p in parts)):
+                return self._json({"ok": False, "error": "参数不合法"}, 400)
+            base = layout.project_dir(_projects_base(), parts[0])
+            try:
+                target = safe_join(base, os.path.join(
+                    layout.DIR_VOICE, parts[1], layout.VOICE_WAV))
+            except ValueError:
+                return self._json({"ok": False, "error": "路径越界"}, 400)
+            if not os.path.isfile(target):
+                return self._json({"ok": False, "error": "音频不存在"}, 404)
+            with open(target, "rb") as f:
+                return self._send(200, f.read(), "audio/wav")
+        if path.startswith("/api/music/audio/"):
+            # 音乐库试听：全局 音乐库/<名字>.wav 原样播放（草稿 _draft 同一口径）。
+            # 名字黑名单与 safe_join 双保险，目录穿越进不来。
+            rest = path[len("/api/music/audio/"):]
+            parts = [p for p in rest.split("/") if p]
+            if (len(parts) != 1 or parts[0] in (".", "..")
+                    or "\\" in parts[0]
+                    or any(ch in parts[0] for ch in '\\/:*?"<>|')):
+                return self._json({"ok": False, "error": "参数不合法"}, 400)
+            try:
+                target = safe_join(os.path.join(ROOT, _MUSIC_LIB),
+                                   parts[0] + ".wav")
+            except ValueError:
+                return self._json({"ok": False, "error": "路径越界"}, 400)
+            if not os.path.isfile(target):
+                return self._json({"ok": False, "error": "音频不存在"}, 404)
             with open(target, "rb") as f:
                 return self._send(200, f.read(), "audio/wav")
         if path.startswith("/api/report/"):
@@ -3015,9 +4020,13 @@ function control(stage,key,spec){
     if(spec.options_source==='voices'){
       // 清单按该项所属引擎取，不是一律取当前引擎——不这么分，切到本地引擎后
       // Edge 的两个下拉也会被填进本地音色名，选中就写进一个永不生效的键。
-      const list=voicesFor(spec);
-      opts=list.length?list.map(x=>({value:x.name,label:x.label||x.name}))
-                      :[{value:v,label:String(v)}];
+      // 再按点位角色过滤：A 角下拉只列 A 案声库条目，B 角只列 B 案。
+      const list=voicesForPoint(key,spec);
+      opts=list.map(x=>({value:x.name,label:x.label||x.name}));
+      // 当前值不在清单里就显式追加（旧值）：页面显示必须与配置里存的值一致。
+      if(v&&!opts.some(o=>String(o.value)===String(v)))
+        opts=opts.concat([{value:v,label:String(v)+'（旧值，重选即换新）'}]);
+      if(!opts.length) opts=[{value:v,label:String(v)}];
     }
     // 白名单里没装的项由后端标 off：照列不误，但置 disabled。
     // 暗显表达「不可选」，不再另写「未安装」字样——那是同一件事说两遍。
@@ -3042,6 +4051,10 @@ function control(stage,key,spec){
       hold='<div class="hold">'+sel+
         (vm?'<button type="button" class="pvbtn" onclick="stdPreview(\''+
             vm[1].toUpperCase()+'\',this)">▶ 试听</button>'+
+            // 原声只在本地引擎下有得放：Edge 的音色是在线的名字，没有本地音频。
+            (spec.engine_scope==='qwen3tts'
+              ?'<button type="button" class="pvbtn" onclick="rawPreview(\''+
+               vm[1].toUpperCase()+'\',this)">▶ 原声</button>':'')+
             '<button type="button" class="pvbtn" onclick="calibVoice(\''+
             vm[1].toUpperCase()+'\',this)">标定</button>':'')+
         '</div>';
@@ -3052,11 +4065,12 @@ function control(stage,key,spec){
     // （冒烟按 id 数控件、核登记，给它一个 f_ 开头的 id 就多出一个查无登记的幽灵）。
     if(spec.options_source==='voices'){
       note+='<div class="desc ratio-note"></div>';
-      // 克隆变体下这些名字不是「合成用的音色」，而是「录参考音频时挑的嗓子」。
-      // 不说明白，人会以为在这里换个名字整期声音就跟着换 —— 实际要重录才生效。
+      // 克隆变体下这份清单不是「模型内置的嗓子」，而是一条条已落地的音频。
+      // 不说明白，人会以为还停在「挑个名字等首次合成现录」的旧路上。
       if((voicesFor(spec)[0]||{}).ref_based) note+='<div class="desc">'+
-        '本机跑的是克隆变体：这几个名字只决定用哪把嗓子录本项目的参考音频。'+
-        '录好后整期都用那份音频，要换得去项目卡片上的「音色」重录一次。</div>';
+        '候选项就是音频本身：官方预录定稿 take 与 VoiceDesign 造的具名档案。'+
+        '选中一条，那条音频立即成为该角的参考音频（复制文件，逐字节相同，'+
+        '要落到当前项目）。CustomVoice 的内置音色名已退役，不再现录。</div>';
     }
   }else if(spec.options_source==='models'){
     // 模型名用下拉（select）。从前这里是「输入框 + datalist」——datalist 是浏览器的
@@ -3064,6 +4078,20 @@ function control(stage,key,spec){
     // 候选只剩含这串字的那一个，看着就像"下拉拉不出来"。select 才是点开列全部。
     // 列表里没有的名字从末项「手动填写…」进，这条能力不丢。
     hold='<div class="hold"><select id="'+id+'" data-models="1"></select></div>';
+  }else if(spec.options_source==='music-library'){
+    // AI 音乐库曲目必须是真下拉：清单是全局音乐库的动态账，由
+    // refreshMusicState → fillMusicLibrarySelects 回填，而那个函数只认
+    // SELECT。从前这里掉进兜底分支渲染成普通文本框——登记表里 tagName
+    // 永远不是 SELECT，回填函数看都不看它一眼，行内一片空白，来源切到
+    // AI 音乐库也没得选。真下拉，空壳等回填。
+    // 试听/混合与档位行同一套：原始素材走 /api/music/library/<名>，
+    // 混合与档位共用 bgmMixPreview（走与成片同一个 mix_bgm）。
+    const sel='<select id="'+id+'"></select>';
+    hold='<div class="hold pv">'+sel+
+      '<button type="button" class="pvbtn" data-pv="'+id+'">▶ 试听</button>'+
+      '<button type="button" class="pvbtn" onclick="bgmMixPreview(this)">▶ 混合</button>'+
+      '</div>';
+    auHtml='<audio controls preload="none" data-pvau="'+id+'" style="display:none"></audio>';
   }else if(spec.type==='int'||spec.type==='float'){
     const step=spec.step||(spec.type==='int'?1:0.1);
     if(spec.min!==undefined&&spec.max!==undefined){
@@ -3166,6 +4194,12 @@ function valOf(key){
   if(spec.type==='int') return parseInt(n.node.value,10);
   if(spec.type==='float') return parseFloat(n.node.value);
   if(spec.type==='bool') return n.node.classList.contains('on');
+  // 空壳下拉不是「选了空」。动态回填的 SELECT（音乐库曲目、模型名）在重建那一刻
+  // options 为空，.value 规范返回 ""——那不是用户的取值，是「还没填」。把它当空值
+  // 返回，cfgVal 会因为 "" 不是 undefined 而不回退到 CFG.values，于是把配置里存的
+  // 选中项盖成空：切页重建后回填就显示成「未选择」。options 为空即尚未回填，此值
+  // 不可信，回 undefined 让 cfgVal 取 CFG.values。
+  if(n.node.tagName==='SELECT'&&!n.node.options.length) return undefined;
   return n.node.value;
 }
 async function put(key,value){
@@ -3188,6 +4222,13 @@ async function put(key,value){
   // applyEngineScope 就永远不跑，Edge 的音色行于是切了引擎也不消失。
   // 同时决定「本地语音环境」那块要不要露出来（只有 Qwen3-TTS 需要它）。
   if(key==='tts.engine'){loadVoices(false); applyEngineScope(); paintTts();}
+  // 任何键落值都可能踩中 show_if 的依赖（如 bgm.mode 换来源）——显隐重算，
+  // 代价是一次登记表遍历，几张卡里带条件的行数一只手数得过来。
+  applyShowIf();
+  // Qwen3-TTS 的 A/B 音色选的是一条条已落地的音频（library:/official:/named:）。
+  // 选中即上场：当场把那条音频复制进当前项目的角色槽位，不等到下次合成。
+  if(key==='tts.qwen3tts_voice_a'||key==='tts.qwen3tts_voice_b')
+    voiceSourceApplied(key,String(value||''));
   if(key.indexOf('tts.speed')===0||key==='script.target_minutes') recalcSoon();
   // 字幕相关点位落值后重画预览：版式 / 字号 / 边距 / 底色 / 说话人分色都影响它
   if(key.indexOf('subtitle.')===0||key==='speaker_indicator.mode') drawSubtitlePreview();
@@ -3232,12 +4273,16 @@ const ZONES=[
                    'tts.timbre_cent_dark','tts.timbre_s300_band',
                    'tts.timbre_sv_guard','tts.timbre_sv_sim',
                    'tts.timbre_sv_min_seconds','tts.timbre_seed_retries']],
+  ['tts','段级混入与音色否决',['tts.timbre_seg_guard','tts.timbre_seg_line',
+                              'tts.timbre_seg_line_q',
+                              'tts.timbre_seg_min_seconds',
+                              'tts.timbre_veto','tts.timbre_cep_abs']],
   ['audio','编码与响度',['audio.sample_rate','audio.bitrate_kbps','audio.channels',
                        'audio.codec','audio.loudnorm_target']],
   ['audio','停顿与降噪',['audio.pause_between_lines','audio.denoise']],
   ['audio','片头尾与声明',['audio.intro_path','audio.outro_path',
                         'audio.ai_disclosure_text','audio.ai_disclosure_path']],
-  ['bgm','来源与音量',['bgm.mode','bgm.preset','bgm.custom_path','bgm.volume']],
+  ['bgm','来源与音量',['bgm.mode','bgm.preset','bgm.library_name','bgm.custom_path','bgm.volume']],
   ['bgm','人声闪避',['bgm.ducking','bgm.duck_threshold','bgm.duck_ratio','bgm.fade_seconds']],
   ['video','画幅与帧率',['video.width','video.height','video.fps','video.produce_vertical']],
   ['video','编码与画面处理',['video.encoder_preset','video.crf','video.bg_dim']],
@@ -3360,7 +4405,23 @@ function renderConfig(){
     // 分区键是参数名前缀（tts.* → tts），不是那三个字的中文名。
     // 试听与标定按钮不再另立区块：它们各跟着自己那一行的音色下拉（见 control），
     // 听的就是这一行选的音色，标定的也是这一行——聚在卡尾等于让人自己连线。
-    if(sec==='tts') card.insertAdjacentHTML('beforeend', ttsEnvHtml());
+    if(sec==='tts'){
+      // 造音色块挂在音色行之后：名字/描述/文案三个框就在 A/B 下拉旁边，
+      // 造完刷新清单，同页即可选中上场 —— 不进任务深处的什么面板。
+      card.insertAdjacentHTML('beforeend', voiceDesignCfgHtml());
+      card.insertAdjacentHTML('beforeend', ttsEnvHtml());
+      // 刚重建出来，显隐状态重算一遍（引擎不是 Qwen3-TTS 时两块都收起）
+      paintTts();
+    }
+    // 「背景音乐」卡上多挂一块 AI 生成（全局音乐库 + 环境搭建）：音乐不姓
+    // 项目，且环境是用户点按钮才装的 —— 卡里只放状态与入口。
+    if(sec==='bgm'){
+      // 只挂内容，**不在这里探测**：此刻 card 还在游离状态，没 appendChild 进
+      // 文档，el('music-cfg') 取到的是 null —— 探测会静默走进「卡不在」的早退
+      // 分支，一次请求都不发，徽标永远停在「探测中…」。与 ffmpeg、语音环境同款，
+      // 探测统一放循环外、挂载完成之后（见本函数尾部）。
+      card.insertAdjacentHTML('beforeend', musicCfgHtml());
+    }
     box.appendChild(card);
   });
   const total=Object.keys(CFG.values).length;
@@ -3371,10 +4432,14 @@ function renderConfig(){
   patchModelNote();
   // 点位刚重建，显隐状态得重算一遍：切到配置页时该收起的组要收起
   applyEngineScope();
+  applyShowIf();
   // 运行环境那张卡也刚重建出来，探一次现状（ffmpeg / ffprobe 在不在）
   refreshDepsState();
   // 本地语音环境那块刚重建出来，探一次现状（缺环境 / 缺包 / 缺模型）
   if(el('tts-env')) refreshTtsState();
+  // 背景音乐那块同理：卡已挂进文档，探一次现状（环境齐没齐、草稿、入库清单）。
+  // 三个探测一个规矩：全部在挂载之后，谁也不许在循环里探游离节点。
+  if(el('music-cfg')) refreshMusicState();
   // 字幕预览也随整卡重建，重画一次（块不在时 drawSubtitlePreview 直接返回）
   drawSubtitlePreview();
 }
@@ -3497,6 +4562,17 @@ function voicesFor(spec){
   const eng=(spec&&spec.engine_scope)||cfgVal('tts.engine')||'edge';
   return (VOICES_BY_ENGINE[eng]||{}).list||[];
 }
+/* 按点位角色过滤的音色清单：key 以 _a / _b 结尾的点位（Edge 与本地引擎各一对）
+   只收自己角色的声库条目 —— 声库每条带 role（A 案 / B 案），A 角下拉绝不出现
+   B 案、反之亦然，A / B 永远念不同文案的约束在清单层就闭环。没有 role 字段的
+   条目（Edge 在线音色、named: 具名档案）角色无关，两边都保留。 */
+function voicesForPoint(key,spec){
+  const m=String(key).match(/voice_([ab])$/);
+  const list=voicesFor(spec);
+  if(!m||!list.some(v=>v.role)) return list;
+  const role=m[1].toUpperCase();
+  return list.filter(v=>!v.role||v.role===role);
+}
 /* 音色语速 ÷ 标准语速 —— 挂在音色下拉框下面那一行。
    只读：音色语速是量出来的，不是填出来的。能填的那个数一旦与实测对不上，
    页面上就有两个语速，又回到「两把尺子量同一份稿子」。
@@ -3521,7 +4597,8 @@ async function fetchVoices(eng,refresh){
   VOICES_LOADING[eng]=1; VOICES_TRIED[eng]=1;
   try{
     const r=await api('/api/voices?engine='+encodeURIComponent(eng)+
-                      (refresh?'&refresh=1':''));
+                      (refresh?'&refresh=1':'')+
+                      '&project='+encodeURIComponent(ACTIVE_PROJ||''));
     if(r.ok) VOICES_BY_ENGINE[eng]={list:r.voices||[], at:Date.now()};
     // 只有当前引擎拉不到才值得打断用户：另一个引擎的服务没开是常态。
     else if(eng===String(cfgVal('tts.engine')||'')) toast(r.error||'音色表不可用','err');
@@ -3529,7 +4606,7 @@ async function fetchVoices(eng,refresh){
     if(eng===String(cfgVal('tts.engine')||'')) toast('音色表请求失败','err');
   }
   delete VOICES_LOADING[eng];
-  fillVoiceSelects(); applyEngineScope();
+  fillVoiceSelects(); fillMusicLibrarySelects(); applyEngineScope(); applyShowIf();
 }
 function ensureVoices(eng){ if(eng&&!VOICES_BY_ENGINE[eng]) fetchVoices(eng,false); }
 function loadVoices(refresh,engine){
@@ -3545,9 +4622,14 @@ function fillVoiceSelects(){
       if(spec.options_source!=='voices') return;
       const eng=spec.engine_scope||cfgVal('tts.engine')||'edge';
       const cur=cfgVal(key);
-      const list=voicesFor(spec);
+      const list=voicesForPoint(key,spec);
       if(!list.length) ensureVoices(eng);
-      const opts=list.length?list:[{name:cur,label:cur}];
+      // 当前值不在清单里（清单换代、旧值退役）时显式列出来：让它 selected，
+      // 页面显示的才与配置里真正存的值一致 —— 否则下拉亮着第一项，存的还是旧值。
+      let opts=list.slice();
+      if(cur&&!opts.some(v=>v.name===cur))
+        opts=opts.concat([{name:cur,label:cur+'（旧值，重选即换新）'}]);
+      if(!opts.length) opts=[{name:cur,label:cur}];
       n.node.innerHTML=opts.map(v=>'<option value="'+esc(v.name)+'"'+
         (v.name===cur?' selected':'')+'>'+esc(v.label||v.name)+'</option>').join('');
       if(!list.length&&cur) n.node.value=cur;
@@ -3566,6 +4648,279 @@ function applyEngineScope(){
       if(row) row.style.display=(String(sc)===cur)?'':'none';
     });
   }
+}
+
+/* 带 show_if 的点位只在依赖键取值匹配时露出：背景音乐卡里「档位 / 曲目 /
+   自备文件」三行各有自己的生效来源（内置合成 / AI 音乐库 / 自备文件），
+   不匹配的来源下露着只会让人以为它还在起作用。声明在服务端规格里
+   （show_if={"依赖键": [取值…]}），这里按登记表通用求值，不为某个键写死。
+   与 applyEngineScope 同一套路：改完值、重建完卡片，都要显式重算一遍。 */
+function showIfMatch(cond){
+  for(const k in cond){
+    if(cond[k].indexOf(String(cfgVal(k)))<0) return false;
+  }
+  return true;
+}
+function applyShowIf(){
+  for(const key in REG){
+    (REG[key]||[]).forEach(n=>{
+      const sf=(n.spec||{}).show_if;
+      if(!sf||!n.node) return;
+      const row=n.node.closest('.f');
+      if(row) row.style.display=showIfMatch(sf)?'':'none';
+    });
+  }
+}
+
+/* ---- 音色来源上场 + VoiceDesign 造音色（配置页） ----
+   本地引擎的音色清单就是一条条已落地的音频：library:名字（随仓声库人耳
+   定稿，A 角下拉只列 A 案、B 角只列 B 案）、official:名字#takeN（旧预录
+   引用，兼容读取）与 named:名字（VoiceDesign 造的）。在下拉里选中一条 =
+   那条音频当场复制进当前项目的角色槽位，逐字节相同 —— 不等下次合成，
+   试听马上能听。 */
+async function voiceSourceApplied(key,value){
+  const role=key.slice(-1)==='a'?'A':'B';
+  let kind='',name='',take=null;
+  if(value.indexOf('library:')===0){
+    kind='library'; name=value.slice('library:'.length);
+  }else if(value.indexOf('official:')===0){
+    kind='official';
+    const rest=value.slice('official:'.length), i=rest.indexOf('#');
+    name=i>=0?rest.slice(0,i):rest;
+    if(i>=0&&rest.slice(i+1)) take=parseInt(rest.slice(i+1),10);
+  }else if(value.indexOf('named:')===0){
+    kind='named'; name=value.slice('named:'.length);
+  }else return; /* 旧值（裸内置音色名）：只落配置不动档案，清单里已没有它们 */
+  if(!name) return;
+  if(!ACTIVE_PROJ){
+    toast('先在脚本页把当前项目选好，选中的音频才有落点','err');return;
+  }
+  /* 声库与旧官方引用走同一条认领接口（official-adopt 内部都认声库）；
+     声库条目天然带角色，A 角认 B 案会被后端 fail-closed 拒掉 —— 但下拉已按
+     角色过滤，正常操作到不了那一步。 */
+  const r=(kind==='official'||kind==='library')
+    ?await api('/api/voice/official-adopt',{project:ACTIVE_PROJ,name:name,
+                                            take:kind==='official'?take:null,
+                                            role:role,force:true})
+    :await api('/api/voice/adopt',{project:ACTIVE_PROJ,name:name,
+                                   role:role,force:true});
+  if(!r.ok){toast(role+' 角认领失败：'+(r.error||''),'err');return}
+  toast(role+' 角 ← '+(kind==='official'?'官方预录':
+        (kind==='library'?'声库音色':'具名音色'))+'「'+name+'」'+
+        (kind==='official'?' take'+take:'')+'，参考音频已换','ok');
+}
+let RAW_AU=null, RAW_BTN=null;
+/* 原声试听：把当前选中嗓子的那条本地音频**原样**播放 —— 不过标尺、不过语速、
+   不过任何换算，听到的就是磁盘上那份 ref 的字节。官方预录放 official_voices
+   里的定稿 take，具名音色放本项目 音色/<名字>/ref.wav；旧值（裸内置音色名）
+   没有本地音频，照实说没有。再点一次 = 停。 */
+function rawPreview(role,btn){
+  const key=role==='A'?'tts.qwen3tts_voice_a':'tts.qwen3tts_voice_b';
+  const v=String(cfgVal(key)||'');
+  let src='';
+  if(v.indexOf('library:')===0){
+    src='/api/voice/library-audio/'+encodeURIComponent(v.slice('library:'.length));
+  }else if(v.indexOf('official:')===0){
+    const rest=v.slice('official:'.length), i=rest.indexOf('#');
+    src='/api/voice/official-audio/'+encodeURIComponent(i>=0?rest.slice(0,i):rest)+
+        '/take'+(i>=0?rest.slice(i+1):'1');
+  }else if(v.indexOf('named:')===0){
+    if(!ACTIVE_PROJ){toast('先在脚本页把当前项目选好','err');return}
+    src='/api/voice/named-audio/'+encodeURIComponent(ACTIVE_PROJ)+'/'+
+        encodeURIComponent(v.slice('named:'.length));
+  }else{
+    toast('旧值没有本地音频可放，重选官方预录或具名音色后再听','err');return;
+  }
+  const stop=()=>{if(RAW_AU){RAW_AU.pause();RAW_AU=null}
+                  if(RAW_BTN){RAW_BTN.textContent='▶ 原声';
+                              RAW_BTN.dataset.playing='';RAW_BTN=null}};
+  if(RAW_BTN===btn&&btn.dataset.playing==='1'){stop();return}
+  stop();
+  RAW_BTN=btn; btn.dataset.playing='1'; btn.textContent='⏹ 停止';
+  RAW_AU=new Audio(src);
+  RAW_AU.onended=()=>{btn.textContent='▶ 原声';btn.dataset.playing='';
+                      RAW_AU=null;RAW_BTN=null;};
+  RAW_AU.play().catch(()=>{toast('音频放不出来','err');
+    btn.textContent='▶ 原声';btn.dataset.playing='';RAW_AU=null;RAW_BTN=null;});
+}
+function voiceDesignCfgHtml(){
+  /* 造嗓走双案草稿流：一次生成 A / B 两案（A 案念 A 案定稿文案、B 案念 B 案，
+     模型只加载一次），先落 音色/_draftA/ 与 _draftB/。两案**各自试听各自保存**
+     —— A 案合格保存 A 案，B 案合格保存 B 案，互不绑定；不满意「重新生成」
+     （换种子出一批新的）或「取消」全丢。「管理音色」展开本项目已保存具名
+     嗓子的清单：删除、提升进声库（随仓推送，跨项目可用）。 */
+  return '<div id="voice-design-cfg" style="display:none;'+
+    'border-top:1px solid var(--line);padding-top:12px;margin-top:16px">'+
+    '<div style="display:flex;align-items:center;gap:12px">'+
+      '<b>VoiceDesign 造音色</b>'+
+      '<button type="button" class="pvbtn" onclick="vdManageToggle(this)">管理音色</button>'+
+    '</div>'+
+    '<div class="desc" style="margin-top:4px">凭文字描述造新嗓子：一次生成 A / B 双案'+
+    '（各念各的定稿文案），分别试听、分别保存 —— 保存后才进上面各自案的音色下拉，'+
+    '选中即上场；满意的自造嗓还能提升进随仓声库。造嗓要加载 VoiceDesign 模型，'+
+    '一次半分钟起步。</div>'+
+    '<div style="margin-top:8px"><input type="text" id="vd-c-name" '+
+    'style="width:100%" placeholder="音色名称（如：老陈说书；不能是 A / B）"></div>'+
+    '<div style="margin-top:6px"><input type="text" id="vd-c-desc" '+
+    'style="width:100%" placeholder="音色描述（如：低沉沙哑的中年男声，像说书人）"></div>'+
+    '<div style="margin-top:6px"><input type="text" id="vd-c-text" '+
+    'style="width:100%" placeholder="参考文案（留空 = A / B 案各念各的定稿文案；填了则两案都念这份）"></div>'+
+    '<div class="btn-row" style="margin-top:9px">'+
+      '<button class="btn primary" id="vd-c-go" onclick="voiceDesignCfg()">生成音色（A/B 双案）</button>'+
+    '</div>'+
+    '<div id="vd-c-cases" style="display:none;margin-top:9px"></div>'+
+    '<div id="vd-c-manage" style="display:none;margin-top:10px"></div>'+
+  '</div>';
+}
+let VD_AU=null,VD_BTN=null;
+function vdStopPreview(){
+  if(VD_AU){VD_AU.pause();VD_AU=null}
+  if(VD_BTN){VD_BTN.textContent='▶ 试听';VD_BTN.dataset.playing='';VD_BTN=null}
+}
+function vdDraftPreview(btn,cs){
+  if(!ACTIVE_PROJ){toast('先在脚本页把当前项目选好','err');return}
+  const stop=()=>{vdStopPreview()};
+  if(VD_BTN===btn&&btn.dataset.playing==='1'){stop();return}
+  stop();
+  VD_BTN=btn;btn.dataset.playing='1';btn.textContent='⏹ 停止';
+  VD_AU=new Audio('/api/voice/named-audio/'+encodeURIComponent(ACTIVE_PROJ)+
+                  '/_draft'+cs);
+  VD_AU.onended=()=>{vdStopPreview()};
+  VD_AU.play().catch(()=>{toast(cs+'案草稿音频放不出来','err');vdStopPreview()});
+}
+async function voiceDesignCfg(){
+  if(!ACTIVE_PROJ){
+    toast('先在脚本页把当前项目选好，造出来的音色才有落点','err');return;
+  }
+  const name=(el('vd-c-name')||{}).value||'', desc=(el('vd-c-desc')||{}).value||'',
+        text=(el('vd-c-text')||{}).value||'';
+  if(!name.trim()){toast('先给音色起个名字','err');return}
+  if(!desc.trim()){toast('音色描述不能空','err');return}
+  vdStopPreview();
+  const r=await api('/api/voice/design',{project:ACTIVE_PROJ,name:name,
+    description:desc,text:text,
+    seed_offset:Math.floor(Math.random()*100000)});
+  if(!r.ok){toast(r.error||'起不来','err');return}
+  taskModal('VoiceDesign 造音色（A/B 双案）');
+  watchTask(r.task_id,
+    ()=>{toast('双案草稿已生成：分别试听，满意哪案保存哪案','ok');
+         /* 实时刷新铁律：回调里按**盘上真状态**亮灯（vdDraftCheck 再查一次
+            /api/voice/draft），不盲显示 —— 万一生成半途落盘不完整，按钮
+            亮着也是骗人。 */
+         vdDraftCheck();},
+    j=>toast('造音色失败：'+(j.error||''),'err'));
+}
+async function vdDraftSave(cs){
+  const name=(el('vd-c-name')||{}).value||'';
+  const r=await api('/api/voice/draft/save',{project:ACTIVE_PROJ,name:name,
+                                             case:cs});
+  if(!r.ok){toast(r.error||'保存失败','err');return}
+  vdStopPreview();
+  toast(cs+'案嗓子已保存（'+r.name+'），在该案音色下拉里选它','ok');
+  loadVoices(true,'qwen3tts');
+  vdDraftCheck();
+  const m=el('vd-c-manage'); if(m&&!m.style.display) vdManageRender();
+}
+async function vdDraftDiscard(){
+  const r=await api('/api/voice/draft/discard',{project:ACTIVE_PROJ});
+  if(!r.ok){toast(r.error||'取消失败','err');return}
+  vdStopPreview();
+  toast('草稿已全部丢弃');
+  vdDraftCheck();
+}
+/* 刷新页面 / 切项目后找回草稿：按盘上真状态摆出各案卡片 —— 哪案草稿在，
+   哪案亮试听/保存；两案各自独立，保存过 A 案不影响 B 案还在草稿里。 */
+async function vdDraftCheck(){
+  if(!ACTIVE_PROJ) return;
+  const r=await api('/api/voice/draft',{project:ACTIVE_PROJ});
+  const c=el('vd-c-cases'); if(!c) return;
+  if(!(r.ok&&r.exists)){c.style.display='none';c.innerHTML='';return}
+  const cases=r.cases||{};
+  let html='';
+  for(const cs of ['A','B']){
+    const it=cases[cs];
+    if(!(it&&it.exists)) continue;
+    const p=it.profile||{};
+    let stats='';
+    if(p.speech_rate) stats+=' · 语速 '+p.speech_rate+' 字/s';
+    if(p.f0_med) stats+=' · F0 '+p.f0_med;
+    html+='<div style="border:1px solid var(--line);border-radius:8px;'+
+      'padding:8px;margin-top:6px">'+
+      '<b>'+cs+'案</b><span class="dim" style="font-size:11px">'+esc(stats)+
+      '</span>'+
+      '<div class="btn-row" style="margin-top:5px">'+
+      '<button type="button" class="pvbtn" onclick="vdDraftPreview(this,\''+cs+
+      '\')">▶ 试听</button>'+
+      '<button class="btn primary" onclick="vdDraftSave(\''+cs+'\')">保存'+cs+
+      '案</button>'+
+      '</div></div>';
+  }
+  html+='<div class="btn-row" style="margin-top:6px">'+
+    '<button class="btn" onclick="voiceDesignCfg()">重新生成</button>'+
+    '<button class="btn" onclick="vdDraftDiscard()">取消草稿</button></div>';
+  c.innerHTML=html; c.style.display='';
+}
+async function vdManageToggle(){
+  const m=el('vd-c-manage'); if(!m) return;
+  if(m.style.display){m.style.display='';return}
+  m.style.display='none';
+  await vdManageRender();
+  m.style.display='';
+}
+async function vdManageRender(){
+  const m=el('vd-c-manage'); if(!m||!ACTIVE_PROJ) return;
+  m.innerHTML='<span class="dim">读取中…</span>';
+  const r=await api('/api/voices?engine=qwen3tts&refresh=0&project='+
+                    encodeURIComponent(ACTIVE_PROJ));
+  const items=(r.voices||[]).filter(v=>String(v.name||'').indexOf('named:')===0);
+  if(!r.ok){m.innerHTML='<span class="dim">'+esc(r.error||'读取失败')+'</span>';return}
+  if(!items.length){m.innerHTML='<span class="dim">本项目还没有已保存的自造嗓子。'+
+    '上面造一条，保存后出现在这里。</span>';return}
+  m.innerHTML=items.map(v=>{
+    const nm=String(v.name).slice('named:'.length);
+    const lib=v.role?'<button type="button" class="pvbtn" data-name="'+esc(nm)+
+      '" onclick="vdPromote(this)">进声库</button>':'';
+    return '<div style="display:flex;align-items:center;gap:8px;margin-top:5px">'+
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+
+      esc(v.label||nm)+'</span>'+lib+
+      '<button type="button" class="pvbtn" data-name="'+esc(nm)+'" '+
+      'onclick="vdManageDelete(this)">删除</button></div>';
+  }).join('');
+}
+async function vdPromote(btn){
+  const name=String(btn.dataset.name||'');
+  /* 提升进声库 = 写进随仓资产：首击红字确认，次击执行（无弹框）。 */
+  if(!btn.dataset.armed){
+    btn.dataset.armed='1';btn.style.color='#e5534b';
+    btn.textContent='确认进声库?';
+    setTimeout(()=>{if(btn&&btn.dataset.armed){btn.dataset.armed='';
+      btn.style.color='';btn.textContent='进声库';}},4000);
+    return;
+  }
+  btn.dataset.armed='';btn.style.color='';btn.textContent='进声库';
+  const r=await api('/api/voice/library/promote',{project:ACTIVE_PROJ,
+                                                  name:name});
+  if(!r.ok){toast(r.error||'提升失败','err');return}
+  toast('「'+name+'」已进随仓声库，所有项目都能从下拉里选它（'+r.text_role+
+        '案）','ok');
+  loadVoices(true,'qwen3tts');
+  vdManageRender();
+}
+async function vdManageDelete(btn){
+  const name=String(btn.dataset.name||'');
+  /* 删除是破坏性动作：首击红字确认，次击执行（无弹框）。 */
+  if(!btn.dataset.armed){
+    btn.dataset.armed='1';btn.style.color='#e5534b';btn.textContent='确认?';
+    setTimeout(()=>{if(btn&&btn.dataset.armed){btn.dataset.armed='';
+      btn.style.color='';btn.textContent='删除';}},4000);
+    return;
+  }
+  btn.dataset.armed='';btn.style.color='';btn.textContent='删除';
+  const r=await api('/api/voice/named/delete',{project:ACTIVE_PROJ,name:name});
+  if(!r.ok){toast(r.error||'删除失败','err');return}
+  toast('音色「'+name+'」已删除','ok');
+  loadVoices(true,'qwen3tts');
+  vdManageRender();
 }
 
 /* ---- 本地语音环境（Qwen3-TTS）----
@@ -3720,6 +5075,8 @@ function paintTts(){
   const box=el('tts-env'); if(!box) return;
   const on=String(cfgVal('tts.engine')||'')==='qwen3tts';
   box.style.display=on?'':'none';
+  const vd=el('voice-design-cfg'); if(vd) vd.style.display=on?'':'none';
+  if(on) vdDraftCheck();
   if(!on||!TTS_STATE) return;
   const st=TTS_STATE, svc=st.service||{};
   const badge=el('tts-badge'), note=el('tts-note'), btn=el('btn-tts-setup');
@@ -3763,6 +5120,228 @@ async function watchTts(tid){
     await refreshTtsState();
   };
   tick();
+}
+
+/* ---- 背景音乐（BGM，全局音乐库）----
+   音乐不姓项目：生成的 BGM 进仓库根的「音乐库」，哪期节目都能用。生成走
+   草稿流（试听满意再保存入库），与造嗓同构。环境搭建是**用户点了按钮才
+   发生**的事 —— 本页只放按钮和状态，绝不后台偷装。实时刷新铁律在本卡
+   全量生效：每个任务的成功回调都当场重渲染对应区块，不依赖手动刷网页。 */
+let MUSIC_STATE=null, MU_AU=null, MU_BTN=null;
+function musicCfgHtml(){
+  return '<div id="music-cfg" style="border-top:1px solid var(--line);'+
+    'padding-top:12px;margin-top:16px">'+
+    '<div style="display:flex;align-items:center;gap:8px">'+
+      '<b>AI 生成背景音乐</b><span id="music-badge" class="dim">探测中…</span></div>'+
+    '<div id="music-note" style="font-size:12px;color:var(--fg3);line-height:1.6;margin-top:5px"></div>'+
+    '<div class="btn-row" style="margin-top:9px">'+
+      '<button class="btn primary" id="btn-music-setup" onclick="setupMusic()">搭建音乐环境</button>'+
+      '<button class="btn" onclick="refreshMusicState()">重新探测</button>'+
+      '<button class="btn" id="btn-stop-m" style="display:none" onclick="stopJob(\'m\')">中止</button>'+
+    '</div>'+
+    '<div class="bar"><i id="music-bar"></i></div>'+
+    '<pre class="log" id="music-log" style="display:none;margin-top:10px">等待任务。</pre>'+
+    '<div id="music-gen" style="display:none;margin-top:14px">'+
+      '<input type="text" id="mu-prompt" style="width:100%" '+
+      'placeholder="音乐描述（如：轻快的钢琴曲，温暖明亮，适合节目开场）">'+
+      '<div class="btn-row" style="margin-top:8px">'+
+        '<label class="desc">时长（秒）</label>'+
+        '<input type="number" id="mu-seconds" min="10" max="30" step="1" value="30" '+
+        'style="width:76px">'+
+        '<button class="btn primary" id="mu-go" onclick="musicGenerate()">生成音乐</button>'+
+        '<span id="mu-actions" style="display:none">'+
+          '<button type="button" class="pvbtn" onclick="musicDraftPreview(this)">▶ 试听</button>'+
+          '<button class="btn primary" onclick="musicDraftSave()">保存</button>'+
+          '<button class="btn" onclick="musicGenerate()">重新生成</button>'+
+          '<button class="btn" onclick="musicDiscard()">取消</button>'+
+        '</span>'+
+      '</div>'+
+    '</div>'+
+    '<div style="margin-top:12px">'+
+      '<button type="button" class="pvbtn" onclick="muManageToggle(this)">管理音乐</button>'+
+      '<div id="mu-manage" style="display:none;margin-top:8px"></div>'+
+    '</div>'+
+  '</div>';
+}
+function muStopPreview(){
+  if(MU_AU){MU_AU.pause();MU_AU=null}
+  if(MU_BTN){MU_BTN.textContent='▶ 试听';MU_BTN.dataset.playing='';MU_BTN=null}
+}
+async function refreshMusicState(){
+  if(!el('music-cfg')) { fillMusicLibrarySelects(); return; }   // 卡不在也回填曲目下拉
+  const r=await api('/api/music/state',{});
+  if(r.ok){ MUSIC_STATE=r.state||null; }
+  paintMusic();
+  fillMusicLibrarySelects();
+  if(el('mu-manage')&&el('mu-manage').style.display==='') muManageRender();
+}
+function fillMusicLibrarySelects(){
+  // 遍历注册表，不写死键名：凡声明 options_source==='music-library' 的下拉，
+  // 清单一律来自全局音乐库（与 BGM 生成卡同源）。入库、删除后经
+  // refreshMusicState 当场回填——生成完不用手动刷新。
+  const nodes=[];
+  for(const key in REG){
+    (REG[key]||[]).forEach(n=>{
+      if(n.node&&n.node.tagName==='SELECT'&&n.spec&&n.spec.options_source==='music-library')
+        nodes.push([key,n]);
+    });
+  }
+  if(!nodes.length) return;
+  const use=st=>{
+    const lib=(st&&st.library)||[];
+    nodes.forEach(([key,n])=>{
+      const cur=cfgVal(key);
+      let opts=lib.map(e=>({v:e.name,l:e.name+(e.seconds?('（'+e.seconds+'s）'):'')}));
+      // 当前值不在清单里（被删/清单换代）时显式列出：显示与真实存储一致，
+      // 不让下拉亮着第一项、存的还是旧值。选它成片会报错，重选即换新。
+      if(cur&&!opts.some(o=>o.v===cur))
+        opts=opts.concat([{v:cur,l:cur+'（已不在库中，重选即换新）'}]);
+      // 存的值是空（还没选过）也得说出来：不加这条，浏览器会亮着第一项，
+      // 看着像已选中「电耗子」，实际配置里还是空串，成片报「没有选曲目」。
+      if(!opts.length) opts=[{v:'',l:'（音乐库还是空的——先去生成并存入库）'}];
+      else if(!cur) opts=[{v:'',l:'（未选择——点开挑一条）'}].concat(opts);
+      n.node.innerHTML=opts.map(o=>'<option value="'+esc(o.v)+'"'+
+        (o.v===cur?' selected':'')+'>'+esc(o.l)+'</option>').join('');
+    });
+  };
+  if(MUSIC_STATE){ use(MUSIC_STATE); return; }
+  api('/api/music/state',{}).then(r=>{ if(r.ok){ MUSIC_STATE=r.state||null; use(MUSIC_STATE);} });
+}
+function paintMusic(){
+  const box=el('music-cfg'); if(!box) return;
+  const st=MUSIC_STATE, badge=el('music-badge'), note=el('music-note'),
+        btn=el('btn-music-setup'), gen=el('music-gen');
+  if(!st){ return }
+  const ready=!!st.ready;
+  badge.className=ready?'ok':'bad';
+  badge.textContent=ready?'已就绪':'待搭建';
+  note.textContent=ready
+    ?'描述一段音乐、选好时长（中文随便写，发送前会先由 LLM 转译成模型吃得动的'
+     +'英文，转译失败自动按原文生成），生成后先试听，满意再保存入库'
+     +'（全局音乐库，所有项目可用）。'
+    :'第一次用要先搭环境（拿官方代码 → 独立环境 → 装依赖 → 下模型，约 16 GB，一次性）。点「搭建音乐环境」开始，断了重跑会接着来。';
+  btn.textContent=ready?'重新搭建':'搭建音乐环境';
+  gen.style.display=ready?'':'none';
+  if(st.draft&&st.draft.exists){
+    const a=el('mu-actions'); if(a) a.style.display='';
+  }else{
+    const a=el('mu-actions'); if(a) a.style.display='none';
+  }
+}
+async function setupMusic(){
+  const btn=el('btn-music-setup'); btn.disabled=true;
+  const r=await api('/api/music/setup',{});
+  if(!r.ok){btn.disabled=false; toast(r.error||'启动失败','err'); return}
+  const lg=el('music-log'); lg.style.display=''; lg.textContent='已开始…';
+  watchMusic(r.task_id);
+}
+async function watchMusic(tid){
+  CUR_JOB=tid;
+  const btn=el('btn-music-setup'), stop=el('btn-stop-m'), lg=el('music-log');
+  if(stop) stop.style.display='';
+  const tick=async()=>{
+    const r=await api('/api/task/'+encodeURIComponent(tid));
+    if(!r.ok){toast(r.error||'任务查不到','err'); return}
+    const j=r.job||{};
+    setBar('music-bar', j.progress||0);
+    if(lg) lg.textContent=(j.log||[]).join('\n')||'等待中…';
+    if(j.status==='running'){setTimeout(tick,1500);return}
+    if(stop) stop.style.display='none';
+    if(btn) btn.disabled=false;
+    toast(j.status==='done'?'音乐环境已就绪':'搭建没成功：'+(j.error||''),
+          j.status==='done'?'ok':'err');
+    await refreshMusicState();   // 回调即重渲染：徽标、生成区当场就位
+  };
+  tick();
+}
+async function musicGenerate(){
+  const prompt=(el('mu-prompt')||{}).value||'';
+  if(!prompt.trim()){toast('音乐描述不能空','err');return}
+  let seconds=parseInt((el('mu-seconds')||{}).value,10);
+  if(!(seconds>=10&&seconds<=30)){toast('时长要 10~30 秒','err');return}
+  muStopPreview();
+  el('mu-go').disabled=true;
+  const r=await api('/api/music/generate',{prompt:prompt.trim(),seconds:seconds,
+    seed_offset:Math.floor(Math.random()*100000)});
+  if(!r.ok){el('mu-go').disabled=false; toast(r.error||'起不来','err'); return}
+  taskModal('生成背景音乐');
+  watchTask(r.task_id,
+    j=>{el('mu-go').disabled=false;
+        toast('草稿已生成，先试听，满意点「保存」','ok');
+        const a=el('mu-actions'); if(a) a.style.display='';   // 实时亮出草稿按钮行
+        refreshMusicState();},
+    j=>{el('mu-go').disabled=false; toast('生成失败：'+(j.error||''),'err');});
+}
+function musicDraftPreview(btn){
+  const stop=()=>{muStopPreview()};
+  if(MU_BTN===btn&&btn.dataset.playing==='1'){stop();return}
+  stop();
+  MU_BTN=btn; btn.dataset.playing='1'; btn.textContent='⏹ 停止';
+  MU_AU=new Audio('/api/music/audio/_draft');
+  MU_AU.onended=()=>{muStopPreview()};
+  MU_AU.play().catch(()=>{toast('草稿音频放不出来','err');muStopPreview()});
+}
+function musicDraftSave(){
+  modalInput('保存背景音乐','给这段音乐起个名字（入库后所有项目可用）','',
+    async name=>{
+      name=(name||'').trim();
+      if(!name){toast('名字不能空','err');return}
+      const r=await api('/api/music/draft/save',{name:name});
+      if(!r.ok){toast(r.error||'保存失败','err');return}
+      muStopPreview();
+      const a=el('mu-actions'); if(a) a.style.display='none';
+      toast('音乐「'+name+'」已入库','ok');
+      refreshMusicState();                     // 管理清单当场多一条
+      const m=el('mu-manage'); if(m&&m.style.display==='') muManageRender();
+    });
+}
+async function musicDiscard(){
+  const r=await api('/api/music/draft/discard',{});
+  if(!r.ok){toast(r.error||'取消失败','err');return}
+  muStopPreview();
+  const a=el('mu-actions'); if(a) a.style.display='none';
+  toast('草稿已丢弃');
+  refreshMusicState();
+}
+function muManageToggle(){
+  const m=el('mu-manage'); if(!m) return;
+  if(m.style.display){m.style.display='';return}
+  m.style.display='none';
+  muManageRender();
+  m.style.display='';
+}
+async function muManageRender(){
+  const m=el('mu-manage'); if(!m) return;
+  m.innerHTML='<span class="dim">读取中…</span>';
+  const r=await api('/api/music/state',{});
+  if(!r.ok){m.innerHTML='<span class="dim">'+esc(r.error||'读取失败')+'</span>';return}
+  MUSIC_STATE=r.state||MUSIC_STATE;
+  const items=(r.state.library||[]);
+  if(!items.length){m.innerHTML='<span class="dim">音乐库还是空的。'+
+    '上面生成一条，保存后出现在这里。</span>';return}
+  m.innerHTML=items.map(v=>
+    '<div style="display:flex;align-items:center;gap:8px;margin-top:5px">'+
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+
+      esc(v.name||'')+'</span>'+
+      '<span class="dim" style="font-size:12px">'+
+        (v.seconds?esc(String(v.seconds)+'s'):'')+'</span>'+
+      '<button type="button" class="pvbtn" data-name="'+esc(v.name||'')+'" '+
+      'onclick="muManageDelete(this)">删除</button></div>').join('');
+}
+async function muManageDelete(btn){
+  const name=String(btn.dataset.name||'');
+  /* 删除是破坏性动作：首击红字确认，次击执行（无弹框）。 */
+  if(!btn.dataset.armed){
+    btn.dataset.armed='1';btn.style.color='#e5534b';btn.textContent='确认?';
+    setTimeout(()=>{if(btn&&btn.dataset.armed){btn.dataset.armed='';
+      btn.style.color='';btn.textContent='删除';}},4000);
+    return;
+  }
+  btn.dataset.armed='';btn.style.color='';btn.textContent='删除';
+  const r=await api('/api/music/delete',{name:name});
+  if(!r.ok){toast(r.error||'删除失败','err');return}
+  toast('音乐「'+name+'」已删除','ok');
+  muManageRender();
 }
 
 /* ---- 运行环境（ffmpeg / ffprobe）----
@@ -5110,13 +6689,70 @@ async function refreshVoices(){
   }
   const st=r.status||{}, vs=r.voices||{};
   const others=(PROJECTS||[]).filter(p=>p.id!==VC_PROJ&&!p.archived);
+  const named=Object.keys(st.roles||{}).filter(k=>k!=='A'&&k!=='B');
+  let namedHtml='';
+  if(named.length){
+    namedHtml='<div class="dim" style="font-size:12px;margin:14px 0 4px">'+
+      '具名音色（VoiceDesign 造的，可认领进 A / B 角给 Base 用）：</div>'+
+      named.map(n=>{
+        const rr=(st.roles||{})[n]||{};
+        return '<div class="vc-row"><div class="vc-role">'+esc(n)+'</div><div class="vc-body">'+
+          '<div>'+Number(rr.seconds||0).toFixed(2)+' 秒 · 来源 '+esc(rr.source||'')+
+          (rr.adopted_from?'（认领自 '+esc(rr.adopted_from)+'）':'')+'</div>'+
+          '<div class="dim" style="font-size:11px">'+esc(rr.design_description||'')+'</div>'+
+          '<div style="margin-top:6px">'+
+          '<button class="mini" onclick="voiceAdopt(\''+esc(n)+'\',\'A\',this)">设为 A</button> '+
+          '<button class="mini" onclick="voiceAdopt(\''+esc(n)+'\',\'B\',this)">设为 B</button>'+
+          '</div></div></div>';
+      }).join('');
+  }
+  const ro=await api('/api/voice/officials',{});
+  let offHtml='';
+  if(ro.ok){
+    const rows=ro.officials||[];
+    if(rows.length){
+      offHtml='<div class="dim" style="font-size:12px;margin:14px 0 4px">'+
+        '声库音色（人耳定稿、随仓分发；A 案只能设为 A 角、B 案只能设为 B 角 '+
+        '—— A / B 永远念不同文案的参考）：</div>'+
+        rows.map(p=>{
+          const nm=String(p.name||'');
+          const rr=String(p.text_role||'A');
+          return '<div class="vc-row"><div class="vc-role">'+esc(nm)+
+            '（'+esc(rr)+'案）</div><div class="vc-body">'+
+            '<div>'+esc(p.family||'')+
+            (p.builtin_voice?' · 源 '+esc(p.builtin_voice)+' take'+p.official_take:'')+
+            (p.f0_med?' · F0 '+p.f0_med+' Hz':'')+
+            (p.seconds?' · '+p.seconds+'s':'')+'</div>'+
+            '<audio controls preload="none" style="width:100%;height:32px;margin:4px 0" '+
+            'src="/api/voice/library-audio/'+encodeURIComponent(nm)+'"></audio>'+
+            '<div style="margin-top:4px">'+
+            '<button class="mini" onclick="voiceAdoptOfficial(\''+esc(nm)+
+              '\',\''+esc(rr)+'\',this)">设为 '+esc(rr)+'</button>'+
+            '</div></div></div>';
+        }).join('');
+    }else{
+      offHtml='<div class="dim" style="font-size:12px;margin:14px 0 4px">'+
+        '声库还是空的（跑 tts_service/curate_voices.py 从人耳挑选结论落库）。</div>';
+    }
+  }
   box.innerHTML=
     '<div class="dim" style="font-size:12px;margin-bottom:10px">'+
-    '整期所有句子都由这两段参考音频决定音色。它随项目保存，换项目互不影响；'+
-    '要与别的项目一致，用下面的「继承」把它复制过来 —— 复制的是文件，'+
-    '波形逐字节相同，不靠重新生成碰运气。</div>'+
-    voiceRow('A',st,vs.A)+voiceRow('B',st,vs.B)+
-    '<div class="dim" style="font-size:12px;margin:12px 0 4px">要与某个项目一致，'+
+    '整期所有句子都由这两段参考音频决定音色。它随项目保存，换项目互不影响。'+
+    '来源首选下面的官方预设（预录定稿），也可以用 VoiceDesign 造、从别的项目继承，'+
+    '都是复制文件，波形逐字节相同，不靠重新生成碰运气。</div>'+
+    voiceRow('A',st,vs.A)+voiceRow('B',st,vs.B)+offHtml+namedHtml+
+    '<div class="dim" style="font-size:12px;margin:14px 0 4px">用 VoiceDesign 造一个'+
+    '新音色（凭描述凭空造嗓，录成三句混合基准；造完认领进 A / B 角）：</div>'+
+    '<div style="margin-bottom:6px"><input type="text" id="vd-name" style="width:100%" '+
+    'placeholder="音色名称（如：老陈说书；不能是 A / B）"></div>'+
+    '<div style="margin-bottom:6px"><input type="text" id="vd-desc" style="width:100%" '+
+    'placeholder="音色描述（如：低沉沙哑的中年男声，像说书人）"></div>'+
+    '<div style="margin-bottom:6px"><input type="text" id="vd-text" style="width:100%" '+
+    'placeholder="参考文案（留空 = 内置三句混合基准文案）"></div>'+
+    '<div style="margin-top:8px">'+
+    '<button class="mini" onclick="voiceDesign()">生成音色</button>'+
+    '</div>'+
+    '<div class="dim" style="font-size:12px;margin:14px 0 4px">要与某个项目一致，'+
     '就从它那里继承：</div>'+
     '<select id="vc-src"><option value="">（选一个项目）</option>'+
     others.map(p=>'<option value="'+esc(p.id)+'">'+esc(p.name)+'</option>').join('')+
@@ -5153,6 +6789,54 @@ async function voiceInherit(){
   watchTask(r.task_id,
     ()=>{toast('已继承，音色与该项目逐字节相同','ok');openVoices(VC_PROJ)},
     j=>toast('继承失败：'+(j.error||''),'err'));
+}
+async function voiceDesign(force){
+  const name=(el('vd-name')||{}).value||'', desc=(el('vd-desc')||{}).value||'',
+        text=(el('vd-text')||{}).value||'';
+  if(!name.trim()){toast('先给音色起个名字','err');return}
+  if(!desc.trim()){toast('音色描述不能空','err');return}
+  const r=await api('/api/voice/design',{project:VC_PROJ,name:name,
+    description:desc,text:text,force:!!force});
+  if(!r.ok){toast(r.error||'起不来','err');return}
+  taskModal('VoiceDesign 造音色（A/B 双案）');
+  watchTask(r.task_id,
+    ()=>{toast('双案草稿已生成：到配置页「VoiceDesign 造音色」分别试听、'+
+               '各自保存','ok');openVoices(VC_PROJ)},
+    j=>toast('造音色失败：'+(j.error||''),'err'));
+}
+async function voiceAdopt(name,role,btn){
+  /* 覆盖已有档案是破坏性动作：首击变红字确认，次击执行（无弹框）。 */
+  if(!btn.dataset.armed){
+    btn.dataset.armed='1';btn.style.color='#e5534b';
+    btn.textContent='确认覆盖'+role+'?';
+    setTimeout(()=>{if(btn&&btn.dataset.armed){btn.dataset.armed='';
+      btn.style.color='';btn.textContent='设为 '+role;}},4000);
+    return;
+  }
+  btn.dataset.armed='';btn.style.color='';btn.textContent='设为 '+role;
+  /* 认领是纯文件复制，同步接口 —— 与官方认领同一条路，不走任务面板。 */
+  const r=await api('/api/voice/adopt',{project:VC_PROJ,name:name,role:role,force:true});
+  if(!r.ok){toast(r.error||'认领失败','err');return}
+  toast(role+' 角现在用的就是「'+name+'」','ok');
+  refreshVoices();
+}
+async function voiceAdoptOfficial(name,role,btn){
+  /* 覆盖已有档案是破坏性动作：首击变红字确认，次击执行（无弹框）。
+     声库认领是纯文件复制，同步接口，不走任务面板；角色把关在后端
+     （A 角只认 A 案），按钮本身也只挂自己角色的那一个。 */
+  if(!btn.dataset.armed){
+    btn.dataset.armed='1';btn.style.color='#e5534b';
+    btn.textContent='确认覆盖'+role+'?';
+    setTimeout(()=>{if(btn&&btn.dataset.armed){btn.dataset.armed='';
+      btn.style.color='';btn.textContent='设为 '+role;}},4000);
+    return;
+  }
+  btn.dataset.armed='';btn.style.color='';btn.textContent='设为 '+role;
+  const r=await api('/api/voice/official-adopt',{project:VC_PROJ,name:name,
+    role:role,force:true});
+  if(!r.ok){toast(r.error||'认领失败','err');return}
+  toast(role+' 角 ← 声库音色「'+name+'」','ok');
+  refreshVoices();
 }
 function editNext(pid,cur){
   modalInput('改下一期号','下一个出片的期号。取消即不改动。',cur,async v=>{

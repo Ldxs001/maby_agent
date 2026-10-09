@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "万恶之源女-檐雨",
+ "family": "万恶之源女",
+ "flavor": "檐雨",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Ono_Anna",
+ "official_take": 4,
+ "seed": 3024977440,
+ "sha16": "c0a1c29c5ac1921f",
+ "f0_med": 230.8,
+ "seconds": 16.32,
+ "voiced_seconds": 12.32,
+ "speech_rate": 3.9,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 6.82,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "轻快灵动的日语女声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "c0a1c29c5ac1921f"
+}

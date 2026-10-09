@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "老傅-压嗓",
+ "family": "老傅",
+ "flavor": "压嗓",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Uncle_Fu",
+ "official_take": 4,
+ "seed": 4184179217,
+ "sha16": "6293e2592c3d448a",
+ "f0_med": 250.0,
+ "seconds": 16.08,
+ "voiced_seconds": 10.32,
+ "speech_rate": 4.65,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 0.0,
+ "loudness_rms_dbfs": -22.9,
+ "language_tag": "",
+ "desc": "低沉醇厚的成熟男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "6293e2592c3d448a"
+}

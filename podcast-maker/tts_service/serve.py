@@ -42,6 +42,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -65,6 +66,10 @@ DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 # 它只被 make_voice.py 那个一次性进程加载，用来把「塞尔娜」这类内置音色录成一段
 # 参考音频，之后整期都走 Base。显存比 Cold start 更贵。
 CUSTOM_VOICE_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+# 音色设计变体。与 CustomVoice 同一纪律：**不常驻**，由 make_voice.py 的
+# design 路径一次性加载 —— 按一段自然语言描述凭空造一个嗓子、录成参考音频
+# 就退出。它没有音色表也不吃参考音频，「音色」只存在于描述文本里。
+VOICE_DESIGN_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 # 与主程序 tts.qwen3tts_port 的默认值保持一致，接入时端口不用改
 DEFAULT_PORT = 9880
 
@@ -292,6 +297,28 @@ def pick_device(prefer: str) -> tuple[str, str]:
 # 引擎
 # --------------------------------------------------------------------------- #
 
+@contextlib.contextmanager
+def _stdout_to_stderr():
+    """本块内第三方库偷偷写进 stdout 的输出，一律赶到 stderr。
+
+    本程序的 stdout 是**结果通道**：make_voice --json 模式下调用方要整段
+    解析，垫进一行杂字就解析不了。而 faster-qwen3-tts 的 CUDA 图预热用裸
+    print() 直写 stdout（predictor_graph.py / talker_graph.py —— 同库的
+    model.py 规规矩矩用 logger，这两个文件没有），实测六行
+    「Warming up / Capturing / captured」正好垫在结果 JSON 前面，调用方
+    json.loads 当场炸掉。规定：凡调库的块，stdout 让位 —— 这是通用的
+    「结果通道纪律」，不是给某一次报错打的补丁。
+
+    已知会写 stdout 的点全部套了它：模型加载 + 预热（ensure）、三条合成路
+    （_gen_clone / _gen_design / 内置音色循环）。线程说明：redirect 换的是
+    进程级 sys.stdout，理论上并发请求会互相串流 —— 但那些输出只是进度提示，
+    串了也只是日志换了条管道，无契约在身；有契约的 --json 路径是单线程 CLI。
+    """
+
+    with contextlib.redirect_stdout(sys.stderr):
+        yield
+
+
 class Engine:
     """模型单例。懒加载：服务启动本身不占显存，第一个请求才加载。"""
 
@@ -326,23 +353,24 @@ class Engine:
             t0 = time.time()
             backend_errors = []
 
-            for name, loader in (
-                ("faster-qwen3-tts（CUDA 图）", self._load_faster),
-                ("qwen-tts（官方，慢）", self._load_official),
-            ):
-                try:
-                    self._model = loader(self.device)
-                    self.backend = name
-                    break
-                except Exception as e:  # noqa: BLE001
-                    backend_errors.append(f"{name}: {e}")
-                    self.log(f"[引擎] {name} 加载失败：{e}")
+            with _stdout_to_stderr():
+                for name, loader in (
+                    ("faster-qwen3-tts（CUDA 图）", self._load_faster),
+                    ("qwen-tts（官方，慢）", self._load_official),
+                ):
+                    try:
+                        self._model = loader(self.device)
+                        self.backend = name
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        backend_errors.append(f"{name}: {e}")
+                        self.log(f"[引擎] {name} 加载失败：{e}")
 
-            if self._model is None:
-                self.last_error = " | ".join(backend_errors)
-                raise RuntimeError("模型加载失败：\n" + self.last_error)
+                if self._model is None:
+                    self.last_error = " | ".join(backend_errors)
+                    raise RuntimeError("模型加载失败：\n" + self.last_error)
 
-            self._consume_first_inference()
+                self._consume_first_inference()
             self.load_seconds = time.time() - t0
             self.log(f"[引擎] 就绪 · {self.backend} · {self.device} · "
                      f"耗时 {self.load_seconds:.1f}s")
@@ -355,16 +383,20 @@ class Engine:
         CUDA 图捕获之后，首次 replay 的状态与之后并不一致。跑一次极短的哑合成把它
         耗掉，这样「同一句永远同一条」对第一个请求也成立。
 
-        内置音色模型只有音色表这一条路，这里就能吃掉；Base 变体没有音色表，连哑
-        合成都要一段参考音频，所以这一跳**必然失败** —— 失败时不置位，留给第一次
-        真正拿到参考音频的请求去做（见 _warm_with_ref）。
+        三种变体的预热方式不同，按 kind 显式分流：内置音色/设计模型不需要参考
+        音频，这里就能吃掉；Base 变体连哑合成都要一段参考音频，这一跳**必然失败**
+        —— 失败时不置位，留给第一次真正拿到参考音频的请求去做（见 _warm_with_ref）。
         """
         try:
-            self.synth_one("嗯", ZH_SPEAKERS[0], seed=0)
+            if self.kind == "voice_design":
+                self._gen_design("嗯", "一位平静的年轻人，声音清晰自然",
+                                 "Chinese", 0)
+            else:
+                self.synth_one("嗯", ZH_SPEAKERS[0], seed=0)
             self._warmed = True
         except Exception as e:  # noqa: BLE001
-            self.log(f"[引擎] 内置音色预热不适用（{type(e).__name__}）：{e}")
-            self.log("[引擎] 改在首次使用参考音频时预热")
+            self.log(f"[引擎] 预热不适用（{type(e).__name__}）：{e}")
+            self.log("[引擎] 改在首次真正合成时预热")
 
     def _warm_with_ref(self, ref_audio: str, ref_text: str) -> None:
         """Base 变体的预热：用一次极短的哑克隆吃掉首帧不确定性。
@@ -409,14 +441,52 @@ class Engine:
         }
         if instruct:
             rich["instruct"] = instruct
+        with _stdout_to_stderr():
+            try:
+                out = fn(**rich)
+            except TypeError:
+                # 实现不认这套参数：退到最小必要集。采样参数保不住也得先出声，
+                # 但这一退会改变音色稳定度，所以记一条日志，不要静默。
+                self.log("[引擎] 克隆接口不吃完整参数集，已退到最小集（音色可能更抖）")
+                out = fn(text=text, language=language, ref_audio=ref_audio,
+                         ref_text=ref_text or "", xvec_only=False)
+        return _split_out(out)
+
+    def _gen_design(self, text: str, description: str | None,
+                    language: str, seed: int | None,
+                    temperature: float | None = None):
+        """VoiceDesign 一次：按自然语言描述凭空造嗓合成。
+
+        接口事实（faster-qwen3-tts 0.4.0 `generate_voice_design`）：音色描述走
+        **`instruct` 参数，没有 `speaker` 参数** —— 传了就是 TypeError。所以
+        VoiceDesign 不走 synth_one 里为内置音色表准备的那套参数（带 speaker），
+        显式直连：描述为空直接报错，不静默拿空描述出声。
+        """
+        model = self.ensure()
+        if seed is not None:
+            set_seed(seed)
+        desc = (description or "").strip()
+        if not desc:
+            raise ValueError(
+                "VoiceDesign 需要一段音色描述（例如「低沉醇厚的成熟男声，"
+                "像说书人」），空描述造不出音色。")
+        fn = getattr(model, "generate_voice_design", None)
+        if fn is None:
+            raise RuntimeError(
+                "当前模型不支持音色设计；造音色要用 VoiceDesign 变体，"
+                "把模型指到 %s。" % VOICE_DESIGN_MODEL)
+        rich: dict[str, Any] = {"text": text, "instruct": desc,
+                                "language": language,
+                                "max_new_tokens": max_frames_for(text),
+                                **_sample_kwargs(temperature)}
         try:
-            out = fn(**rich)
+            with _stdout_to_stderr():
+                out = fn(**rich)
         except TypeError:
-            # 实现不认这套参数：退到最小必要集。采样参数保不住也得先出声，
-            # 但这一退会改变音色稳定度，所以记一条日志，不要静默。
-            self.log("[引擎] 克隆接口不吃完整参数集，已退到最小集（音色可能更抖）")
-            out = fn(text=text, language=language, ref_audio=ref_audio,
-                     ref_text=ref_text or "", xvec_only=False)
+            # 实现不认这套参数：退到最小必要集。采样参数保不住也得先出声。
+            self.log("[引擎] 设计接口不吃完整参数集，已退到最小集")
+            with _stdout_to_stderr():
+                out = fn(text=text, instruct=desc, language=language)
         return _split_out(out)
 
     def _load_faster(self, device: str):
@@ -470,10 +540,13 @@ class Engine:
                   ref_audio: str | None = None, ref_text: str | None = None,
                   temperature: float | None = None,
                   ) -> tuple[Any, int]:
-        """合成一句。两条路**显式分流**，不靠「挨个方法试一遍」去猜。
+        """        合成一句。三条路**显式分流**，不靠「挨个方法试一遍」去猜。
 
           - 给了 `ref_audio` → 参考音频克隆（ICL）。Base 变体走这条。
-          - 没给 → 内置音色表。CustomVoice / voice_design 走这条。
+          - 没给、模型是 voice_design 变体 → 音色设计。描述从 `instruct` 进来
+            （接口事实见 _gen_design：VoiceDesign 的 instruct 就是音色描述，
+            没有 speaker 参数）。
+          - 没给、其余变体 → 内置音色表。CustomVoice 走这条。
 
         以前只有一个遍历式的实现：挨个试 generate_custom_voice / voice_design /
         voice_clone，只对 TypeError 兜底。Base 模型下 generate_custom_voice 抛的是
@@ -485,6 +558,9 @@ class Engine:
                 self._warm_with_ref(ref_audio, ref_text or "")
             return self._gen_clone(text, ref_audio, ref_text or "", instruct,
                                    language, seed, temperature)
+
+        if self.kind == "voice_design":
+            return self._gen_design(text, instruct, language, seed, temperature)
 
         model = self.ensure()
         if seed is not None:
@@ -502,19 +578,20 @@ class Engine:
         lean: dict[str, Any] = {"text": text, "speaker": speaker}
 
         gen = None
-        for attr in ("generate_custom_voice", "generate_voice_design"):
-            fn = getattr(model, attr, None)
-            if fn is None:
-                continue
-            for kwargs in (rich, lean):
-                try:
-                    gen = fn(**kwargs)
-                    break
-                except TypeError:
-                    # 这个实现不认这套参数，退到下一套再试
+        with _stdout_to_stderr():
+            for attr in ("generate_custom_voice", "generate_voice_design"):
+                fn = getattr(model, attr, None)
+                if fn is None:
                     continue
-            if gen is not None:
-                break
+                for kwargs in (rich, lean):
+                    try:
+                        gen = fn(**kwargs)
+                        break
+                    except TypeError:
+                        # 这个实现不认这套参数，退到下一套再试
+                        continue
+                if gen is not None:
+                    break
         if gen is None:
             raise RuntimeError(
                 "模型没有可用的内置音色合成方法。若是 Base 变体，请带 ref_audio "

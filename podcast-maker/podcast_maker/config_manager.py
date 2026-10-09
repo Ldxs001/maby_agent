@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "1.7.2"
+VERSION = "2.9.1"
 
 
 # ============================================================================
@@ -389,6 +389,7 @@ MODE_SPEC = {
         "options": {
             "none": {"label": "不用音乐"},
             "builtin": {"label": "内置合成"},
+            "library": {"label": "AI 音乐库"},
             "custom": {"label": "自备文件"},
         },
     },
@@ -712,15 +713,21 @@ PARAM_SPEC = {
     "tts.qwen3tts_port": _p("int", 9880, "voice", "语音服务端口",
                             min=1, max=65535, step=1,
                             engine_scope="qwen3tts"),
-    "tts.qwen3tts_voice_a": _p("str", "Serena", "voice", "A 角音色（Qwen3-TTS）",
+    "tts.qwen3tts_voice_a": _p("str", "library:瑟琳-利落", "voice",
+                               "A 角音色（Qwen3-TTS）",
                                options_source="voices", engine_scope="qwen3tts",
                                views=("script", "render"),
-                               help="仅在引擎选 Qwen3-TTS 时出现。"
-                                    "音色由本地服务 /speakers 枚举"),
-    "tts.qwen3tts_voice_b": _p("str", "Uncle_Fu", "voice", "B 角音色（Qwen3-TTS）",
+                               help="列出的是一条条已落地的音频：随仓声库的"
+                                    "人耳定稿（library:…，A 角只列 A 案）与 "
+                                    "VoiceDesign 造的具名档案（named:…）。"
+                                    "选中哪条，哪条音频立即成为该角的参考音频"
+                                    "（复制文件，逐字节相同）"),
+    "tts.qwen3tts_voice_b": _p("str", "library:老傅-收束", "voice",
+                               "B 角音色（Qwen3-TTS）",
                                options_source="voices", engine_scope="qwen3tts",
                                views=("script", "render"),
-                               help="仅在引擎选 Qwen3-TTS 时出现"),
+                               help="同 A 角：候选项就是声库/造好的音频本身，"
+                                    "B 角下拉只列 B 案，选中即上场"),
     "tts.unload_llm_before_synth": _p(
         "bool", True, "voice", "合成前腾显存", engine_scope="qwen3tts",
         help="合成前卸载 LM Studio / Ollama 的驻留模型。本地 TTS 上 GPU 要占约 5GB，"
@@ -793,6 +800,48 @@ PARAM_SPEC = {
         help="短于该值的句子不参与嵌入点名：x-vector 对短句的相似度系统性"
              "偏低（时长-sim 相关 r=0.49），是误报源；实测剔除 <3s 零漏损，"
              "短句仍有其余五族纯代码判据兜底"),
+    "tts.timbre_seg_guard": _p(
+        "bool", True, "voice", "段级异常混入维（分段判）",
+        engine_scope="qwen3tts", views=("render",),
+        help="按谱变点把每句切成段，逐段求基频（段内平均谱 + 谐波和），"
+             "任一段偏离该角色段级常态即点名。老六维的 F0 是整句中位，"
+             "0.31 秒的局部混入会被九成正常语音抹平——这一维管的就是它，"
+             "位置无关（句首/句中/句尾一样判）。判据族第六族，与前五族并列"),
+    "tts.timbre_seg_line": _p(
+        "float", 3.2, "voice", "段级混入判定线（σ，退路值）",
+        engine_scope="qwen3tts", min=2.0, max=8.0,
+        help="正常路径下判定线由池自校准（timbre_seg_line_q，按该角色"
+             "「每句最高段 z」分布的分位定），本值只在池太小建不起分布时"
+             "退回使用。只报上偏——段级基频偏低是音色自然差异（低沉、"
+             "气声），不是混入。**口径注**：段级峰值统计天然偏高，N≈10 段"
+             "取 max 本来就会到 2-3σ，所以固定线在整池上的超线率没有直接"
+             "含义，这正是改用池自校准的原因"),
+    "tts.timbre_veto": _p(
+        "bool", True, "voice", "第 9 维音色否决",
+        engine_scope="qwen3tts", views=("render",),
+        help="段级维命中后，用倒谱谱包络比对 + 声门三件套（CPP/HNR/"
+             "H1*-H2*）给被点名段做音色否决：同人抬音高不改声门开商，"
+             "包络与声门都贴池常态 ⇒ 压掉不点名。否决只往下压、不新增"
+             "报警；量不出的量按压不成处理（该报照报）。机制定标见 "
+             "2026-10-08 探针：两个独立真混入件签名一致，同人喊高全压"),
+    "tts.timbre_seg_line_q": _p(
+        "float", 90.0, "voice", "段级报警线池自校准分位",
+        engine_scope="qwen3tts", min=50.0, max=99.0, step=1.0, unit="%",
+        help="报警线 = 该角色「每句最高段 z」分布的这个分位。固定线在 "
+             "max 统计量上口径错（N≈10 段取 max 天然到 2-3σ，旧 3.2 线在 "
+             "B 池实测 53% 句超线），改为按池自身分布定。90 分位 = 报警率 "
+             "约一成，B 池实测 5.73σ、A 池 4.27σ"),
+    "tts.timbre_cep_abs": _p(
+        "float", 1.0, "voice", "包络绝对压制线",
+        engine_scope="qwen3tts", min=0.0, max=3.0, step=0.1,
+        help="d_cep（倒谱谱包络形状距离）低于此值直接压掉——包络贴池常态"
+             "的段根本不像混入。定标数据上这条线零误伤；另一道否决是 "
+             "h1h2_z≥0（真混入的 H1*-H2* 稳定为负），无参数"),
+    "tts.timbre_seg_min_seconds": _p(
+        "float", 0.20, "voice", "段级判据段长门（秒）",
+        engine_scope="qwen3tts", min=0.0, max=2.0, step=0.05, unit="秒",
+        help="短于该值的段不参与判决：谐波和法在太短的段上估不出基频，"
+             "硬判只会制造误报"),
 
     "audio.sample_rate": _p("enum", 44100, "voice", "采样率（Hz）"),
     "audio.bitrate_kbps": _p("int", 192, "voice", "码率（kbps）",
@@ -835,13 +884,23 @@ PARAM_SPEC = {
     "bgm.mode": _p("enum", "builtin", "voice", "背景音乐来源"),
     "bgm.preset": _p("enum", "pensive", "voice", "背景音乐档位",
                      preview_base="/api/bgm/", mix_preview=True,
+                     show_if={"bgm.mode": ["builtin"]},
                      help="试听按钮播放的是该档位的原始循环素材，成片里会被"
                           "拉长混音、垫在人声底下；混合按钮用标准标尺做前景，"
                           "按当前音量/闪避/淡入参数真混一遍"),
     "bgm.custom_path": _p("path", "", "voice", "自备音乐文件", pick="audio",
+                          show_if={"bgm.mode": ["custom"]},
                           help="本机绝对路径，留空即不使用。只在上面「背景音乐来源」"
                                "选「自备文件」时生效；**文件不在等同于没填**——成品"
                                "会没有背景音乐（这一条不会报错，所以界面上会提醒）"),
+    "bgm.library_name": _p("str", "", "voice", "AI 音乐库曲目",
+                           options_source="music-library",
+                           show_if={"bgm.mode": ["library"]},
+                           preview_base="/api/music/library/",
+                           mix_preview=True,
+                           help="只在「背景音乐来源」选「AI 音乐库」时生效。清单来自"
+                                "配置页「AI 生成背景音乐」入库的全局音乐库（所有项目"
+                                "共用）；生成入口在那里，试听满意保存入库后这里就能选"),
     "bgm.volume": _p("float", 0.50, "voice", "音乐音量",
                      min=0.0, max=1.0, step=0.01,
                      help="默认值由实测确定：素材已统一到 -23 LUFS，此音量下"
@@ -857,6 +916,20 @@ PARAM_SPEC = {
                               "音乐越难在句间停顿里回升"),
     "bgm.fade_seconds": _p("float", 3.0, "voice", "淡入淡出（秒）",
                            min=0.0, max=10.0, step=0.5, unit="秒"),
+
+    # ---- 环境音 ----
+    "sfx.enabled": _p("bool", False, "voice", "环境音",
+                      help="开启后由模型按脚本逐句判断，在合适的句子前后插入"
+                           "金属碰撞/雨声/厮杀等短音效，或给整段垫氛围底。"
+                           "关闭时全链零痕迹：不调模型、不插声音"),
+    "sfx.event_gain_db": _p("float", -6.0, "voice", "环境音·事件音量",
+                            min=-20.0, max=0.0, step=0.5, unit="dB",
+                            help="事件音在库内已统一到峰值 -3 dBFS，这里整体"
+                                 "再压一档，默认比人声低约 6 dB"),
+    "sfx.bed_gain_db": _p("float", -8.0, "voice", "环境音·垫底音量",
+                          min=-30.0, max=0.0, step=0.5, unit="dB",
+                          help="氛围垫底在库内已统一到 RMS -26 dBFS，这里整体"
+                               "再压一档，落在人声之下、BGM 之上"),
 
     # ---- 画面 ----
     "video.width": _p("int", 1920, "frame", "横屏宽", min=320, max=3840, step=2, unit="像素"),
@@ -1016,6 +1089,7 @@ SECTION_LABELS = {
     "script": "写作目标", "gate": "门禁阈值", "intro_outro": "片头片尾",
     "llm": "语言模型", "project": "项目",
     "tts": "角色与音色", "audio": "音频输出", "bgm": "背景音乐",
+    "sfx": "环境音",
     "aigc": "AIGC 标识",
     "video": "画面输出", "background": "背景", "animation": "动画",
     "speaker_indicator": "说话人提示", "subtitle": "字幕", "cover": "封面",
@@ -1026,7 +1100,7 @@ SECTION_LABELS = {
 SECTION_ORDER = [
     "script", "gate", "intro_outro",
     "project", "llm",
-    "tts", "audio", "bgm", "aigc",
+    "tts", "audio", "bgm", "sfx", "aigc",
     "video", "background", "animation", "speaker_indicator", "subtitle", "cover",
     "frame",
 ]
@@ -1041,6 +1115,8 @@ SECTION_NOTE = {
     "tts": "两位主持人的称呼、音色与语速。音色随所选引擎切换——同屏只显示当前引擎那一套",
     "audio": "导出的音频文件参数；码率受采样率的物理上限约束",
     "bgm": "背景音乐的来源、音量与人声闪避",
+    "sfx": "环境音的开关与音量：模型按脚本逐句判断，在合适的句子前后插入"
+           "短音效或垫氛围底，关闭时全链零痕迹",
     "aigc": "AI 生成内容的合规标识：元数据隐式标识与片头语音声明"
             "（《人工智能生成合成内容标识办法》，2025-09-01 施行）",
     "video": "画幅、帧率与编码质量",
@@ -1402,6 +1478,9 @@ def validate_config(cfg):
     mode = cfg.get("bgm.mode")
     if mode == "custom" and not cfg.get("bgm.custom_path"):
         errs.append("背景音乐来源选择了自备文件，但未指定文件路径。")
+    if mode == "library" and not (cfg.get("bgm.library_name") or "").strip():
+        errs.append("背景音乐来源选择了 AI 音乐库，但未选择曲目——先在配置页"
+                    "「AI 生成背景音乐」生成并保存入库，再回来选。")
 
     if cfg.get("tts.speed_a") and cfg.get("tts.speed_b"):
         ratio = max(cfg["tts.speed_a"], cfg["tts.speed_b"]) / min(cfg["tts.speed_a"], cfg["tts.speed_b"])

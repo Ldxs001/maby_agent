@@ -1,0 +1,136 @@
+{
+ "schema": 2,
+ "kind": "official_preset",
+ "builtin_voice": "Ono_Anna",
+ "language_tag": "Japanese",
+ "desc": "轻快灵动的日语女声",
+ "text": "我一直觉得这本书写得很有意思。有人问我：“这书真的是AI写的吗？”我翻到最后一页……这答案太让人吃惊了！",
+ "texts": {
+  "A": "我一直觉得这本书写得很有意思。有人问我：“这书真的是AI写的吗？”我翻到最后一页……这答案太让人吃惊了！",
+  "B": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！"
+ },
+ "rate_window": [
+  4.0,
+  4.36
+ ],
+ "model": "C:\\Users\\sm001\\WorkBuddy\\podcast-maker\\tts_service\\models\\Qwen3-TTS-12Hz-1.7B-CustomVoice",
+ "device": "cuda",
+ "backend": "faster-qwen3-tts（CUDA 图）",
+ "takes": [
+  {
+   "take": 1,
+   "text_role": "A",
+   "text": "我一直觉得这本书写得很有意思。有人问我：“这书真的是AI写的吗？”我翻到最后一页……这答案太让人吃惊了！",
+   "seed": 1352807866,
+   "attempts": 9,
+   "seconds": 19.28,
+   "voiced_seconds": 10.83,
+   "speech_rate": 4.8,
+   "rate_out_of_window": true,
+   "rate_window": [
+    4.0,
+    4.36
+   ],
+   "f0_med": 250.0,
+   "sha16": "7b0a168989eeee5e",
+   "loudness_gain_db": 7.99,
+   "loudness_rms_dbfs": -23.0
+  },
+  {
+   "take": 2,
+   "text_role": "A",
+   "text": "我一直觉得这本书写得很有意思。有人问我：“这书真的是AI写的吗？”我翻到最后一页……这答案太让人吃惊了！",
+   "seed": 1352808838,
+   "attempts": 5,
+   "seconds": 14.08,
+   "voiced_seconds": 10.27,
+   "speech_rate": 5.06,
+   "rate_out_of_window": true,
+   "rate_window": [
+    4.0,
+    4.36
+   ],
+   "f0_med": 242.4,
+   "sha16": "cef16e4a44c9d8f6",
+   "loudness_gain_db": 3.88,
+   "loudness_rms_dbfs": -23.0
+  },
+  {
+   "take": 3,
+   "text_role": "A",
+   "text": "我一直觉得这本书写得很有意思。有人问我：“这书真的是AI写的吗？”我翻到最后一页……这答案太让人吃惊了！",
+   "seed": 1352809831,
+   "attempts": 4,
+   "seconds": 19.28,
+   "voiced_seconds": 11.15,
+   "speech_rate": 4.66,
+   "rate_out_of_window": true,
+   "rate_window": [
+    4.0,
+    4.36
+   ],
+   "f0_med": 263.7,
+   "sha16": "79598b88a1555f8f",
+   "loudness_gain_db": 12.5,
+   "loudness_rms_dbfs": -23.0
+  },
+  {
+   "take": 4,
+   "text_role": "B",
+   "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+   "seed": 3024977440,
+   "attempts": 3,
+   "seconds": 16.32,
+   "voiced_seconds": 12.32,
+   "speech_rate": 3.9,
+   "rate_out_of_window": true,
+   "rate_window": [
+    4.0,
+    4.36
+   ],
+   "f0_med": 230.8,
+   "sha16": "c0a1c29c5ac1921f",
+   "loudness_gain_db": 6.82,
+   "loudness_rms_dbfs": -23.0
+  },
+  {
+   "take": 5,
+   "text_role": "B",
+   "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+   "seed": 3024978454,
+   "attempts": 5,
+   "seconds": 19.12,
+   "voiced_seconds": 10.69,
+   "speech_rate": 4.49,
+   "rate_out_of_window": true,
+   "rate_window": [
+    4.0,
+    4.36
+   ],
+   "f0_med": 255.3,
+   "sha16": "db0ed3eba58aa9d5",
+   "loudness_gain_db": 9.62,
+   "loudness_rms_dbfs": -23.0
+  },
+  {
+   "take": 6,
+   "text_role": "B",
+   "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+   "seed": 3024979475,
+   "attempts": 8,
+   "seconds": 13.76,
+   "voiced_seconds": 9.43,
+   "speech_rate": 5.09,
+   "rate_out_of_window": true,
+   "rate_window": [
+    4.0,
+    4.36
+   ],
+   "f0_med": 289.2,
+   "sha16": "ec2acb29ae6a5ff7",
+   "loudness_gain_db": 2.56,
+   "loudness_rms_dbfs": -23.0
+  }
+ ],
+ "created": "2026-10-08 11:22:25"
+}

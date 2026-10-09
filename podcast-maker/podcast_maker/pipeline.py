@@ -33,6 +33,7 @@ from . import (aigc_label, assets_factory, audio_engine, duration_model, layout,
                paradigms, project_store)
 from . import script_engine
 from . import ingest, probe, source_store, subtitle_engine, tts_engine, video_engine
+from . import sfx_engine
 from .config_manager import GATE_BY_KEY, INTRO_OUTRO, REVIEW_TAG, VERSION
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -834,6 +835,14 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
         % (est["line_count"], est["total_chars"], est["total_seconds"],
            est["target_seconds"], est["deviation_pct"]))
 
+    # ---- 1b. 环境音决策 ----
+    # 只读定稿脚本的句子文本，不改稿；关 = 零行为零连接。决策失败降级为
+    # 「本期不加环境音」，不停产——装饰性资产不配拦人。
+    sfx_plan = sfx_engine.plan_sfx(script, work, cfg, log=log or None)
+    if sfx_plan and sfx_plan.get("entries"):
+        log("环境音计划：%d 句将插入（账本 %s）"
+            % (len(sfx_plan["entries"]), sfx_engine.plan_path(work)))
+
     # ---- 2. 背景 / 封面 / 音乐 ----
     step(2, "生成背景 / 封面 / 音乐", 0.15)
     aigc = aigc_label.labeled(cfg)
@@ -874,6 +883,16 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
                                        voice_root=root)
     audio_files = tts_result["files"]
     durations = tts_result["durations"]
+
+    # ---- 3a. 环境音执行 ----
+    # 在实测回填之前：句前/句后烘焙改写该句 wav，时长增量实测回填，预估
+    # 偏差表与字幕时间轴拿到的就是含环境音的真实时长。
+    if sfx_plan and sfx_plan.get("entries"):
+        audio_files, durations, sfx_added = sfx_engine.apply(
+            audio_files, durations, work, sfx_plan, cfg, log=log or None)
+        if sfx_added > 0:
+            result["sfx_added_seconds"] = sfx_added
+            log("环境音新增时长 %.2f 秒（已计入实测与偏差表）" % sfx_added)
 
     for i, item in enumerate(script):
         if i < len(durations):

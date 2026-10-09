@@ -690,5 +690,141 @@ class EmbedFlaggedRepairTest(unittest.TestCase):
         self.assertEqual(len(self.embed_calls), 2)
 
 
+class SegIncursionVetoTest(unittest.TestCase):
+    """第 9 维音色否决钉子：两道级联（d_cep 绝对线 / h1h2_z≥0）各自零误伤
+    的定标结论（2026-10-08 探针 + 端到端复验），以及"压不成"处理。
+
+    定标事实（B 池 83 句 + A 池 88 句端到端）：真混入 self_i012_o1 / syn_head
+    的 h1h2_z 稳定为负（-0.5 / -0.9）且 d_cep ≥ 1.23；同人喊高 0127_B 包络
+    d_cep 1.26 贴池常态。这里用合成行钉住同一套判定边界。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import numpy as np
+        from podcast_maker import seg_incursion as si
+        if not si.available():
+            raise unittest.SkipTest("需要 numpy")
+        cls.si = si
+        cls.np = np
+        cls.base = {
+            "mu": 100.0, "sd": 10.0, "n": 500,
+            "env_mu": np.zeros(13), "env_sd": np.full(13, 1.0),
+            "gl": {"cpp": (0.3, 0.1), "hnr": (5.0, 2.0), "h1h2": (1.0, 1.5)},
+        }
+        cls.veto = {"cep_abs": si.DCP_ABS}
+
+    @staticmethod
+    def _seg(f0=160.0):
+        # z = (160-100)/10 = 6.0 ≥ 线：一个稳稳触发第 8 维的段
+        return [{"t0": 0.5, "t1": 1.0, "dur": 0.5, "f0": f0, "n": 20}]
+
+    def _row(self, env_off, h1h2):
+        """env 13 点整体偏 env_off（d_cep = |env_off|），声门 h1h2 给定值。"""
+        return {"t0": 0.5, "t1": 1.0, "dur": 0.5, "f0": 160.0, "n": 20,
+                "env": [env_off] * 13, "cpp": 0.3, "hnr": 5.0, "h1h2": h1h2}
+
+    def test_envelope_normal_pressed(self):
+        """道①：包络贴池常态（d_cep<1.0）→ 压。同人喊高 0127_B（1.26 临界
+        之上但线上未触发 / 0032 类 0.5-0.9）走的都是这道。"""
+        self.assertTrue(self.si.veto_hit(self._row(0.5, -1.75),
+                                         self.base, self.veto))
+
+    def test_h1h2_nonnegative_pressed(self):
+        """道②：包络偏了（d_cep≥1.0）但 H1*-H2* 不低于池 → 压。真混入的
+        h1h2_z 稳定为负，用力说话常 ≥0——实测零误伤线。"""
+        self.assertTrue(self.si.veto_hit(self._row(2.0, 1.0),
+                                         self.base, self.veto))
+
+    def test_true_incursion_signature_not_pressed(self):
+        """真混入签名（d_cep 2.25 / h1h2_z -1.83，即 self_i012_o1 的实测
+        位置）→ 两道都不压，照报。"""
+        self.assertFalse(self.si.veto_hit(self._row(2.25, -1.75),
+                                          self.base, self.veto))
+
+    def test_missing_dims_not_pressed(self):
+        """压不成处理：包络/声门量不出（极端短段）→ 不否决，该报照报。
+        第 9 维缺席绝不放行报不出的病。"""
+        row = {"t0": 0.5, "t1": 1.0, "dur": 0.5, "f0": 160.0, "n": 20,
+               "env": None, "cpp": None, "hnr": None, "h1h2": None}
+        self.assertFalse(self.si.veto_hit(row, self.base, self.veto))
+
+    def test_flag_veto_suppresses(self):
+        """第 8 维命中 + 第 9 维否决 → 返回 None（压掉不留痕）。"""
+        segs = self._seg()
+        segs[0]["env"] = [0.5] * 13
+        segs[0]["cpp"] = 0.3
+        segs[0]["hnr"] = 5.0
+        segs[0]["h1h2"] = 1.0
+        self.assertIsNotNone(
+            self.si.flag(segs, self.base, 5.73))
+        self.assertIsNone(
+            self.si.flag(segs, self.base, 5.73, veto=self.veto))
+
+    def test_flag_without_veto_unchanged(self):
+        """veto 不传 = 旧行为，纯第 8 维照报（向后兼容）。"""
+        segs = self._seg()
+        segs[0]["env"] = None
+        self.assertIsNotNone(self.si.flag(segs, self.base, 5.73))
+
+    def test_calibrate_needs_min_files(self):
+        """池自校准：句数 < MIN_CAL_FILES 时分位无意义 → None（调用方退
+        固定线），不硬凑。"""
+        si = self.si
+        segs = [[{"t0": 0.5, "t1": 1.0, "dur": 0.5, "f0": 100.0, "n": 5}]]
+        self.assertIsNone(si.calibrate(segs * (si.MIN_CAL_FILES - 1),
+                                       self.base))
+        cal = si.calibrate(segs * si.MIN_CAL_FILES, self.base)
+        self.assertIsNotNone(cal)
+        self.assertIn("line", cal)
+        self.assertEqual(cal["n_files"], si.MIN_CAL_FILES)
+
+
+class SegIncursionDimsTest(unittest.TestCase):
+    """measure() 行结构钉子：段行必须带第 9 维特征（env / cpp / hnr / h1h2），
+    baseline 必须收出声门池分布——缺了第 9 维就整个失效，且不报错。"""
+
+    def test_rows_carry_timbre_dims(self):
+        import tempfile
+        import wave as wavemod
+
+        import numpy as np
+        from podcast_maker import seg_incursion as si
+        if not si.available():
+            raise unittest.SkipTest("需要 numpy")
+        # 合成 1s 男声区浊音：150Hz 基频 + 2..6 次谐波递减（SHS 可判真基频、
+        # 周期性好 → 声门三件套可算）
+        sr = si.SR_F0
+        t = np.arange(sr, dtype=np.float64) / sr
+        x = np.zeros_like(t)
+        for h, amp in ((1, 1.0), (2, 0.6), (3, 0.4), (4, 0.3), (5, 0.2),
+                       (6, 0.15)):
+            x += amp * np.sin(2 * np.pi * 150.0 * h * t)
+        x *= np.hanning(len(x))
+        pcm = (x / np.abs(x).max() * 32000).astype("<i2")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        try:
+            with wavemod.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                w.writeframes(pcm.tobytes())
+            rows = si.measure(path)
+            self.assertTrue(rows)
+            r = max(rows, key=lambda r: r["dur"])
+            self.assertGreaterEqual(r["dur"], si.DUR_GATE)
+            for k in ("env", "cpp", "hnr", "h1h2"):
+                self.assertIn(k, r)
+                self.assertIsNotNone(r[k])
+            self.assertAlmostEqual(r["f0"], 150.0, delta=3.0)
+            base = si.baseline([rows])
+            self.assertIn("gl", base)
+            self.assertIn("h1h2", base["gl"])
+            self.assertIn("env_mu", base)
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()

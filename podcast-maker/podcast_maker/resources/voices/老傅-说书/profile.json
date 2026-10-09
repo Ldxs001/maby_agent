@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "老傅-说书",
+ "family": "老傅",
+ "flavor": "说书",
+ "text_role": "A",
+ "text": "我一直觉得这本书写得很有意思。有人问我：“这书真的是AI写的吗？”我翻到最后一页……这答案太让人吃惊了！",
+ "builtin_voice": "Uncle_Fu",
+ "official_take": 1,
+ "seed": 357447542,
+ "sha16": "22c1c9445c04d0fa",
+ "f0_med": 189.7,
+ "seconds": 14.32,
+ "voiced_seconds": 10.05,
+ "speech_rate": 5.17,
+ "rate_out_of_window": true,
+ "loudness_gain_db": -0.36,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "低沉醇厚的成熟男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "22c1c9445c04d0fa"
+}

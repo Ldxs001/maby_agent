@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "万恶之源女-清晓",
+ "family": "万恶之源女",
+ "flavor": "清晓",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Ono_Anna",
+ "official_take": 6,
+ "seed": 3024979475,
+ "sha16": "ec2acb29ae6a5ff7",
+ "f0_med": 289.2,
+ "seconds": 13.76,
+ "voiced_seconds": 9.43,
+ "speech_rate": 5.09,
+ "rate_out_of_window": true,
+ "loudness_gain_db": 2.56,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "轻快灵动的日语女声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "ec2acb29ae6a5ff7"
+}

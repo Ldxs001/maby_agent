@@ -51,7 +51,7 @@ import urllib.error
 import urllib.request
 import wave
 
-from . import bins, layout
+from . import bins, layout, seg_incursion
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VOICE_CACHE = os.path.join(ROOT, "voices_cache.json")
@@ -718,16 +718,64 @@ def _edge_synth(text, voice, speed, sample_rate):
 # 落在 `音色/<角色>/`，由 tts_service/make_voice.py 一次性录好。此后整期读的都是
 # 那份文件 —— 换项目不会互相影响，要有意保持一致就把上个项目那份复制过来。
 
+def _base_refs_active(out_dir, role):
+    """读角色 ref_base 账本，返回 active sign；无账本/无指向/账本坏 → None。"""
+    p = layout.voice_base_refs_file(out_dir, role)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as fh:
+            led = json.load(fh)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(led, dict):
+        return None
+    sign = str(led.get("active") or "")
+    return sign or None
+
+
+def _ref_pair(out_dir, role):
+    """这个角色该拿哪一对（波形, 转录）去合成：有账本就认 active 版 icl。
+
+    判定只写这一处。主程序读档案、声纹挑参考、测试核对，三处都调它 ——
+    这条规则散着写，迟早对不上，而对不上的表现是「明明加了 icl 却没生效」，
+    查起来毫无线索。
+
+    账本（base_refs.json）有 active 指向 → 必须用那一版 icl（wav + txt 两件
+    齐才作数）：ICL 拿转录当示例台词，只有音频没有转录，参考音频的**内容**
+    会当成该念的话串进结果里。**指向的件缺失时 fail-closed 报错，绝不静默
+    退回 ref.wav** —— 那等于换嗓（实测过：换嗓后旧 icl 残留，整期合成的是
+    旧嗓，体检还以为抓到了退化）。没有账本的项目（从没做过 ref_base）走
+    ref.wav 本尊，行为与既往一致。
+    """
+    sign = _base_refs_active(out_dir, role)
+    if sign is not None:
+        iw = layout.voice_icl_file(out_dir, role, sign)
+        it = layout.voice_icl_text_file(out_dir, role, sign)
+        if os.path.isfile(iw) and os.path.isfile(it):
+            return iw, it
+        raise TTSError(
+            "%s 角音色账本指向 ref_base_%s，但 icl 两件不齐 —— 先跑 "
+            "tts_service/make_base_ref.py 补齐再出片。不静默退回 ref.wav："
+            "那等于换嗓。" % (role, sign))
+    return layout.voice_ref_file(out_dir, role), layout.voice_text_file(out_dir, role)
+
+
 def voice_profiles(out_dir):
-    """读项目现有的音色档案，返回 {"A": {"wav":…, "text":…}, …}。
+    """读项目现有的音色档案，返回 {"A": {"wav":…, "text":…, "ref_wav":…}, …}。
 
     只认「波形 + 转录」两件齐的：ICL 模式要拿转录当示例台词，缺了它参考音频的
     内容会串进结果。宁可当它没有、重新录一份，也不要拿半份档案去合成。
+
+    `wav` / `text` 是**送合成**的那一对（有账本时就是 active 版 icl 那一对）；
+    `ref_wav` 恒指音色本体 ref.wav；`base_wav` / `base_sign` 在走 ICL 时指向
+    合成条件同源的那份 ref_base_<sign> —— **声纹锚用它**：当期用什么生成，
+    检测就拿什么当锚（wavlm 对整条波形做池化，icl 是「静音 + 两段读法」的
+    拼接件，不能直接去比）。
     """
     have = {}
     for role in ("A", "B"):
-        wav = layout.voice_ref_file(out_dir, role)
-        txt = layout.voice_text_file(out_dir, role)
+        wav, txt = _ref_pair(out_dir, role)
         if not (os.path.isfile(wav) and os.path.isfile(txt)):
             continue
         try:
@@ -736,36 +784,33 @@ def voice_profiles(out_dir):
         except OSError:
             continue
         if text and os.path.getsize(wav) > 1024:
-            have[role] = {"wav": wav, "text": text}
+            have[role] = {"wav": wav, "text": text,
+                          "ref_wav": layout.voice_ref_file(out_dir, role)}
+            sign = _base_refs_active(out_dir, role)
+            if sign and os.path.basename(wav) == "%s_%s.wav" % (
+                    layout.VOICE_ICL_STEM, sign):
+                have[role]["base_wav"] = layout.voice_baseref_file(
+                    out_dir, role, sign)
+                have[role]["base_sign"] = sign
     return have
 
 
 def ensure_voice_profiles(out_dir, voices, cfg, log=None, force=False):
-    """备齐本项目的角色音色档案，缺谁录谁。
+    """备齐本项目的角色音色档案，缺谁补谁。
 
-    放到合成这一步而不是立项那一步，理由是显存：录档案要独占跑一次内置音色模型
-    （约 3.4GB），而立项时 LM Studio 通常正开着；到合成前本来就要腾显存，顺路做掉
-    不额外制造一次冲突。
-
-    **不做任何选择交互**：用哪个内置音色由项目自己那套 qwen_voice_a/b 决定（已经
-    通过 apply_to_config 叠进 cfg），参考文案是脚本里固定的那段**混合三句型**
-    （陈述 + 疑问 + 惊叹各一句，见 make_voice.REF_TEXTS —— Base 克隆整条继承
-    ref 的韵律先验，混合 ref 让输出全局更生动；念全校验由工具自己兜底）——
-    于是在**同一设备、同一后端**下，同一套音色名在任何项目里录出来的音频
-    逐字节相同，不同音色名则自然不同。
-
-    这个前提不能省：`pick_device()` 在显存不足时会静默退 CPU，而 CPU 路径出的
-    是另一条波形（实测同一套输入，GPU 得 sha256[:16] 713bab2d382ab0fd / F0
-    228.6Hz，CPU 得另一条且 F0 偏走）。所以本函数要排在腾显存之后调用，让
-    make_voice.py 拿得到 GPU；profile.json 里记了 `device`，事后可对账。
-    要跨项目强一致、不依赖设备，用 `make_voice.py --from` 复制文件。
+    「补」是复制不是录制：音色来源只有两种已经落地的音频 —— 官方预录定稿
+    take（official:…）与本项目具名档案（named:…，VoiceDesign 造的），用哪个
+    由项目自己那套 qwen_voice_a/b 决定（已经通过 apply_to_config 叠进 cfg）。
+    选了哪条，哪条的字节原样落进角色槽位，逐字节相同 —— 同一来源在任何项目
+    里得到的就是同一条波形，不同来源自然不同。CustomVoice 每项目现录那条路
+    已退役：句间像换人是引擎级病（实证过），预录定稿是它的替代，不是它的补丁。
     """
     log = log or (lambda m: None)
     have = voice_profiles(out_dir)
     need = [r for r in ("A", "B") if force or r not in have]
     if not need:
         log("音色档案已就绪（%s）" % "、".join(
-            "%s 角 %.1f 秒" % (r, os.path.getsize(have[r]["wav"]) / 48000.0)
+            "%s 角 %.1f 秒" % (r, (_wav_seconds(have[r]["ref_wav"]) or 0.0))
             for r in sorted(have)))
         return have
 
@@ -778,7 +823,7 @@ def ensure_voice_profiles(out_dir, voices, cfg, log=None, force=False):
     if not os.path.isfile(script):
         raise TTSError("缺少音色档案工具：%s" % script)
 
-    log("本项目缺 %s 角的音色档案，现在录一次（约半分钟，只录这一次）"
+    log("本项目缺 %s 角的音色档案，现在从选定的来源复制一份（只这一次）"
         % "、".join(need))
     cmd = [py, script, "--project-dir", out_dir,
            "--voice-dir", layout.DIR_VOICE, "--json",
@@ -811,7 +856,7 @@ def ensure_voice_profiles(out_dir, voices, cfg, log=None, force=False):
             raise TTSError("录完 %s 角的音色档案仍未落盘，检查 %s 目录。"
                            % (role, layout.voice_dir(out_dir)))
         log("%s 角音色档案已就绪（%.1f 秒）"
-            % (role, os.path.getsize(rec["wav"]) / 48000.0))
+            % (role, (_wav_seconds(rec["ref_wav"]) or 0.0)))
         _warn_if_recorded_on_cpu(out_dir, role, log)
     return got
 
@@ -1403,14 +1448,20 @@ def _timbre_baselines(rows, log):
 
 def _timbre_capture(r, base, threshold, dull_thr, id_deep, id_full, id_s300,
                     cent_dark=_SPEC_CENT_DARK, s300_band=_SPEC_S300_BAND,
-                    sv_line=_SV_SIM_LINE, sv_min_s=_SV_MIN_SECONDS):
+                    sv_line=_SV_SIM_LINE, sv_min_s=_SV_MIN_SECONDS,
+                    seg_base=None, seg_line=seg_incursion.Z_LINE,
+                    seg_min_s=seg_incursion.DUR_GATE, seg_veto=None):
     """判据合验，返回命中原因列表（空列表 = 放行）。
 
     检测与修复候选验收共用这一把尺：原始句命中任何一条就点名重出，
     重出候选必须全过才准转正——检测放进去的病，验收时必须保证治好了。
     判据族：四维加权分 / 暗淡子分 / 身份下限（女声定标三件套，原样保留）+
-    频谱形态（缺亮音、低频双向）+ 嵌入身份（时长门内 sim<线）。
-    嵌入不可用（row 无 sv 值）时该维自动缺席——不误报也不假装查过。
+    频谱形态（缺亮音、低频双向）+ 嵌入身份（时长门内 sim<线）+ 段级异常混入
+    （该角色段级基线之上的局部高音段，命中后再过第 9 维音色否决）。
+    嵌入不可用（row 无 sv 值）时该维自动缺席——不误报也不假装查过；
+    段级维同理（`seg_base` 为 None 即缺席，numpy 缺失或该角色建不起基线）。
+    第 9 维（`seg_veto`，池自校准的否决线）只往下压：同人抬音高不改声门
+    开商、包络贴池常态的命中段不点名；量不出的量按压不成处理，该报照报。
     """
     reasons = []
     if r.get("score") is not None and r["score"] >= threshold:
@@ -1424,7 +1475,27 @@ def _timbre_capture(r, base, threshold, dull_thr, id_deep, id_full, id_s300,
     reasons.extend(_specform_flags(r, base, cent_dark, s300_band))
     if _sv_flag(r.get("sv"), r.get("seconds"), sv_line, sv_min_s):
         reasons.append("嵌入%.2f" % r["sv"])
+    if seg_base is not None:
+        f = seg_incursion.flag(r.get("seg"), seg_base, seg_line, seg_min_s,
+                               veto=seg_veto)
+        if f:
+            reasons.append(f)
     return reasons
+
+
+def _sv_ref_path(ref):
+    """说话人声纹该拿哪个文件当参考：**跟合成条件同源的那份 ref_base**。
+
+    合成走 ICL 时，整批句子继承的是 ref_base_<sign> 的嗓子 —— 锚就必须是
+    同一个 sign 的 ref_base（「当期用什么生成就用什么检测」）；拿 ref.wav
+    当锚会把「Base 克隆 vs 原始 take」的固定偏差记到每一句头上，整批被
+    系统性压低（实测 B 角 59 句全破线）。icl 拼接件本身（含静音与两段
+    读法）仍然不能直接去比。没走 ICL 的项目合成用的就是 ref.wav，锚也
+    是它 —— 两者天然同源。
+    """
+    if not ref:
+        return ""
+    return ref.get("base_wav") or ref.get("wav") or ""
 
 
 def _voice_fingerprint(ref):
@@ -1481,6 +1552,15 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
     sv_guard = bool(cfg.get("tts.timbre_sv_guard", True))
     sv_line = float(cfg.get("tts.timbre_sv_sim", _SV_SIM_LINE))
     sv_min_s = float(cfg.get("tts.timbre_sv_min_seconds", _SV_MIN_SECONDS))
+    seg_guard = bool(cfg.get("tts.timbre_seg_guard", True))
+    seg_line = float(cfg.get("tts.timbre_seg_line", seg_incursion.Z_LINE))
+    seg_min_s = float(cfg.get("tts.timbre_seg_min_seconds", seg_incursion.DUR_GATE))
+    seg_line_q = float(cfg.get("tts.timbre_seg_line_q", 90.0))
+    veto_on = bool(cfg.get("tts.timbre_veto", True))
+    cep_abs = float(cfg.get("tts.timbre_cep_abs", seg_incursion.DCP_ABS))
+    if seg_guard and not seg_incursion.available():
+        log("音色体检：段级异常混入维缺席（缺 numpy），其余判据照常")
+        seg_guard = False
 
     t0 = time.time()
     rows = []
@@ -1491,14 +1571,60 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
             log("音色体检：%s 测量失败，不参与判定（%s）"
                 % (os.path.basename(audio_files[i]), e))
             continue
-        rows.append({"index": i, "speaker": item.get("speaker", "A"),
-                     "f0": f0, "cent": cent, "rms": rms_db, "pres": pres,
-                     "s300": s300, "jit": jit,
-                     "seconds": _wav_seconds(audio_files[i])})
+        row = {"index": i, "speaker": item.get("speaker", "A"),
+               "f0": f0, "cent": cent, "rms": rms_db, "pres": pres,
+               "s300": s300, "jit": jit,
+               "seconds": _wav_seconds(audio_files[i])}
+        if seg_guard:
+            try:
+                row["seg"] = seg_incursion.measure(audio_files[i], seg_min_s)
+            except Exception as e:  # noqa: BLE001
+                log("音色体检：%s 段级测量失败，该句段级维缺席（%s）"
+                    % (os.path.basename(audio_files[i]), e))
+                row["seg"] = None
+        rows.append(row)
     baselines, scored = _timbre_baselines(rows, log)
     if not baselines:
         log("音色体检：没有任何角色建得起基线，跳过")
         return None
+
+    # 段级维的基线：**按角色分别定**，池子是该角色全部句子的段（不是参考音频
+    # 自己那一条）。参考只有几秒、十来个段，段级标准差在两版之间能差 50% 以上，
+    # 拿它当分母，线的含义随素材抖；更糟的是「一套标准扫全场」时，A 是女高音、
+    # B 是男声，A 会被系统性全报（实测 1954 段报 312 段，绝大多数是 A）。
+    # 报警线与否决线（第 9 维）同样**按角色池自校准**（calibrate）：固定线在
+    # 「每句最高段」这个 max 统计量上口径错，N≈10 段取 max 天然到 2-3σ。
+    seg_bases, seg_lines, seg_vetos = {}, {}, {}
+    if seg_guard:
+        by_spk = {}
+        for r in rows:
+            if r.get("seg"):
+                by_spk.setdefault(r["speaker"], []).append(r["seg"])
+        for spk in sorted(by_spk):
+            base = seg_incursion.baseline(by_spk[spk])
+            if not base:
+                continue
+            seg_bases[spk] = base
+            cal = seg_incursion.calibrate(by_spk[spk], base, seg_line_q,
+                                          dur_gate=seg_min_s)
+            if cal:
+                seg_lines[spk] = cal["line"]
+                if veto_on:
+                    seg_vetos[spk] = {"cep_abs": cep_abs}
+            else:
+                seg_lines[spk] = seg_line
+        log("音色体检：段级基线 %s"
+            % ("；".join(
+                "%s μ=%.0fHz σ=%.1f(%d段) 线=%.2f%s"
+                % (k, seg_bases[k]["mu"], seg_bases[k]["sd"], seg_bases[k]["n"],
+                   seg_lines.get(k, seg_line),
+                   ("（否决：cep<%.2f 或 h1h2_z≥0）" % seg_vetos[k]["cep_abs"])
+                   if k in seg_vetos
+                   else ("（否决关/池不足，退固定线）" if veto_on else "（否决关）"))
+                for k in sorted(seg_bases))
+               or "无"))
+        if not seg_bases:
+            log("音色体检：没有任何角色建得起段级基线，段级维缺席")
 
     voices = {"A": cfg.get("tts.qwen3tts_voice_a", ""),
               "B": cfg.get("tts.qwen3tts_voice_b", "")}
@@ -1514,20 +1640,27 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
                              "sim_line": sv_line, "min_seconds": sv_min_s,
                              "note": "未启用（tts.timbre_sv_guard=false）"}
     if sv_guard:
-        ref_paths = sorted({refs[spk]["wav"] for spk in baselines
-                            if spk in refs and refs[spk].get("wav")})
+        ref_paths = sorted({_sv_ref_path(refs.get(spk)) for spk in baselines
+                            if _sv_ref_path(refs.get(spk))})
         m = _service_embed(
             ref_paths + [audio_files[r["index"]] for r in scored], cfg, log)
         if m is not None and all(w in m for w in ref_paths):
             sv_map = m
             sv_info["available"] = True
             sv_info["note"] = ""
+            # 期级记录：当期每角用哪份 ref_base 当锚（与合成条件同源）。
+            # 重出换嗓后翻旧账，看这一栏就知道那期比的是哪条嗓子。
+            sv_info["anchors"] = {
+                spk: {"anchor": os.path.basename(_sv_ref_path(refs.get(spk)))
+                      or "（缺）",
+                      "base_sign": (refs.get(spk) or {}).get("base_sign", "")}
+                for spk in baselines if _sv_ref_path(refs.get(spk))}
         else:
             sv_info["note"] = "嵌入服务不可用，身份判定只跑了纯代码判据"
     if sv_map is not None:
         for r in scored:
             ref_doc = refs.get(r["speaker"]) or {}
-            rv = sv_map.get(ref_doc.get("wav") or "")
+            rv = sv_map.get(_sv_ref_path(ref_doc))
             r["sv"] = (round(_cosine(sv_map[audio_files[r["index"]]], rv), 4)
                        if rv else None)
 
@@ -1535,7 +1668,11 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
         r["why"] = _timbre_capture(r, baselines[r["speaker"]], threshold,
                                    dull_thr, id_deep, id_full, id_s300,
                                    cent_dark=cent_dark, s300_band=s300_band,
-                                   sv_line=sv_line, sv_min_s=sv_min_s) \
+                                   sv_line=sv_line, sv_min_s=sv_min_s,
+                                   seg_base=seg_bases.get(r["speaker"]),
+                                   seg_line=seg_lines.get(r["speaker"], seg_line),
+                                   seg_min_s=seg_min_s,
+                                   seg_veto=seg_vetos.get(r["speaker"])) \
             if r["score"] is not None else []
         r["flag"] = bool(r["why"])
     flagged = [r for r in scored if r["flag"]]
@@ -1643,11 +1780,18 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
             cand = {"f0": f0, "cent": cent, "rms": rms_db, "pres": pres,
                     "s300": s300, "jit": jit,
                     "seconds": _wav_seconds(tmp)}
+            if seg_guard:
+                # 候选也要过段级那一维：原句是被段级点名的，候选若不能同样
+                # 量出段级值，验收就缺了一把尺（同下面嵌入那条的道理）。
+                try:
+                    cand["seg"] = seg_incursion.measure(tmp, seg_min_s)
+                except Exception:  # noqa: BLE001
+                    cand["seg"] = None
             # 候选的嵌入验收：检测放进去的病（嵌入点名），候选必须同样过嵌入
             # 才准转正。逐条单嵌，量级 = 被点名句数 × 0.5s，可忽略。
             if sv_map is not None:
                 cv = _service_embed([tmp], cfg, log)
-                rv = sv_map.get((refs.get(spk) or {}).get("wav") or "")
+                rv = sv_map.get(_sv_ref_path(refs.get(spk)))
                 if cv and rv and tmp in cv:
                     cand["sv"] = _cosine(cv[tmp], rv)
             s = _timbre_score(cand, baselines[spk])
@@ -1656,7 +1800,11 @@ def timbre_repair(audio_files, script, cfg, log=None, emotion_level=None,
             why = _timbre_capture(cand, baselines[spk], threshold, dull_thr,
                                   id_deep, id_full, id_s300,
                                   cent_dark=cent_dark, s300_band=s300_band,
-                                  sv_line=sv_line, sv_min_s=sv_min_s)
+                                  sv_line=sv_line, sv_min_s=sv_min_s,
+                                  seg_base=seg_bases.get(spk),
+                                  seg_line=seg_lines.get(spk, seg_line),
+                                  seg_min_s=seg_min_s,
+                                  seg_veto=seg_vetos.get(spk))
             if sv_map is not None and "sv" not in cand and \
                     any(w.startswith("嵌入") for w in r["why"]):
                 # 原句是嵌入点名的，候选却没量出嵌入——验收缺尺，不许过。

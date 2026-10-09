@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "老傅-收束",
+ "family": "老傅",
+ "flavor": "收束",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Uncle_Fu",
+ "official_take": 6,
+ "seed": 4184181280,
+ "sha16": "20407e81dd8a9f1c",
+ "f0_med": 180.5,
+ "seconds": 13.92,
+ "voiced_seconds": 10.09,
+ "speech_rate": 4.76,
+ "rate_out_of_window": true,
+ "loudness_gain_db": -1.9,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "低沉醇厚的成熟男声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "20407e81dd8a9f1c"
+}

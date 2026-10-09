@@ -1,0 +1,23 @@
+{
+ "kind": "voice_library",
+ "name": "薇薇-温言",
+ "family": "薇薇",
+ "flavor": "温言",
+ "text_role": "B",
+ "text": "我们先把问题理清楚，一步一步来。总有人问：“这样讲大家能听明白吗？”可没想到……答案竟这么简单！",
+ "builtin_voice": "Vivian",
+ "official_take": 4,
+ "seed": 2072295708,
+ "sha16": "f2d49418d4786d9f",
+ "f0_med": 220.2,
+ "seconds": 15.52,
+ "voiced_seconds": 9.25,
+ "speech_rate": 5.19,
+ "rate_out_of_window": true,
+ "loudness_gain_db": -1.1,
+ "loudness_rms_dbfs": -23.0,
+ "language_tag": "",
+ "desc": "明亮、略带锋芒的年轻女声",
+ "created": "2026-10-08 13:08:32",
+ "ref_md5": "f2d49418d4786d9f"
+}
