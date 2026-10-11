@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -459,10 +459,10 @@ MIN_RATIO = 1.2
 
 
 def target_chars(cfg):
-    """一期脚本的**成稿目标字数**。由目标时长与标准语速反推，不问模型。
+    """一期脚本的**成稿目标字数**。由目标时长与脚本估时基准反推，不问模型。
 
     压比体检的分母：画地图侧只回答「这一期原文 ÷ 这一期脚本」落在哪个区间，
-    分母就是它。不接 calib：这一层的尺子是标准语速，跟本期用哪个音色无关。
+    分母就是它。不接 calib：这一层的尺子是脚本估时基准，跟本期用哪个音色无关。
     """
     tm = float(cfg.get("script.target_minutes", 12.0))
     return round(duration_model.chars_for_target(tm * 60.0, 1.0))
@@ -472,7 +472,7 @@ def offset_chars(cfg):
     """成稿目标的**偏移量**：成稿目标 × 1.25——只是个中间量，不是"1"。
 
     口径（使用者定，全链唯一的算法源）：
-    - **1 = 输出 max = 每期时长 × 标准语速**（`target_chars`，不含偏移——
+    - **1 = 输出 max = 每期时长 × 脚本估时基准**（`target_chars`，不含偏移——
       它对应的是人设定的时长换算出的真实字数）；
     - **x = 输入 max = 1 × 偏移量 1.25 × 档位**（素材容量）；
     - **下限 = 1 × 偏移量 1.25 × 1.2**（25 分钟一期 ≈ 9877 字）。

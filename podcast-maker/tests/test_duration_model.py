@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -144,8 +144,74 @@ class TestCalibration(unittest.TestCase):
         self.assertAlmostEqual(again.get("edge", "v", 1.0)["k"], 4.0, places=3)
 
 
+class TestCalibrateDevice(unittest.TestCase):
+    """校准表带设备印记：换档即失效。
+
+    CPU 与 GPU 两条路径产出的波形不是同一条（实测同一输入 md5 不同）。把两种
+    设备上量的样本 EMA 到一起，等于拿两把尺子量同一份稿子 —— 所以：
+      · 每次实测都把「哪个设备 / 哪个后端」随系数落盘，事后可查；
+      · 本次设备与上一条不同时，旧样本一概不参与（n 归零、EMA 不混、L2 不并）；
+      · 两边任一为空（下游没报设备）时维持原 EMA 行为，不误伤。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pm-calibdev-")
+        self.calib = D.Calibration(path=os.path.join(self.tmp, "calib.json"))
+
+    def _pairs(self, k=4.0):
+        return [{"text": "中" * c, "seconds": c / k} for c in (5, 10, 20, 40)]
+
+    def test_device_recorded_with_coefficients(self):
+        st = D.calibrate(self.calib, "qwen3tts", "v", 1.0, self._pairs(),
+                         device="cuda", backend="faster-qwen3-tts")
+        self.assertEqual(st.get("device"), "cuda")
+        self.assertEqual(st.get("backend"), "faster-qwen3-tts")
+        e = self.calib.get("qwen3tts", "v", 1.0)
+        self.assertEqual(e["device"], "cuda")
+        self.assertEqual(e["backend"], "faster-qwen3-tts")
+
+    def test_same_device_keeps_ema(self):
+        D.calibrate(self.calib, "qwen3tts", "v", 1.0, self._pairs(),
+                    device="cuda", backend="x")
+        st = D.calibrate(self.calib, "qwen3tts", "v", 1.0, self._pairs(),
+                         device="cuda", backend="x")
+        self.assertEqual(st["samples"], 8)      # 同档沿用：样本累加
+        self.assertEqual(self.calib.get("qwen3tts", "v", 1.0)["n"], 8)
+
+    def test_device_switch_resets_history(self):
+        D.calibrate(self.calib, "qwen3tts", "v", 1.0, self._pairs(k=4.0),
+                    device="cuda")
+        # 换成 CPU：旧样本不参与，本次直接起算 —— k 就是本批的，不被 4.0 拉低
+        st = D.calibrate(self.calib, "qwen3tts", "v", 1.0, self._pairs(k=9.0),
+                         device="cpu")
+        self.assertEqual(st["samples"], 4)
+        self.assertAlmostEqual(st["k"], 9.0, places=3)
+        self.assertEqual(self.calib.get("qwen3tts", "v", 1.0)["device"], "cpu")
+
+    def test_missing_device_keeps_previous_stamp(self):
+        D.calibrate(self.calib, "qwen3tts", "v", 1.0, self._pairs(),
+                    device="cuda")
+        # 下游没报设备：沿用上一条已知值，不凭空丢掉可查性
+        st = D.calibrate(self.calib, "qwen3tts", "v", 1.0, self._pairs())
+        self.assertEqual(st.get("device"), "cuda")
+
+    def test_summary_carries_device(self):
+        D.calibrate(self.calib, "qwen3tts", "v", 1.0, self._pairs(),
+                    device="cpu", backend="qwen-tts")
+        row = [r for r in self.calib.summary() if r["voice"] == "v"][0]
+        self.assertEqual(row["device"], "cpu")
+        self.assertEqual(row["backend"], "qwen-tts")
+
+    def test_stats_has_no_device_key_when_absent(self):
+        """旧数据（没这一栏）不该凭空冒出一个 None 键 —— 界面据此判「未知」。"""
+        self.calib.groups["qwen3tts|old|1.00"] = {"k": 4.0, "n": 5, "mode": "L1"}
+        st = self.calib.stats("qwen3tts", "old", 1.0)
+        self.assertNotIn("device", st)
+        self.assertNotIn("backend", st)
+
+
 class TestStandardRate(unittest.TestCase):
-    """标准语速：脚本阶段唯一的一把尺子。
+    """脚本估时基准：脚本阶段唯一的一把尺子。
 
     它必须与音色无关——换一期换了个音色，稿子的时长目标不该跟着变。
     各音色相对它的快慢由一个比例体现（`ratio_of`），与估算本身分开。
@@ -157,7 +223,7 @@ class TestStandardRate(unittest.TestCase):
                     "script.target_minutes": 4.0, "audio.pause_between_lines": 0.35}
 
     def test_standard_k_is_the_fallback_and_the_script_ruler(self):
-        # 一个常量两处用：估算的缺省值、校准缺样本时的兜底，同为标准语速。
+        # 一个常量两处用：估算的缺省值、校准缺样本时的兜底，同为脚本估时基准。
         self.assertEqual(D.standard_stats()["k"], D.STANDARD_K)
         self.assertEqual(D.DEFAULT_K, D.STANDARD_K)
 

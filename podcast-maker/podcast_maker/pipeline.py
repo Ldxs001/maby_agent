@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -908,14 +908,18 @@ def _run_episode(cfg, calib, material, title, episode_no="", project_dir=None,
              for i in range(min(len(script), len(durations)))
              if script[i].get("speaker") == "A"]
     if len(pairs) >= 3:
-        st = duration_model.calibrate(calib, engine, voice, speed, pairs)
-        # 顺带报一句该音色相对标准语速的比例——它是「这一期换音色后会长/短多少」
+        # 这一批真正跑在哪个设备/后端，由服务自报（合成刚结束、模型是热的）：
+        # 与标定那栏同源落进校准表 —— 「换档即失效」靠它，不靠事后猜。
+        dev, bak = tts_engine.running_device(cfg)
+        st = duration_model.calibrate(calib, engine, voice, speed, pairs,
+                                      device=dev, backend=bak)
+        # 顺带报一句该音色相对脚本估时基准的比例——它是「这一期换音色后会长/短多少」
         # 的唯一依据，配置页显示的就是这个数。
         ratio = duration_model.ratio_of(calib, engine, voice, speed)
         log("校准已更新：%s k=%.3f（%s，样本 %d）%s"
             % (voice or "-", float(st.get("k") or duration_model.STANDARD_K),
                st.get("mode"), st.get("samples", 0),
-               "，比例 %.2f（音色语速÷标准语速）" % ratio if ratio else ""))
+               "，比例 %.2f（音色语速÷脚本估时基准）" % ratio if ratio else ""))
 
     measured = sum(durations)
     result["measured_seconds"] = round(measured, 2)

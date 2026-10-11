@@ -4,7 +4,7 @@
 
 本地运行，不依赖云服务。音频默认走本地 Qwen3-TTS 服务（`tts_service/`，Apache-2.0，音色跟着项目走：每个项目自动录一段参考音频、落在项目的「音色」目录里，整期以它为音色源头；换项目互不影响，要与别的项目一致就整目录复制；合成开工前自动拉起、收工自动停掉并归还显存），也可切回 edge-tts（客户端库 LGPL-3.0，调微软 Edge 在线朗读接口）；视频画面只提供固定档位，脚本内容由 LLM 生成。
 
-作者：wUwproject · 许可：Apache-2.0
+作者：[username-redacted] · 许可：Apache-2.0
 
 ## 核心约定
 
@@ -36,14 +36,19 @@
 - [podcast_maker/duration_model.py](podcast_maker/duration_model.py)：字数 ↔ 时长换算、标准语速与音色校准
 - [podcast_maker/tts_engine.py](podcast_maker/tts_engine.py)：语音合成
 - [podcast_maker/audio_engine.py](podcast_maker/audio_engine.py)：拼接、混音、编码、参数校验
+- [podcast_maker/sfx_engine.py](podcast_maker/sfx_engine.py)：环境音（资源库读取 → LLM 逐句决策 → 合成后混入；与 BGM 链互不干涉）
 - [podcast_maker/subtitle_engine.py](podcast_maker/subtitle_engine.py)：字幕框几何（两档共用同一个矩形）、歌词档折行与换句上滚、单行滚动档的三段式横滚、字宽实渲标定、SRT/ASS/LRC、时间轴
-- [podcast_maker/assets_factory.py](podcast_maker/assets_factory.py)：排版规格与流式执行器、声波几何（wave_layout）、背景与静态层烘焙（整幅压暗 + 字幕框一次画进背景图）、封面、BGM、字形覆盖检查
+- [podcast_maker/assets_factory.py](podcast_maker/assets_factory.py)：排版规格与流式执行器、声波几何（wave_layout）、背景与静态层烘焙（整幅压暗 + 字幕框一次画进背景图）、封面、内置 BGM 档位、字形覆盖检查
 - [podcast_maker/video_engine.py](podcast_maker/video_engine.py)：动画、说话人指示、合成（含「框与第一句字幕同时出现」的双背景按帧接）、分段并行（默认关——实测净亏）
+- [podcast_maker/aigc_label.py](podcast_maker/aigc_label.py)：AIGC 合规标识（元数据隐式标识 + 产物打标的唯一入口）
+- [podcast_maker/bins.py](podcast_maker/bins.py)：ffmpeg / ffprobe 的唯一查找、探测与安装
 - [podcast_maker/project_store.py](podcast_maker/project_store.py)：项目登记表、三种规划方式（成稿规划 / 逐期即兴 / 单集）、期号记忆、期数地图与分支期号、项目设定覆盖配置
 - [podcast_maker/source_store.py](podcast_maker/source_store.py)：素材库（成稿入库落盘、章节清单、按落点取原文；结构不归它管，由 probe 给）
 - [podcast_maker/planner.py](podcast_maker/planner.py)：期数地图（排图、插入点与拆分、分支期号分配、落点核对）
 - [podcast_maker/probe.py](podcast_maker/probe.py)：结构探查（四路证据、同系列归纳、杂项识别、准入、L2 类型判定；素材入库即触发，结果冻结落盘）
 - [podcast_maker/paradigms.py](podcast_maker/paradigms.py)：素材范式数据层（切分依据/整合依据/重点判据/推进方式）
+- [podcast_maker/seg_incursion.py](podcast_maker/seg_incursion.py)：段级异常混入判据（音色体检的独立一维）
+- [podcast_maker/layout.py](podcast_maker/layout.py)：项目目录布局的唯一定义处（子目录名、各期产物路径）
 - [podcast_maker/web_ui.py](podcast_maker/web_ui.py)：界面与 HTTP 接口
 - [podcast_maker/llm_client.py](podcast_maker/llm_client.py)：LLM 客户端（流式、约束解码、静默超时与总时限分工）
 - [podcast_maker/ingest.py](podcast_maker/ingest.py)：素材导入与锚点切章
@@ -64,6 +69,36 @@
 - [tests/test_probe.py](tests/test_probe.py)：编号形态全覆盖、围栏内不算标题、同系列归纳、准入、容量确定性、L2 判定预算与降级
 - [tests/test_ingest.py](tests/test_ingest.py)：md 标题保留为锚点、上传路径锚点存活、按锚点切章
 - [tests/test_video_escape.py](tests/test_video_escape.py)：滤镜路径转义层级
+- [tests/test_llm_client.py](tests/test_llm_client.py)：后端兼容、思考段剥离与 JSON 提取、meta 是调用方判断依据
+- [tests/test_replace_and_absorb.py](tests/test_replace_and_absorb.py)：段内查重与就地替换、并句可行域
+- [tests/test_material_source.py](tests/test_material_source.py)：料源按范式分流（成稿走地图落点、逐期即兴用调用方给的）
+- [tests/test_paradigms.py](tests/test_paradigms.py)：范式卡两档提示词与上限取值
+- [tests/test_review.py](tests/test_review.py)：前期回顾三条的降级口径
+- [tests/test_sw_outline.py](tests/test_sw_outline.py)：structured-writer 规划（`.outline.json`）接入
+- [tests/test_batch.py](tests/test_batch.py)：批量串行、失败跳过、熔断与软中止、批量合成读盘上定稿那一份
+- [tests/test_project_tasks.py](tests/test_project_tasks.py)：项目页三件长活的背景化与互斥
+- [tests/test_web_api.py](tests/test_web_api.py)：Web 接口回归（产物路径表与试听入口）
+- [tests/test_cli_resume.py](tests/test_cli_resume.py)：续跑续哪一期的判定
+- [tests/test_launch_open.py](tests/test_launch_open.py)：浏览器由服务在端口绑定后打开
+- [tests/test_banner.py](tests/test_banner.py)：启动抬头只许有一份
+- [tests/test_bins.py](tests/test_bins.py)：ffmpeg / ffprobe 定位（查找顺序、界面与实跑一致、一键安装）
+- [tests/test_sources.py](tests/test_sources.py)：下载源不许几处走散
+- [tests/test_text_spacing.py](tests/test_text_spacing.py)：中英文字距规范化
+- [tests/test_preview_standard.py](tests/test_preview_standard.py)：标准标尺试听 / 标定按钮 / BGM 混合试听 / structured-writer 开关归项目
+- [tests/test_subtitle_txt.py](tests/test_subtitle_txt.py)：四份字幕同源（SRT / LRC / 整秒 TXT / 洁版 TXT）
+- [tests/test_aigc_label.py](tests/test_aigc_label.py)：AIGC 标识（元数据七要素、图片块插入、实测落盘、片头声明偏移）
+- [tests/test_sfx.py](tests/test_sfx.py)：环境音资源库完整性与决策校验、执行层时长回填
+- [tests/test_tts_engine.py](tests/test_tts_engine.py)：本地语音环境三态与两处入口一致
+- [tests/test_voice_design.py](tests/test_voice_design.py)：VoiceDesign 接入（造嗓 / 认领 / 安装链）
+- [tests/test_timbre_guard.py](tests/test_timbre_guard.py)：音色体检（四维严苛分 / 暗淡子分 / 修复循环）
+- [tests/test_music_service.py](tests/test_music_service.py)：AI 音乐服务（草稿流 CLI、常量钉、BGM 三层转译与降级、空壳下拉回退）
+- [tests/test_bgm_loudness.py](tests/test_bgm_loudness.py)：BGM 素材响度归一
+- [tests/test_video_parallel.py](tests/test_video_parallel.py)：分段并行三条硬约束
+- [tests/test_changelog_tone.py](tests/test_changelog_tone.py)：更新日志文风与版本齐步
+- [tools/sources.py](tools/sources.py)：镜像源唯一登记处
+- [tools/bgm_level.py](tools/bgm_level.py) / [tools/bgm_loudness.py](tools/bgm_loudness.py)：BGM 响度工具
+- [tools/lrc_round_seconds.py](tools/lrc_round_seconds.py)：LRC 时间戳取整
+- [tools/reglue_review.py](tools/reglue_review.py)：前期回顾重拼工具
 - [tools/ui_smoke.py](tools/ui_smoke.py)：真实浏览器界面冒烟（需服务在跑）
 - [tools/e2e_http.py](tools/e2e_http.py)：走 HTTP 的端到端验收，含成稿规划全链路与 docx 样式证据入库（需服务在跑；`--scratch` 可换产物落点）
 
@@ -75,6 +110,20 @@
 - [tts_service/make_voice.py](tts_service/make_voice.py)：角色音色档案——生成 / 继承 / 查账（跑 CustomVoice，一次性进程）
 - [tts_service/check.py](tts_service/check.py)：本机能否跑通的验收脚本（只读，不动 LM Studio）
 - [tts_service/setup.bat](tts_service/setup.bat)：建独立 venv、装 CUDA torch、下两个模型
+- [tts_service/setup_env.py](tts_service/setup_env.py)：环境搭建的唯一实现（`setup.bat` 与配置页「搭建」两个入口都只是把它跑起来）；下载源 import `tools/sources.py`
+- [tts_service/fetch_model.py](tts_service/fetch_model.py)：权重三源下载链（ModelScope → HF 镜像 → 官方 HF，断点续传）
+- [tts_service/make_base_ref.py](tts_service/make_base_ref.py)：给角色生成 `ref_base` 并用它拼 ICL 参考音频
+- [tts_service/curate_voices.py](tts_service/curate_voices.py)：人耳挑选落库（车间 `official_voices/` → 随仓声库 `podcast_maker/resources/voices/`）
+- [tts_service/record_official_presets.py](tts_service/record_official_presets.py)：官方 9 个内置音色预录（各录一次、定稿落库，附试听页）
+- [tts_service/requirements-torch.txt](tts_service/requirements-torch.txt) / [tts_service/requirements-tts.txt](tts_service/requirements-tts.txt)：依赖清单（pip 源只能写在文件里）
+
+## 音乐服务
+
+本地 AI 谱曲是独立环境（自带 ACE-Step 1.5，主程序不引入），走子进程调用解耦。
+生成的 BGM 落进**仓库根的全局音乐库** `音乐库/`（`music_gen.LIB_DIRNAME`），各项目共用同一座库。
+
+- [music_service/music_gen.py](music_service/music_gen.py)：BGM 生成与管理唯一实现（草稿流：生成固定进 `_draft.wav` → 试听 → 留用落库；重名拒绝、删除守卫、入参 fail-closed）
+- [music_service/setup_music_env.py](music_service/setup_music_env.py)：音乐环境六步搭建（配置页「搭建」按钮触发）
 
 ## 可选
 

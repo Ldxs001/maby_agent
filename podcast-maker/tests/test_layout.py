@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ LINES = {
     "tagline": "能不能让代码干代码的活",
     "title": "链与两头",
     "episode_no": "3",
-    "attribution": "wUwproject · CC BY-SA 4.0",
+    "attribution": "[username-redacted] · CC BY-SA 4.0",
 }
 
 # 背景与封面共用同一组三色（accent / light / muted）。

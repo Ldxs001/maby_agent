@@ -695,6 +695,127 @@ class TestRawVoicePreview(unittest.TestCase):
         self.assertIn("▶ 原声", page)
         self.assertIn("⏹ 停止", page)
 
+    def _raw_block(self):
+        """原声播放器那一整段：从状态声明到下一个功能块之前。"""
+        page = getattr(web_ui, "PAGE", "") or ""
+        i = page.index("let RAW_AU=null")
+        j = page.index("function voiceDesignCfgHtml(")
+        return page[i:j]
+
+    def test_reuses_single_player_instead_of_new_audio_per_click(self):
+        """播放器全页只造一个、反复用。
+
+        每点一次 new Audio 的写法里，旧对象丢引用**不等于停播**：真机实测连点
+        12 下就有 6 份同一段音频错位叠着响（听感正是「第一个音节没了」），再点
+        几下音频输出被占满，就彻底「放不出来」，关掉页面才恢复。
+        """
+        body = self._raw_block()
+        self.assertEqual(body.count("new Audio("), 1)
+        self.assertIn("if(!RAW_AU) RAW_AU=new Audio()", body)
+
+    def test_stop_releases_source(self):
+        """停 = pause + 摘 src + load()，当场把解码器与音频输出还给系统。"""
+        body = self._raw_block()
+        self.assertIn("RAW_AU.removeAttribute('src')", body)
+        self.assertIn("RAW_AU.load()", body)
+
+    def test_aborted_play_is_not_a_failure(self):
+        """换曲时那个主动 pause() 会让上一轮 pending 的 play() 以 AbortError
+        收场 —— 那是换曲的常态。把它当故障报错、并顺手把共享状态一并清掉，
+        正是「越点越乱」的成因：新一轮的播放器引用会被抹掉，从此失联。
+        """
+        body = self._raw_block()
+        self.assertIn("AbortError", body)
+        self.assertIn("RAW_SEQ", body)
+
+    def test_failure_reported_once_per_round(self):
+        """一次故障两条路都会到（元素的 error 事件 + play() 的拒绝），只报一条。"""
+        body = self._raw_block()
+        self.assertIn("let told=false", body)
+
+    def test_icon_link_suppresses_favicon_404(self):
+        """空 data URI 图标：省掉浏览器每开一页就发的一条 /favicon.ico 404。"""
+        page = getattr(web_ui, "PAGE", "") or ""
+        self.assertIn('<link rel="icon" href="data:,">', page)
+
+
+class TestPreviewMutex(unittest.TestCase):
+    """试听类播放器「同一时刻只响一路」。
+
+    页面上会同台发声的试听有六处（标准试听 / 混合试听 / 档位试听 / 原声 /
+    造嗓草稿 / 音乐草稿），各有一套播放器。谁也不知道别人在响，两路叠着播，
+    听感就是两个人在同时说话。每路把自己的「停」函数登进仲裁，任一路开始播放
+    前先让当前占用者停下 —— 这条链断了，叠响就会回来。
+    """
+
+    def _page(self):
+        return getattr(web_ui, "PAGE", "") or ""
+
+    def _block(self, start, end):
+        page = self._page()
+        i = page.index(start)
+        return page[i:page.index(end, i)]
+
+    def test_single_arbiter(self):
+        """仲裁只有一个：一个占用者变量、一取一还两个函数。"""
+        page = self._page()
+        self.assertEqual(page.count("function claimAudio("), 1)
+        self.assertEqual(page.count("function releaseAudio("), 1)
+        self.assertEqual(page.count("let AUDIO_OWNER=null"), 1)
+        # 抢之前先停别人，否则「互斥」只是个名字
+        self.assertIn("if(AUDIO_OWNER&&AUDIO_OWNER!==stop)AUDIO_OWNER();", page)
+
+    def test_every_voice_claims_and_releases(self):
+        """六路发声者都要抢喇叭（claim）、五路「停」都要交还（release）。
+
+        档位试听是原生 <audio>，它的停函数是逐行现建的闭包 claimAudio(stop)，
+        没有具名 stop 函数。
+        """
+        page = self._page()
+        for fn in ("stdStopVoice", "mixStopVoice", "rawStopVoice",
+                   "vdStopPreview", "muStopPreview"):
+            self.assertIn("claimAudio(%s)" % fn, page)
+            self.assertIn("releaseAudio(%s)" % fn, page)
+        self.assertIn("claimAudio(stop)", page)
+
+    def test_stop_functions_release_the_source(self):
+        """五路「停」一律 pause + 摘 src + load()：当场把解码器与音频输出还给系统。"""
+        for fn, nxt in (("stdStopVoice", "async function stdPreview("),
+                        ("mixStopVoice", "async function bgmMixPreview("),
+                        ("rawStopVoice", "function rawPreview("),
+                        ("vdStopPreview", "function vdDraftPreview("),
+                        ("muStopPreview", "function musicDraftPreview(")):
+            body = self._block("function %s(){" % fn, nxt)
+            self.assertIn(".pause()", body, fn)
+            self.assertIn("removeAttribute('src')", body, fn)
+            self.assertIn(".load()", body, fn)
+            self.assertIn("releaseAudio(%s)" % fn, body, fn)
+
+    def test_standard_preview_can_be_stopped(self):
+        """标准试听原先只能播不能停：补停止函数、按钮改「⏹ 停止」、再点 = 停。"""
+        page = self._page()
+        self.assertIn(
+            "if(stdBtn===btn&&btn.dataset.playing==='1'){stdStopVoice();return}", page)
+        body = self._block("async function stdPreview(", "async function calibVoice(")
+        self.assertIn("claimAudio(stdStopVoice)", body)
+        self.assertIn("⏹ 停止", body)
+        # 播放中不能被 finally 复位成「▶ 试听」，否则按钮写着能停其实停不了
+        self.assertIn("else if(!started) btn.textContent=old;", body)
+
+    def test_mixed_preview_can_be_stopped(self):
+        """混合试听同病同治：能停、能抢喇叭。"""
+        body = self._block("async function bgmMixPreview(", "/* ---- 控件登记")
+        self.assertIn(
+            "if(mixBtn===btn&&btn.dataset.playing==='1'){mixStopVoice();return}", body)
+        self.assertIn("claimAudio(mixStopVoice)", body)
+        self.assertIn("⏹ 停止", body)
+
+    def test_base_preview_joins_the_arbiter(self):
+        """档位试听（原生 <audio>）原先自顾自播，也纳入仲裁。"""
+        body = self._block("if(spec.preview_base&&node){", "if(spec.type==='path'&&node){")
+        self.assertIn("claimAudio(stop)", body)
+        self.assertIn("releaseAudio(stop)", body)
+
 
 class TestDraftFlow(unittest.TestCase):
     """造嗓草稿流：生成进 _draft、试听后保存/丢弃；管理删除带引用守卫。

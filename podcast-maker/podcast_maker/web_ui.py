@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@ LOCK = threading.Lock()
 
 # ------------------------------------------------------------------ 工具
 def voice_ratios():
-    """每个已实测音色的「音色语速 ÷ 标准语速」，供配置页挂在音色旁边。
+    """每个已实测音色的「音色语速 ÷ 脚本估时基准」，供配置页挂在音色旁边。
 
     比例由实测算出，不做人工录入：音色语速是量出来的，不是填出来的——
     能填的那个数一旦和实测对不上，页面上就有两个语速，又回到两把尺子。
@@ -68,6 +68,35 @@ def voice_ratios():
             continue
         out.append(dict(row, ratio=ratio, standard_k=duration_model.STANDARD_K))
     return out
+
+
+def standard_payload():
+    """配置载荷里的「脚本估时基准」块：脚本尺子 k ＋ 各角色试听的分母。
+
+    两组数管的阶段不同，而界面上「配置 → 声音」那一行会同时提到它们，所以一并
+    由后端算好下发（界面不写死，尺子重建后跟着变）：
+
+    - `k`（`STANDARD_K` = 4.39）：脚本估时唯一的那把尺子，常数、与音色无关。
+      它旁边就挂着「▶ 试听」，容易被当成试听的分母——所以再给一份 `k_sentence`。
+    - `k_sentence`：`{"A": …, "B": …}`，**各自角色试听换算的分母** = 该角色标尺
+      那段音频脱去句间气口后的语速，口径与标定的逐句量对齐（分子 `k_role` 也是
+      逐句量的）。A / B 各一条尺子、各自念自己的 ref.txt，分母天然不同，不能共用。
+
+    只读尺子盘档，**不在页面加载路径上合成**；某角色尺子不在场（还没建）就不出
+    那一项，界面照实不报这个数，不拿整段口径冒充。
+    """
+    std = duration_model.standard_rate()
+    ks = {}
+    for role in ("A", "B"):
+        try:
+            ruler = tts_engine.read_ruler(_previews_dir(), role)
+        except Exception:
+            ruler = None
+        if ruler:
+            ks[role] = round(float(ruler.get("k_sentence") or ruler["k"]), 2)
+    if ks:
+        std["k_sentence"] = ks
+    return std
 
 
 def make_llm(cfg):
@@ -365,9 +394,9 @@ def api_config_get():
         "style_dims": STYLE_DIMS, "preset_spec": PRESET_SPEC,
         "warnings": warns + warns2, "errors": errs + errs2,
         "calibration": CALIB.summary(),
-        # 脚本侧唯一的那把尺子，以及各音色相对它的比例。两样都由后端算好下发：
-        # 界面不做换算，改了标准语速只改一处，页面上不会出现第二个数。
-        "standard": duration_model.standard_rate(),
+        # 脚本侧唯一的那把尺子（＋试听的分母），以及各音色相对它的比例。都由
+        # 后端算好下发：界面不做换算，改一处页面上不会出现第二个数。
+        "standard": standard_payload(),
         "ratios": voice_ratios(),
     }
 
@@ -431,7 +460,7 @@ def api_estimate(body):
         est = duration_model.explain(script, cfg)
     else:
         est = None
-    # 脚本侧的尺子是标准语速，与音色无关：这里不传 CALIB，估时不受本期音色影响。
+    # 脚本侧的尺子是脚本估时基准，与音色无关：这里不传 CALIB，估时不受本期音色影响。
     hint = duration_model.target_hint(
         cfg, speeds=[round(x * 0.05, 2) for x in range(10, 41, 5)])
     return {"ok": True, "estimate": est, "hint": hint}
@@ -960,31 +989,33 @@ def _previews_dir():
     return os.path.join(ROOT, "previews")
 
 
-def _std_ruler_synth(cfg, pid):
-    """标准标尺的合成闭包：钉死 Qwen3-TTS 的 A 角本色与 1.0 原速。
+def _std_ruler_synth(cfg, pid, role="A"):
+    """某角色标准标尺的合成闭包：钉死 Qwen3-TTS 该角色本色与 1.0 原速。
 
-    尺子只有一条，载体必须与「当前选了什么引擎」彻底解耦——否则首次生成
+    尺子 A / B 各一条，载体必须与「当前选了什么引擎」彻底解耦——否则首次生成
     那一刻停在哪个引擎，尺子就成了谁的嗓子。永远由本地 Qwen3-TTS 合成
     （离线、可复现）；Edge 引擎下标尺缺失就照实报错，不静默外采在线引擎。
     所有检查（音色已选、参考音频在场、服务起停）都在闭包内：标尺缓存命中
     时这个闭包根本不会被调，也就不该因为没项目、没档案而报错。
-    本地合成走音色克隆必须给参考音频——用当前项目 A 角的音色档案。
+    本地合成走音色克隆必须给参考音频——用当前项目该角色的音色档案。
     """
+    role = "B" if str(role or "A").strip().upper() == "B" else "A"
+
     def _one(text):
-        voice = cfg.get("tts.qwen3tts_voice_a", "")
+        voice = cfg.get("tts.qwen3tts_voice_%s" % role.lower(), "")
         if not voice:
             raise tts_engine.TTSError(
-                "标准标尺钉死由 Qwen3-TTS 的 A 角音色合成——请先在 Qwen3-TTS "
-                "音色里选好 A 角（当前引擎是什么不影响这条规则）。")
+                "标准标尺钉死由 Qwen3-TTS 的 %s 角音色合成——请先在 Qwen3-TTS "
+                "音色里选好 %s 角（当前引擎是什么不影响这条规则）。" % (role, role))
         if not pid:
             raise tts_engine.TTSError(
-                "标尺要 A 角音色档案做参考音频——先把页面归属切到某个项目。")
+                "标尺要 %s 角音色档案做参考音频——先把页面归属切到某个项目。" % role)
         root = layout.project_dir(_projects_base(), pid)
-        ref = tts_engine.voice_profiles(root).get("A")
+        ref = tts_engine.voice_profiles(root).get(role)
         if ref is None:
             raise tts_engine.TTSError(
-                "本项目还没有 A 角的音色档案——首次成片合成会自动录一份，"
-                "之后才能生成标准标尺。")
+                "本项目还没有 %s 角的音色档案——首次成片合成会自动录一份，"
+                "之后才能生成标准标尺。" % role)
         tts_engine.acquire_service(cfg)
         try:
             return tts_engine.synth_line(text, voice, 1.0, cfg, ref=ref)
@@ -994,22 +1025,62 @@ def _std_ruler_synth(cfg, pid):
     return _one
 
 
-def _get_std_ruler(cfg, pid):
-    """取（必要时生成）标准标尺，返回 {"path","k"}。载体身份随 json 落盘。"""
+def _std_ruler_text(pid, role):
+    """该角色尺子该念的文本 = 项目里那个角色的 ref.txt（转录）。
+
+    试听播的就是「本人按本色语速念这段参考」，所以文本必须是本人的 ref.txt。
+    读不到（没项目 / 没档案 / 空文件）就退回标定文本兜底——尺子照建，换算仍
+    同口径可用（分子、分母都是逐句／句口径），只是那段样音不是本人参考而已。
+    """
+    role = "B" if str(role or "A").strip().upper() == "B" else "A"
+    try:
+        if pid:
+            root = layout.project_dir(_projects_base(), pid)
+            p = layout.voice_text_file(root, role)
+            if os.path.isfile(p):
+                with open(p, encoding="utf-8") as f:
+                    t = f.read().strip()
+                if t:
+                    return t
+    except Exception:
+        pass
+    return tts_engine.STANDARD_RULER_TEXT
+
+
+def _get_std_ruler(cfg, pid, allow_build=True, role="A"):
+    """取（必要时生成）**某角色**的标准标尺，返回 {"path","k","k_sentence"}。
+
+    载体身份随 json 落盘。`allow_build=False` 时**只读**：标尺不在就抛 TTSError，
+    绝不在请求里现合成——生成要起本地服务 + 加载模型，那是合成量级，不该由一次
+    试听点击承担。
+    """
+    role = "B" if str(role or "A").strip().upper() == "B" else "A"
+    carrier = {"engine": "qwen3tts",
+               "voice": cfg.get("tts.qwen3tts_voice_%s" % role.lower(), "")}
+    # 尺子是在哪个设备/后端上生的，一并落盘可查（只在真要生成时问一次服务；
+    # 缓存命中的只读路径不问，不给试听白添一次探测）。
+    if allow_build:
+        _dev, _bak = tts_engine.running_device(cfg)
+        if _dev:
+            carrier["device"] = _dev
+        if _bak:
+            carrier["backend"] = _bak
     return tts_engine.standard_ruler(
-        _previews_dir(), _std_ruler_synth(cfg, pid),
-        carrier={"engine": "qwen3tts",
-                 "voice": cfg.get("tts.qwen3tts_voice_a", "")})
+        _previews_dir(), _std_ruler_synth(cfg, pid, role),
+        text=_std_ruler_text(pid, role),
+        carrier=carrier, allow_build=allow_build, role=role)
 
 
 def api_preview_standard(body):
     """A/B 角色标准试听：同一份标准标尺音频，按角色换算播放速度。
 
-    换算 = 滑杆倍率 × 标尺实测语速 ÷ 该音色实测语速。标尺自己多快都无关
-    紧要——它在分子分母之间被精确消去，听到的是「该角色以当前滑杆念稿」
-    的真实语速；载体固定 A 角本色，A 试听于是恒等于原速。该音色没有实测
-    就停下（去点它旁边的「标定」）——拿默认值顶替等于把「量过的」伪装成
-    「没量过的」，试听会撒谎。
+    换算 = 滑杆倍率 × 该音色实测语速 ÷ **标尺的句子口径语速**。两个 k 必须
+    同口径：`k_role` 是逐句量出来的（分母 = 各句时长之和，不含句间停顿），
+    所以分母也得用尺子的**句子口径**（整段扣掉模型自发的句间停顿）——拿整段
+    口径当分母，试听会系统性偏快（本机实测 7.87%）。方向判据把符号钉死：
+    **音色越快，算出的倍率越大**（播得越快）；写成「标尺 ÷ 音色」方向就反
+    了，越快的音色反而播得越慢。该音色没有实测就停下（去点它旁边的「标定」）
+    ——拿默认值顶替等于把「量过的」伪装成「没量过的」，试听会撒谎。
     """
     cfg = CFG.data()
     role = str(body.get("role") or "A").upper()
@@ -1019,14 +1090,26 @@ def api_preview_standard(body):
     g = CALIB.get(engine, voice, 1.0)
     k_role = float(g.get("k") or 0) if g else 0.0
     if k_role <= 0:
-        return {"ok": False, "error":
+        return {"ok": False, "need_calib": role, "error":
                 "%s 角音色（%s）还没有语速实测——点音色旁的「标定」现测一次，"
                 "标定后试听才是它的真实快慢。" % (role, voice or "-")}
     pd = _previews_dir()
     try:
-        ruler = _get_std_ruler(cfg, str(body.get("project") or "").strip())
-        rate = float(speed) * ruler["k"] / k_role
-        out = os.path.join(pd, "std_%s_%s.wav" % (role, ("%.3f" % rate)))
+        # 只读标尺：试听不许现合成（生成要起服务 + 加载模型，见 _get_std_ruler）。
+        # 分母要用**该角色自己那条**尺子：A/B 文本不同、句间停顿不同，换算才对齐。
+        ruler = _get_std_ruler(cfg, str(body.get("project") or "").strip(),
+                               allow_build=False, role=role)
+    except tts_engine.TTSError as e:
+        return {"ok": False, "need_ruler": True, "error": str(e)}
+    # 分母取句子口径；旧尺子没这一列时 read_ruler 已退回整段口径，这里只兜底。
+    k_ruler = float(ruler.get("k_sentence") or ruler["k"])
+    try:
+        rate = float(speed) * k_role / k_ruler
+        # 缓存键必须带上「尺子 + 音色实测」两个身份：只按 rate 命名时，换了尺子
+        # 或换了音色后即使 rate 数值撞上同一格（三位小数），也会拿旧音频冒充新
+        # 口径——听感对不上，且查不出为什么。
+        out = os.path.join(pd, "std_%s_%.3f_k%.3f_r%.3f.wav" % (
+            role, rate, k_role, k_ruler))
         if not os.path.exists(out):
             audio_engine.speed_shift(ruler["path"], out, rate)
         with open(out, "rb") as f:
@@ -1034,7 +1117,7 @@ def api_preview_standard(body):
     except (tts_engine.TTSError, audio_engine.AudioError) as e:
         return {"ok": False, "error": str(e)}
     return {"ok": True, "role": role, "rate": round(rate, 3),
-            "k_role": round(k_role, 2), "k_std": round(ruler["k"], 2),
+            "k_role": round(k_role, 2), "k_sentence": round(k_ruler, 2),
             "audio_base64": base64.b64encode(data).decode("ascii")}
 
 
@@ -1067,7 +1150,13 @@ def api_bgm_mix_preview(body):
             return {"ok": False, "error": str(e)}
     pd = _previews_dir()
     try:
-        std = _get_std_ruler(cfg, str(body.get("project") or "").strip())["path"]
+        # 与试听同一口径：只读标尺，绝不现合成。混合试听只关心响度关系，
+        # 前景固定取 A 角尺子即可（这里听的不是语速）。
+        std = _get_std_ruler(cfg, str(body.get("project") or "").strip(),
+                             allow_build=False, role="A")["path"]
+    except tts_engine.TTSError as e:
+        return {"ok": False, "need_ruler": True, "error": str(e)}
+    try:
         out = os.path.join(pd, "bgm_mix.wav")
         audio_engine.mix_bgm(std, out, bgm, cfg)
         with open(out, "rb") as f:
@@ -1080,10 +1169,15 @@ def api_bgm_mix_preview(body):
 def api_voice_calibrate(body):
     """标定按钮：给还没有实测的音色现量一次语速，结果进校准表复用。
 
-    固定三句标定文本逐句合成、逐句实测时长，走与成片校准同一个
-    duration_model.calibrate——EMA 平滑、落盘、汇总展示全是现成机制，
-    这里只负责「量」，不另立存储。标定固定按 1.0 本色语速量：滑杆倍率
-    在试听换算里显式处理，校准表里只该有本色值。
+    **参考音频取自「音色本体」自生成的 ref_base、文本取本体自己的转录**：标定
+    从此不再问项目要档案——本体（library: → resources/voices/<名>/）自己带一套
+    ref_base。成片用的也是这份 ref_base 拼出的 icl，两条链同源，量到的 k 与成片
+    才是同一条嗓子；拿别的音频量出来的 k 白标。ref_base 缓存命中即用，缺则现场
+    生成一次（tts_engine.ensure_calib_ref，走项目 ref_base 的唯一实现）。
+
+    逐句合成、逐句实测时长，走与成片校准同一个 duration_model.calibrate——EMA
+    平滑、落盘、汇总展示全是现成机制，这里只负责「量」，不另立存储。标定固定按
+    1.0 本色语速量：滑杆倍率在试听换算里显式处理，校准表里只该有本色值。
 
     Edge 与本地引擎同样对待：Edge 的在线接口只吐音频流、不报语速，
     「能不能直接取语速值」的答案是取不到——两种引擎的语速都得靠量。
@@ -1097,23 +1191,41 @@ def api_voice_calibrate(body):
         return {"ok": False, "error": "%s 角音色还没选，没有可标定的对象。" % role}
     local = engine in tts_engine.LOCAL_ENGINES
     ref = None
+    ref_text = ""
+    pid = str(body.get("project") or "").strip()
     if local:
-        pid = str(body.get("project") or "").strip()
-        if not pid:
+        # 本体解析按「当前选中音色」自己走，不要求归属已在某个项目：library: /
+        # official: 音色的本体随仓 / 在车间，任何项目、甚至没切项目都解析得出；
+        # 只有 named:（项目具名档案）才需要 project_root。
+        proot = layout.project_dir(_projects_base(), pid) if pid else None
+        entity = tts_engine.voice_entity_ref(voice, project_root=proot)
+        if entity is None:
             return {"ok": False, "error":
-                    "本地引擎走音色克隆，标定需要参考音频——先把归属切到项目。"}
-        root = layout.project_dir(_projects_base(), pid)
-        ref = tts_engine.voice_profiles(root).get(role)
-        if ref is None:
-            return {"ok": False, "error":
-                    "本项目还没有 %s 角的音色档案——首次成片合成会自动录一份，"
-                    "之后才能标定。" % role}
+                    "音色「%s」解析不出本体（参考音频或转录缺），无法标定。"
+                    "library: 音色请确认声库条目完整；named: 音色需先把归属切到"
+                    "它所在的项目。" % voice}
+        ref_text = entity.get("text") or ""
+        try:
+            base = tts_engine.ensure_calib_ref(entity, role, cfg)
+        except tts_engine.TTSError as e:
+            return {"ok": False, "error": str(e)}
+        ref = {"wav": base, "text": ref_text}
+    # 标定文本：本体转录逐句量；切不出 ≥3 句（calibrate 的下限）就退回标定文本
+    # 兜底——宁可量一段通用话，也不让「句数不足」把标定直接卡死。
+    texts = [p.strip() for p in re.split(r"(?<=[。！？!?；;])", ref_text)
+             if p.strip()]
+    if len(texts) < 3:
+        texts = list(tts_engine.CALIBRATION_LINES)
     lines = []
     tmpdir = tempfile.mkdtemp(prefix="calib_")
+    dev = bak = ""
     try:
         if local:
+            # 与合成同款：标定也要加载本地模型，先腾显存。否则这次量到的 k 可能
+            # 是 CPU 上的波形，而成片必腾显存、必 CUDA —— 两条不是同一条，白标。
+            tts_engine.unload_llm_models()
             tts_engine.acquire_service(cfg)
-        for text in tts_engine.CALIBRATION_LINES:
+        for text in texts:
             data = tts_engine.synth_line(text, voice, 1.0, cfg, ref=ref)
             p = os.path.join(tmpdir, "line.wav")
             with open(p, "wb") as f:
@@ -1122,6 +1234,18 @@ def api_voice_calibrate(body):
             if sec <= 0:
                 return {"ok": False, "error": "标定句合成后读不出时长，本次没有计。"}
             lines.append({"text": text, "seconds": sec})
+        # 逐句合成完、模型已加载：此刻问一次服务，把它真正跑的设备/后端记下来，
+        # 随系数落盘 —— 「换档即失效」就靠这一栏。
+        if local:
+            dev, bak = tts_engine.running_device(cfg)
+        # 标定刚把服务拉起、模型也热了：该角色标尺若是缺的，趁热补上等于零增量
+        # 成本（只多一次整段合成），省得试听时为它单独起一次服务。补建失败不牵连
+        # 标定（标定结果照落表）——这一步是顺手的，不是标定成功的条件。
+        if local:
+            try:
+                _get_std_ruler(cfg, pid, allow_build=True, role=role)
+            except Exception:  # noqa: BLE001
+                pass
     except tts_engine.TTSError as e:
         return {"ok": False, "error": str(e)}
     finally:
@@ -1131,9 +1255,10 @@ def api_voice_calibrate(body):
     if len(lines) < 3:
         return {"ok": False, "error":
                 "有效标定句不足 3 句（只量到 %d 句），没有落表。" % len(lines)}
-    stats = duration_model.calibrate(CALIB, engine, voice, 1.0, lines)
+    stats = duration_model.calibrate(CALIB, engine, voice, 1.0, lines,
+                                     device=dev, backend=bak)
     return {"ok": True, "k": stats.get("k"), "samples": stats.get("samples"),
-            "mode": stats.get("mode"),
+            "mode": stats.get("mode"), "device": stats.get("device", ""),
             "ratio": duration_model.ratio_of(CALIB, engine, voice, 1.0)}
 
 
@@ -1390,6 +1515,23 @@ def _voice_tool(py, root, *extra):
             "--project-dir", root, "--voice-dir", layout.DIR_VOICE, *extra]
 
 
+def _prep_voice_tool(cmd, log=None):
+    """跑音色工具（认领 / 录制 / 补 ref_base / 造嗓）前：先腾显存，再明确要 GPU。
+
+    这几条链与成片合成一样是本地 Base 模型的重活，但设备判定发生在**子进程**
+    里（`pick_device` 读整卡空闲），不像 `synthesize()` 自带腾显存 —— 不先清掉
+    LM Studio / Ollama 的驻留模型，子进程就会静默退 CPU，产出的 ref_base 与
+    成片不在同一条波形上（实测同一输入 CPU 与 CUDA 的 md5 不同）。所以这里与
+    `synthesize()` 同款：先腾显存；再把 `--device cuda` 钉进命令行，让「要 GPU」
+    这件事是**明说**的 —— 真不够时 `pick_device` 仍会退 CPU，并把原因如实写进
+    记录的 `device` / `device_note`，查得到，不静默。
+    """
+    tts_engine.unload_llm_models(log)
+    if "--device" not in cmd:
+        cmd = list(cmd) + ["--device", "cuda"]
+    return cmd
+
+
 def _sub_env():
     """子进程统一环境：强 PIPE 里也走 UTF-8。
 
@@ -1518,6 +1660,7 @@ def api_voice_build(body):
         if force:
             cmd.append("--force")
 
+        cmd = _prep_voice_tool(cmd, lambda m: pipeline.job_log(job, m))
         proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "tts_service"),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace",
@@ -1640,6 +1783,7 @@ def api_voice_official_adopt(body):
     if bool(body.get("force")):
         cmd.append("--force")
 
+    cmd = _prep_voice_tool(cmd)
     proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "tts_service"),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace",
@@ -1706,6 +1850,7 @@ def api_voice_design(body):
                           "--design-seed-offset", str(seed_offset), "--force")
         if text:
             cmd += ["--design-text", text]
+        cmd = _prep_voice_tool(cmd, lambda m: pipeline.job_log(job, m))
         proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "tts_service"),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace",
@@ -2160,6 +2305,7 @@ def api_voice_adopt(body):
     if bool(body.get("force")):
         cmd.append("--force")
 
+    cmd = _prep_voice_tool(cmd)
     proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "tts_service"),
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace",
@@ -3157,6 +3303,8 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 空 data URI 图标：浏览器据此不再去要 /favicon.ico，省掉每条页面一条 404。 -->
+<link rel="icon" href="data:,">
 <title>播客制作智能体</title>
 <style>
 :root{
@@ -3589,7 +3737,7 @@ setTimeout(hideBootSplash,8000);
     </div>
     <div class="col-r">
       <div class="card">
-        <h2>字与时间 <span class="tag">口径＝标准语速</span></h2>
+        <h2>字与时间 <span class="tag">口径＝脚本估时基准</span></h2>
         <div class="gauge" id="gauge"></div>
         <div id="hint" style="margin-top:12px"></div>
         <div id="standard-box" style="margin-top:14px"></div>
@@ -3766,21 +3914,60 @@ async function api(path,body){
 }
 function toggleSw(node){node.classList.toggle('on')}
 
-/* 标准试听：一份全局固定的标准标尺音频（A 角本色 · 原生 1.0，合成一次落盘
-   不再动），A/B 各按「滑杆倍率 × 标尺实测语速 ÷ 自己音色的实测语速」换算
-   播放速度——标尺自己多快都被公式消去，听到的就是该角色成片的真实快慢。
-   混合试听同用这一份做前景。按钮跟在各自角色的音色行上，不聚在页尾。 */
-let stdAu=null,mixAu=null;
+/* 标准试听：A / B **各有一条**自己的标准标尺音频（本人本色 · 原生 1.0，合成
+   一次落盘不再动；文本就是该角色的 ref.txt），各按「滑杆倍率 × 自己音色的实测
+   语速 ÷ 自己尺子的句子口径语速」换算播放速度。两个 k 口径必须对齐：分子逐句
+   （不含句间停顿），分母也得用尺子的句子口径（整段扣掉它自己那几段句间停顿）
+   ——否则听到的词速会系统性偏快。混合试听取 A 角那条做前景。按钮跟在各自角色
+   的音色行上，不聚在页尾。 */
+/* 会同台发声的试听不止一处（标准试听 / 混合试听 / 档位试听 / 原声 / 造嗓草稿 /
+   音乐草稿），各有一套播放器。以前谁也不知道别人在响，两路叠着播 —— 听感就是两个
+   人在同时说话。每路把自己的「停」函数登进仲裁：任一路开始播放前先让当前占用者
+   停下，再把自己设成占用者；自己停时交还。比较的是同一个函数引用，所以停函数按行
+   各建一份也不妨事。 */
+let AUDIO_OWNER=null;
+function claimAudio(stop){
+  if(AUDIO_OWNER&&AUDIO_OWNER!==stop)AUDIO_OWNER();
+  AUDIO_OWNER=stop;
+}
+function releaseAudio(stop){if(AUDIO_OWNER===stop)AUDIO_OWNER=null}
+
+let stdAu=null,stdBtn=null,mixAu=null,mixBtn=null;
+function stdStopVoice(){
+  if(stdAu){stdAu.onended=null;stdAu.onerror=null;
+            stdAu.pause();stdAu.removeAttribute('src');stdAu.load()}
+  if(stdBtn){stdBtn.textContent='▶ 试听';stdBtn.dataset.playing=''}
+  stdBtn=null;releaseAudio(stdStopVoice);
+}
 async function stdPreview(role,btn){
+  if(stdBtn===btn&&btn.dataset.playing==='1'){stdStopVoice();return}   // 再点一次 = 停
+  stdStopVoice();
   btn.disabled=true;const old=btn.textContent;btn.textContent='…准备中';
+  let hint=false,started=false;
   try{
     const r=await api('/api/preview/standard',{role:role,project:ACTIVE_PROJ});
-    if(!r.ok){toast(r.error,'err');return}
+    if(!r.ok){
+      toast(r.error,'err');
+      // 缺实测 / 缺标尺不是「坏了」，是「还差一步」——把那一步直接写在按钮上，
+      // 人就近看得见该点哪（两秒多后复位回「▶ 试听」）。别的错照旧只弹提示。
+      hint=!!(r.need_calib||r.need_ruler);
+      return;
+    }
     if(!stdAu)stdAu=new Audio();
+    stdAu.onended=()=>stdStopVoice();
+    stdAu.onerror=()=>{if(stdBtn===btn)stdStopVoice()};
     stdAu.src='data:audio/wav;base64,'+r.audio_base64;
-    stdAu.play();
-    toast(role+' 角播放速度 ×'+r.rate+'（音色实测 '+r.k_role+' · 标尺 '+r.k_std+' 有效字/秒）','ok');
-  }finally{btn.disabled=false;btn.textContent=old;}
+    claimAudio(stdStopVoice);                       // 抢扬声器：原声/混合先停
+    stdBtn=btn;btn.dataset.playing='1';btn.textContent='⏹ 停止';started=true;
+    stdAu.play().catch(()=>{if(stdBtn===btn)stdStopVoice();
+                            toast('试听音频放不出来','err')});
+    toast(role+' 角播放速度 ×'+r.rate+'（音色实测 '+r.k_role+' · '+role+
+          ' 角标尺 '+r.k_sentence+' 有效字/秒）','ok');
+  }finally{
+    btn.disabled=false;
+    if(hint){btn.textContent='先点旁边的「标定」';setTimeout(()=>{btn.textContent=old},2600)}
+    else if(!started) btn.textContent=old;          // 播放中按钮停在「⏹ 停止」
+  }
 }
 async function calibVoice(role,btn){
   btn.disabled=true;const old=btn.textContent;btn.textContent='…标定中';
@@ -3805,15 +3992,29 @@ function refreshRatioNotes(){
     });
   }
 }
+function mixStopVoice(){
+  if(mixAu){mixAu.onended=null;mixAu.onerror=null;
+            mixAu.pause();mixAu.removeAttribute('src');mixAu.load()}
+  if(mixBtn){mixBtn.textContent='▶ 混合';mixBtn.dataset.playing=''}
+  mixBtn=null;releaseAudio(mixStopVoice);
+}
 async function bgmMixPreview(btn){
+  if(mixBtn===btn&&btn.dataset.playing==='1'){mixStopVoice();return}   // 再点一次 = 停
+  mixStopVoice();
   btn.disabled=true;const old=btn.textContent;btn.textContent='…混合中';
+  let started=false;
   try{
     const r=await api('/api/bgm/mix_preview',{project:ACTIVE_PROJ});
     if(!r.ok){toast(r.error,'err');return}
     if(!mixAu)mixAu=new Audio();
+    mixAu.onended=()=>mixStopVoice();
+    mixAu.onerror=()=>{if(mixBtn===btn)mixStopVoice()};
     mixAu.src='data:audio/wav;base64,'+r.audio_base64;
-    mixAu.play();
-  }finally{btn.disabled=false;btn.textContent=old;}
+    claimAudio(mixStopVoice);                      // 抢扬声器
+    mixBtn=btn;btn.dataset.playing='1';btn.textContent='⏹ 停止';started=true;
+    mixAu.play().catch(()=>{if(mixBtn===btn)mixStopVoice();
+                            toast('混合试听放不出来','err')});
+  }finally{btn.disabled=false;if(!started)btn.textContent=old;}
 }
 
 /* ---- 控件登记：同一个点位可能在多处出现，值必须同步 ---- */
@@ -4059,7 +4260,11 @@ function control(stage,key,spec){
             vm[1].toUpperCase()+'\',this)">标定</button>':'')+
         '</div>';
     }
-    // 音色这一行多带一句它相对标准语速的比例：换音色会改成品快慢，
+    // 角色（A/B）从点位 key 推：试听换算的分母与「比例」说明都要按角色取，而
+    // A、B 各有一条自己的尺子。挂在 spec 上，refreshRatioNotes 才查得到同一份。
+    const _vm=String(key).match(/voice_([ab])$/);
+    if(_vm) spec.role=_vm[1].toUpperCase();
+    // 音色这一行多带一句它相对脚本估时基准的比例：换音色会改成品快慢，
     // 而这个数就是那件事的全部依据。跟着下拉的当前值走，换一个音色重算一次。
     // 不占 id：它是一句说明不是控件，界面上「带 id 的即控件」这条口径不能破
     // （冒烟按 id 数控件、核登记，给它一个 f_ 开头的 id 就多出一个查无登记的幽灵）。
@@ -4137,11 +4342,11 @@ function control(stage,key,spec){
     const pv=wrap.querySelector('[data-pv="'+id+'"]');
     const au=wrap.querySelector('[data-pvau="'+id+'"]');
     if(pv&&au){
-      const stop=()=>{au.pause();au.removeAttribute('src');au.style.display='none';
-        pv.textContent='▶ 试听';};
+      const stop=()=>{au.pause();au.removeAttribute('src');au.load();
+        au.style.display='none';pv.textContent='▶ 试听';releaseAudio(stop);};
       pv.onclick=()=>{
         if(au.paused){au.src=spec.preview_base+encodeURIComponent(node.value);
-          au.style.display='';au.play();pv.textContent='⏹ 停止';}
+          au.style.display='';claimAudio(stop);au.play();pv.textContent='⏹ 停止';}
         else stop();
       };
       au.onended=stop;
@@ -4456,14 +4661,14 @@ function renderQuick(){
                        'animation.mode','audio.bitrate_kbps']);
 }
 /* 脚本页只讲口径，不列音色。
-   估时用的是一把与音色无关的尺子（标准语速），把音色名与实测系数搬到这里，
+   估时用的是一把与音色无关的尺子（脚本估时基准），把音色名与实测系数搬到这里，
    等于让人以为「换音色会改脚本的时长目标」——那两件事分属两个阶段。
    各音色相对标准的快慢，在「配置 → 声音」里、每个音色自己那一行看。 */
 function renderStandard(){
   const box=el('standard-box'); if(!box) return;
   const s=CFG.standard||{};
   if(!s.k){box.innerHTML='';return;}
-  box.innerHTML='<div class="desc">估时口径：标准语速 <b>'+s.k.toFixed(2)+'</b> 有效字/秒'+
+  box.innerHTML='<div class="desc">估时口径：脚本估时基准 <b>'+s.k.toFixed(2)+'</b> 有效字/秒'+
     '（≈'+s.cpm+' 汉字/分钟）。全篇按这一把尺子估，与本期用哪个音色无关；'+
     '各音色相对标准的快慢见「配置 → 声音」。</div>';
 }
@@ -4573,7 +4778,7 @@ function voicesForPoint(key,spec){
   const role=m[1].toUpperCase();
   return list.filter(v=>!v.role||v.role===role);
 }
-/* 音色语速 ÷ 标准语速 —— 挂在音色下拉框下面那一行。
+/* 音色语速 ÷ 脚本估时基准 —— 挂在音色下拉框下面那一行。
    只读：音色语速是量出来的，不是填出来的。能填的那个数一旦与实测对不上，
    页面上就有两个语速，又回到「两把尺子量同一份稿子」。
    没实测过就照实说没有，不拿 1.00 冒充量过的数。 */
@@ -4584,9 +4789,23 @@ function ratioNote(spec,voice){
                                      Math.abs(x.speed-1.0)<1e-6);
   if(!row) return '比例 —：该音色尚无实测样本，点旁边「标定」现测一次';
   const r=row.ratio;
-  return '比例 '+r.toFixed(2)+' ＝ 音色语速 ÷ 标准语速（'+(s.k?s.k.toFixed(2):'—')+
-         ' 有效字/秒）· '+(r<1?'比标准慢':(r>1?'比标准快':'与标准同速'))+
-         ' · 实测 '+row.samples+' 句';
+  // 「脚本估时基准」（4.39）与「试听分母」不是同一个数，这行两个都要提，必须说清：
+  // 4.39 是脚本估时的常数，与音色、与尺子都无关；试听算倍率用的分母是**该角色
+  // 自己那条尺子**脱去句间气口后的语速（与标定的逐句口径对齐）。A/B 各一条尺子，
+  // 分母按 role 取，不能共用。两个数都由后端下发，界面不写死。
+  // 不再叫「标准语速」——它一再被误读成尺子的语速（用户 2026-10-10 据此以为
+  // 「还在用老尺子」），改名断掉这个联想；数字一个未动。
+  const role=String((spec&&spec.role)||'A').toUpperCase();
+  const ksMap=(s.k_sentence&&typeof s.k_sentence==='object')?s.k_sentence:{};
+  const ks=Number(ksMap[role])||0;
+  const base=s.k?s.k.toFixed(2):'—';
+  return '比例 '+r.toFixed(2)+' ＝ 本色语速 '+(Number(row.k)||0).toFixed(2)+
+         ' ÷ 脚本估时基准 '+base+' 有效字/秒 · '+
+         (r<1?'比基准慢':(r>1?'比基准快':'与基准同速'))+
+         ' · 实测 '+row.samples+' 句'+
+         (ks>0?'｜试听分母用 '+role+' 角尺子 '+ks.toFixed(2)+
+               ' 有效字/秒（脱去句间气口，与标定同口径）':'')+
+         '；'+base+' 只用于脚本估时，与尺子无关';
 }
 const VOICES_LOADING={}, VOICES_TRIED={};
 async function fetchVoices(eng,refresh){
@@ -4709,11 +4928,25 @@ async function voiceSourceApplied(key,value){
         (kind==='library'?'声库音色':'具名音色'))+'「'+name+'」'+
         (kind==='official'?' take'+take:'')+'，参考音频已换','ok');
 }
-let RAW_AU=null, RAW_BTN=null;
+let RAW_AU=null, RAW_BTN=null, RAW_SEQ=0;
 /* 原声试听：把当前选中嗓子的那条本地音频**原样**播放 —— 不过标尺、不过语速、
    不过任何换算，听到的就是磁盘上那份 ref 的字节。官方预录放 official_voices
    里的定稿 take，具名音色放本项目 音色/<名字>/ref.wav；旧值（裸内置音色名）
-   没有本地音频，照实说没有。再点一次 = 停。 */
+   没有本地音频，照实说没有。再点一次 = 停。
+
+   播放器全页只造一个、反复用。**绝不能每点一次就 new Audio**：旧对象丢引用
+   不等于停播，它会带着解码器继续播下去。实测连点 12 下就有 6 份同一段音频
+   错位叠着响 —— 听感正是「第一个音节没了」；再点几下音频输出被占满，就彻底
+   「放不出来」，关掉页面才恢复。每轮发一个序号，回调只认自己那一轮：换曲时
+   那个主动 pause() 会让上一轮 pending 的 play() 以 AbortError 收场，那是换曲
+   的常态而非故障 —— 报错和「清状态」都不能由它触发，否则会把新一轮的引用
+   一并抹掉，播放器从此失联。 */
+function rawStopVoice(){
+  if(RAW_AU){RAW_AU.onended=null;RAW_AU.onerror=null;
+             RAW_AU.pause();RAW_AU.removeAttribute('src');RAW_AU.load()}
+  if(RAW_BTN){RAW_BTN.textContent='▶ 原声';RAW_BTN.dataset.playing=''}
+  RAW_BTN=null;releaseAudio(rawStopVoice);
+}
 function rawPreview(role,btn){
   const key=role==='A'?'tts.qwen3tts_voice_a':'tts.qwen3tts_voice_b';
   const v=String(cfgVal(key)||'');
@@ -4731,17 +4964,30 @@ function rawPreview(role,btn){
   }else{
     toast('旧值没有本地音频可放，重选官方预录或具名音色后再听','err');return;
   }
-  const stop=()=>{if(RAW_AU){RAW_AU.pause();RAW_AU=null}
-                  if(RAW_BTN){RAW_BTN.textContent='▶ 原声';
-                              RAW_BTN.dataset.playing='';RAW_BTN=null}};
-  if(RAW_BTN===btn&&btn.dataset.playing==='1'){stop();return}
-  stop();
+  if(RAW_BTN===btn&&btn.dataset.playing==='1'){rawStopVoice();return}
+  const seq=++RAW_SEQ;
+  rawStopVoice();
+  if(!RAW_AU) RAW_AU=new Audio();
+  const au=RAW_AU, name=v.replace(/^(library|named|official):/,'');
+  // 一次故障两条路都会到（元素的 error 事件 + play() 的拒绝），一轮只报一次。
+  let told=false;
+  const fail=()=>{if(told)return;told=true;
+    rawStopVoice();
+    toast('音频放不出来：'+name+' 的本地音频读不出来，换个音色或重新标定一次','err')};
+  claimAudio(rawStopVoice);                          // 抢扬声器：试听/混合先停
   RAW_BTN=btn; btn.dataset.playing='1'; btn.textContent='⏹ 停止';
-  RAW_AU=new Audio(src);
-  RAW_AU.onended=()=>{btn.textContent='▶ 原声';btn.dataset.playing='';
-                      RAW_AU=null;RAW_BTN=null;};
-  RAW_AU.play().catch(()=>{toast('音频放不出来','err');
-    btn.textContent='▶ 原声';btn.dataset.playing='';RAW_AU=null;RAW_BTN=null;});
+  au.onended=()=>{if(seq===RAW_SEQ)rawStopVoice()};
+  au.onerror=()=>{
+    if(seq!==RAW_SEQ||!au.getAttribute('src'))return;   // 已被下一轮接管 / 正在拆
+    if(au.error&&au.error.code===1)return;              // 1=MEDIA_ERR_ABORTED，主动停
+    fail();
+  };
+  au.src=src;
+  au.play().catch(e=>{
+    if(seq!==RAW_SEQ)return;                            // 已被下一轮接管
+    if(e&&e.name==='AbortError')return;                 // pause() 打断 pending play()
+    fail();
+  });
 }
 function voiceDesignCfgHtml(){
   /* 造嗓走双案草稿流：一次生成 A / B 两案（A 案念 A 案定稿文案、B 案念 B 案，
@@ -4774,19 +5020,23 @@ function voiceDesignCfgHtml(){
 }
 let VD_AU=null,VD_BTN=null;
 function vdStopPreview(){
-  if(VD_AU){VD_AU.pause();VD_AU=null}
-  if(VD_BTN){VD_BTN.textContent='▶ 试听';VD_BTN.dataset.playing='';VD_BTN=null}
+  if(VD_AU){VD_AU.onended=null;VD_AU.onerror=null;
+            VD_AU.pause();VD_AU.removeAttribute('src');VD_AU.load()}
+  if(VD_BTN){VD_BTN.textContent='▶ 试听';VD_BTN.dataset.playing=''}
+  VD_BTN=null;releaseAudio(vdStopPreview);
 }
 function vdDraftPreview(btn,cs){
   if(!ACTIVE_PROJ){toast('先在脚本页把当前项目选好','err');return}
-  const stop=()=>{vdStopPreview()};
-  if(VD_BTN===btn&&btn.dataset.playing==='1'){stop();return}
-  stop();
+  if(VD_BTN===btn&&btn.dataset.playing==='1'){vdStopPreview();return}
+  vdStopPreview();
+  if(!VD_AU)VD_AU=new Audio();
+  VD_AU.onended=()=>vdStopPreview();
+  VD_AU.onerror=()=>{if(VD_BTN===btn)vdStopPreview()};
+  VD_AU.src='/api/voice/named-audio/'+encodeURIComponent(ACTIVE_PROJ)+'/_draft'+cs;
+  claimAudio(vdStopPreview);                     // 抢扬声器
   VD_BTN=btn;btn.dataset.playing='1';btn.textContent='⏹ 停止';
-  VD_AU=new Audio('/api/voice/named-audio/'+encodeURIComponent(ACTIVE_PROJ)+
-                  '/_draft'+cs);
-  VD_AU.onended=()=>{vdStopPreview()};
-  VD_AU.play().catch(()=>{toast(cs+'案草稿音频放不出来','err');vdStopPreview()});
+  VD_AU.play().catch(()=>{if(VD_BTN===btn)vdStopPreview();
+                          toast(cs+'案草稿音频放不出来','err')});
 }
 async function voiceDesignCfg(){
   if(!ACTIVE_PROJ){
@@ -5164,8 +5414,10 @@ function musicCfgHtml(){
   '</div>';
 }
 function muStopPreview(){
-  if(MU_AU){MU_AU.pause();MU_AU=null}
-  if(MU_BTN){MU_BTN.textContent='▶ 试听';MU_BTN.dataset.playing='';MU_BTN=null}
+  if(MU_AU){MU_AU.onended=null;MU_AU.onerror=null;
+            MU_AU.pause();MU_AU.removeAttribute('src');MU_AU.load()}
+  if(MU_BTN){MU_BTN.textContent='▶ 试听';MU_BTN.dataset.playing=''}
+  MU_BTN=null;releaseAudio(muStopPreview);
 }
 async function refreshMusicState(){
   if(!el('music-cfg')) { fillMusicLibrarySelects(); return; }   // 卡不在也回填曲目下拉
@@ -5273,13 +5525,16 @@ async function musicGenerate(){
     j=>{el('mu-go').disabled=false; toast('生成失败：'+(j.error||''),'err');});
 }
 function musicDraftPreview(btn){
-  const stop=()=>{muStopPreview()};
-  if(MU_BTN===btn&&btn.dataset.playing==='1'){stop();return}
-  stop();
+  if(MU_BTN===btn&&btn.dataset.playing==='1'){muStopPreview();return}
+  muStopPreview();
+  if(!MU_AU)MU_AU=new Audio();
+  MU_AU.onended=()=>muStopPreview();
+  MU_AU.onerror=()=>{if(MU_BTN===btn)muStopPreview()};
+  MU_AU.src='/api/music/audio/_draft';
+  claimAudio(muStopPreview);                     // 抢扬声器
   MU_BTN=btn; btn.dataset.playing='1'; btn.textContent='⏹ 停止';
-  MU_AU=new Audio('/api/music/audio/_draft');
-  MU_AU.onended=()=>{muStopPreview()};
-  MU_AU.play().catch(()=>{toast('草稿音频放不出来','err');muStopPreview()});
+  MU_AU.play().catch(()=>{if(MU_BTN===btn)muStopPreview();
+                          toast('草稿音频放不出来','err')});
 }
 function musicDraftSave(){
   modalInput('保存背景音乐','给这段音乐起个名字（入库后所有项目可用）','',
@@ -5514,7 +5769,7 @@ function setBar(id,v){const n=el(id);if(n)n.style.width=Math.round(v*100)+'%'}
 /* ---- 脚本 ---- */
 function renderGauge(est,hint){
   const g=el('gauge');
-  // 第四格报的是尺子本身（标准语速），不是这份稿子的实测值：脚本阶段与音色无关，
+  // 第四格报的是尺子本身（脚本估时基准），不是这份稿子的实测值：脚本阶段与音色无关，
   // 摆一个「这份稿子的语速」在那儿，只会让人以为它可以随音色变。
   const s=CFG.standard||{};
   const rate=s.k?s.k.toFixed(2):'—';
@@ -5526,14 +5781,14 @@ function renderGauge(est,hint){
       '<div class="g"><div class="k">台词字数</div><div class="v">'+est.total_chars+'</div><div class="s">'+est.line_count+' 句</div></div>'+
       '<div class="g"><div class="k">预估时长</div><div class="v">'+fmt(est.total_seconds)+'</div><div class="s">目标 '+fmt(est.target_seconds)+'</div></div>'+
       '<div class="g"><div class="k">偏差</div><div class="v '+cls+'">'+(dev>0?'+':'')+dev.toFixed(1)+'%</div><div class="s">阈值 ±'+lim+'%</div></div>'+
-      '<div class="g"><div class="k">标准语速</div><div class="v">'+rate+'</div><div class="s">有效字/秒 ≈'+(s.cpm||'—')+' 汉字/分</div></div>';
+      '<div class="g"><div class="k">脚本估时基准</div><div class="v">'+rate+'</div><div class="s">有效字/秒 ≈'+(s.cpm||'—')+' 汉字/分</div></div>';
   }else{
     g.innerHTML='<div class="empty">生成脚本后显示</div>';
   }
   if(hint&&hint.options){
-    el('hint').innerHTML='<div class="desc">目标时长反推（按标准语速）：'+
+    el('hint').innerHTML='<div class="desc">目标时长反推（按脚本估时基准）：'+
       hint.options.map(o=>'语速 '+o.speed.toFixed(2)+'x 约 '+o.effective_chars+' 字').join(' · ')+
-      '</div><div class="desc">口径：全篇按标准语速估，与音色无关。</div>';
+      '</div><div class="desc">口径：全篇按脚本估时基准估，与音色无关。</div>';
   }else{
     el('hint').innerHTML='';
   }

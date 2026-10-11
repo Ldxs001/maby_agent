@@ -28,3 +28,16 @@ _smoke_server.log
 # 因此本目录可以随时整个删掉，不会断掉任何引用（曾攒到 8 GB）。
 _smoke/
 /ui_*.png
+
+# ---- 标定用 ref_base：随音色本体生成，跨项目共享，不入库 ----
+# 落在 calib_refs/<角色>/<本体指纹>/，由 tts_engine.ensure_calib_ref 现场生成；
+# 「用时再下」同待遇，随时可整个删掉、下次标定自会重建。
+/calib_refs/
+
+# ---- 项目内的 ref_base / icl 派生件：由 Base 模型现场生成，不入库 ----
+# 落在 projects/<项目>/音色/<角色>/，换嗓即重掷；随时可删，出片时自会重建。
+ref_base_*.wav
+ref_base_*.json
+icl_*.wav
+icl_*.txt
+base_refs.json

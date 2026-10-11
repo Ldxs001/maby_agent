@@ -207,6 +207,46 @@ def _spec_cos(x, sr_x: int, ref, sr_ref: int) -> float:
 
 
 # ----------------------------------------------------------------- 生成本体
+def _gen_baseref(eng, text: str, ref_wav: str, ref, sr_ref: int,
+                 sr_t: int, salt: str, log=print):
+    """跑 CANDS 个候选、按谱形选最贴本体的一条，返回 (arr, cands, best)。
+
+    **唯一实现**：项目 ref_base（``build_role``）与标定用 ref_base
+    （``build_from``）都走这里 —— 两条链各挑各的，迟早挑出两条不同波形，而
+    「标定与成片同源」正是这套机制的命根子。
+
+    ``salt`` 是种子盐（传 role）：成片与标定对同一本体必须拿到同一条，所以
+    盐要一致。``ref`` / ``sr_ref`` 是调用方已读入的本体波形与采样率（它们还要
+    用来算 ref 时长、比谱形，一并从调用方传进来，免得重复读盘）。
+    """
+    ref_t = _resample(ref, sr_ref, sr_t)     # 仅用于跟候选比谱形，不动档案
+    base_seed = serve.seed_for(text, "baseref:" + salt)
+    cands, arrs = [], []
+    for k in range(CANDS):
+        seed = base_seed + k * 100003
+        t1 = time.time()
+        wav, sr = eng._gen_clone(text=text, ref_audio=ref_wav, ref_text=text,
+                                 instruct=None, language="Chinese", seed=seed)
+        # 服务固定吐 24000（模型固有的），统一到推动点口径再落盘 —— 出片链路
+        # 上所有音频同源同率，不再出现「参考一套率、成品另一套率」那种两把尺子
+        arr = _resample(np.asarray(wav, dtype=np.float32).reshape(-1),
+                        int(sr), sr_t)
+        arrs.append(arr)
+        sc = _spec_cos(arr, sr_t, ref_t, sr_t)
+        cands.append({"index": k, "seed": seed, "spec_cos": sc,
+                      "seconds": round(len(arr) / sr_t, 3),
+                      "gen_seconds": round(time.time() - t1, 1)})
+        log("  候选 %d/%d：谱形相似 %.4f · %.2fs · 生成 %.1fs"
+            % (k + 1, CANDS, sc, len(arr) / sr_t, time.time() - t1))
+
+    ok = [c for c in cands if c["spec_cos"] == c["spec_cos"]]
+    best = max(ok, key=lambda c: c["spec_cos"]) if ok else cands[0]
+    log("  选中候选 %d（谱形相似 %.4f）" % (best["index"], best["spec_cos"]))
+    # 选中的那条直接从内存取回 —— 重跑一次虽然同种子本该同波形，但那要靠
+    # 「同设备同后端同版本」三个条件同时成立，多跑一次就多一个变量。
+    return arrs[int(best["index"])], cands, best
+
+
 def build_role(eng, root: str, role: str, force: bool, log,
                sample_rate: int) -> dict:
     """为一个角色生成 ref_base_<sign> 三件并记账；命中账本直接复用。
@@ -248,36 +288,10 @@ def build_role(eng, root: str, role: str, force: bool, log,
                            % (role, mv.TXT_NAME))
 
     ref, sr_ref = _read_wav(ref_wav)
-    ref_t = _resample(ref, sr_ref, sample_rate)   # 仅用于跟候选比谱形，不动档案
     log("%s 角 ref：%.2fs / %dHz → 统一口径 %dHz · %d 字 · sign %s"
         % (role, len(ref) / sr_ref, sr_ref, sample_rate, len(text), sign))
-
-    base_seed = serve.seed_for(text, "baseref:" + role)
-    cands, arrs = [], []
-    for k in range(CANDS):
-        seed = base_seed + k * 100003
-        t1 = time.time()
-        wav, sr = eng._gen_clone(text=text, ref_audio=ref_wav, ref_text=text,
-                                 instruct=None, language="Chinese", seed=seed)
-        # 服务固定吐 24000（模型固有的），统一到推动点口径再落盘 —— 出片链路
-        # 上所有音频同源同率，不再出现「参考一套率、成品另一套率」那种两把尺子
-        arr = _resample(np.asarray(wav, dtype=np.float32).reshape(-1),
-                        int(sr), sample_rate)
-        arrs.append(arr)
-        sc = _spec_cos(arr, sample_rate, ref_t, sample_rate)
-        cands.append({"index": k, "seed": seed, "spec_cos": sc,
-                      "seconds": round(len(arr) / sample_rate, 3),
-                      "gen_seconds": round(time.time() - t1, 1)})
-        log("  候选 %d/%d：谱形相似 %.4f · %.2fs · 生成 %.1fs"
-            % (k + 1, CANDS, sc, len(arr) / sample_rate, time.time() - t1))
-
-    ok = [c for c in cands if c["spec_cos"] == c["spec_cos"]]
-    best = max(ok, key=lambda c: c["spec_cos"]) if ok else cands[0]
-    log("  选中候选 %d（谱形相似 %.4f）" % (best["index"], best["spec_cos"]))
-
-    # 选中的那条直接从内存取回 —— 重跑一次虽然同种子本该同波形，但那要靠
-    # 「同设备同后端同版本」三个条件同时成立，多跑一次就多一个变量。
-    arr = arrs[int(best["index"])]
+    arr, cands, best = _gen_baseref(eng, text, ref_wav, ref, sr_ref,
+                                    sample_rate, role, log)
     _write_wav(base_path, arr, sample_rate)
 
     # ICL = 同一条嗓子的两段，隔 0.15s。两半同源、同率、同一个后端 —— 不会再出现
@@ -324,6 +338,77 @@ def build_role(eng, root: str, role: str, force: bool, log,
     return {"role": role, "skipped": False, "sign": sign,
             "base_ref": base_path, "icl_wav": icl_wav, "icl_txt": icl_txt,
             "record": rec}
+
+
+def build_from(ref_wav: str, text: str, out_dir: str, role: str,
+               device: str = "auto", force: bool = False, log=print,
+               sample_rate=None) -> dict:
+    """从任一本体 (wav, text) 生成一份标定用 ref_base 到 out_dir。
+
+    「本体」= 音色来源解析出的参考音频（library: → resources/voices/<名>/ref.wav，
+    named: → 项目具名档案，official: → 预录 take）。本函数**不依赖项目结构** ——
+    标定从此不必先切项目、也不必项目先有档案。
+
+    与项目 ref_base 同源：候选生成走同一份 ``_gen_baseref``、种子盐同为 role，
+    故同本体同设备后端下，产物与项目里那份 ``ref_base_<sign>.wav`` 字节相同
+    （认领是复制、生成是确定函数）。标定量到的因此与成片用的是同一条嗓子。
+
+    产物落 out_dir：``ref_base.wav`` ＋ ``ref_base.json``（溯源）。
+    命中（out_dir 已有且本体指纹一致）直接复用，除非 force。
+    """
+    sr_t = resolve_sample_rate(sample_rate)
+    sign = mv.digest_of(ref_wav)[:16]
+    base_path = os.path.join(out_dir, "ref_base.wav")
+    rec_path = os.path.join(out_dir, "ref_base.json")
+    if not force and os.path.isfile(base_path) and os.path.isfile(rec_path):
+        try:
+            with io.open(rec_path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (ValueError, OSError):
+            rec = {}
+        if isinstance(rec, dict) and rec.get("sign") == sign:
+            log("ref_base 命中缓存（sign %s），直接复用不重做。" % sign)
+            return {"sign": sign, "wav": base_path, "record": rec_path,
+                    "hit": True}
+
+    text = str(text or "").strip()
+    if not text:
+        raise RuntimeError("标定文本为空 —— ICL 缺转录会把内容串进结果。")
+    os.makedirs(out_dir, exist_ok=True)
+
+    resolved = serve.resolve_model(serve.DEFAULT_MODEL)
+    if serve.model_kind(resolved) != "base":
+        raise RuntimeError("ref_base 要用 Base 变体生成，当前解析到 %s（%s）。"
+                           % (resolved, serve.model_kind(resolved)))
+    log("加载 %s —— 与出片同一份 Base，跑完就退" % os.path.basename(resolved))
+    eng = serve.Engine(resolved, device, log)
+    t0 = time.time()
+    eng.ensure()
+    log("  后端 %s · 设备 %s · 加载 %.1fs"
+        % (eng.backend, eng.device, time.time() - t0))
+
+    ref, sr_ref = _read_wav(ref_wav)
+    log("%s 角 ref：%.2fs / %dHz → 统一口径 %dHz · %d 字 · sign %s"
+        % (role, len(ref) / sr_ref, sr_ref, sr_t, len(text), sign))
+    arr, cands, best = _gen_baseref(eng, text, ref_wav, ref, sr_ref,
+                                    sr_t, role, log)
+    _write_wav(base_path, arr, sr_t)
+    rec = {"schema": 1, "role": role, "sign": sign,
+           "source_ref": os.path.basename(ref_wav),
+           "source_sha16": sign,
+           "sample_rate": int(sr_t), "source_sample_rate": int(sr_ref),
+           "ref_seconds": round(len(ref) / sr_ref, 3),
+           "base_seconds": round(len(arr) / sr_t, 3),
+           "cands": cands, "picked": best,
+           "device": str(eng.device or ""), "backend": eng.backend,
+           "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+    tmp = rec_path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(rec, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, rec_path)
+    log("  → %s（%.2fs @%dHz）"
+        % (os.path.basename(base_path), len(arr) / sr_t, sr_t))
+    return {"sign": sign, "wav": base_path, "record": rec_path, "hit": False}
 
 
 # ----------------------------------------------------------------- 入口
@@ -384,7 +469,8 @@ def build(project_dir: str, roles=ROLES, voice_dir_name: str = "音色",
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="生成 ref_base.wav 与 icl.wav（角色参考音频的 ICL 前缀）。")
-    ap.add_argument("--project-dir", required=True, help="项目目录")
+    ap.add_argument("--project-dir", default="",
+                    help="项目目录（项目内生成时才需要）")
     ap.add_argument("--voice-dir", default="音色", help="音色子目录名")
     ap.add_argument("--role", default="both", choices=("A", "B", "both"),
                     help="只做某个角色，默认两个都做")
@@ -393,14 +479,36 @@ def main() -> int:
     ap.add_argument("--sample-rate", type=int, default=None,
                     help="覆盖统一采样率（默认取 audio.sample_rate，通常不必给）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出结果")
+    # 「脱离项目」那一路：从任一本体生成标定用 ref_base（见 build_from）。
+    ap.add_argument("--from-wav", default="",
+                    help="音色本体波形；给了它就走脱离项目的标定 ref_base 生成")
+    ap.add_argument("--from-text", default="",
+                    help="本体念的文本文件（配 --from-wav）")
+    ap.add_argument("--out-dir", default="",
+                    help="标定 ref_base 的落点目录（配 --from-wav）")
     args = ap.parse_args()
 
-    roles = ROLES if args.role == "both" else (args.role,)
     log = (lambda m: None) if args.json else (lambda m: print(m, flush=True))
     try:
-        out = build(args.project_dir, roles, args.voice_dir,
-                    args.force, args.device, log,
-                    sample_rate=args.sample_rate)
+        if args.from_wav:
+            if not (args.from_text and args.out_dir):
+                raise SystemExit("--from-wav 需要配 --from-text 与 --out-dir。")
+            if args.role == "both":
+                raise SystemExit("--from-wav 一次只做一个角色（--role A|B）。")
+            with io.open(args.from_text, encoding="utf-8") as fh:
+                text = fh.read().strip()
+            out = build_from(args.from_wav, text, args.out_dir, args.role,
+                             args.device, args.force, log,
+                             sample_rate=args.sample_rate)
+        else:
+            if not args.project_dir:
+                raise SystemExit("--project-dir 必填（或改用 --from-wav 那一路）。")
+            roles = ROLES if args.role == "both" else (args.role,)
+            out = build(args.project_dir, roles, args.voice_dir,
+                        args.force, args.device, log,
+                        sample_rate=args.sample_rate)
+    except SystemExit:
+        raise
     except Exception as e:  # noqa: BLE001
         if args.json:
             print(json.dumps({"error": str(e)}, ensure_ascii=False))

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,6 +45,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -55,6 +56,19 @@ from . import bins, layout, seg_incursion
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VOICE_CACHE = os.path.join(ROOT, "voices_cache.json")
+
+# 音色「本体」目录 —— 参考音频（本体）与它念的文本从这里解析，**不问项目**。
+# 标定参考由本体自生成（见 voice_entity_ref / ensure_calib_ref），从此不必先切
+# 项目、也不必项目先有档案。三种来源各有本体（语法与 make_voice 同一套）：
+#   library:<名>  → resources/voices/<名>/（随仓声库，人耳定稿）
+#   official:<名>#takeN → tts_service/official_voices/<名>/takeN.wav（旧语法，已退役）
+#   named:<名>    → <项目>/音色/<名>/（VoiceDesign 造的具名档案，是项目资产）
+VOICES_LIBRARY_DIR = os.path.join(ROOT, "podcast_maker", "resources", "voices")
+OFFICIAL_VOICES_DIR = os.path.join(ROOT, "tts_service", "official_voices")
+# 标定用 ref_base 的缓存落点：<repo>/calib_refs/<角色>/<本体指纹前16>。随音色本体走、
+# 与项目无关（跨项目共享同一份）；同本体同设备后端下与成片那份 ref_base 字节相同
+# （认领是复制、生成是确定函数），故标定量的与成片用的是同一条嗓子。入库由 .gitignore 挡。
+CALIB_REFS_DIR = os.path.join(ROOT, "calib_refs")
 
 # 本地服务引擎：走同一套 HTTP 契约（POST /tts 合成，GET /speakers 枚举音色）
 LOCAL_ENGINES = ("qwen3tts",)
@@ -124,6 +138,25 @@ def service_health(cfg, timeout=6):
                   % (info.get("device") or "未加载", info.get("vram_free_mb"))), info
 
 
+def running_device(cfg):
+    """问一次服务：它现在真正跑在哪个设备、哪个后端。→ (device, backend)
+
+    拿不到（服务没起 / 请求失败 / 模型还没加载）一律返回 ("", "")——调用方据此
+    就不写这两栏，而不是拿 "未加载" 之类的占位去冒充设备。只认服务自报的
+    `cuda` / `cpu` 两个真值：用到它的地方（成片回填、标定落表、尺子落盘）都是
+    刚跑完一次合成、模型正热着的时刻，正常必能拿到真值。
+    """
+    try:
+        ok, _msg, info = service_health(cfg)
+    except Exception:  # noqa: BLE001
+        return "", ""
+    if not ok:
+        return "", ""
+    dev = str(info.get("device") or "").strip()
+    bak = str(info.get("backend") or "").strip()
+    return (dev if dev in ("cuda", "cpu") else ""), bak
+
+
 def engine_available(engine, cfg=None):
     """引擎可用性探测。返回 (ok, message)。"""
     if engine in LOCAL_ENGINES:
@@ -163,6 +196,11 @@ def unload_llm_models(log=None):
     为什么要做：本地 TTS 上 GPU 要占约 5GB，而 LM Studio 里的模型动辄十几 GB。
     两者同时在场，TTS 会因空闲显存不足被降级到 CPU（慢十倍），严重时直接加载
     失败。语音合成全程用不到任何语言模型，所以合成前先把它们请下去。
+
+    调用方有三类，口径一致：成片合成（`synthesize`）、标定按钮
+    （`web_ui.api_voice_calibrate`）、音色工具几处 spawn（`web_ui._prep_voice_tool`
+    包住的认领 / 录制 / 补 ref_base / 造嗓）—— 它们都要加载同一个本地模型，
+    都该在干净显存里判设备。
 
     没装 lms / ollama 不算失败——本机没有可卸的东西而已。
     返回 {"unloaded": [...], "skipped": [...], "failed": [...]}。
@@ -224,7 +262,12 @@ def unload_llm_models(log=None):
 # 显存还回去；别人先起的（用户手动开着、上一批留下的）一律不动——那不是我们的
 # 进程，不该由我们决定它的生死。
 _SERVICE_LOCK = threading.Lock()
-_SERVICE = {"refs": 0, "proc": None, "job": None, "owned": False}
+# 起服务是慢活（`_wait_ready` 最长 90 秒）。锁只用来裁决「谁去起」，不关慢活：
+# `starting` 标记已有线程在起，其余线程在条件变量上等它——否则一次起服务会把
+# 所有读锁的入口（服务状态、试听）一起拖住，界面观感就是整页卡死。
+_SERVICE_CV = threading.Condition(_SERVICE_LOCK)
+_SERVICE = {"refs": 0, "proc": None, "job": None, "owned": False,
+            "starting": False}
 
 
 # 本地服务要在一个独立环境里跑，理由写在 tts_service/setup_env.py 的文件头
@@ -525,23 +568,49 @@ def acquire_service(cfg, log=None):
 
     批量合成时由外层包一次即可 —— 内层各期只是把计数加上去，最后一个退出来
     才轮到停服务，免得每一期都重启一遍（每次重启都要重新加载权重）。
+
+    **起服务在锁外做**：`_wait_ready` 最长 90 秒，把它关在锁里等于让别的读锁
+    入口干等 90 秒（界面观感即卡死）。这里用 `starting` 位 + 条件变量：只放
+    一个线程去起，其余在「启动中」上等它，谁都不占着锁。
     """
     log = log or (lambda m: None)
-    with _SERVICE_LOCK:
+    with _SERVICE_CV:
         _SERVICE["refs"] += 1
-        if _SERVICE["owned"]:
-            return
-        if service_health(cfg)[0]:
-            # 已经有服务在跑（不管是用户开的还是上一批留下的），用就是了，别动它。
-            return
-        _SERVICE["proc"], _SERVICE["job"] = _spawn_service(cfg, log)
+        while True:
+            if _SERVICE["owned"]:
+                return
+            if _SERVICE["starting"]:
+                # 已有线程在起：等它起完再裁决，不各自起一份。
+                _SERVICE_CV.wait()
+                continue
+            if service_health(cfg)[0]:
+                # 已经有服务在跑（不管是用户开的还是上一批留下的），用就是了，别动它。
+                return
+            _SERVICE["starting"] = True
+            break
+    try:
+        proc, job = _spawn_service(cfg, log)   # 慢活，故意放在锁外
+    except BaseException:
+        with _SERVICE_CV:
+            _SERVICE["starting"] = False
+            _SERVICE_CV.notify_all()
+        raise
+    with _SERVICE_CV:
+        _SERVICE["proc"] = proc
+        _SERVICE["job"] = job
         _SERVICE["owned"] = True
+        _SERVICE["starting"] = False
+        _SERVICE_CV.notify_all()
 
 
 def release_service(log=None):
     """合成收工：引用计数 -1。归零且服务是自己起的，才停掉。"""
     log = log or (lambda m: None)
-    with _SERVICE_LOCK:
+    with _SERVICE_CV:
+        # 启动中先等它起完再裁决：否则会出现「刚起好、refs 已归零、却因为
+        # 那一刻 owned 还是 False 而没人停」的服务泄漏。
+        while _SERVICE["starting"]:
+            _SERVICE_CV.wait()
         _SERVICE["refs"] = max(0, _SERVICE["refs"] - 1)
         if _SERVICE["refs"] or not _SERVICE["owned"]:
             return
@@ -557,7 +626,7 @@ def release_service(log=None):
 
 def service_owned():
     """当前跑着的服务是不是我们拉起来的（界面状态用）。"""
-    with _SERVICE_LOCK:
+    with _SERVICE_CV:
         return bool(_SERVICE["owned"])
 
 
@@ -827,7 +896,11 @@ def ensure_voice_profiles(out_dir, voices, cfg, log=None, force=False):
         % "、".join(need))
     cmd = [py, script, "--project-dir", out_dir,
            "--voice-dir", layout.DIR_VOICE, "--json",
-           "--role", ("both" if len(need) == 2 else need[0])]
+           "--role", ("both" if len(need) == 2 else need[0]),
+           # 与 web_ui 认领同一口径：这条链也在跑 Base 模型，把「要 GPU」明说出来。
+           # 调用它的 synthesize() 已经腾过显存，正常就落在 CUDA；真不够时
+           # pick_device 仍退 CPU，并如实写进档案记录的 device 栏。
+           "--device", "cuda"]
     va = str(voices.get("A") or "").strip()
     vb = str(voices.get("B") or "").strip()
     if va:
@@ -878,6 +951,167 @@ def _warn_if_recorded_on_cpu(out_dir, role, log):
         log("注意：%s 角的参考音频是跑 CPU 录出来的，与 GPU 路径不是同一条波形，"
             "音色基准已与其他项目不同。要一致，先腾空显存重录，或用「继承」"
             "从别的项目复制。" % role)
+
+
+def _sha256_file(path):
+    """文件内容指纹（全量 sha256 的十六进制）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_json_file(path):
+    """读一个 JSON 文件；不存在 / 解析失败一律返回 None（读账本不做裁判）。"""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def voice_entity_ref(voice, project_root=None):
+    """把音色来源字符串解析成「音色本体」—— 参考音频 + 它念的文本。
+
+    这是标定「不再问项目要参考」的入口：本体住在音色自己的目录里，与当前项目
+    无关。三种来源各有本体（语法与 make_voice.parse_voice_source 同一套）：
+
+    - ``library:名字``  → ``resources/voices/<名>/{ref.wav, ref.txt}``（随仓声库）
+    - ``official:名#takeN`` → ``official_voices/<名>/takeN.wav`` ＋ 该 take 的文本
+      （旧预录语法，已退役，仅兼容读取）
+    - ``named:名字``    → ``<项目>/音色/<名>/{ref.wav, ref.txt}``
+      （具名档案是项目资产，必须给 project_root 才解析得出）
+
+    解析不出（来源不合法 / 文件不齐 / 文本空）返回 None —— 调用方按「没有可
+    标定的本体」处理，不猜、不兜。
+    """
+    spec = str(voice or "").strip()
+    kind, sep, rest = spec.partition(":")
+    if not sep or not rest.strip():
+        return None
+    name, _, take = rest.partition("#")
+    name = name.strip()
+    if not name:
+        return None
+
+    if kind in ("library", "named"):
+        if kind == "library":
+            d = os.path.join(VOICES_LIBRARY_DIR, name)
+        else:
+            if not project_root:
+                return None
+            d = os.path.join(project_root, layout.DIR_VOICE, name)
+        wav = os.path.join(d, "ref.wav")
+        txt = os.path.join(d, "ref.txt")
+        if not (os.path.isfile(wav) and os.path.isfile(txt)):
+            return None
+        try:
+            with open(txt, encoding="utf-8") as fh:
+                body = fh.read().strip()
+        except OSError:
+            return None
+        if not body:
+            return None
+        return {"source": spec, "uri": "%s:%s" % (kind, name),
+                "wav": wav, "text": body}
+
+    if kind == "official":
+        d = os.path.join(OFFICIAL_VOICES_DIR, name)
+        prof = _read_json_file(os.path.join(d, "profile.json")) or {}
+        takes = prof.get("takes") or []
+        want = int(take) if take.strip().isdigit() else None
+        pick = None
+        if want is not None:
+            pick = next((t for t in takes
+                         if int(t.get("take") or 0) == want), None)
+        if pick is None and takes:
+            pick = takes[0]           # 没给 take：取第一条候选，不静默改名
+        if not pick:
+            return None
+        tn = int(pick.get("take") or 1)
+        wav = os.path.join(d, "take%d.wav" % tn)
+        text = str(pick.get("text") or "").strip()
+        if os.path.isfile(wav) and text:
+            return {"source": spec, "uri": "official:%s#%d" % (name, tn),
+                    "wav": wav, "text": text}
+        return None
+
+    return None
+
+
+def calib_ref_dir(role, sign16):
+    """标定用 ref_base 的落点：<repo>/calib_refs/<角色>/<本体指纹前16>。"""
+    r = "B" if str(role or "A").strip().upper() == "B" else "A"
+    return os.path.join(CALIB_REFS_DIR, r, str(sign16))
+
+
+def ensure_calib_ref(entity, role, cfg, log=None):
+    """保证该音色本体有一份标定用 ref_base：缓存命中即用，缺则现场生成。
+
+    生成走 ``tts_service/make_base_ref.py`` 的 ``build_from`` —— 与项目 ref_base
+    同一份**唯一实现**，种子盐用 role，故同本体同设备后端下产物与成片那份
+    ``ref_base_<sign>.wav`` 字节相同（标定与成片同源，不会白标）。
+
+    产物落 ``<repo>/calib_refs/<角色>/<本体指纹前16>/``，随音色本体走、跨项目
+    共享，命中不重做。生成前先腾显存、并明说 ``--device cuda`` —— 与成片同款，
+    免得静默退 CPU、标定参考与成片不在同一条波形上。返回 ref_base.wav 路径。
+    """
+    log = log or (lambda m: None)
+    wav = str(entity.get("wav") or "")
+    text = str(entity.get("text") or "")
+    if not (wav and os.path.isfile(wav) and text):
+        raise TTSError("音色本体不齐（波形或文本缺），无法生成标定用 ref_base。")
+
+    sign = _sha256_file(wav)[:16]
+    out_dir = calib_ref_dir(role, sign)
+    base = os.path.join(out_dir, "ref_base.wav")
+    meta = os.path.join(out_dir, "ref_base.json")
+    if os.path.isfile(base) and os.path.isfile(meta):
+        rec = _read_json_file(meta)
+        if isinstance(rec, dict) and rec.get("sign") == sign:
+            log("标定用 ref_base 命中缓存（%s），直接复用不重做。" % sign)
+            return base
+
+    py = venv_python()
+    if not py:
+        raise TTSError(
+            "要生成标定用 ref_base，但本地语音环境还没建——到配置页点一次"
+            "「搭建本地语音环境」，或手动执行 %s。"
+            % os.path.join("tts_service", "setup_env.py"))
+    script = os.path.join(_SERVICE_DIR, "make_base_ref.py")
+    if not os.path.isfile(script):
+        raise TTSError("缺少 ref_base 生成工具：%s" % script)
+
+    tmpdir = tempfile.mkdtemp(prefix="calibref_")
+    try:
+        txt = os.path.join(tmpdir, "ref.txt")
+        with open(txt, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        cmd = [py, script, "--json", "--from-wav", wav, "--from-text", txt,
+               "--out-dir", out_dir,
+               "--role", ("B" if str(role or "A").upper() == "B" else "A"),
+               "--device", "cuda"]
+        # 与成片同款：先腾显存，再明说要 GPU。真不够时 pick_device 仍退 CPU，
+        # 并如实写进 ref_base.json 的 device / backend，查得到、不静默。
+        log("按音色本体生成标定用 ref_base（%s 角）……" % role)
+        unload_llm_models(log)
+        r = subprocess.run(cmd, capture_output=True, cwd=_SERVICE_DIR)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    out = (r.stdout or b"").decode("utf-8", "replace").strip()
+    err = (r.stderr or b"").decode("utf-8", "replace").strip()
+    if r.returncode != 0:
+        raise TTSError("生成标定用 ref_base 失败：%s"
+                       % (err[-400:] or out[-400:] or "看日志。"))
+    if '"error"' in out:
+        raise TTSError("生成标定用 ref_base 失败：%s" % out[-400:])
+    if not os.path.isfile(base):
+        raise TTSError("ref_base 工具跑完但没落盘：%s" % base)
+    rec = _read_json_file(meta) or {}
+    log("标定用 ref_base 就绪（%s · 设备 %s）"
+        % (sign, rec.get("device") or "?"))
+    return base
 
 
 def _service_synth(text, voice, speed, cfg, degree=None, ref=None,
@@ -1921,45 +2155,194 @@ CALIBRATION_LINES = (
     "第二句稍微长一点，中间带上逗号和句号，让停顿也一起进入统计。",
     "第三句收尾，短促干脆，用来压住前两句可能带来的拖沓。",
 )
+# 这三句只在「角色 ref.txt 切不出 ≥3 句」时兜底（calibrate 要 ≥3 对样本）。
 STANDARD_RULER_TEXT = "".join(CALIBRATION_LINES)
 
 # 标尺落盘是一对文件：音频 + 它自己的实测语速。json 不在场（旧版 Edge 合成的
 # 残档就没有）视为「没有标尺」，下次重新生成交付——不认没有刻度的尺子。
-RULER_WAV = "standard.wav"
-RULER_JSON = "standard.json"
+#
+# **A / B 各一条，不再共用一条**：尺子的文本必须是**该角色自己的 ref.txt**，
+# 试听才播得出「本人按本色语速念那段参考」的声音。共用一条会让两个角色都听到
+# 同一个嗓子的样音，且换算分母与各自 k_role 的口径对不齐（分子逐句量的是本人、
+# 分母却是别人的音频）。
+RULER_WAV = "standard_A.wav"
+RULER_JSON = "standard_A.json"
+RULER_WAV_B = "standard_B.wav"
+RULER_JSON_B = "standard_B.json"
 
 
-def standard_ruler(cache_dir, synth_one, carrier=None):
-    """标准音频：全局唯一的一份语速标尺，合成一次、落盘、之后只读。
+def ruler_files(role="A"):
+    """某角色尺子的落盘文件名（A / B 各一份，互不覆盖）。"""
+    if str(role or "A").strip().upper() == "B":
+        return RULER_WAV_B, RULER_JSON_B
+    return RULER_WAV, RULER_JSON
+
+# 试听换算的分母要用「句子口径」语速：k_role 是**逐句**量出来的（分母 = 各句时长
+# 之和，不含句间停顿），而尺子的 k = 有效字 ÷ 整段时长，**含模型自己那几段句间
+# 停顿**。拿逐句口径的目标去除以整段口径的基准，听到的词速会系统性偏快（本机实测
+# 尺子偏快 7.87%）。句间停顿的位置由**尺子那段文本自身**决定——各句有效字占比即
+# 句边界，故可从音频里确定性定位后扣除，不必人为加参数；文本随角色而异（A 与 B
+# 各有自己的 ref.txt），所以边界必须由「这条尺子用的文本」算，不能写死一份。
+_SILENCE_DB = -45
+_SILENCE_MIN = 0.10
+_BOUNDARY_TOL = 0.10      # 句边界容差，占整段时长的比例
+
+
+def _silence_segments(wav, total):
+    """silencedetect 列出 (起, 止, 时长)；检测不了返回 []（绝不因此让试听挂掉）。"""
+    import subprocess
+    try:
+        from .audio_engine import ffmpeg_bin
+        p = subprocess.run(
+            [ffmpeg_bin(), "-hide_banner", "-i", wav, "-af",
+             "silencedetect=noise=%ddB:d=%.2f" % (_SILENCE_DB, _SILENCE_MIN),
+             "-f", "null", "-"], capture_output=True, text=True, timeout=30)
+    except Exception:
+        return []
+    starts, ends = [], []
+    for ln in p.stderr.splitlines():
+        if "silence_start:" in ln:
+            starts.append(float(ln.split("silence_start:")[1].split()[0]))
+        elif "silence_end:" in ln:
+            ends.append(float(ln.split("silence_end:")[1].split()[0]))
+    out = []
+    for i, s in enumerate(starts):
+        e = ends[i] if i < len(ends) else total
+        out.append((s, e, max(0.0, e - s)))
+    return out
+
+
+def _sentence_boundary_fracs(text):
+    """一段文本的句边界位置（累计有效字占比），供句口径量法定位句间停顿。
+
+    按句末标点切句；只剩一句（或切不出边界）就返回空列表——单句没有句间停顿
+    可扣，调用方据此退让。
+    """
+    from . import duration_model
+    parts = [p.strip() for p in re.split(r"(?<=[。！？!?；;])", text or "")
+             if p.strip()]
+    if len(parts) < 2:
+        return []
+    effs = [duration_model.effective_chars(l) for l in parts]
+    tot = float(sum(effs)) or 1.0
+    out, acc = [], 0.0
+    for e in effs[:-1]:
+        acc += e
+        out.append(acc / tot)
+    return out
+
+
+def ruler_sentence_k(wav, text=None, total=None):
+    """尺子的「句子口径」语速 = 有效字 ÷ (整段时长 − 句间停顿)。
+
+    `text` 是这条尺子念的文本（角色自己的 ref.txt）。句边界由它算出——A/B 文本
+    不同，边界位置自然不同，不能共用一份写死的比例。
+
+    量不出句间停顿（旧残档 / 检测失败 / 静音段对不上句边界）就返回 None：调用方
+    退回整段口径。量的目的是让试听更准，量不出来不该让它挂掉。
+    """
+    from . import duration_model
+    from .audio_engine import probe_duration_safe
+    txt = text or STANDARD_RULER_TEXT
+    T = float(total) if total else float(probe_duration_safe(wav) or 0)
+    if T <= 0:
+        return None
+    fracs = _sentence_boundary_fracs(txt)
+    if not fracs:
+        return None
+    segs = _silence_segments(wav, T)
+    if not segs:
+        return None
+    gap = 0.0
+    for frac in fracs:
+        want = frac * T
+        near = [s for s in segs
+                if abs((s[0] + s[1]) / 2.0 - want) <= _BOUNDARY_TOL * T]
+        if not near:
+            return None
+        gap += min(near, key=lambda s: abs((s[0] + s[1]) / 2.0 - want))[2]
+    span = T - gap
+    if span <= 0:
+        return None
+    return duration_model.effective_chars(txt) / span
+
+
+def read_ruler(cache_dir, role="A"):
+    """只读某角色已落盘的标准标尺：返回 {"path","k"}；不在场 / 残缺返回 None。
+
+    与 `standard_ruler` 共用同一套「什么算有效标尺」的判据（音频 + 配套 json
+    且 k>0），但**绝不触发合成**——试听这类只读入口必须能在标尺缺失时立刻
+    停下来报错，而不是就地拉起本地服务、加载模型、现场合成。
+    """
+    wav_name, meta_name = ruler_files(role)
+    wav = os.path.join(cache_dir, wav_name)
+    meta = os.path.join(cache_dir, meta_name)
+    if not (os.path.exists(wav) and os.path.exists(meta)):
+        return None
+    try:
+        with open(meta, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        k = float(d.get("k") or 0)
+    except (OSError, ValueError):
+        return None  # 残档：json 缺损等同于没有标尺
+    if k <= 0:
+        return None
+    try:
+        ks = float(d.get("k_sentence") or 0)
+    except (TypeError, ValueError):
+        ks = 0.0
+    if ks <= 0:
+        # 旧尺子（建它时还没记这一列）或字段写坏：从音频现量一次。只读、不合成，
+        # 量不出就退回整段口径——宁可差那 7.87%，也不让试听在这里断掉。
+        try:
+            ks = ruler_sentence_k(wav, text=d.get("text") or None) or k
+        except Exception:
+            ks = k
+    return {"path": wav, "k": k, "k_sentence": ks,
+            "text": d.get("text") or "", "role": str(role or "A").upper()}
+
+
+def standard_ruler(cache_dir, synth_one, text=None, carrier=None,
+                   allow_build=True, role="A"):
+    """某角色的标准音频：该角色的语速标尺，合成一次、落盘、之后只读。
 
     尺子 ＝ 一段固定文本的原速录音 ＋ 它自己的实测语速（有效字 ÷ 秒）。
+    文本是**该角色自己的 ref.txt**：试听要播的就是「本人按本色语速念这段参考」，
+    所以 A / B 各有一条，互不覆盖（文件名见 `ruler_files`）。
+
     首次调用经 `synth_one`（调用方闭包：绑定引擎、音色、参考音频与服务起停）
     一次合成为 wav，ffprobe 读出实际时长算出 k，与音频成对落盘；之后每次调用
     直接读文件，不再合成，也不随配置漂移——尺子不动，量的对象才会可比。
 
-    `carrier`（{"engine","voice"}）是载体的身份，随 json 落盘可查：尺子是
+    `carrier`（{"engine","voice",…}）是载体的身份，随 json 落盘可查：尺子是
     谁的嗓子必须说得清，不靠生成那一刻的运气。
 
     `synth_one` 只在标尺不存在时才被调用：缓存命中时连参考音频都不检查。
     合成、测时长任何一步失败都照实报错（TTSError 向上冒），不写半个标尺、
-    不返回假音频。换算公式（播放速度 × 标尺 k ÷ 音色实测 k）里标尺自己的
-    语速被精确消去，所以用谁的嗓子做载体都成立——但载体身份必须钉死，
-    不许随「当前选了哪个引擎」漂移（钉在谁身上由调用方闭包定）。
+    不返回假音频。换算公式（播放速度 × 音色实测 k ÷ 标尺 k）的两个 k 口径必须
+    对齐：分子是**逐句**量出来的（不含句间停顿），分母也就只能用**句子口径**——
+    所以落盘时除整段口径的 k 之外，再量一列 k_sentence（整段扣掉模型自发的句间
+    停顿，句边界由 `text` 自身算出）。载体身份必须钉死，不许随「当前选了哪个
+    引擎」漂移（钉在谁身上由调用方闭包定）。
+
+    `allow_build=False` 时只读：标尺不在就抛 TTSError，绝不合成——试听这类
+    只读入口要立刻停下来报错，而不是就地拉起本地服务、加载模型现生成。
     """
-    wav = os.path.join(cache_dir, RULER_WAV)
-    meta = os.path.join(cache_dir, RULER_JSON)
-    if os.path.exists(wav) and os.path.exists(meta):
-        try:
-            with open(meta, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if float(d.get("k") or 0) > 0:
-                return {"path": wav, "k": float(d["k"])}
-        except (OSError, ValueError):
-            pass  # 残档：json 缺损等同于没有标尺，往下走重新生成
+    txt = text or STANDARD_RULER_TEXT
+    cached = read_ruler(cache_dir, role)
+    if cached:
+        return cached
+    if not allow_build:
+        raise TTSError(
+            "标准标尺还没生成——它要由本地引擎合成一次才能落盘。"
+            "请先在音色面板点一次「标定」（会连带把标尺补上），再回来试听。")
+    wav_name, meta_name = ruler_files(role)
+    wav = os.path.join(cache_dir, wav_name)
+    meta = os.path.join(cache_dir, meta_name)
     from .audio_engine import probe_duration_safe
     from . import duration_model
     os.makedirs(cache_dir, exist_ok=True)
-    data = synth_one(STANDARD_RULER_TEXT)
+    data = synth_one(txt)
     tmp = wav + ".tmp"
     with open(tmp, "wb") as f:
         f.write(data)
@@ -1967,15 +2350,22 @@ def standard_ruler(cache_dir, synth_one, carrier=None):
     if sec <= 0:
         os.remove(tmp)
         raise TTSError("标准音频合成后读不出时长，标尺没有落盘。")
-    k = duration_model.effective_chars(STANDARD_RULER_TEXT) / sec
+    k = duration_model.effective_chars(txt) / sec
     os.replace(tmp, wav)
+    try:
+        ks = ruler_sentence_k(wav, text=txt, total=sec)
+    except Exception:
+        ks = None
     stamp = datetime.datetime.now().isoformat(timespec="seconds")
     meta_tmp = meta + ".tmp"
     meta_doc = {"k": round(k, 4), "seconds": round(sec, 3),
-                "text": STANDARD_RULER_TEXT, "created": stamp}
+                "text": txt, "role": str(role or "A").upper(), "created": stamp}
+    if ks and ks > 0:
+        meta_doc["k_sentence"] = round(ks, 4)
     if carrier:
         meta_doc["carrier"] = dict(carrier)
     with open(meta_tmp, "w", encoding="utf-8") as f:
         json.dump(meta_doc, f, ensure_ascii=False, indent=2)
     os.replace(meta_tmp, meta)
-    return {"path": wav, "k": round(k, 4)}
+    return {"path": wav, "k": round(k, 4),
+            "k_sentence": round(ks, 4) if ks and ks > 0 else round(k, 4)}

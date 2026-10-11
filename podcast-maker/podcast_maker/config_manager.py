@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ from . import paradigms as _paradigms
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
-VERSION = "2.9.1"
+VERSION = "2.11.0"
 
 
 # ============================================================================
@@ -713,7 +713,7 @@ PARAM_SPEC = {
     "tts.qwen3tts_port": _p("int", 9880, "voice", "语音服务端口",
                             min=1, max=65535, step=1,
                             engine_scope="qwen3tts"),
-    "tts.qwen3tts_voice_a": _p("str", "library:瑟琳-利落", "voice",
+    "tts.qwen3tts_voice_a": _p("str", "library:说书女-惊堂", "voice",
                                "A 角音色（Qwen3-TTS）",
                                options_source="voices", engine_scope="qwen3tts",
                                views=("script", "render"),
@@ -722,7 +722,7 @@ PARAM_SPEC = {
                                     "VoiceDesign 造的具名档案（named:…）。"
                                     "选中哪条，哪条音频立即成为该角的参考音频"
                                     "（复制文件，逐字节相同）"),
-    "tts.qwen3tts_voice_b": _p("str", "library:老傅-收束", "voice",
+    "tts.qwen3tts_voice_b": _p("str", "library:说书男-缓板", "voice",
                                "B 角音色（Qwen3-TTS）",
                                options_source="voices", engine_scope="qwen3tts",
                                views=("script", "render"),

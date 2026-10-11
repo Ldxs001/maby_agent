@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ from .config_manager import (BANNED_RULES, DISCOURSE_NEUTRAL, DISCOURSE_ORDER,
 def material_capacity(cfg):
     """一期素材的**内容额度**（字）：成稿目标 × 偏移量 1.25 × 压缩档。
 
-    口径（全链唯一的算法源）：**1 = 成稿目标**（每期时长 × 标准语速，不含
+    口径（全链唯一的算法源）：**1 = 成稿目标**（每期时长 × 脚本估时基准，不含
     偏移——它对应人设定的时长换算出的真实字数）；**x = 1 × 1.25 × 档位**；
     下限 = 1 × 1.25 × 1.2（素材至少多出偏移后脚本两成，写作才有「压缩」
     可言）。偏移量 1.25 只进算式、不改变"1"。与排图体检（planner 的
@@ -651,7 +651,7 @@ def normalize_script(data, cfg, vocab=None):
     - 字段缺失即补位（speaker 缺省承接上一句、text 补字距并折叠空白、emotion
       不在词表落中性档「承接」）
     - 空 text 的条目直接丢弃
-    - estimated_seconds 由时长模型按标准语速计算，丢弃 LLM 给的任何数字
+    - estimated_seconds 由时长模型按脚本估时基准计算，丢弃 LLM 给的任何数字
 
     emotion 的收束分两层：这里按**本篇词表**收（`vocab`＝`vocab_words(card)`
     的产物，缺省退基础表——基础表场景行为与从前一致）；语篇标签的生成侧约束
@@ -924,7 +924,7 @@ def _fill_line_seconds(lines, cfg):
     末尾少一个 `estimated_seconds`——不补就是 0 秒，字幕时间轴会错位、总时长
     会少算。正文句在正文收束（`normalize_script`）时已经量过，这里判为「有」
     就原样留着；补的时候与那一遍同一个口径（`duration_model.estimate_line`），
-    不接音色标定——脚本阶段的时长一律按标准语速估。
+    不接音色标定——脚本阶段的时长一律按脚本估时基准估。
 
     判据是「没有时长或为 0」：正常量出来最小也是 1 秒，0 只可能是没量过。
     这里**不做**任何格式收束：speaker / emotion / text 都是模板与正文里已经规范
@@ -1020,7 +1020,7 @@ def gate_generate(script, cfg, paradigm=None, extra_tags=()):
     不管传没传 `extra_tags`，**粘合句都不进逐句判据**（见函数内 `glue_lines`）：
     它们是程序逐字拼的固定结构，模型没参与、也改不动。
 
-    不接 calib：脚本阶段的时长一律按标准语速估，与音色无关。
+    不接 calib：脚本阶段的时长一律按脚本估时基准估，与音色无关。
     """
     items = []
     lo = int(cfg.get("gate.min_chars", 8))
@@ -1239,7 +1239,7 @@ def gate_generate(script, cfg, paradigm=None, extra_tags=()):
     # 豁免挡在逐句判据之外——两侧口径一致：粘合句不进任何逐句判据。
 
     # 总时长按「软门禁」办：不达标照常写进报告，但不阻断放行、也不回灌重写。
-    # 它是估算值不是实测值——真正的时长要等合成出来才作数；而估时口径是**标准语速**，
+    # 它是估算值不是实测值——真正的时长要等合成出来才作数；而估时口径是**脚本估时基准**，
     # 与本期用哪个音色无关（各音色相对标准的快慢见配置页那个比例）。
     # 拿一个估不准的秒数把稿子打回重写，等于让模型围着一个它既测不出、
     # 也控不住的数字反复改，最后把内容改坏。
@@ -1260,7 +1260,7 @@ def gate_generate(script, cfg, paradigm=None, extra_tags=()):
                  est["deviation_pct"], allowed))
     if not ok:
         # 反馈要可操作：只给偏差百分比，模型不知道该增删多少内容。
-        # 换算系数取本稿口径的有效语速（explain 已按标准语速算好，含语速倍率），
+        # 换算系数取本稿口径的有效语速（explain 已按脚本估时基准算好，含语速倍率），
         # 不用另一个常量顶替——同一个数出自同一处，改了尺子两处一起变。
         k = est.get("speech_cps") or duration_model.STANDARD_K
         detail += "；需%s约 %d 字" % ("删减" if diff > 0 else "增加",
@@ -5251,7 +5251,7 @@ def generate(material, cfg, llm, preset_key=None,
 
     产出含 title —— 标题与正文同一次生成，不再让用户到合成页补。
 
-    不接 calib：这一段的时长口径是标准语速，跟用哪个音色无关。
+    不接 calib：这一段的时长口径是脚本估时基准，跟用哪个音色无关。
 
     `should_stop` 是放弃指令（后台任务被中止时置位）。只在**轮次之间**看它：
     正在跑的那一次调用掐不断——本地模型一个请求就是一次不可分割的生成——但
@@ -5390,7 +5390,7 @@ def generate(material, cfg, llm, preset_key=None,
     log("素材类型：%s；对话形式：%s（连着说的上限 A %d 句 / B %d 句）"
         % (card.get("label") or "自适应", paradigms.DIALOGUE_FORMS[form_key]["label"],
            *_run_caps(card, cfg)))
-    log("目标：%.0f 秒 / 约 %.0f 字 / 约 %d 句（按标准语速 %.2f 有效字/秒 ≈ %d 汉字/分钟）"
+    log("目标：%.0f 秒 / 约 %.0f 字 / 约 %d 句（按脚本估时基准 %.2f 有效字/秒 ≈ %d 汉字/分钟）"
         % (target_seconds, target_chars, line_count,
            duration_model.STANDARD_K, duration_model.STANDARD_CPM))
 

@@ -568,7 +568,13 @@ class TestFrontendPins(unittest.TestCase):
             self.assertIn(needle, self.page, needle)
 
     def test_draft_audio_endpoint_used(self):
-        self.assertIn("new Audio('/api/music/audio/_draft')", self.page)
+        """草稿试听走 /api/music/audio/_draft；播放器全页只造一个、反复用。
+
+        每点一次 new Audio 的旧写法会把上一只播放器只丢引用不释放 —— 它带着
+        解码器继续发声（rawPreview 段有实测：连点 12 下 6 路叠着响）。
+        """
+        self.assertIn("MU_AU.src='/api/music/audio/_draft'", self.page)
+        self.assertIn("if(!MU_AU)MU_AU=new Audio()", self.page)
 
     def test_realtime_refresh_pins(self):
         """实时刷新铁律：每个成功回调都必须当场重渲染对应区块。"""

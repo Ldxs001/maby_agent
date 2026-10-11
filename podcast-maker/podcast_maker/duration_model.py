@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@
     L1 单参数（默认）      t = eff / (k · speed)
     L2 三参数最小二乘       t = (a·汉字 + b·标点 + c) / speed
 
-标准语速（STANDARD_K）：脚本阶段唯一的一把尺子，与音色无关——稿子的时长目标
+脚本估时基准（STANDARD_K）：脚本阶段唯一的一把尺子，与音色无关——稿子的时长目标
 不该随「这期换了哪个音色」变。音色之间快慢的差异，由校准实测换算成一个比例
 （`ratio_of`）挂在配置页的音色旁边，看得见、可追溯。
 
@@ -41,7 +41,7 @@ from datetime import datetime
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CALIB_PATH = os.path.join(ROOT, "calibration.json")
 
-# ---------------------------------------------------------------- 标准语速
+# ---------------------------------------------------------------- 脚本估时基准
 # 脚本侧唯一的一把尺子：估时只认它，跟用哪个音色无关。
 #
 # 锚点（外部标准 + 本机实测，都核过）：
@@ -57,7 +57,7 @@ STANDARD_CPM = 256.0        # 汉字/分钟
 EFF_PER_HANZI = 1.029       # 有效字 ÷ 汉字（同一个批实测的口径折算）
 STANDARD_K = round(STANDARD_CPM / 60.0 * EFF_PER_HANZI, 2)   # ≈4.39 有效字/秒
 
-# 旧名保留：校准表没有该音色样本时的兜底值，与标准语速同源——全局只有一把尺子。
+# 旧名保留：校准表没有该音色样本时的兜底值，与脚本估时基准同源——全局只有一把尺子。
 DEFAULT_K = STANDARD_K
 
 # L2 启用门槛：样本达到该数量后才拟合三参数
@@ -163,6 +163,10 @@ class Calibration:
                "a": g.get("a"), "b": g.get("b"), "c": g.get("c")}
         if out["mode"] == "L2" and None in (out["a"], out["b"], out["c"]):
             out["mode"] = "L1"
+        # 设备/后端只在本组真的记过时才带上（借来的组不冒充「本组实测设备」）。
+        for extra in ("device", "backend"):
+            if g.get(extra):
+                out[extra] = g[extra]
         if borrowed_from is not None:
             out["borrowed"] = borrowed_from
         return out
@@ -191,13 +195,16 @@ class Calibration:
                 "samples": int(g.get("n", 0)),
                 "mode": g.get("mode", "L1"),
                 "updated": g.get("updated", ""),
+                # 这组是在哪个设备/后端上量的 —— 界面据此显示，换档后一眼看得出。
+                "device": g.get("device", ""),
+                "backend": g.get("backend", ""),
             })
         return rows
 
 
 # ----------------------------------------------------------------- 标准尺子
 def standard_stats():
-    """标准语速的 stats，形状与 `Calibration.stats()` 一致，估算函数可以直接取。
+    """脚本估时基准的 stats，形状与 `Calibration.stats()` 一致，估算函数可以直接取。
 
     脚本阶段一律用它：目标字数反推、逐句估时、总时长门禁，全项目同一把尺子。
     音色之间的快慢差异不在估算里体现——那是「配置 → 声音」里每个音色的比例。
@@ -207,12 +214,12 @@ def standard_stats():
 
 
 def standard_rate():
-    """标准语速的两个单位，供界面显性展示。"""
+    """脚本估时基准的两个单位，供界面显性展示。"""
     return {"k": STANDARD_K, "cpm": round(STANDARD_CPM), "per_hanzi": EFF_PER_HANZI}
 
 
 def ratio_of(calib, engine, voice, speed=1.0):
-    """音色语速 ÷ 标准语速。没有该音色的实测样本时返回 None。
+    """音色语速 ÷ 脚本估时基准。没有该音色的实测样本时返回 None。
 
     只认该音色自己量出来的 k：借别人的数顶替，等于把「量过的」伪装成「没量过的」
     反过来——这个比例的全部价值就在于它是这一个音色的现场值。
@@ -269,7 +276,7 @@ def speaker_ctx(cfg, speaker):
 
 
 def estimate_line(text, speaker, cfg, calib=None):
-    """单句估时。默认按**标准语速**估；传 calib 才改用该说话人音色的实测系数。
+    """单句估时。默认按**脚本估时基准**估；传 calib 才改用该说话人音色的实测系数。
 
     脚本阶段一律不传 calib：稿子的时长目标不该随「这期换了哪个音色」变。
     """
@@ -279,7 +286,7 @@ def estimate_line(text, speaker, cfg, calib=None):
 
 
 def estimate_total(script, cfg, calib=None, include_pauses=True):
-    """全篇估时（秒）。默认标准语速，口径同 `estimate_line`。"""
+    """全篇估时（秒）。默认脚本估时基准，口径同 `estimate_line`。"""
     total = 0.0
     for item in script or []:
         total += estimate_line(item.get("text", ""), item.get("speaker", "A"), cfg, calib)
@@ -355,11 +362,19 @@ def fit_l2(pairs):
     return {"a": a, "b": bb, "c": c}
 
 
-def calibrate(calib, engine, voice, speed, lines):
+def calibrate(calib, engine, voice, speed, lines, device=None, backend=None):
     """用实测结果更新校准系数。
 
     lines: [{"text":..., "seconds":...}]，seconds 为实测音频时长。
     返回更新后的 stats（供界面显性展示）。
+
+    `device` / `backend` 是这次实测跑在哪个设备、哪个后端（调用方从本地服务
+    `/health` 取）。它与系数一起落盘、可查，并驱动一条**换档即失效**的规则：
+    CPU 与 GPU 两条路径产出的波形不是同一条（实测同一输入 md5 不同），把两种
+    设备上量的样本 EMA 到一起，等于拿两把尺子量同一份稿子。所以只要本次设备与
+    上一条记录**不同**（且两边都有值），就丢弃旧样本、本次结果直接起算 —— 旧
+    条目的 n / k / L2 系数一概不参与，避免跨档污染。两边任一为空（下游没报设备）
+    时维持原有 EMA 行为，不误伤。
     """
     pairs = []
     for ln in lines or []:
@@ -377,8 +392,16 @@ def calibrate(calib, engine, voice, speed, lines):
 
     key = group_key(engine, voice, speed)
     old = calib.groups.get(key) or {}
-    old_n = int(old.get("n", 0))
 
+    # 换档即失效：设备/后端变了，旧样本与新样本不可混（两条波形不是同一条）。
+    dev = str(device or "").strip()
+    bak = str(backend or "").strip()
+    old_dev = str(old.get("device") or "").strip()
+    if dev and old_dev and dev != old_dev:
+        old = {}          # 旧档不参与 EMA、不参与 L2 合并 —— 本次起算
+        old_dev = ""
+
+    old_n = int(old.get("n", 0))
     k_new = fit_l1(pairs)
     if k_new is None:
         return calib.stats(engine, voice, speed)
@@ -389,6 +412,13 @@ def calibrate(calib, engine, voice, speed, lines):
 
     entry = {"k": round(k, 4), "n": old_n + len(pairs), "mode": "L1",
              "updated": datetime.now().isoformat(timespec="seconds")}
+    # 设备/后端随系数落盘：本次没报就沿用上一条已知值，不凭空丢失可查性。
+    entry_dev = dev or old_dev
+    if entry_dev:
+        entry["device"] = entry_dev
+    entry_bak = bak or str(old.get("backend") or "").strip()
+    if entry_bak:
+        entry["backend"] = entry_bak
 
     sample_count = old_n + len(pairs)
     if sample_count >= L2_MIN_SAMPLES:
@@ -432,7 +462,7 @@ def _merge_history(old, pairs):
 def explain(script, cfg, calib=None):
     """逐句明细，供界面显性展示（需求三的"字/时间"）。
 
-    默认按标准语速估——脚本页看到的秒数与音色无关，全篇一把尺子。
+    默认按脚本估时基准估——脚本页看到的秒数与音色无关，全篇一把尺子。
     传 calib 才按各说话人音色的实测系数估（出片侧要拿音色算数时才用）。
     """
     rows = []
@@ -479,7 +509,7 @@ def explain(script, cfg, calib=None):
 
 
 def target_hint(cfg, calib=None, speeds=(1.0,)):
-    """事前反推：给定目标时长与若干语速，给出目标有效字数。默认标准语速。"""
+    """事前反推：给定目标时长与若干语速，给出目标有效字数。默认脚本估时基准。"""
     target = float(cfg.get("script.target_minutes", 4.0)) * 60.0
     engine = cfg.get("tts.engine", "edge")
     voice = cfg.get("tts.voice_a", "")

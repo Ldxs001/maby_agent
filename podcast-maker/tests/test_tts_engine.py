@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -126,6 +126,38 @@ class TestThreeStates(unittest.TestCase):
             self.assertEqual(st["message"], self._msg(packages=["torch"]))
         with _patch():
             self.assertTrue(tts_engine.local_state()["ready"])
+
+
+class TestRunningDevice(unittest.TestCase):
+    """服务自报的设备：只认 cuda / cpu 两个真值，拿不到就空。
+
+    成片回填、标定落表、尺子落盘都用它把「谁在哪儿跑」记下来（换档即失效靠
+    这一栏）。「未加载」之类的占位不算设备 —— 那只是模型还没进显存。
+    """
+
+    def test_real_device_and_backend(self):
+        with mock.patch.object(
+                tts_engine, "service_health",
+                return_value=(True, "", {"device": "cuda",
+                                         "backend": "faster-qwen3-tts"})):
+            self.assertEqual(tts_engine.running_device({}),
+                             ("cuda", "faster-qwen3-tts"))
+
+    def test_placeholder_device_is_empty(self):
+        with mock.patch.object(
+                tts_engine, "service_health",
+                return_value=(True, "", {"device": "未加载", "backend": ""})):
+            self.assertEqual(tts_engine.running_device({}), ("", ""))
+
+    def test_offline_is_empty(self):
+        with mock.patch.object(tts_engine, "service_health",
+                               return_value=(False, "离线", {})):
+            self.assertEqual(tts_engine.running_device({}), ("", ""))
+
+    def test_exception_is_empty(self):
+        with mock.patch.object(tts_engine, "service_health",
+                               side_effect=RuntimeError("boom")):
+            self.assertEqual(tts_engine.running_device({}), ("", ""))
 
 
 class TestOneWordingEverywhere(unittest.TestCase):
@@ -488,6 +520,30 @@ class TestVoiceControls(unittest.TestCase):
         self.assertIn('ICL_STEM = "%s"' % layout.VOICE_ICL_STEM, src)
         self.assertIn('BASE_REFS_NAME = "%s"' % layout.VOICE_BASE_REFS, src)
 
+    def test_ref_base_has_one_candidate_picker(self):
+        """项目 ref_base 与标定 ref_base 共用同一份候选挑选（唯一实现）。
+
+        两条链各挑各的，迟早挑出两条不同波形，而「标定与成片同源」正是这套
+        机制的命根子。所以 build_role 与 build_from 都必须调 _gen_baseref，
+        而不是各写一遍候选循环。
+        """
+        with open(os.path.join(_ROOT, "tts_service", "make_base_ref.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("def _gen_baseref(", src)
+        self.assertIn("def build_from(", src)
+        # 2 处调用（定义带类型标注，故按调用签名计数）
+        self.assertEqual(src.count("_gen_baseref(eng, text, ref_wav"), 2,
+                         "候选挑选必须只有一条实现（build_role / build_from 各一调用）")
+
+    def test_cli_exposes_detached_ref_base_path(self):
+        """命令行留出「脱离项目」那一路：标定才能不依赖项目。"""
+        with open(os.path.join(_ROOT, "tts_service", "make_base_ref.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        for flag in ('"--from-wav"', '"--from-text"', '"--out-dir"'):
+            self.assertIn(flag, src)
+
     def test_the_voice_dir_name_has_one_source(self):
         """音色目录名只有一处真源（layout.DIR_VOICE），工具那侧靠参数收。"""
         with open(os.path.join(_ROOT, "tts_service", "make_voice.py"),
@@ -771,6 +827,117 @@ class TestServiceJob(unittest.TestCase):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         proc.wait(timeout=10)
         self.assertIsNone(tts_engine._job_assign(proc))
+
+
+class TestVoiceEntityRef(unittest.TestCase):
+    """音色本体解析：标定从此从本体要参考，不再问项目。"""
+
+    def test_library_resolves_to_repo_voice_dir(self):
+        ref = tts_engine.voice_entity_ref("library:说书女-惊堂")
+        self.assertIsNotNone(ref, "随仓声库里的音色应解析得出本体")
+        self.assertEqual(
+            ref["wav"], os.path.join(tts_engine.VOICES_LIBRARY_DIR,
+                                     "说书女-惊堂", "ref.wav"))
+        self.assertTrue(os.path.isfile(ref["wav"]))
+        self.assertTrue(ref["text"].strip(), "本体转录不能是空的")
+
+    def test_library_missing_entry_is_none(self):
+        self.assertIsNone(tts_engine.voice_entity_ref("library:没有这个音色"))
+
+    def test_named_needs_project_root(self):
+        td = tempfile.mkdtemp()
+        d = os.path.join(td, layout.DIR_VOICE, "我的嗓")
+        os.makedirs(d)
+        with open(os.path.join(d, "ref.wav"), "wb") as fh:
+            fh.write(b"\0" * 4096)
+        with open(os.path.join(d, "ref.txt"), "w", encoding="utf-8") as fh:
+            fh.write("一句话。")
+        # 具名档案是项目资产：不给项目解析不出，给了才成
+        self.assertIsNone(tts_engine.voice_entity_ref("named:我的嗓"))
+        ref = tts_engine.voice_entity_ref("named:我的嗓", project_root=td)
+        self.assertIsNotNone(ref)
+        self.assertEqual(ref["wav"], os.path.join(d, "ref.wav"))
+
+    def test_unknown_source_is_none(self):
+        for bad in ("", "薇薇-清亮", "bogus:x", "library:", "official:",
+                    "library:不存在"):
+            self.assertIsNone(tts_engine.voice_entity_ref(bad), bad)
+
+
+class TestCalibRef(unittest.TestCase):
+    """标定用 ref_base：落点随音色本体走，与项目无关。"""
+
+    def test_dir_carries_role_and_sign(self):
+        d = tts_engine.calib_ref_dir("A", "abc123")
+        self.assertTrue(d.startswith(tts_engine.CALIB_REFS_DIR))
+        self.assertEqual(os.path.basename(d), "abc123")
+        self.assertEqual(os.path.basename(os.path.dirname(d)), "A")
+
+    def test_bad_role_falls_back_to_a(self):
+        d = tts_engine.calib_ref_dir("zzz", "s")
+        self.assertEqual(os.path.basename(os.path.dirname(d)), "A")
+
+    def test_cache_hit_does_not_spawn_generator(self):
+        """本体指纹一致即命中缓存，绝不起子进程重做。"""
+        td = tempfile.mkdtemp()
+        wav = os.path.join(td, "ref.wav")
+        with open(wav, "wb") as fh:
+            fh.write(b"\0" * 4096)
+        sign = tts_engine._sha256_file(wav)[:16]
+        with mock.patch.object(tts_engine, "CALIB_REFS_DIR", td):
+            out = tts_engine.calib_ref_dir("A", sign)
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, "ref_base.wav"), "wb") as fh:
+                fh.write(b"\0" * 4096)
+            with open(os.path.join(out, "ref_base.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"sign": sign}, fh)
+            with mock.patch.object(tts_engine.subprocess, "run",
+                                   side_effect=AssertionError("不该起子进程")):
+                p = tts_engine.ensure_calib_ref(
+                    {"wav": wav, "text": "一句话。"}, "A", {}, log=lambda m: None)
+        self.assertEqual(p, os.path.join(out, "ref_base.wav"))
+
+    def test_miss_spawns_generator_on_cuda(self):
+        """缓存没命中：起生成器，命令行必须钉在 --from-wav/--out-dir/--device cuda。"""
+        td = tempfile.mkdtemp()
+        wav = os.path.join(td, "ref.wav")
+        with open(wav, "wb") as fh:
+            fh.write(b"\0" * 4096)
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = list(cmd)
+            out = cmd[cmd.index("--out-dir") + 1]
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, "ref_base.wav"), "wb") as fh:
+                fh.write(b"\0" * 4096)
+            with open(os.path.join(out, "ref_base.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"sign": tts_engine._sha256_file(wav)[:16]}, fh)
+
+            class _R:
+                returncode = 0
+                stdout = b""
+                stderr = b""
+            return _R()
+
+        with mock.patch.object(tts_engine, "CALIB_REFS_DIR", td), \
+             mock.patch.object(tts_engine, "venv_python",
+                               return_value=VENV_PY), \
+             mock.patch.object(tts_engine, "unload_llm_models",
+                               lambda *a, **k: None), \
+             mock.patch.object(tts_engine.subprocess, "run",
+                               side_effect=fake_run):
+            p = tts_engine.ensure_calib_ref(
+                {"wav": wav, "text": "一句话。"}, "B", {}, log=lambda m: None)
+        self.assertTrue(p.endswith("ref_base.wav"))
+        cmd = seen["cmd"]
+        self.assertIn("--from-wav", cmd)
+        self.assertEqual(cmd[cmd.index("--from-wav") + 1], wav)
+        self.assertIn("--from-text", cmd)
+        self.assertEqual(cmd[cmd.index("--role") + 1], "B")
+        self.assertEqual(cmd[cmd.index("--device") + 1], "cuda")
 
 
 if __name__ == "__main__":

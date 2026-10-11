@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -204,12 +204,12 @@ class TestPlanMap(Base):
     这套判据与从前那套的分别不在写法，在**谁持有决定权**。从前期数与落点都在
     模型手里：期数问模型（同一份素材两次排出 60 期和 5 期，两个都「合乎提示词」），
     落点也让模型抄（抄错一条这一期就取不到料）。现在期数由 `probe.capacity()`
-    从目标时长与标准语速算出来，落点由分组结果直接取用，模型只决定哪些单元
+    从目标时长与脚本估时基准算出来，落点由分组结果直接取用，模型只决定哪些单元
     合成一期、以及这一期叫什么。
     """
 
     def plan(self, cfg=None, item=None, llm=None, log=None):
-        # 不再需要「隔离的口径表」：容量由标准语速算出，与机器上的
+        # 不再需要「隔离的口径表」：容量由脚本估时基准算出，与机器上的
         # calibration.json 无关，同一个断言在哪台机器上都是同一个数。
         return PLN.plan_map(self.base, self.pid, item or self.item,
                             cfg or self.cfg, llm, log=log)
@@ -307,7 +307,7 @@ class TestPlanMap(Base):
         # 容量当期数用，等于假设「原文一个字换脚本一个字、照单全念」。
         llm = FakeLLM(groups_json([([1, 2, 3], "甲")]))
         res = self.plan(llm=llm)
-        # 容量与实现同源：都由标准语速算出，不随机器上的校准变。
+        # 容量与实现同源：都由脚本估时基准算出，不随机器上的校准变。
         self.assertEqual(res["capacity"], probe.capacity(self.cfg))
         self.assertIn("由你决定", llm.prompt)
         self.assertNotIn("请正好排出", llm.prompt)
@@ -824,7 +824,7 @@ class TestUnitListContract(Base):
 class TestRatioCheck(unittest.TestCase):
     """压比体检：两条红线之间都合格，红线外的反馈自带期号、字数与方向。
 
-    口径（使用者定的公式）：**1 = 成稿目标**（每期时长 × 标准语速，不含
+    口径（使用者定的公式）：**1 = 成稿目标**（每期时长 × 脚本估时基准，不含
     偏移），分母就是它。偏移量 1.25 只进算式、不改变"1"：
 
     - 上限 = 档位 × 1.25（素材容量 x = 1 × 1.25 × 档位）；

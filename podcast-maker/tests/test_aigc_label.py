@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -87,7 +87,7 @@ class TestAigcJson(unittest.TestCase):
         spec = PARAM_SPEC["aigc.content_producer"]
         self.assertEqual(spec["default"], "")
         self.assertTrue(spec.get("required"))
-        self.assertNotIn("wUwproject", json.dumps(PARAM_SPEC["aigc.content_producer"],
+        self.assertNotIn("[username-redacted]", json.dumps(PARAM_SPEC["aigc.content_producer"],
                                                   ensure_ascii=False))
 
     def test_ascii_safe(self):

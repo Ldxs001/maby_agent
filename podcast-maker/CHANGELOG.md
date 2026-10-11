@@ -12,6 +12,225 @@
 
 ---
 
+## v2.11.0
+
+**本次改动：VoiceDesign 人物 roster 40 条落库随仓声库、出厂默认音色切换 roster 条目**
+
+**新增**
+
+- **随仓声库新增 VoiceDesign 人物 40 条**：`resources/voices/` 新增 5 人物（说书／编辑／学生／长者／主播）× 男女两 family × 4 flavor，A 案 20 条、B 案 20 条，命名 `人物-flavor`，profile 与 curate 同一 schema（`kind=voice_library`、`family`／`flavor`／`text_role` 分案），并保留 `source: voicedesign` 与全套溯源（seed、f0_med、语速、响度、design_description）。生成全部走 faster-qwen3-tts CUDA 路径，念全校验（语速 3.5–7.0 字/s、段数 ≥3）通过后入库，波形逐字节复制并以 sha256 前 16 位对账。其中 15 条首轮被语速门禁拦下：根因是部分描述含加速表述（编辑 family 基础串「语速偏快」）叠加女声底速偏高；修法为改写描述（去除加速表述、慢速锚前置）加种子平移扫描，四轮后 40/40 通过，门禁阈值未放宽。
+
+**变更**
+
+- **出厂默认音色切换**：`tts.qwen3tts_voice_a` / `tts.qwen3tts_voice_b` 默认值由 `library:瑟琳-利落` / `library:老傅-收束` 改为 `library:说书女-惊堂`（A 案）/ `library:说书男-缓板`（B 案），`make_voice.DEFAULT_VOICES` 同步对齐。旧条目仍在声库，存量项目对旧条目的引用不受影响；新项目未配置时的 A/B 参考音频即落在新条目上。
+
+---
+
+## v2.10.0
+
+**本次改动：试听只读标尺（缺标尺秒回引导）、本地服务起服务移出业务锁、试听换算倍率方向修正、试听分母口径对齐、音色行补注试听分母、原声播放器改单实例复用、试听类播放器互斥、标准与混合试听补停止、标定与音色工具补腾显存、校准表与标尺记录生成设备（换档即失效）、标准尺子 A/B 分离（各念各自 ref.txt）、试听按角色分管、标定改以 ref_base 为参考并念角色 ref.txt、试听缓存键带尺子身份、标定改从音色本体自生成 ref_base（脱离项目）与独立缓存目录、ref_base 候选挑选收敛为唯一实现、全局「标准语速」更名「脚本估时基准」、旧校准表留档另存后从零**
+
+**修复**
+
+- **试听可能卡满 90 秒**：`api_preview_standard` / `api_bgm_mix_preview` 取标尺走
+  `_get_std_ruler`，而标尺缓存缺失时该调用会现场拉起本地 TTS 服务、加载模型、合成一句
+  18 秒标尺音频（`_std_ruler_synth` → `acquire_service`，`_wait_ready` 上限 90 秒），
+  于是「试听」按钮可以停在「…准备中」直到超时。修法：标尺取用加 `allow_build` 开关，
+  两个只读入口一律传 `False`；`tts_engine.standard_ruler` 配独立的 `read_ruler` 只读判定，
+  标尺不在即抛错。实测缺标尺时接口 1.8 ms 返回，不再起服务。
+- **一次起服务锁死整页状态接口**：`tts_engine.acquire_service` 原先把 `_spawn_service`
+  （含 90 秒 `_wait_ready`）整个包在 `_SERVICE_LOCK` 内，期间任何读锁入口一起等待。改为
+  `starting` 状态位加条件变量：起服务移到锁外，只放一个线程去起，其余在「启动中」上等待；
+  `release_service` 在启动完成后才裁决是否停机，避免「服务刚起好、引用计数已归零、无人停」
+  的泄漏。
+- **缺实测 / 缺标尺只提示不给出口**：两个只读入口的失败响应带回 `need_calib`（该角缺语速
+  实测）/ `need_ruler`（标尺未生成）标志；前端 `stdPreview` 据此就地把该角色按钮改显
+  「先点旁边的「标定」」，2.6 秒后复位。
+- **试听播放倍率的两个语速位置写反**：`api_preview_standard` 按 `rate = speed × ruler["k"] ÷ k_role` 换算，而试听音频的实际语速等于 `ruler["k"] × rate`；要让它等于成片真实语速 `k_role × speed`，倍率只能是 `speed × k_role ÷ ruler["k"]`。两个语速在分式里的位置颠倒，方向随之整体反转——音色比标尺快时播得偏慢、比标尺慢时播得偏快，偏差幅度随音色与标尺的差距放大。标尺载体与 A 角音色同为 Vivian 时两式近似相等（`k_role ≈ k_std`），方向错误被掩盖，换用其它音色后显形。实测（`library:薇薇-清亮`、滑杆 0.80，k_role 3.8369）：修前试听词速 4.273 有效字/秒、成片 3.070，偏快 39.2%；修后 3.070，与成片一致（残差来自倍率取三位小数）。修法：把分式里的两个语速对调；`tts_engine.standard_ruler` 的换算说明与 `web_ui` 的换算注释同步改写，并补方向判据（音色越快、倍率越大）。分母该取哪个口径另见下条。
+- **试听分母口径与分子不对齐，词速系统性偏快 7.87%**：`k_role` 由逐句标定得到，分母是三句各自时长之和，**不含句间停顿**；而标尺的 `k = 有效字 ÷ 整段时长`，**含模型连读时自发产生的句间停顿**。逐句口径的目标除以整段口径的基准，两端口径不一致，试听听到的词速整体偏快。实测标尺 `previews/standard.wav`（18.240 秒 / 79.50 有效字）含 8 段静音共 3.681 秒；按三句有效字 26.5 / 28.5 / 24.5 定出的句边界为 0.333 / 0.692，据此定位到两段句间停顿 0.623 秒（位置 0.337）与 0.707 秒（位置 0.714），合计 1.330 秒。整段口径 4.3586、句子口径 79.50 ÷ 16.910 = 4.7015，比值 1.0787。修法：`standard_ruler` 落盘时增列 `k_sentence`（句子口径，构建时从刚写出的音频量得）；`read_ruler` 读到旧尺子缺该列时从音频只读现量一次，量不出退回整段口径；`api_preview_standard` 的分母改用 `k_sentence`。验证：真机 `api_preview_standard` 调用，A 角（`library:薇薇-清亮`、滑杆 0.80）目标词速 3.0695、试听 3.0691（−0.01%）；B 角（`library:艾登-从容`、滑杆 0.90）目标 3.8385、试听 3.8352（−0.09%，差值来自倍率取三位小数）；同两例在旧口径下均为 +7.87%。
+- **原声按钮连点几次后「音频放不出来」**：`rawPreview` 每点一次即 `new Audio(src)`，旧对象只置空引用（`RAW_AU=null`）而**不停播也不释放**，解码器与音频输出随之留存；同一处 `stop()` 里的 `pause()` 又会打断上一轮 pending 的 `play()`，其 `AbortError` 被 `catch` 无差别当作故障——既弹出「音频放不出来」，又把**共用**的 `RAW_AU` / `RAW_BTN` 一并清空，连新一轮刚建好的播放器一起抹掉，按钮与实际播放状态自此脱节。真机实测（headless Edge，A / B 两角交替点击 12 次、间隔 40 ms）：新建播放器 12 个、**6 路同一段音频同时在播且错位叠放**、误报 6 条——听感即「第一个音节没了」；音频通道被占满后转为彻底放不出，重开页面才恢复。修法：全页只保留一个 `Audio` 实例，换曲只换 `src`；停止走 `pause()` + `removeAttribute('src')` + `load()`（与配置页既有 `preview_base` 试听的释放写法一致）；每轮发一个 `RAW_SEQ`，`onended` / `onerror` / `play()` 的拒绝只认自己那一轮，`AbortError` 与「已被下一轮接管」一律静默返回；一次故障会有两条路到达（元素 `error` 事件与 `play()` 拒绝），只报一条。验证：同一浏览器同一参数，修后点击 12 次与 60 次均为新建 1 个、并发 1 路、误报 0；另过停止、切曲、播完自动复位、真 404 照实报一条、图标请求归零共 8 项功能判据。
+- **试听与原声互不独占，两路可同时发声**：页面上会发声的试听共六处——标准试听
+  （`stdPreview`）、混合试听（`bgmMixPreview`）、档位试听（原生 `<audio>`）、原声
+  （`rawPreview`）、造嗓草稿（`vdDraftPreview`）、音乐草稿（`musicDraftPreview`），
+  各持一套播放器，任一路开始播放都不通知其余各路的停止函数，两路叠着响，听感即两人
+  同时说话。修法：设全页共用的占用者 `AUDIO_OWNER`，每路暴露自己的「停」函数并登进
+  `claimAudio`——开播前先把当前占用者停下，自己停时经 `releaseAudio` 交还；档位试听的
+  停函数是逐行现建的闭包，按同一接口登记。实测（headless Edge + CDP，配置页 A 角）：
+  试听在播时点原声，试听 `paused` 转真；原声在播时点试听，原声 `paused` 转真；占用者
+  随之在两路之间转移（`stdStopVoice` ↔ `rawStopVoice`），两路皆停后回到空。
+- **标准试听与混合试听只能播不能停**：二者的按钮点一次即播，再点仍是重播，没有停止
+  路径；按钮文案恒为「▶ 试听」（「▶ 混合」），播放中也不改，从按钮上看不出当前是否
+  在播。修法：各增停止函数（`stdStopVoice` / `mixStopVoice`），走 `pause()` +
+  `removeAttribute('src')` + `load()` 释放；按钮改双态——播放中显「⏹ 停止」，再点一次
+  即停；`stdPreview` 的 `finally` 由「一律复位文案」改为「未进入播放才复位」，否则刚
+  点亮的「⏹ 停止」会被复位覆盖。原声、造嗓草稿、音乐草稿三处的停止函数同步补上
+  「摘 `src` + `load()`」的释放动作与占用者交还；造嗓草稿与音乐草稿的播放器由每次
+  `new Audio` 改为单实例复用。
+- **标定与音色工具未腾显存，参考音频可能在 CPU 上生成**：`unload_llm_models()` 全仓只在
+  `synthesize()` 内被调用一处；标定（`api_voice_calibrate` → `synth_line`）、标尺构建
+  （`_get_std_ruler` → `_std_ruler_synth`）、音色工具（认领 / 声库认领 / 录制 / 造嗓，经
+  `make_voice.py` 子进程进入 `make_base_ref.build(device="auto")`）三类链均未调用它。后者的
+  设备判定发生在**子进程**内，按整卡空闲内存判定（`pick_device`，门槛 4500 + 800 =
+  5300 MB），LM Studio 驻留模型期间静默退 CPU；而 CPU 与 CUDA 两条路径产出不是同一条波形
+  （同一输入 md5 不同）。后果：标定得到的语速与成片的实际语速可能不同源，生成的 ref_base
+  与成片不在同一波形上。证据：本项目 `音色/` 下 14 份 ref_base 记录中 7 份 `device: cpu`、
+  7 份 `cuda`，同一小时内反复切换。修法：`unload_llm_models()` 接入 `api_voice_calibrate`
+  （合成前）；新增 `web_ui._prep_voice_tool`，把腾显存与 `--device cuda` 一并加进四处音色
+  工具 spawn；`tts_engine.ensure_voice_profiles` 的子进程命令行同步补 `--device cuda`。
+
+**变更**
+
+- **标定结束补建标尺**：`api_voice_calibrate` 在本地引擎分支、三句标定合成完成后，若标尺
+  缺失则补建一次（服务已在场、模型已加载，增量成本为一次标尺合成）；补建失败不影响标定
+  结果。
+- **音色行补注「试听的分母不是标准语速」**：配置页音色行的「比例 N ＝ 音色语速 ÷ 标准语速
+  （4.39 有效字/秒）」紧接「▶ 试听」按钮，而该按钮换算用的分母是标尺的**句子口径**语速
+  （4.70 有效字/秒）——两个数并排却只报其一，容易被误按「滑杆 × 比例」推出试听倍率
+  （所得与真实倍率相差 7.87%）。修法：`web_ui.standard_payload()` 在配置载荷的「标准语速」
+  块内增发 `k_sentence`，取自只读的 `tts_engine.read_ruler`（不在页面加载路径上合成；读尺子
+  出任何岔子都降级为只报 `k`，尺子不在场则不报该字段）；前端 `ratioNote` 在其后补一句
+  「｜试听分母 4.70 有效字/秒（标尺脱去句间气口，与标定的逐句口径对齐）；上面 4.39 只用于
+  脚本估时」。`STANDARD_K`（4.39）与试听分母（4.7015）均未改动，只补说明。盘上
+  `previews/standard.json` 是旧版构建产物、缺 `k_sentence` 列，已按构建路径同一写法补列
+  （`ruler_sentence_k` 量得 4.7015），音频与既有字段未动——补列只省掉每页一次现量，
+  读取路径本身对缺列已有兜底。
+- **页面不再请求 `/favicon.ico`**：`<head>` 增 `<link rel="icon" href="data:,">`。该请求由
+  浏览器自动发出，服务端无此路由、恒回 404，与音频播放无关，只会在控制台留下干扰记录。
+- **校准表与标尺记录生成设备，换档即失效**：`duration_model.calibrate` 增 `device` /
+  `backend` 两参数，随系数一并落盘；`Calibration._normalize` 与 `summary` 在有值时带出这
+  两栏（本组未记则不凭空补键）。`tts_engine.standard_ruler` 的 `carrier` 增 `device` /
+  `backend`，由 `web_ui._get_std_ruler` 在允许构建时经 `tts_engine.running_device` 取得，
+  只读路径（试听）不探测。`ref_base` 记录原有这两栏。`calibrate` 同时比较本次设备与上一条
+  记录：不同则丢弃旧样本、本次直接起算（EMA 不混、L2 不并），两边任一为空时维持原 EMA
+  行为。新增 `tts_engine.running_device`：向服务 `/health` 取设备，只认 `cuda` / `cpu`
+  两个真值，「未加载」等占位一律返回空。`pipeline` 的实测回填调用 `calibrate` 时传入当次
+  设备与后端。
+- **标准尺子 A / B 分离，各念各自 ref.txt**：原标尺全局唯一（`previews/standard.wav`），
+  文本是三句标定文案、载体取首次生成时的 A 角档案，A / B 试听播的是同一段音频、只是
+  播放速度快慢不同——听到的不是本人的嗓子。改为每角色一条（`standard_A.wav` /
+  `standard_B.wav` 及各自 json）：文本取该角色项目档案里的 `ref.txt`，载体是该角色音色。
+  `tts_engine` 增 `ruler_files(role)` 定文件名，`read_ruler` / `standard_ruler` 增 `role`
+  参数，落盘 json 增 `role` 字段；`_sentence_boundary_fracs` 由写死的三句占比改为按**传入
+  文本**算（A、B 文本不同，句边界位置不同）；新增 `web_ui._std_ruler_text` 读该角色
+  `ref.txt`，读不到退回标定文本兜底。原有 `previews/standard.wav` / `standard.json`
+  保留在盘上，代码不再引用。
+- **试听按角色分管**：`_get_std_ruler` / `_std_ruler_synth` 增 `role` 参数，
+  `api_preview_standard` 用该角色自己那条尺子的 `k_sentence` 做分母；`standard_payload`
+  的 `k_sentence` 由单值改为 `{"A": …, "B": …}`；前端 `ratioNote` 按点位 `key` 推出的
+  角色取对应分母（`control()` 内把角色挂到 `spec.role`，`refreshRatioNotes` 与
+  `fillRatio` 共用同一份）。A / B 两条尺子文本与句间停顿各不相同，「整段 → 句口径」
+  的换算系数随之不同（实测旧尺子 ×1.079、新 A ×1.112、新 B ×1.183），分母只能逐条实量。
+- **标定改以 ref_base 为参考、念角色自己的 ref.txt**：原标定用 `voice_profiles` 的合成对
+  （有账本时是 icl 拼接件），文本固定为三句标定文案。而成片用的参考正是 ref_base 那一套
+  （账本 active 版 icl 由它拼出），标定量的必须与成片同一条嗓子。改为：参考取该角色
+  `base_wav`（`ref_base_<sign>.wav`）本尊，转录取单份 `ref.txt`（与 base 音频内容一致，
+  不取 icl 的两遍转录），文本按 `ref.txt` 逐句切分后逐句合成。`ref_base` 缺席（未做过的
+  项目）时退回账本那一对，`ref.txt` 切不出 ≥3 句（`calibrate` 的下限）时退回标定文案
+  ——两条兜底都不改变既有行为。
+- **试听缓存键带尺子身份**：`api_preview_standard` 的落盘文件名原为
+  `std_<角色>_<倍率>.wav`，只按倍率命名；换尺子或换音色后即使倍率撞上同一格（三位小数），
+  也会复用旧音频，听感对不上且无从查起。改为
+  `std_<角色>_<倍率>_k<音色实测>_r<尺子句口径>.wav`，两个身份都进键。
+- **标定脱离项目：参考自音色本体生成，落独立缓存目录**：原标定要求先把页面归属切到某个
+  项目、且该项目已有该角音色档案，参考取项目 `音色/<角色>/` 下的 `ref_base`。这使「量一下
+  这个音色多快」必须先具备一个项目。改为：由当前选中音色解析出**音色本体**（`library:` →
+  `resources/voices/<名>/`；`named:` → 项目具名档案；`official:` → 预录 take），本体自带
+  一套 `ref_base`（同本体同设备后端下与项目那份字节相同——认领是复制、生成是确定函数），
+  标定参考即取它。`tts_engine` 增 `voice_entity_ref`（本体定位）、`ensure_calib_ref`（缓存
+  命中即用、缺则现场生成）、`calib_ref_dir`；落点 `<repo>/calib_refs/<角色>/<本体指纹前16>/`，
+  随音色本体走、跨项目共享，`.gitignore` 挡入库。`named:` 音色的本体是项目资产，仍需项目
+  归属；本体解析不出（来源非法 / 文件不齐）即报错，不猜、不退回旧参考。
+- **ref_base 的候选挑选收敛为唯一实现**：项目链（`build_role`）与标定链（`build_from`）
+  原先各自一套候选生成与谱形挑选，两条链会挑出两条不同波形，而「标定与成片同源」正是这套
+  机制的命门。抽出 `make_base_ref._gen_baseref`（跑候选、按谱形选最贴本体的一条），两处
+  共用；`make_base_ref` 增 `build_from(ref_wav, text, out_dir, role, …)` 与命令行
+  `--from-wav / --from-text / --out-dir`（不再要求 `--project-dir`）。
+- **「标准语速」全局更名为「脚本估时基准」**：该词一再被读成「尺子的语速」，进而在做完
+  A / B 尺子后仍以为页面在用旧尺子。4.39 是脚本阶段估时的常数（256 汉字/分 × 1.029），
+  与音色、与尺子都无关；试听换算的分母是各角色自己那条尺子的句子口径。全仓（界面文案、
+  模块 docstring、注释、测试说明）统一改名，数字一个未动。
+- **旧校准表留档另存、新表从零**：盘上 15 条记录的参考多为 icl 或历史版本，新架构下参考
+  换了，旧数字对应的嗓子已不是现在用的那条；不清空还会让新样本经 EMA 与旧样本混合、
+  永远标不准。原表另存为 `calibration.pre-refbase-2026-10-10.json`，`calibration.json`
+  以空 `groups` 起新表。
+
+**测试**
+
+- `tests/test_preview_standard.py` 增 6 条：`read_ruler` 只读取用（无标尺返回 None、有标尺
+  不回写）、`standard_ruler(allow_build=False)` 缺标尺抛错且不合成、试听缺标尺带 `need_ruler`
+  且不调 `speed_shift`、试听缺实测带 `need_calib`、混合试听缺标尺带 `need_ruler` 且不调
+  `mix_bgm`；两条既有用例的 `_get_std_ruler` mock 签名随 `allow_build` 更新。
+- 全量 1554 → 1560 通过（skipped=1）。
+- 真机 E2E（headless Edge + CDP，临时实例）：缺标尺时试听接口 1.8 ms 返回（原为 90 秒等待）；
+  A 角（缺实测）点试听按钮 300 ms 内改显「先点旁边的「标定」」，B 角正常秒回。
+- `tests/test_preview_standard.py` 的换算用例更名为 `test_rate_is_speed_times_role_k_over_ruler_k`，断言值同步改为 `1.2 × 4.31 ÷ 4.26`：原用例名与断言照着写反的公式写，方向错误因此从未被测出；新断言下两种方向给出不同结果（1.214 与 1.186），写反即红。
+- 换算修正后复跑全量 1560 通过（skipped=1）；`api_preview_standard` 真实调用核对：k_role 3.8369、标尺句子口径 4.7015、滑杆 0.80 → 倍率 0.653，试听词速 3.070 与成片一致。
+- `tests/test_preview_standard.py` 增 5 条：分母取 `k_sentence`（该列在场时不用整段 k）、构建落盘 `k_sentence` 且整段 k 保留、旧尺子缺列时只读取回现量、真跑 ffmpeg 量得 有效字 ÷（整段 − 句间停顿）、无句间停顿返回 None 且不抛异常。
+- 分母口径修正后复跑全量 1565 通过（skipped=1）。
+- `tests/test_preview_standard.py` 增 4 条 `TestStandardPayload`：尺子在场时 `k` 与
+  `k_sentence` 一并下发且两者不等、旧尺子缺列时如实退回整段口径、尺子不在场时不含
+  `k_sentence`、读尺子抛异常时降级为只报 `k`（不让配置页加载不出来）。
+- 音色行补注后复跑全量 1569 通过（skipped=1）；另抽取页面内联脚本（3 段共 140 059 字符）
+  过 `node --check`，并用真前端 `ratioNote` 渲染两种快慢音色的说明核对文案。
+- `tests/test_voice_design.py` 的 `TestRawVoicePreview` 增 5 条：播放器全页只造一个
+  （`new Audio(` 在该整段只出现一次、且带 `if(!RAW_AU)` 守卫）、停止时摘 `src` 并 `load()`、
+  换曲的 `AbortError` 与 `RAW_SEQ` 守卫在场、一次故障只报一条（`told` 标志）、页面含空图标
+  `<link rel="icon" href="data:,">`。
+- 原声播放器修复后复跑全量 1574 通过（skipped=1）；真机验收 8 项（点开播放、再点停止、
+  切曲时旧按钮自动复位、40 ms 快换仍只一路、播完自动复位、真 404 恰好报一条、404 后按钮
+  复位、浏览器不再请求 `favicon.ico`）全部通过。
+- `tests/test_voice_design.py` 增 `TestPreviewMutex` 6 条：仲裁唯一（一个占用者变量、
+  一取一还两函数、抢之前先停别人）、六路发声者都 `claimAudio`、五路「停」都
+  `releaseAudio`、五路「停」皆 `pause` + 摘 `src` + `load()`、标准试听可停且 `finally`
+  不复位播放态、档位试听登记仲裁。
+- `tests/test_music_service.py` 的 `test_draft_audio_endpoint_used` 改为断言
+  `MU_AU.src='/api/music/audio/_draft'` 与 `if(!MU_AU)MU_AU=new Audio()` 并存：原断言钉的
+  是「每次 new Audio」的旧写法，与单实例复用相抵。
+- 播放器互斥与试听停止落地后复跑全量 1580 通过（skipped=1）；真机验收（headless Edge +
+  CDP，配置页 A 角）7 项：点试听开播、点原声时试听自动停、再点试听时原声自动停、再点
+  试听即停、再点试听重播、原声与试听交替互斥、再点原声即停。另做连点压力：A / B 两角
+  原声交替点击 12 次（间隔 250 ms），新建播放器 1 个、同时在响 1 路。
+- `tests/test_duration_model.py` 增 `TestCalibrateDevice` 6 条：设备与后端随系数落盘、
+  同设备样本累加、换设备丢弃旧样本（样本数归零、系数为本批值）、本次缺设备时沿用上一条、
+  `summary` 带出设备与后端、旧数据不凭空出现该键。
+- `tests/test_tts_engine.py` 增 `TestRunningDevice` 4 条：真实设备与后端、占位「未加载」
+  返回空、服务离线返回空、探测异常返回空。
+- `tests/test_preview_standard.py` 增 `TestVoiceToolPrep` 3 条（腾显存后加 `--device cuda`、
+  已带该参数则不重复加、四处音色工具 spawn 全部经过该函数）、`TestVoiceCalibrate` 本地引擎
+  1 条（先腾显存、设备与后端随系数落表）、`TestRulerCarrierPinned` 2 条（构建路径烙设备与
+  后端、只读路径不探测服务）。
+- 腾显存与设备落表落地后复跑全量 1596 通过（skipped=1）。
+- `tests/test_preview_standard.py` 增 5 条：A / B 两条尺子各占文件名、写入互不覆盖、
+  只读各取自己那条、文本随角色落到各自 json；`_sentence_boundary_fracs` 按传入文本算
+  （等长文本 0.5、不等长 0.2778、单句返回空）；试听缓存键含音色实测与尺子句口径两个
+  身份；标定取 `ref_base` 本尊并用 `ref.txt` 逐句（断言传给合成的参考与三句文本）、
+  无 `ref_base` 时退回账本那一对。`TestStandardPayload` 四条随 `k_sentence` 改为按角色
+  下发而更新，`_get_std_ruler` 系列的 mock 签名随 `role` 参数同步。
+- 尺子 A / B 分离与标定改参考后复跑全量 1601 通过（skipped=1）。
+- 真机验收（`--port 8814` 临时实例，真服务）：`/api/config` 下发
+  `k_sentence = {"A": 4.45, "B": 4.55}`；A 角试听（`library:薇薇-清亮`、滑杆 1.0）倍率
+  0.863、分母 4.45，B 角（`library:艾登-从容`、滑杆 0.9）倍率 0.843、分母 4.55，两角各
+  用自己的尺子；混合试听照常取 A 角尺子。另跑一次真标定（临时校准表，未写盘上
+  `calibration.json`）：参考与文本确为该角 `ref_base` 与 `ref.txt`，A 角 k 4.9479、
+  B 角 k 4.8549，`device: cuda`，`samples: 3`。
+- `tests/test_tts_engine.py` 增 `TestVoiceEntityRef` 4 条（声库音色解析到本体目录、声库无
+  此条返回 None、具名本体需项目根、非法来源一律 None）、`TestCalibRef` 4 条（落点带角色与
+  本体指纹、非法角色归 A、缓存命中不起子进程、未命中起生成器且命令行钉 `--from-wav` /
+  `--out-dir` / `--device cuda`）；`TestScriptPins` 增 2 条（`ref_base` 候选挑选只有一条实现、
+  命令行留出脱离项目那一路）。
+- `tests/test_preview_standard.py` 的标定用例改为按新流程断言：参考取本体自生成的
+  `ref_base`、文本取本体转录，`voice_entity_ref` / `ensure_calib_ref` 的入参逐条核对；原
+  「无 `ref_base` 退回账本那一对」用例改为「本体解析不出即报错、不落表」，另增一条具名本体
+  缺项目时如实报错。
+- 标定脱离项目后复跑全量 1612 通过（skipped=1）。
+- 真机核对：`voice_entity_ref` 对 `library:薇薇-清亮` / `library:艾登-从容` / `official:Vivian#1`
+  均解析出本体（波形在场、转录非空），未登记音色与无名具名档案返回 None；脱离项目路径真机
+  跑通——`make_base_ref.py --from-wav …/薇薇-清亮/ref.wav --from-text …/ref.txt --out-dir …
+  --role A --device cuda` 生成 `ref_base.wav`（11.2 秒 / 44100 Hz，`device: cuda`，
+  `backend: faster-qwen3-tts（CUDA 图）`），再次以同本体调用命中缓存 0.37 秒返回、不加载模型。
+
+---
+
 ## v2.9.1
 
 **本次改动：修复 AI 音乐库曲目下拉选中后切页回来变「未选择」（空壳下拉被读成空值）**
@@ -3270,7 +3489,7 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 
 **变更**
 
-- **内容制作者改为法定必填，去除作者名预设**：`aigc.provider_code`（默认硬编码 `wUwproject`）更名为 `aigc.content_producer`，默认值置空，配置页加「必填」徽标；留空时 `aigc_json` 报错停产，错误信息给填写指引。理由：制作者身份跟的是运行工具的人——工具开源后每个用户填自己的名称或编码，代码里预设任何人的名字都是伪造归属；模型名、工具名同样不是制作者。manifest 记录字段同步更名，`REQUIRED_FIELDS` 常量明确七要素中法律必填的三项（Label / ContentProducer / ProduceID），配置页说明写明必填范围。版权行配置不受影响（可空，性质不同）。
+- **内容制作者改为法定必填，去除作者名预设**：`aigc.provider_code`（默认硬编码 `[username-redacted]`）更名为 `aigc.content_producer`，默认值置空，配置页加「必填」徽标；留空时 `aigc_json` 报错停产，错误信息给填写指引。理由：制作者身份跟的是运行工具的人——工具开源后每个用户填自己的名称或编码，代码里预设任何人的名字都是伪造归属；模型名、工具名同样不是制作者。manifest 记录字段同步更名，`REQUIRED_FIELDS` 常量明确七要素中法律必填的三项（Label / ContentProducer / ProduceID），配置页说明写明必填范围。版权行配置不受影响（可空，性质不同）。
 
 ---
 
@@ -3297,7 +3516,7 @@ instruct 已判死（v0.9.0，两轮对照一反向一无效），混合参考�
 **说明**
 
 - **标识开关与停产纪律**：关掉 `aigc.labeling` 即回到无标识产物；打标失败（ffmpeg 缺失、声明合成失败、自定义音频路径不存在）**报错停产**，不静默跳过——合规动作缺一块的片子不该被造出来。
-- **内容编号的取值**：内容编号 ProduceID 取产物文件名（去扩展名），期号前缀天然唯一；服务提供者编码默认 wUwproject，接入标识服务平台后换成平台分配的编码。
+- **内容编号的取值**：内容编号 ProduceID 取产物文件名（去扩展名），期号前缀天然唯一；服务提供者编码默认 [username-redacted]，接入标识服务平台后换成平台分配的编码。
 - **平台侧边界**：平台侧声明（发布时的"AI 生成"开关）与平台转码是否保留元数据不在本管线管辖内；文件内显式声明 + 元数据 + 封面水印三层随文件走，不受平台影响。
 
 ---

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -415,7 +415,7 @@ def _ratio_issues(episodes, target, ratio):
     """压比体检：逐期对照压缩档的两条红线，返回问题列表（空 = 全员达标）。
 
     压比 = 期素材字数 ÷ **成稿目标**（`probe.target_chars`，不含偏移——
-    口径法源：1 = 每期时长 × 标准语速，偏移量不改变"1"）。两条红线：
+    口径法源：1 = 每期时长 × 脚本估时基准，偏移量不改变"1"）。两条红线：
 
     - **上限 = 档位 × 1.25**（压不动线）：素材容量 x = 1 × 1.25 × 档位，超过
       它，模型只能反复删减，有损之上再有损，损到语义不保——这是把内容压进

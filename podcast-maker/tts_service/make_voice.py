@@ -41,8 +41,9 @@ Base 变体的音色不在模型里，在一段参考音频里。这段音频是
 这个结果，所以「新项目自动录一份」与「从老项目拷一份」在 GPU 上等价。
 
 前提不能省。`pick_device()` 在空闲显存不足时会**静默**退 CPU，而 CPU 路径的数值
-结果与 GPU 路径不是同一条（同一套输入，波形不同、F0 也不同）。所以录档案之前
-要先确认没有别的模型占着显存；profile.json 里记了 `device`，两份档案音色对不上
+结果与 GPU 路径不是同一条（同一套输入，波形不同、F0 也不同）。主程序（web_ui）
+拉起本工具前会先腾显存、并把 `--device cuda` 钉进命令行；直接跑 CLI 的人要自己
+保证显存干净。profile.json 与 ref_base 记录里都记了 `device`，两份档案音色对不上
 时先看这一栏。真要跨项目对齐又要绕过这一切，用 `--from` 继承：复制文件，
 不依赖任何数值巧合。
 """
@@ -86,7 +87,7 @@ REF_TEXTS = {
 RATE_MIN, RATE_MAX, MIN_SEGMENTS, MAX_ATTEMPTS = 3.5, 7.0, 3, 4
 
 # 与 config_manager.PARAM_SPEC 里 tts.qwen3tts_voice_a / _b 的**出厂默认值**一致
-# （library:瑟琳-利落 / library:老傅-收束 —— 随仓声库条目，A 案 / B 案各一，
+# （library:说书女-惊堂 / library:说书男-缓板 —— 随仓声库条目，A 案 / B 案各一，
 # 与 adopt_official 的角色把关同向）。
 # 主程序会把项目里配好的音色来源通过 --voice-a / --voice-b 传进来覆盖它，
 # 这里只兜「直接跑命令行」那一种入口。
@@ -95,9 +96,11 @@ RATE_MIN, RATE_MAX, MIN_SEGMENTS, MAX_ATTEMPTS = 3.5, 7.0, 3, 4
 # 「命令行直接跑」与「主程序自动跑」会落到两条不同音频上，而档案里看不出
 # 是哪个入口来的，排查起来毫无线索。有测试逐条比对这两处。
 # 默认音色来自随仓声库（resources/voices），且**必须各认各的案**（A 角认 A 案、
-# B 角认 B 案，与 adopt_official 的把关一致）：A 角瑟琳-利落（Serena A 案）、
-# B 角老傅-收束（Uncle_Fu B 案）—— 沿 2026-10 前默认的 Serena/Uncle_Fu 家族。
-DEFAULT_VOICES = {"A": "library:瑟琳-利落", "B": "library:老傅-收束"}
+# B 角认 B 案，与 adopt_official 的把关一致）：A 角说书女-惊堂（VoiceDesign
+# 说书女 A 案）、B 角说书男-缓板（VoiceDesign 说书男 B 案）—— 2026-10 起默认
+# 换 VoiceDesign 人物 roster（说书 family），旧默认瑟琳-利落/老傅-收束
+# 已随前代 37 条整体归档（archive/voices-前代37/），声库仅存 roster 40 条。
+DEFAULT_VOICES = {"A": "library:说书女-惊堂", "B": "library:说书男-缓板"}
 
 ROLES = ("A", "B")
 # VoiceDesign 造嗓的**草稿目录**：造嗓先落这里，试听满意后再「保存」改名成

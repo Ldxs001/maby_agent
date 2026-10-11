@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright 2026 wUwproject
+# Copyright 2026 [username-redacted]
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@
 # 发布工具读取 __version__ 赋值行的引号字面量（PyPI setup.py 解析同理），
 # 故本文件任何注释都不得出现形如 赋值名 + 等号 + 引号 的文本。
 # 与 config_manager.VERSION 同步修改。
-__version__ = "2.9.1"
+__version__ = "2.11.0"
 
 from .config_manager import (ConfigManager, GATE_SPEC, MODE_SPEC, PARAM_SPEC,
                              PRESET_SPEC, VERSION)

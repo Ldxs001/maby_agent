@@ -1,7 +1,8 @@
 # 播客制作智能体 · 设计方案
 
-> 版本：v0.1.0-plan（草案，待拍板）
-> 作者：wUwproject | 许可证：Apache 2.0
+> 版本：源起 v0.1.0-plan（本文是设计方案与演进记录，正文按时间顺序累加）
+> 现状：已落地并演进至 v2.10.0；实现以仓库与 [CHANGELOG.md](CHANGELOG.md) 为准，逐节收口见 §17
+> 作者：[username-redacted] | 许可证：Apache 2.0
 > 依赖来源：`douyin_podcast_maker`（成熟资产移植）+ `maby_agent` 智能体范式
 > 日期：2026-09-11
 
@@ -620,7 +621,7 @@ $$t = a\cdot N_{\text{汉字}} + b\cdot N_{\text{标点}} + c$$
 
 | 层 | 内容 |
 |---|---|
-| L1 身份 | Podcast Maker v0.1.0 | 作者 wUwproject | Apache 2.0 |
+| L1 身份 | Podcast Maker v0.1.0 | 作者 [username-redacted] | Apache 2.0 |
 | L2 触发与能力 | 用户提供素材与要求时调用；能写脚本、合成声音、烧字幕、出成片与封面；**不能**发布到平台、不能做声纹克隆、不能生成人脸、不能替用户决定风格 |
 | L3 行为约束 | fail-closed（LLM 不可用即报错，不静默兜底）；脚本必须落进模板；同一人连说不超过范式卡上限；时长偏差超阈即回灌；文案忠于素材，禁编造；门禁不过不给产物 |
 | L4 接口 | HTTP API 表 + `script.json` schema + 产物清单 + CLI 参数 |
